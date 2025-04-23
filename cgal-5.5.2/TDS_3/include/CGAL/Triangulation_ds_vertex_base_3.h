@@ -69,8 +69,8 @@ private:
   // The names are chooses complicated so that we do not have to document them
   // (privacy by obfuscation)
   public:
-  typedef uint16_t Has_visited_for_vertex_extractor;
-  uint16_t visited_for_vertex_extractor;
+  typedef uint8_t Has_visited_for_vertex_extractor;
+  uint8_t visited_for_vertex_extractor;
 };
 
 template < class TDS >

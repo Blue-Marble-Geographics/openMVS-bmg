@@ -1238,7 +1238,7 @@ static inline edge_id_t make_edge_id(vertex_handle_t a, vertex_handle_t b) {
 }
 
 template<class T>
-struct PaddedVector
+struct alignas(64) PaddedVector
 {
 		std::vector<T> mData;
 		char mPadding[64-sizeof(mData)];
@@ -1427,14 +1427,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	{
 		TD_TIMER_STARTD();
 
-
 		std::vector<point_t> vertices;
-		vertices.reserve(numVertices);
-		point_t* __restrict dstVertices = vertices.data();
-
+		vertices.resize(numVertices);
 		std::vector<std::ptrdiff_t> indices;
-		indices.reserve(numVertices);
-		ptrdiff_t* __restrict dstIndices = indices.data();
+		indices.resize(numVertices);
 
 		// fetch points
 		if (bUseOnlyROI && !IsBounded())
@@ -1444,14 +1440,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			const PointCloud::Point X(pPointStream[j], pPointStream[j+1], pPointStream[j+2]);
 			if (bUseOnlyROI && !obb.Intersects(X))
 				continue;
-			dstVertices[i] = point_t(X.x, X.y, X.z);
-			dstIndices[i] = i;
+			vertices[i] = point_t(X.x, X.y, X.z);
+			indices[i] = i;
 		}
-
-		vertices.resize(numVertices);
-		indices.resize(numVertices);
-
-		DEBUG_EXTRA("time %s", TD_TIMER_GET_FMT().c_str());
 
 		// sort vertices
 		typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
@@ -1542,7 +1533,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						// know a little about what we are working with.
 						nearest = delaunay.nearest_vertex_in_cell(p, c);
 
-						static uint16_t marker = 0;
+						static uint8_t marker = 0;
 
 						const _DataD ax = _SetD(p.x());
 						const _DataD ay = _SetD(p.y());
@@ -1663,8 +1654,8 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				// update point visibility info
 				hint->info().InsertViews(pointcloud, idx);
 				++cnt;
-				if (!(cnt & 15)) {
-					progress += 16;
+				if (!(cnt & 31)) {
+					progress += 32;
 				}
 			});
 		}

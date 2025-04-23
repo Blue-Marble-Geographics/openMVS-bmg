@@ -101,7 +101,7 @@ public:
   class Cell_data {
     unsigned char conflict_state;
   public:
-      uint16_t marker;
+    uint8_t marker;
 
     Cell_data() : conflict_state(0), marker(0) {}
 
