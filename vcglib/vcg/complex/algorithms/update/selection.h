@@ -108,36 +108,47 @@ public:
 
     if(! (Allocator<ComputeMeshType>::template IsValidHandle(*_m, vsH))) return false;
 
-    for(auto vi = _m->vert.begin(); vi != _m->vert.end(); ++vi)
-      if( !(*vi).IsD() )
+		int64_t cnt = (int64_t) _m->vert.size();
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& vi = _m->vert[i];
+      if( !vi.IsD() )
       {
-        if(vsH[*vi]) { 
-           if(!andFlag) (*vi).SetS();
+        if(vsH[vi]) { 
+           if(!andFlag) vi.SetS();
         } else {
-          if(!orFlag)   (*vi).ClearS();
+          if(!orFlag)   vi.ClearS();
         }
       }
+    }
 
-    for(auto ei = _m->edge.begin(); ei != _m->edge.end(); ++ei)
-      if( !(*ei).IsD() )
+	  cnt = (int64_t) _m->edge.size();
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& e = _m->edge[i];
+      if( !e.IsD() )
       {
-        if(esH[*ei]) { 
-           if(!andFlag) (*ei).SetS();
+        if(esH[e]) { 
+           if(!andFlag) e.SetS();
         } else {
-          if(!orFlag)   (*ei).ClearS();
+          if(!orFlag)   e.ClearS();
         }
       }
-    
-    
-    for(auto fi = _m->face.begin(); fi != _m->face.end(); ++fi)
-      if( !(*fi).IsD() )
+    }
+
+    cnt = (int64_t) _m->face.size();
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& f = _m->face[i];
+      if( !f.IsD() )
       {  
-        if(fsH[*fi]) { 
-           if(!andFlag) (*fi).SetS();
+        if(fsH[f]) { 
+           if(!andFlag) f.SetS();
         } else {
-          if(!orFlag)   (*fi).ClearS();
+          if(!orFlag)   f.ClearS();
         }
-     }
+      }
+    }
 
      for (auto ti = _m->tetra.begin(); ti != _m->tetra.end(); ++ti)
       if (!(*ti).IsD())

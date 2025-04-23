@@ -160,8 +160,10 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 }
 
 // finalize application instance
-void Finalize()
+void TFinalize()
 {
+	MVS::Finalize();
+
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	// print memory statistics
 	Util::LogMemoryInfo();
@@ -358,7 +360,7 @@ int main(int argc, LPCTSTR* argv)
 		scene.platforms.size(), scene.images.size(), scene.pointcloud.GetSize(),
 		TD_TIMER_GET_FMT().c_str());
 
-	Finalize();
+	TFinalize();
 	return EXIT_SUCCESS;
 }
 /*----------------------------------------------------------------*/

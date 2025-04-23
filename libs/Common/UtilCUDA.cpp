@@ -50,6 +50,10 @@ int _convertSMVer2Cores(int major, int minor)
 		{0x70, 64 }, // Volta Generation (SM 7.0) GV100 class
 		{0x72, 64 }, // Volta Generation (SM 7.2) GV10B class
 		{0x75, 64 }, // Turing Generation (SM 7.5) TU1xx class
+		{0x80, 64 }, // Ampere Generation (SM 8.0) GA100 class
+		{0x86, 128}, // Ampere Generation (SM 8.6) GA102-GA107 class
+		{0x89, 128}, // Ada Generation (SM 8.9) AD106 class
+		{0x90, 128}, // Hopper Generation (SM 9.0) GH100 class
 		{-1, -1}
 	};
 
@@ -122,10 +126,10 @@ CUresult _gpuGetMaxGflopsDeviceId(Device& bestDevice)
 		if (device.major > 0 && device.major < 9999) {
 			best_SM_arch = MAXF(best_SM_arch, device.major);
 			device.ID = (CUdevice)current_device;
-			devices.Insert(device);
+			devices.emplace_back(std::move(device));
 		}
 	}
-	if (devices.IsEmpty()) {
+	if (devices.empty()) {
 		VERBOSE("CUDA error: all devices have compute mode prohibited");
 		return CUDA_ERROR_PROFILER_DISABLED;
 	}
@@ -133,22 +137,22 @@ CUresult _gpuGetMaxGflopsDeviceId(Device& bestDevice)
 	// Find the best CUDA capable GPU device
 	Device* max_perf_device = NULL;
 	size_t max_compute_perf = 0;
-	FOREACHPTR(pDevice, devices) {
-		ASSERT(pDevice->computeMode != CU_COMPUTEMODE_PROHIBITED);
-		int sm_per_multiproc = _convertSMVer2Cores(pDevice->major, pDevice->minor);
+	for (Device& device: devices) {
+		ASSERT(device.computeMode != CU_COMPUTEMODE_PROHIBITED);
+		int sm_per_multiproc = _convertSMVer2Cores(device.major, device.minor);
 		int multiProcessorCount;
-		if (reportCudaError(cuDeviceGetAttribute(&multiProcessorCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, (CUdevice)pDevice->ID)) != CUDA_SUCCESS)
+		if (reportCudaError(cuDeviceGetAttribute(&multiProcessorCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device.ID)) != CUDA_SUCCESS)
 			continue;
 		int clockRate;
-		if (reportCudaError(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, pDevice->ID)) != CUDA_SUCCESS)
+		if (reportCudaError(cuDeviceGetAttribute(&clockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device.ID)) != CUDA_SUCCESS)
 			continue;
 		size_t compute_perf = (size_t)multiProcessorCount * sm_per_multiproc * clockRate;
 		if (compute_perf > max_compute_perf &&
 			(best_SM_arch < 3 || // if we find GPU with SM major > 2, search only these
-			 pDevice->major == best_SM_arch) ) // if our device==dest_SM_arch, choose this, or else pass
+			 device.major == best_SM_arch) ) // if our device==dest_SM_arch, choose this, or else pass
 		{
 			max_compute_perf = compute_perf;
-			max_perf_device  = pDevice;
+			max_perf_device  = &device;
 		}
 	}
 	if (max_perf_device == NULL)
@@ -179,8 +183,8 @@ CUresult initDevice(int deviceID)
 		VERBOSE("CUDA error: compute capability 3.2 or greater required (available %d.%d for device[%d])", device.ID, device.major, device.minor);
 		return CUDA_ERROR_INVALID_DEVICE;
 	}
-	devices.Insert(device);
-	checkCudaError(cuCtxCreate(&devices.Last().ctx, CU_CTX_SCHED_AUTO, device.ID));
+	devices.emplace_back(device);
+	checkCudaError(cuCtxCreate(&devices.back().ctx, CU_CTX_SCHED_AUTO, device.ID));
 
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	char name[2048];

@@ -13,7 +13,7 @@
 // D E F I N E S ///////////////////////////////////////////////////
 
 #define MVSI_PROJECT_ID "MVSI" // identifies the project stream
-#define MVSI_PROJECT_VER ((uint32_t)6) // identifies the version of a project stream
+#define MVSI_PROJECT_VER ((uint32_t)7) // identifies the version of a project stream
 
 // set a default namespace name if none given
 #ifndef _INTERFACE_NAMESPACE
@@ -24,6 +24,11 @@
 // (should be uncommented if OpenCV is not available)
 #if !defined(_USE_OPENCV) && !defined(_USE_CUSTOM_CV)
 #define _USE_CUSTOM_CV
+#endif
+
+// set to disable custom NO_ID declaration
+#ifndef _DISABLE_NO_ID
+#define _INTERFACE_NO_ID
 #endif
 
 
@@ -162,7 +167,9 @@ public:
 namespace _INTERFACE_NAMESPACE {
 
 // invalid index
+#ifdef _INTERFACE_NO_ID
 constexpr uint32_t NO_ID {std::numeric_limits<uint32_t>::max()};
+#endif
 
 // custom serialization
 namespace ARCHIVE {
@@ -386,6 +393,21 @@ struct Interface
 			static uint32_t GetNormalizationScale(uint32_t width, uint32_t height) { return std::max(width, height); }
 			uint32_t GetNormalizationScale() const { return GetNormalizationScale(width, height); }
 
+			// project point: camera to image (homogeneous) coordinates
+			inline Pos3d operator * (const Pos3d& X) const {
+				return Pos3d(
+					K(0,2)+K(0,0)*X.x/X.z,
+					K(1,2)+K(1,1)*X.y/X.z,
+					1.0);
+			}
+			// back-project point: image (z is the depth) to camera coordinates
+			inline Pos3d operator / (const Pos3d& x) const {
+				return Pos3d(
+					(x.x-K(0,2))*x.z/K(0,0),
+					(x.y-K(1,2))*x.z/K(1,1),
+					1.0);
+			}
+
 			template <class Archive>
 			void serialize(Archive& ar, const unsigned int version) {
 				ar & name;
@@ -499,14 +521,40 @@ struct Interface
 
 	// structure describing an image
 	struct Image {
+		// structure describing how an other image relates to this image in terms of overlap,
+		// i.e. how many 3D points are shared between the two images, base-line and common area,
+		// useful for ex. when selecting the best images to densly match with
+		struct ViewScore {
+			uint32_t ID; // image local-ID, the index in this scene images list
+			uint32_t points; // number of 3D points shared with the reference image
+			float scale; // image scale relative to the reference image
+			float angle; // image angle relative to the reference image (radians)
+			float area; // common image area relative to the reference image (ratio)
+			float score; // aggregated image score relative to the reference image (larger is better)
+
+			template<class Archive>
+			void serialize(Archive& ar, const unsigned int /*version*/) {
+				ar & ID;
+				ar & points;
+				ar & scale;
+				ar & angle;
+				ar & area;
+				ar & score;
+			}
+		};
+		
 		std::string name; // image file name
 		std::string maskName; // segmentation file name (optional)
 		uint32_t platformID; // ID of the associated platform
 		uint32_t cameraID; // ID of the associated camera on the associated platform
 		uint32_t poseID; // ID of the pose of the associated platform
-		uint32_t ID; // ID of this image in the global space (optional)
+		uint32_t ID; // image global-ID, ex. the ID given outside the current scene, like the index in the full list of image files (optional)
+		float minDepth; // minimum depth of the points seen by this image (optional)
+		float avgDepth; // average depth of the points seen by this image (optional)
+		float maxDepth; // maximum depth of the points seen by this image (optional)
+		std::vector<ViewScore> viewScores; // list of view scores for this image (optional)
 
-		Image() : platformID(NO_ID), cameraID(NO_ID), poseID(NO_ID), ID(NO_ID) {}
+		Image() : platformID(NO_ID), cameraID(NO_ID), poseID(NO_ID), ID(NO_ID), minDepth(0), avgDepth(0), maxDepth(0) {}
 
 		bool IsValid() const { return poseID != NO_ID; }
 
@@ -521,6 +569,12 @@ struct Interface
 			ar & poseID;
 			if (version > 2) {
 				ar & ID;
+			}
+			if (version > 6) {
+				ar & minDepth;
+				ar & avgDepth;
+				ar & maxDepth;
+				ar & viewScores;
 			}
 		}
 	};
@@ -731,7 +785,7 @@ struct HeaderDepthDataRaw {
 	float dMin, dMax; // depth range for this view
 	// image file name length followed by the characters: uint16_t nFileNameSize; char* FileName
 	// number of view IDs followed by view ID and neighbor view IDs: uint32_t nIDs; uint32_t* IDs
-	// camera, rotation and position matrices (row-major): double K[3][3], R[3][3], C[3]
+	// camera, rotation and position matrices (row-major) at image resolution: double K[3][3], R[3][3], C[3]
 	// depth, normal, confidence maps: float depthMap[height][width], normalMap[height][width][3], confMap[height][width]
 	inline HeaderDepthDataRaw() : name(0), type(0), padding(0) {}
 	static uint16_t HeaderDepthDataRawName() { return *reinterpret_cast<const uint16_t*>("DR"); }

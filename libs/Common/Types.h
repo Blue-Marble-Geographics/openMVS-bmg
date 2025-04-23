@@ -59,31 +59,26 @@
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <optional>
 #include <vector>
 #include <list>
 #include <queue>
 #include <deque>
 #include <iterator>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 #include <random>
+#include <thread>
 #ifdef _USE_OPENMP
 #include <omp.h>
 #endif
 
 // Function delegate functionality
-#ifdef _SUPPORT_CPP11
-#include "FastDelegateCPP11.h"
+#include "FastDelegate.h"
 #define DELEGATE fastdelegate::delegate
 #define DELEGATEBIND(DLGT, FNC) DLGT::from< FNC >()
 #define DELEGATEBINDCLASS(DLGT, FNC, OBJ) DLGT::from(*OBJ, FNC)
-#else
-#include "FastDelegate.h"
-#include "FastDelegateBind.h"
-#define DELEGATE fastdelegate::FastDelegate
-#define DELEGATEBIND(DLGT, FNC) fastdelegate::bind(FNC)
-#define DELEGATEBINDCLASS(DLGT, FNC, OBJ) fastdelegate::bind(FNC, OBJ)
-#endif
 
 // include usual boost libraries
 #ifdef _USE_BOOST
@@ -385,6 +380,25 @@ typedef TAliasCast<double,int32_t> CastD2I;
 #endif
 
 
+// functions simplifying the task of printing messages
+namespace SEACAVE {
+// print the given message composed of any number of arguments to the given stream
+template<typename... Args>
+std::ostringstream& PrintMessageToStream(std::ostringstream& oss, Args&&... args) {
+	// fold expression to insert all arguments into the stream
+	(oss << ... << args);
+	return oss;
+}
+// print the given message composed of any number of arguments to a string
+template<typename... Args>
+std::string PrintMessageToString(Args&&... args) {
+	std::ostringstream oss;
+	(oss << ... << args);
+	return oss.str();
+}
+} // namespace SEACAVE
+
+
 // I N C L U D E S /////////////////////////////////////////////////
 
 #include "Strings.h"
@@ -435,7 +449,6 @@ typedef class GENERAL_API cList<double, double, 0>      DoubleArr;
 #include "EventQueue.h"
 #include "SML.h"
 #include "ConfigTable.h"
-#include "HTMLDoc.h"
 
 
 // D E F I N E S ///////////////////////////////////////////////////
@@ -689,13 +702,13 @@ constexpr T factorial(T n) {
 }
 template<typename T>
 constexpr T combinations(const T& n, const T& k) {
-	ASSERT(n >= k);
+	SIMPLE_ASSERT(n >= k);
 	#if 1
 	T num = n;
 	const T den = factorial(k);
 	for (T i=n-k+1; i<n; ++i)
 		num *= i;
-	ASSERT(num%den == 0);
+	SIMPLE_ASSERT(num%den == 0);
 	return num/den;
 	#else
 	return factorial(n) / (factorial(k)*factorial(n-k));
@@ -969,10 +982,6 @@ FORCEINLINE INTTYPE Round2Int(double x) {
 // INTERPOLATION
 
 // Linear interpolation
-inline float lerp(float u, float v, float x)
-{
-	return u + (v - u) * x;
-}
 template<typename Type>
 inline Type lerp(const Type& u, const Type& v, float x)
 {
@@ -980,13 +989,6 @@ inline Type lerp(const Type& u, const Type& v, float x)
 }
 
 // Cubic interpolation
-inline float cerp(float u0, float u1, float u2, float u3, float x)
-{
-	const float p((u3 - u2) - (u0 - u1));
-	const float q((u0 - u1) - p);
-	const float r(u2 - u0);
-	return x * (x * (x * p + q) + r) + u1;
-}
 template<typename Type>
 inline Type cerp(const Type& u0, const Type& u1, const Type& u2, const Type& u3, float x)
 {
@@ -1184,10 +1186,10 @@ inline void sse_prefetch(const void* p) {_mm_prefetch((const char*)p, _MM_HINT_N
 
 // C L A S S E S ///////////////////////////////////////////////////
 
-inline bool   ISINFORNAN(float x)			{ return (std::isinf(x) || std::isnan(x)); }
-inline bool   ISINFORNAN(double x)			{ return (std::isinf(x) || std::isnan(x)); }
-inline bool   ISFINITE(float x)				{ return (!std::isinf(x) && !std::isnan(x)); }
-inline bool   ISFINITE(double x)			{ return (!std::isinf(x) && !std::isnan(x)); }
+inline bool   ISINFORNAN(float x)			{ return std::isinf(x) || std::isnan(x); }
+inline bool   ISINFORNAN(double x)			{ return std::isinf(x) || std::isnan(x); }
+inline bool   ISFINITE(float x)				{ return std::isfinite(x); }
+inline bool   ISFINITE(double x)			{ return std::isfinite(x); }
 template<typename _Tp>
 inline bool   ISFINITE(const _Tp* x, size_t n)	{ for (size_t i=0; i<n; ++i) if (ISINFORNAN(x[i])) return false; return true; }
 
@@ -1205,7 +1207,7 @@ template<typename _Tp>
 inline _Tp    SIGN(_Tp x)					{ if (x > _Tp(0)) return _Tp(1); if (x < _Tp(0)) return _Tp(-1); return _Tp(0); }
 
 template<typename _Tp>
-inline _Tp    ABS(_Tp    x)					{ return std::abs(x); }
+__forceinline _Tp    ABS(_Tp    x)					{ return std::abs(x); }
 
 template<typename _Tp>
 constexpr _Tp    ZEROTOLERANCE()			{ return _Tp(0); }
@@ -1269,6 +1271,7 @@ public:
 	#ifdef _USE_EIGEN
 	EIGEN_MAKE_ALIGNED_OPERATOR_NEW_IF_VECTORIZABLE_FIXED_SIZE(TYPE,2)
 	typedef Eigen::Matrix<TYPE,2,1> EVec;
+	typedef Eigen::Map<const EVec> CEVecMap;
 	typedef Eigen::Map<EVec> EVecMap;
 	#endif
 
@@ -1285,7 +1288,7 @@ public:
 	template <typename T> inline TPoint2(const cv::Matx<T,2,1>& rhs) : Base(rhs(0),rhs(1)) {}
 	template <typename T> inline TPoint2(const cv::Matx<T,1,2>& rhs) : Base(rhs(0),rhs(1)) {}
 	#ifdef _USE_EIGEN
-	inline TPoint2(const EVec& rhs) { operator EVec& () = rhs; }
+	inline TPoint2(const EVec& rhs) { operator EVecMap () = rhs; }
 	#endif
 	explicit inline TPoint2(const TYPE& _x) : Base(_x,_x) {}
 	inline TPoint2(const TYPE& _x, const TYPE& _y) : Base(_x,_y) {}
@@ -1295,19 +1298,25 @@ public:
 	template <typename T> inline TPoint2& operator = (const cv::Matx<T,2,1>& rhs) { operator Vec& () = rhs; return *this; }
 	template <typename T> inline TPoint2& operator = (const cv::Matx<T,1,2>& rhs) { operator VecT& () = rhs; return *this; }
 	#ifdef _USE_EIGEN
-	inline TPoint2& operator = (const EVec& rhs) { operator EVec& () = rhs; return *this; }
+	inline TPoint2& operator = (const EVec& rhs) { operator EVecMap () = rhs; return *this; }
 	#endif
 
 	// conversion to another data type
-	template <typename T> inline operator TPoint2<T> () const { return TPoint2<T>(x,y); }
+	template <typename T> inline operator TPoint2<T> () const { return TPoint2<T>((T)x,(T)y); }
 
 	// pointer to the first element access
 	inline const TYPE* ptr() const { return &x; }
 	inline TYPE* ptr() { return &x; }
 
+	// iterator base access to enable range-based for loops
+	inline const TYPE* begin() const { return &x; }
+	inline const TYPE* end() const { return &x+3; }
+
 	// 1D element access
-	inline const TYPE& operator [](size_t i) const { ASSERT(i>=0 && i<2); return ptr()[i]; }
-	inline TYPE& operator [](size_t i) { ASSERT(i>=0 && i<2); return ptr()[i]; }
+	inline const TYPE& operator ()(int i) const { ASSERT(i>=0 && i<2); return ptr()[i]; }
+	inline TYPE& operator ()(int i) { ASSERT(i>=0 && i<2); return ptr()[i]; }
+	inline const TYPE& operator [](int i) const { ASSERT(i>=0 && i<2); return ptr()[i]; }
+	inline TYPE& operator [](int i) { ASSERT(i>=0 && i<2); return ptr()[i]; }
 
 	// Access point as Size equivalent
 	inline operator const Size& () const { return *((const Size*)this); }
@@ -1323,10 +1332,9 @@ public:
 
 	#ifdef _USE_EIGEN
 	// Access point as Eigen equivalent
-	inline operator const EVec& () const { return *((const EVec*)this); }
-	inline operator EVec& () { return *((EVec*)this); }
+	inline operator EVec () const { return CEVecMap((const TYPE*)this); }
 	// Access point as Eigen::Map equivalent
-	inline operator const EVecMap () const { return EVecMap((TYPE*)this); }
+	inline operator CEVecMap () const { return CEVecMap((const TYPE*)this); }
 	inline operator EVecMap () { return EVecMap((TYPE*)this); }
 	#endif
 
@@ -1361,6 +1369,7 @@ public:
 	#ifdef _USE_EIGEN
 	EIGEN_MAKE_ALIGNED_OPERATOR_NEW_IF_VECTORIZABLE_FIXED_SIZE(TYPE,3)
 	typedef Eigen::Matrix<TYPE,3,1> EVec;
+	typedef Eigen::Map<const EVec> CEVecMap;
 	typedef Eigen::Map<EVec> EVecMap;
 	#endif
 
@@ -1377,10 +1386,10 @@ public:
 	template <typename T> inline TPoint3(const cv::Matx<T,3,1>& rhs) : Base(rhs(0),rhs(1),rhs(2)) {}
 	template <typename T> inline TPoint3(const cv::Matx<T,1,3>& rhs) : Base(rhs(0),rhs(1),rhs(2)) {}
 	#ifdef _USE_EIGEN
-	inline TPoint3(const EVec& rhs) { operator EVec& () = rhs; }
+	inline TPoint3(const EVec& rhs) { operator EVecMap () = rhs; }
 	#endif
 	explicit inline TPoint3(const TYPE& _x) : Base(_x,_x,_x) {}
-	__forceinline TPoint3(const TYPE& _x, const TYPE& _y, const TYPE& _z) : Base(_x,_y,_z) {}
+	inline TPoint3(const TYPE& _x, const TYPE& _y, const TYPE& _z) : Base(_x,_y,_z) {}
 	template <typename T> inline TPoint3(const cv::Point_<T>& pt, const T& _z=T(1)) : Base(pt.x,pt.y,_z) {}
 	template <typename T1, typename T2> inline TPoint3(const cv::Point_<T1>& pt, const T2& _z) : Base(pt.x,pt.y,_z) {}
 
@@ -1388,34 +1397,39 @@ public:
 	template <typename T> inline TPoint3& operator = (const cv::Matx<T,3,1>& rhs)  { operator Vec& () = rhs; return *this; }
 	template <typename T> inline TPoint3& operator = (const cv::Matx<T,1,3>& rhs)  { operator VecT& () = rhs; return *this; }
 	#ifdef _USE_EIGEN
-	inline TPoint3& operator = (const EVec& rhs) { operator EVec& () = rhs; return *this; }
+	inline TPoint3& operator = (const EVec& rhs) { operator EVecMap () = rhs; return *this; }
 	#endif
 
 	// conversion to another data type
-	template <typename T> inline operator TPoint3<T> () const { return TPoint3<T>(x,y,z); }
+	template <typename T> inline operator TPoint3<T> () const { return TPoint3<T>((T)x,(T)y,(T)z); }
 
 	// pointer to the first element access
 	inline const TYPE* ptr() const { return &x; }
 	inline TYPE* ptr() { return &x; }
 
+	// iterator base access to enable range-based for loops
+	inline const TYPE* begin() const { return &x; }
+	inline const TYPE* end() const { return &x+3; }
+
 	// 1D element access
-	inline const TYPE& operator [](BYTE i) const { ASSERT(i<3); return ptr()[i]; }
-	inline TYPE& operator [](BYTE i) { ASSERT(i<3); return ptr()[i]; }
+	inline const TYPE& operator ()(int i) const { ASSERT(i>=0 && i<3); return ptr()[i]; }
+	inline TYPE& operator ()(int i) { ASSERT(i>=0 && i<3); return ptr()[i]; }
+	inline const TYPE& operator [](int i) const { ASSERT(i>=0 && i<3); return ptr()[i]; }
+	inline TYPE& operator [](int i) { ASSERT(i>=0 && i<3); return ptr()[i]; }
 
 	// Access point as vector equivalent
-	inline operator const Vec& () const { return *((const Vec*)this); }
-	inline operator Vec& () { return *((Vec*)this); }
+	inline operator const Vec& () const { return *reinterpret_cast<const Vec*>(this); }
+	inline operator Vec& () { return *reinterpret_cast<Vec*>(this); }
 
 	// Access point as transposed vector equivalent
-	inline operator const VecT& () const { return *((const VecT*)this); }
-	inline operator VecT& () { return *((VecT*)this); }
+	inline operator const VecT& () const { return *reinterpret_cast<const VecT*>(this); }
+	inline operator VecT& () { return *reinterpret_cast<VecT*>(this); }
 
 	#ifdef _USE_EIGEN
 	// Access point as Eigen equivalent
-	inline operator const EVec& () const { return *((const EVec*)this); }
-	inline operator EVec& () { return *((EVec*)this); }
+	inline operator EVec () const { return CEVecMap((const TYPE*)this); }
 	// Access point as Eigen::Map equivalent
-	inline operator const EVecMap () const { return EVecMap((TYPE*)this); }
+	inline operator CEVecMap () const { return CEVecMap((const TYPE*)this); }
 	inline operator EVecMap () { return EVecMap((TYPE*)this); }
 	#endif
 
@@ -1472,7 +1486,7 @@ public:
 	template <typename T> inline TMatrix(const cv::Point3_<T>& rhs) : Base(rhs.x, rhs.y, rhs.z) {}
 	inline TMatrix(const cv::Mat& rhs) : Base(rhs) {}
 	#ifdef _USE_EIGEN
-	inline TMatrix(const EMat& rhs) { operator EMat& () = rhs; }
+	inline TMatrix(const EMat& rhs) { operator EMatMap () = rhs; }
 	#endif
 
 	TMatrix(TYPE v0); //!< 1x1 matrix
@@ -1509,7 +1523,7 @@ public:
 	template <typename T> inline TMatrix& operator = (const cv::Matx<T,m,n>& rhs) { Base::operator = (rhs); return *this; }
 	inline TMatrix& operator = (const cv::Mat& rhs) { Base::operator = (rhs); return *this; }
 	#ifdef _USE_EIGEN
-	inline TMatrix& operator = (const EMat& rhs) { operator EMat& () = rhs; return *this; }
+	inline TMatrix& operator = (const EMat& rhs) { operator EMatMap () = rhs; return *this; }
 	#endif
 
 	inline bool IsEqual(const Base&) const;
@@ -1520,13 +1534,12 @@ public:
 	inline TYPE& operator [](size_t i) { ASSERT(i<elems); return val[i]; }
 
 	// Access point as vector equivalent
-	inline operator const Vec& () const { return *((const Vec*)this); }
-	inline operator Vec& () { return *((Vec*)this); }
+	inline operator const Vec& () const { return *reinterpret_cast<const Vec*>(this); }
+	inline operator Vec& () { return *reinterpret_cast<Vec*>(this); }
 
 	#ifdef _USE_EIGEN
 	// Access point as Eigen equivalent
-	inline operator const EMat& () const { return *((const EMat*)this); }
-	inline operator EMat& () { return *((EMat*)this); }
+	inline operator EMat () const { return CEMatMap((const TYPE*)val); }
 	// Access point as Eigen::Map equivalent
 	inline operator CEMatMap() const { return CEMatMap((const TYPE*)val); }
 	inline operator EMatMap () { return EMatMap((TYPE*)val); }
@@ -1562,6 +1575,7 @@ public:
 	typedef cv::Size Size;
 	#ifdef _USE_EIGEN
 	typedef Eigen::Matrix<TYPE,Eigen::Dynamic,Eigen::Dynamic,Eigen::RowMajor> EMat;
+	typedef Eigen::Map<const EMat> CEMatMap;
 	typedef Eigen::Map<EMat> EMatMap;
 	#endif
 
@@ -1614,7 +1628,9 @@ public:
 	/// What is the elem stride of the matrix?
 	inline size_t elem_stride() const { ASSERT(dims == 2 && step[1] == sizeof(TYPE)); return step[1]; }
 	/// Compute the area of the 2D matrix
-	inline int area() const { ASSERT(dims == 2); return cols*rows; }
+	inline int area() const { ASSERT(dims == 0 || dims == 2); return cols*rows; }
+	/// Compute the memory size of this matrix (in bytes)
+	inline size_t memory_size() const { return cv::Mat::total() * cv::Mat::elemSize(); }
 
 	/// Is this coordinate inside the 2D matrix?
 	template <typename T>
@@ -1741,8 +1757,10 @@ public:
 	inline TYPE* getData() { ASSERT(cv::Mat::empty() || cv::Mat::isContinuous()); return (TYPE*)data; }
 
 	#ifdef _USE_EIGEN
+	// Access point as Eigen equivalent
+	inline operator EMat () const { return CEMatMap(getData(), rows, cols); }
 	// Access point as Eigen::Map equivalent
-	inline operator const EMatMap () const { return EMatMap(getData(), rows, cols); }
+	inline operator const CEMatMap () const { return CEMatMap(getData(), rows, cols); }
 	inline operator EMatMap () { return EMatMap(getData(), rows, cols); }
 	#endif
 
@@ -1829,43 +1847,38 @@ typedef CLISTDEF2(DVector) DVectorArr;
 #define _COLORMODE _COLORMODE_BGR
 #endif
 
-template<typename TYPE> class ColorType
-{
-public:
+template<typename TYPE> struct ColorType {
 	typedef TYPE value_type;
 	typedef value_type alt_type;
+	typedef value_type work_type;
 	static const value_type ONE;
 	static const alt_type ALTONE;
 };
-template<> class ColorType<uint8_t>
-{
-public:
+template<> struct ColorType<uint8_t> {
 	typedef uint8_t value_type;
 	typedef float alt_type;
+	typedef float work_type;
 	static const value_type ONE;
 	static const alt_type ALTONE;
 };
-template<> class ColorType<uint32_t>
-{
-public:
+template<> struct ColorType<uint32_t> {
 	typedef uint32_t value_type;
 	typedef float alt_type;
+	typedef float work_type;
 	static const value_type ONE;
 	static const alt_type ALTONE;
 };
-template<> class ColorType<float>
-{
-public:
+template<> struct ColorType<float> {
 	typedef float value_type;
 	typedef uint8_t alt_type;
+	typedef float work_type;
 	static const value_type ONE;
 	static const alt_type ALTONE;
 };
-template<> class ColorType<double>
-{
-public:
+template<> struct ColorType<double> {
 	typedef double value_type;
 	typedef uint8_t alt_type;
+	typedef float work_type;
 	static const value_type ONE;
 	static const alt_type ALTONE;
 };
@@ -1894,6 +1907,7 @@ struct TPixel {
 		TYPE c[3];
 	};
 	typedef typename ColorType<TYPE>::alt_type ALT;
+	typedef typename ColorType<TYPE>::work_type WT;
 	typedef TYPE Type;
 	typedef TPoint3<TYPE> Pnt;
 	static const TPixel BLACK;
@@ -1975,9 +1989,9 @@ struct TPixel {
 	template<typename T> inline TPixel& operator-=(T v) { return (*this = operator-(v)); }
 	inline uint32_t toDWORD() const { return RGBA((uint8_t)r, (uint8_t)g, (uint8_t)b, (uint8_t)0); }
 	// tools
-	template <typename VT>
-	static TPixel colorRamp(VT v, VT vmin, VT vmax);
-	static TPixel gray2color(ALT v);
+	static TPixel colorRamp(WT v, WT vmin, WT vmax);
+	static TPixel gray2color(WT v);
+	static TPixel random();
 	#ifdef _USE_BOOST
 	// serialize
 	template <class Archive>
@@ -2145,7 +2159,11 @@ public:
 	inline TImage(const Size& sz) : Base(sz) {}
 	inline TImage(const Size& sz, const TYPE& v) : Base(sz, v) {}
 	inline TImage(const Size& sz, TYPE* _data, size_t _step=Base::AUTO_STEP) : Base(sz.height, sz.width, _data, _step) {}
+	#ifdef _SUPPORT_CPP11
+	inline TImage(cv::Mat&& rhs) : Base(std::forward<cv::Mat>(rhs)) {}
 
+	inline TImage& operator = (cv::Mat&& rhs) { BaseBase::operator=(std::forward<cv::Mat>(rhs)); return *this; }
+	#endif
 	inline TImage& operator = (const Base& rhs) { BaseBase::operator=(rhs); return *this; }
 	inline TImage& operator = (const BaseBase& rhs) { BaseBase::operator=(rhs); return *this; }
 	inline TImage& operator = (const cv::MatExpr& rhs) { BaseBase::operator=(rhs); return *this; }
@@ -2186,7 +2204,7 @@ public:
 
 	template <typename T, typename PARSER>
 	static void RasterizeTriangle(const TPoint2<T>& v1, const TPoint2<T>& v2, const TPoint2<T>& v3, PARSER& parser);
-	template <typename T, typename PARSER>
+	template <typename T, typename PARSER, bool CULL=true>
 	static void RasterizeTriangleBary(const TPoint2<T>& v1, const TPoint2<T>& v2, const TPoint2<T>& v3, PARSER& parser);
 	template <typename T, typename PARSER>
 	static void RasterizeTriangleDepth(TPoint3<T> p1, TPoint3<T> p2, TPoint3<T> p3, PARSER& parser);
@@ -2203,7 +2221,10 @@ public:
 
 	bool Load(const String&);
 	bool Save(const String&) const;
+
+	#ifndef _RELEASE
 	void Show(const String& winname, int delay=0, bool bDestroy=true) const;
+	#endif
 
 	__forceinline TYPE& pix(const ImageRef& pt)
 	{
@@ -2413,7 +2434,7 @@ struct TAccumulator {
 	AccumType value;
 	WeightType weight;
 
-	inline TAccumulator() : value(0), weight(0) {}
+	inline TAccumulator() : value(INITTO(static_cast<Type*>(NULL), 0)), weight(0) {}
 	inline TAccumulator(const Type& v, const WeightType& w) : value(v), weight(w) {}
 	inline bool IsEmpty() const { return weight <= 0; }
 	// adds the given weighted value to the internal value
@@ -2817,6 +2838,7 @@ protected:
 
 #endif // _USE_EIGEN
 
+#include "../Math/LMFit/lmmin.h"
 #include "Types.inl"
 #include "Util.inl"
 #include "Rotation.h"
@@ -2825,6 +2847,7 @@ protected:
 #include "OBB.h"
 #include "Plane.h"
 #include "Ray.h"
+#include "Line.h"
 #include "Octree.h"
 #include "UtilCUDA.h"
 

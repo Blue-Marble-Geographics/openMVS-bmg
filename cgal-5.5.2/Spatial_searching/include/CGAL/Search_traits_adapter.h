@@ -294,7 +294,7 @@ public:
   }
 
   template <class FT,class Dimension>
-  FT min_distance_to_rectangle(const Query_item& p, const CGAL::Kd_tree_rectangle<FT,Dimension>& b,FT* dists) const
+  FT min_distance_to_rectangle(const Query_item& p, const CGAL::Kd_tree_rectangle<FT,Dimension>& b,std::vector<FT>& dists) const
   {
     return Base_distance::min_distance_to_rectangle(p,b,dists);
   }
@@ -305,7 +305,7 @@ public:
     return Base_distance::max_distance_to_rectangle(p,b);
   }
   template <class FT,class Dimension>
-  FT max_distance_to_rectangle(const Query_item& p,const CGAL::Kd_tree_rectangle<FT,Dimension>& b,FT* dists) const
+  FT max_distance_to_rectangle(const Query_item& p,const CGAL::Kd_tree_rectangle<FT,Dimension>& b,std::vector<FT>& dists) const
   {
     return Base_distance::max_distance_to_rectangle(p,b,dists);
   }

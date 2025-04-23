@@ -757,12 +757,12 @@ void SemiGlobalMatcher::Fuse(const Scene& scene, IIndex idxImage, IIndex numNeig
 	FOREACH(idxNeighbor, leftImage.neighbors) {
 		const ViewScore& neighbor = leftImage.neighbors[idxNeighbor];
 		// exclude neighbors that over the limit or too small score
-		ASSERT(scene.images[neighbor.idx.ID].IsValid());
+		ASSERT(scene.images[neighbor.ID].IsValid());
 		if ((numNeighbors && idxNeighbor >= numNeighbors) ||
 			(neighbor.score < fMinScore))
 			break;
 		// check if the disparity-map was estimated for this images pair
-		const Image& rightImage = scene.images[neighbor.idx.ID];
+		const Image& rightImage = scene.images[neighbor.ID];
 		Disparity subpixelSteps;
 		cv::Size imageSize; Matrix3x3 H; Matrix4x4 Q;
 		DisparityMap disparityMap; AccumCostMap costMap;
@@ -1819,6 +1819,7 @@ void SemiGlobalMatcher::RefineDisparityMap(DisparityMap& disparityMap) const
 }
 
 
+#if 0
 // extract disparity and range from the pixel-map
 void SemiGlobalMatcher::DisplayState(const cv::Size& size) const
 {
@@ -1839,6 +1840,7 @@ void SemiGlobalMatcher::DisplayState(const cv::Size& size) const
 
 	cv::destroyAllWindows();
 }
+#endif
 
 // Compute the disparity-map for the rectified image from the given depth-map of the un-rectified image;
 // the disparity map needs to be already constructed at the desired size (valid size, excluding the border)
@@ -1877,7 +1879,8 @@ void SemiGlobalMatcher::Disparity2DepthMap(const DisparityMap& disparityMap, con
 		auto pixel = [&](int, int r, int c) {
 			const ImageRef x(c,r); Point2f u;
 			ProjectVertex_3x3_2_2(H.val, x.ptr(), u.ptr());
-			u.x -= halfWindowSizeX; u.y -= halfWindowSizeY;
+			u.x -= (float)halfWindowSizeX;
+			u.y -= (float)halfWindowSizeY;
 			float disparity;
 			if (!disparityMap.sampleSafe(disparity, u, [](Disparity d) { return d != NO_DISP; })) {
 				depthMap(x) = 0;
@@ -1903,7 +1906,8 @@ void SemiGlobalMatcher::Disparity2DepthMap(const DisparityMap& disparityMap, con
 		auto pixel = [&](int, int r, int c) {
 			const ImageRef x(c,r); Point2f u;
 			ProjectVertex_3x3_2_2(H.val, x.ptr(), u.ptr());
-			u.x -= halfWindowSizeX; u.y -= halfWindowSizeY;
+			u.x -= (float)halfWindowSizeX;
+			u.y -= (float)halfWindowSizeY;
 			float disparity;
 			if (!disparityMap.sampleSafe(disparity, u, [](Disparity d) { return d != NO_DISP; }))
 				depthMap(x) = 0;
@@ -2228,7 +2232,7 @@ bool SemiGlobalMatcher::ExportDisparityMap(const String& fileName, const Dispari
 } // ExportDisparityMap
 
 
-// export point cloud
+// export point-cloud
 bool SemiGlobalMatcher::ExportPointCloud(const String& fileName, const Image& imageData, const DisparityMap& disparityMap, const Matrix4x4& Q, Disparity subpixelSteps)
 {
 	ASSERT(!disparityMap.empty());
@@ -2360,7 +2364,7 @@ bool MVS::STEREO::ExportCamerasEngin(const Scene& scene, const String& fileName)
 			image.neighbors.size()
 		);
 		for (const auto& neighbor: image.neighbors)
-			f.print(" %u", neighbor.idx.ID);
+			f.print(" %u", neighbor.ID);
 		f.print("\n");
 	}
 

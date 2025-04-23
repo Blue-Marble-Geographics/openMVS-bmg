@@ -1168,7 +1168,11 @@ struct MVS_API DepthEstimator {
 		ASSERT(ISEQUAL(norm(normal), 1.f));
 	}
 
+#if 1// New version
+	static bool ImportIgnoreMask(const Image&, const cv::Size&, uint8_t nIgnoreMaskLabel, BitMatrix&, Image8U* =NULL);
+#else
 	static bool ImportIgnoreMask(const Image&, const Image8U::Size&, BitMatrix&, uint16_t nIgnoreMaskLabel);
+#endif
 	static void MapMatrix2ZigzagIdx(const Image8U::Size& size, DepthEstimator::MapRefArr& coords, const BitMatrix& mask, int rawStride=16);
 
 	const float smoothBonusDepth, smoothBonusNormal;
@@ -1186,12 +1190,22 @@ struct MVS_API DepthEstimator {
 
 
 // Tools
+#if 1 // New version
+// Tools
+bool TriangulatePoints2DepthMap(
+	const DepthData::ViewData& image, const PointCloud& pointcloud, const IndexArr& points,
+	DepthMap& depthMap, NormalMap& normalMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly=false);
+bool TriangulatePoints2DepthMap(
+	const DepthData::ViewData& image, const PointCloud& pointcloud, const IndexArr& points,
+	DepthMap& depthMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly=false);
+#else
 bool TriangulatePoints2DepthMap(
 	const DepthData::ViewData& image, const PointCloudStreaming& pointcloud, const IndexArr& points,
 	DepthMap& depthMap, NormalMap& normalMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly=false);
 bool TriangulatePoints2DepthMap(
 	const DepthData::ViewData& image, const PointCloudStreaming& pointcloud, const IndexArr& points,
 	DepthMap& depthMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly=false);
+#endif
 
 // Robustly estimate the plane that fits best the given points
 MVS_API unsigned EstimatePlane(const Point3Arr&, Plane&, double& maxThreshold, bool arrInliers[]=NULL, size_t maxIters=0);

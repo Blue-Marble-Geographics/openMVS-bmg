@@ -341,12 +341,16 @@ class Smooth
                 cb(100 * i / step, "Classic Laplacian Smoothing");
             TD.Init(lpz);
             AccumulateLaplacianInfo(m, TD, cotangentWeight);
-            for (auto vi = m.vert.begin(); vi != m.vert.end(); ++vi)
-                if (!(*vi).IsD() && TD[*vi].cnt > 0)
-                {
-                    if (!SmoothSelected || (*vi).IsS())
-                        (*vi).P() = ((*vi).P() + TD[*vi].sum) / (TD[*vi].cnt + 1);
-                }
+
+            const int64_t cnt = (int64_t) m.vn;
+#pragma omp parallel for
+            for(int64_t i = 0; i < cnt; ++i) {
+              auto& vi = m.vert[i];
+              if (!vi.IsD() && TD[vi].cnt > 0) {
+                  if (!SmoothSelected || vi.IsS())
+                      vi.P() = (vi.P() + TD[vi].sum) / (TD[vi].cnt + 1);
+              }
+            }
         }
     }
 

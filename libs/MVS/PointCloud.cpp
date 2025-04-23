@@ -76,6 +76,7 @@ PointCloud::PointCloud(const PointCloudStreaming& pcs)
 		const size_t offset = pcs.pointViewsOffsets[i];
 		const uint32_t* src = pcs.pointViewsMemory.data() + offset;
 		auto& tmp = pointViews.emplace_back();
+		tmp.reserve((unsigned) numPointViews);
 		for (size_t j = 0; j < numPointViews; ++j) {
 			tmp.emplace_back(src[j]);
 		}
@@ -205,7 +206,7 @@ Planef PointCloud::EstimateGroundPlane(const ImageArr& images, float planeThresh
 		SEACAVE::Random rnd;
 		#endif
 		const REAL randPointsRatio(MAXF(REAL(1e-4),(REAL)randMinPoints/GetSize()));
-		const SEACAVE::Random::result_type randPointsTh(CEIL2INT<SEACAVE::Random::result_type>(randPointsRatio*rnd.max()));
+		const SEACAVE::Random::result_type randPointsTh(CEIL2INT<SEACAVE::Random::result_type>(randPointsRatio*SEACAVE::Random::max()));
 		workPoints.reserve(CEIL2INT<PointArr::IDX>(randPointsRatio*GetSize()));
 		for (const Point& X: points)
 			if (rnd() <= randPointsTh)
@@ -233,7 +234,8 @@ Planef PointCloud::EstimateGroundPlane(const ImageArr& images, float planeThresh
 	for (const Point& X: *pPoints)
 		if (plane.DistanceAbs(X) < maxThreshold)
 			inliers.emplace_back(X);
-	OptimizePlane(plane, inliers.data(), inliers.size(), 100, static_cast<float>(threshold));
+	const RobustNorm::GemanMcClure<double> robust(threshold);
+	plane.Optimize(inliers.data(), inliers.size(), robust);
 
 	// make sure the plane is well oriented, negate plane normal if it faces same direction as cameras on average
 	if (!images.empty()) {
@@ -317,7 +319,7 @@ bool PointCloud::Load(const String& fileName)
 
 	// read PLY body
 	BasicPLY::PointColNormal vertex;
-	for (int i = 0; i < (int)ply.elems.size(); i++) {
+	for (int i = 0; i < ply.get_elements_count(); i++) {
 		int elem_count;
 		LPCSTR elem_name = ply.setup_element_read(i, &elem_count);
 		if (PLY::equal_strings(BasicPLY::elem_names[0], elem_name)) {
@@ -726,7 +728,7 @@ bool PointCloudStreaming::Load(const String& fileName)
 
 	// read PLY body
 	BasicPLY::PointColNormal vertex;
-	for (int i = 0; i < (int)ply.elems.size(); i++) {
+	for (int i = 0; i < (int)ply.get_elements_count(); i++) {
 		int elem_count;
 		LPCSTR elem_name = ply.setup_element_read(i, &elem_count);
 		if (PLY::equal_strings(BasicPLY::elem_names[0], elem_name)) {

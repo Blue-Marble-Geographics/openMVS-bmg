@@ -44,7 +44,8 @@ const Camera Camera::IDENTITY(Matrix3x3::eye(), Point3(REAL(0), REAL(0), REAL(0)
 
 Camera::Camera(const Matrix3x4& _P, bool bUpdate/*=true*/)
 	:
-	P(_P)
+	P(_P),
+	Pf(Cast<float>(_P))
 {
 	if (bUpdate)
 		DecomposeP();
@@ -73,18 +74,48 @@ Camera& Camera::operator= (const CameraIntern& camera)
 	C = camera.C;
 	return *this;
 }
+Camera Camera::GetScaled(REAL s) const
+{
+	return Camera(GetScaledK(s), R, C);
+}
+Camera Camera::GetScaled(const cv::Size& size, const cv::Size& newSize) const
+{
+	return Camera(GetScaledK(size, newSize), R, C);
+}
 /*----------------------------------------------------------------*/
 
+
+Matrix4x4 Camera::GetP() const {
+	Matrix4x4 P4;
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 4; ++j)
+			P4(i, j) = P(i, j);
+	P4(3, 0) = P4(3, 1) = P4(3, 2) = 0;
+	P4(3, 3) = 1;
+	return P4;
+} // GetP
+Matrix4x4 Camera::GetRC() const {
+	Matrix3x4 P3;
+	AssembleProjectionMatrix(R, C, P3);
+	Matrix4x4 RC4;
+	for (int i = 0; i < 3; ++i)
+		for (int j = 0; j < 4; ++j)
+			RC4(i, j) = P3(i, j);
+	RC4(3, 0) = RC4(3, 1) = RC4(3, 2) = 0;
+	RC4(3, 3) = 1;
+	return RC4;
+} // GetRC
+/*----------------------------------------------------------------*/
 
 void Camera::ComposeP_RC()
 {
 	AssembleProjectionMatrix(R, C, P);
+	Pf = Cast<float>(P);
 } // ComposeP_RC
-/*----------------------------------------------------------------*/
-
 void Camera::ComposeP()
 {
 	AssembleProjectionMatrix(K, R, C, P);
+	Pf = Cast<float>(P);
 } // ComposeP
 /*----------------------------------------------------------------*/
 
@@ -92,8 +123,6 @@ void Camera::DecomposeP_RC()
 {
 	DecomposeProjectionMatrix(P, R, C);
 } // DecomposeP_RC
-/*----------------------------------------------------------------*/
-
 void Camera::DecomposeP()
 {
 	DecomposeProjectionMatrix(P, K, R, C);
@@ -137,8 +166,7 @@ void MVS::DecomposeProjectionMatrix(const PMatrix& P, KMatrix& K, RMatrix& R, CM
 	const Vec4 hC(P.RightNullVector());
 	C = CMatrix(hC[0],hC[1],hC[2]) * INVERT(hC[3]);
 	// perform RQ decomposition
-	const cv::Mat mP(3,4,cv::DataType<REAL>::type,const_cast<REAL*>(P.val));
-	cv::RQDecomp3x3(mP(cv::Rect(0,0, 3,3)), K, R);
+	RQDecomp3x3<REAL>(cv::Mat(3,4,cv::DataType<REAL>::type,const_cast<REAL*>(P.val))(cv::Rect(0,0, 3,3)), K, R);
 	// normalize calibration matrix
 	K *= INVERT(K(2,2));
 	// ensure positive focal length
@@ -158,7 +186,7 @@ void MVS::DecomposeProjectionMatrix(const PMatrix& P, RMatrix& R, CMatrix& C)
 	#ifndef _RELEASE
 	KMatrix K;
 	DecomposeProjectionMatrix(P, K, R, C);
-	ASSERT(K.IsEqual(Matrix3x3::IDENTITY));
+	ASSERT(K.IsEqual(Matrix3x3::IDENTITY, 1e-5));
 	#endif
 	// extract camera center as the right null vector of P
 	const Vec4 hC(P.RightNullVector());
@@ -184,6 +212,50 @@ void MVS::AssembleProjectionMatrix(const RMatrix& R, const CMatrix& C, PMatrix& 
 	Eigen::Map<Matrix3x3::EMat,0,Eigen::Stride<4,0> >(P.val) = (const Matrix3x3::EMat)R;
 	Eigen::Map<Point3::EVec,0,Eigen::Stride<0,4> >(P.val+3) = ((const Matrix3x3::EMat)R) * (-((const Point3::EVec)C));
 } // AssembleProjectionMatrix
+/*----------------------------------------------------------------*/
+
+// compute the focus of attention of a set of cameras; only cameras
+// that have the focus of attention in front of them are considered
+Point3 MVS::ComputeCamerasFocusPoint(const CameraArr& cameras, const Point3* pInitialFocus)
+{
+	// set initial focus point
+	Point3 focus;
+	if (pInitialFocus == NULL) {
+		// initialize focus point to the average camera center
+		focus = Point3::ZERO;
+		for (const Camera& camera: cameras)
+			focus += camera.C;
+		focus /= cameras.size();
+		// compute average distance to the cameras
+		REAL avgDist = 0;
+		for (const Camera& camera: cameras)
+			avgDist += SQRT(camera.DistanceSq(focus));
+		avgDist /= cameras.size();
+		// move focus point to the average distance in front of first camera
+		focus = cameras.front().C + cameras.front().Direction()*avgDist;
+	} else
+		focus = *pInitialFocus;
+	// compute focus point as the point in front of the active cameras,
+	// closest to the view direction of each camera
+	uint32_t numActive = 0;
+	Point3::EVec smp(Point3::EVec::Zero());
+	Matrix3x3::EMat smTm(Matrix3x3::EMat::Zero());
+	for (const Camera& camera: cameras) {
+		if (!camera.IsInFront(focus))
+			continue;
+		// https://en.wikipedia.org/wiki/Line–line_intersection#In_more_than_two_dimensions
+		const Point3::EVec dir = camera.Direction();
+		const Matrix3x3::EMat m(Matrix3x3::EMat::Identity() - dir * dir.transpose());
+		const Matrix3x3::EMat mTm(m.transpose() * m);
+		const Point3::EVec s = mTm * Point3::EVec(camera.C);
+		smp += s;
+		smTm += mTm;
+		++numActive;
+	}
+	if (numActive >= 2)
+		focus = smTm.inverse() * smp;
+	return focus;
+} // ComputeCamerasFocusPoint
 /*----------------------------------------------------------------*/
 
 

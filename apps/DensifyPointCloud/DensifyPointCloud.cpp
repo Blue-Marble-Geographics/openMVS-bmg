@@ -285,8 +285,10 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 }
 
 // finalize application instance
-void Finalize()
+void TFinalize()
 {
+	MVS::Finalize();
+
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	// print memory statistics
 	Util::LogMemoryInfo();
@@ -325,7 +327,7 @@ int main(int argc, LPCTSTR* argv)
 			scene.mesh.SamplePoints(ROUND2INT<unsigned>(-OPT::fSampleMesh), pointcloud);
 		VERBOSE("Sample mesh completed: %u points (%s)", pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
 		pointcloud.Save(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName))+_T(".ply"));
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 #endif
 	}
@@ -338,7 +340,7 @@ int main(int argc, LPCTSTR* argv)
 			return EXIT_FAILURE;
 		fs >> scene.obb;
 		scene.Save(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName))+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 	}
 	if (!scene.IsBounded())
@@ -348,7 +350,7 @@ int main(int argc, LPCTSTR* argv)
 		if (!fs)
 			return EXIT_FAILURE;
 		fs << scene.obb;
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 	}
 	if (!OPT::strMeshFileName.empty())
@@ -369,7 +371,7 @@ int main(int argc, LPCTSTR* argv)
 		if (!scene.ExportMeshToDepthMaps(MAKE_PATH_SAFE(OPT::strExportDepthMapsName)))
 			return EXIT_FAILURE;
 		VERBOSE("Mesh projection completed: %u depth-maps (%s)", scene.images.size(), TD_TIMER_GET_FMT().c_str());
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 	}
 	if (OPT::fMaxSubsceneArea > 0) {
@@ -380,7 +382,7 @@ int main(int argc, LPCTSTR* argv)
 		Scene::ImagesChunkArr chunks;
 		scene.Split(chunks, OPT::fMaxSubsceneArea);
 		scene.ExportChunks(chunks, GET_PATH_FULL(OPT::strOutputFileName), (ARCHIVE_TYPE)OPT::nArchiveType);
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 #endif
 	}
@@ -393,7 +395,7 @@ int main(int argc, LPCTSTR* argv)
 		const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName))+_T("_filtered"));
 		scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 		scene.pointcloud.Save(baseFileName+_T(".ply"));
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 #endif
 	}
@@ -413,7 +415,7 @@ int main(int argc, LPCTSTR* argv)
 			scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 			scene.pointcloud.Save(baseFileName+_T(".ply"));
 		}
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 #endif
 	}
@@ -436,7 +438,7 @@ int main(int argc, LPCTSTR* argv)
 			if (ABS(OPT::nFusionMode) != 1)
 				return EXIT_FAILURE;
 			VERBOSE("Depth-maps estimated (%s)", TD_TIMER_GET_FMT().c_str());
-			Finalize();
+			TFinalize();
 			return EXIT_SUCCESS;
 		}
 		VERBOSE("Densifying point-cloud completed: %u points (%s)", scene.pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
@@ -451,7 +453,7 @@ int main(int argc, LPCTSTR* argv)
 		scene.ExportCamerasMLP(baseFileName+_T(".mlp"), baseFileName+_T(".ply"));
 	#endif
 
-	Finalize();
+	TFinalize();
 	return EXIT_SUCCESS;
 }
 /*----------------------------------------------------------------*/

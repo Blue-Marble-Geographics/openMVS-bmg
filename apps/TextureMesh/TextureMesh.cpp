@@ -63,10 +63,12 @@ unsigned nTextureSizeMultiple;
 unsigned nRectPackingHeuristic;
 uint32_t nColEmpty;
 float fSharpnessWeight;
+int nIgnoreMaskLabel;
 unsigned nOrthoMapResolution;
 unsigned nArchiveType;
 int nProcessPriority;
 unsigned nMaxThreads;
+int nMaxTextureSize;
 String strExportType;
 String strConfigFileName;
 boost::program_options::variables_map vm;
@@ -99,7 +101,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 			), "verbosity level")
 		#endif
 		#ifdef _USE_CUDA
-		("cuda-device", boost::program_options::value(&CUDA::desiredDeviceID)->default_value(-1), "CUDA device number to be used to texture the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
+		("cuda-device", boost::program_options::value(&SEACAVE::CUDA::desiredDeviceID)->default_value(-1), "CUDA device number to be used to texture the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
 		#endif
 		;
 
@@ -107,6 +109,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 	boost::program_options::options_description config("Texture options");
 	config.add_options()
 		("input-file,i", boost::program_options::value<std::string>(&OPT::strInputFileName), "input filename containing camera poses and image list")
+		("mesh-file,m", boost::program_options::value<std::string>(&OPT::strMeshFileName), "mesh file name to texture (overwrite existing mesh)")
 		("output-file,o", boost::program_options::value<std::string>(&OPT::strOutputFileName), "output filename for storing the mesh")
 		("decimate", boost::program_options::value(&OPT::fDecimateMesh)->default_value(1.f), "decimation factor in range [0..1] to be applied to the input surface before refinement (0 - auto, 1 - disabled)")
 		("close-holes", boost::program_options::value(&OPT::nCloseHoles)->default_value(30), "try to close small holes in the input surface (0 - disabled)")
@@ -122,13 +125,14 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("empty-color", boost::program_options::value(&OPT::nColEmpty)->default_value(0x00FF7F27), "color used for faces not covered by any image")
 		("sharpness-weight", boost::program_options::value(&OPT::fSharpnessWeight)->default_value(0.5f), "amount of sharpness to be applied on the texture (0 - disabled)")
 		("orthographic-image-resolution", boost::program_options::value(&OPT::nOrthoMapResolution)->default_value(0), "orthographic image resolution to be generated from the textured mesh - the mesh is expected to be already geo-referenced or at least properly oriented (0 - disabled)")
+		("ignore-mask-label", boost::program_options::value(&OPT::nIgnoreMaskLabel)->default_value(-1), "label value to ignore in the image mask, stored in the MVS scene or next to each image with '.mask.png' extension (-1 - auto estimate mask for lens distortion, -2 - disabled)")
+		("max-texture-size", boost::program_options::value(&OPT::nMaxTextureSize)->default_value(8192), "maximum texture size, split it in multiple textures of this size if needed (0 - unbounded)")
 		;
 
 	// hidden options, allowed both on command line and
 	// in config file, but will not be shown to the user
 	boost::program_options::options_description hidden("Hidden options");
 	hidden.add_options()
-		("mesh-file", boost::program_options::value<std::string>(&OPT::strMeshFileName), "mesh file name to texture (overwrite the existing mesh)")
 		("views-file", boost::program_options::value<std::string>(&OPT::strViewsFileName), "file name containing the list of views to be used for texturing (optional)")
 		;
 
@@ -211,8 +215,10 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 }
 
 // finalize application instance
-void Finalize()
+void TFinalize()
 {
+	MVS::Finalize();
+
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	// print memory statistics
 	Util::LogMemoryInfo();
@@ -282,7 +288,7 @@ int main(int argc, LPCTSTR* argv)
 		return EXIT_FAILURE;
 	}
 	const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
-	if (OPT::nOrthoMapResolution && !scene.mesh.textureDiffuse.empty()) {
+	if (OPT::nOrthoMapResolution && !scene.mesh.HasTexture()) { // JPB WIP BUG!scene.mesh.textureDiffuse.empty()) {
 		// the input mesh is already textured and an orthographic projection was requested
 		goto ProjectOrtho;
 	}
@@ -305,7 +311,9 @@ int main(int argc, LPCTSTR* argv)
 
 	// compute mesh texture
 	TD_TIMER_START();
-	if (!scene.TextureMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::minCommonCameras, OPT::fOutlierThreshold, OPT::fRatioDataSmoothness, OPT::bGlobalSeamLeveling, OPT::bLocalSeamLeveling, OPT::nTextureSizeMultiple, OPT::nRectPackingHeuristic, Pixel8U(OPT::nColEmpty), OPT::fSharpnessWeight, views))
+	if (!scene.TextureMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::minCommonCameras, OPT::fOutlierThreshold, OPT::fRatioDataSmoothness,
+						   OPT::bGlobalSeamLeveling, OPT::bLocalSeamLeveling, OPT::nTextureSizeMultiple, OPT::nRectPackingHeuristic, Pixel8U(OPT::nColEmpty),
+						   OPT::fSharpnessWeight, OPT::nIgnoreMaskLabel, OPT::nMaxTextureSize, views))
 		return EXIT_FAILURE;
 	VERBOSE("Mesh texturing completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 
@@ -334,7 +342,7 @@ int main(int argc, LPCTSTR* argv)
 		sml.Save(baseFileName+_T("_orthomap.txt"));
 	}
 
-	Finalize();
+	TFinalize();
 	return EXIT_SUCCESS;
 }
 /*----------------------------------------------------------------*/

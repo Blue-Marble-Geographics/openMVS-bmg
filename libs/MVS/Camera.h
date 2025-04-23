@@ -131,6 +131,16 @@ public:
 		return invK;
 	}
 
+	// scale image pixel coordinates with the given scale such that it accounts for
+	// the convention that the center of a pixel is defined at integer coordinates
+	template<typename TYPE>
+	static inline TPoint2<TYPE> ScaleImagePixel(const TPoint2<TYPE>& x, TYPE s) {
+		return TPoint2<TYPE>(
+			(x.x+TYPE(0.5))*s-TYPE(0.5),
+			(x.y+TYPE(0.5))*s-TYPE(0.5)
+		);
+	}
+
 	// return scaled K (assuming standard K format)
 	template<typename TYPE>
 	static inline TMatrix<TYPE,3,3> ScaleK(const TMatrix<TYPE,3,3>& K, TYPE s) {
@@ -201,6 +211,27 @@ public:
 			width, height );
 	}
 
+	// return the OpenGL projection matrix corresponding to K:
+	// - flip: if true, flip the y axis to match OpenGL image convention
+	template<typename TYPE>
+	static inline TMatrix<TYPE,4,4> ProjectionMatrixOpenGL(const TMatrix<TYPE,3,3>& K, const cv::Size& size, TYPE nearZ, TYPE farZ, bool flip = true) {
+		// based on https://strawlab.org/2011/11/05/augmented-reality-with-OpenGL
+		const TYPE fx(K(0,0)), fy(K(1,1));
+		const TYPE cx(K(0,2)+0.5f), cy(K(1,2)+0.5f);
+		const TYPE skew(K(0,1));
+		const TYPE ihw(TYPE(2)/size.width), ihh(TYPE(2)/size.height);
+		const TYPE iy(flip ? TYPE(-1) : TYPE(1));
+		const TYPE ilen(TYPE(1)/(farZ-nearZ));
+		return TMatrix<TYPE,4,4>(
+			fx*ihw, skew*ihw, cx*ihw-TYPE(1), 0,
+			0, iy*fy*ihh, iy*(cy*ihh-TYPE(1)), 0,
+			0, 0, (farZ+nearZ)*ilen, -TYPE(2)*farZ*nearZ*ilen,
+			0, 0, 1, 0);
+	}
+	inline Matrix4x4 GetProjectionMatrixOpenGL(const cv::Size& size, REAL nearZ, REAL farZ, bool flipY = true) const {
+		return ProjectionMatrixOpenGL(K, size, nearZ, farZ, flipY);
+	}
+
 	// normalize inhomogeneous 2D point by the given camera intrinsics K
 	// K is assumed to be the [3,3] triangular matrix with: fx, fy, s, cx, cy and scale 1
 	template <typename TYPE>
@@ -228,6 +259,7 @@ class MVS_API Camera : public CameraIntern
 {
 public:
 	PMatrix P; // the composed projection matrix (3x4)
+	TMatrix<float,3,4> Pf;
 
 public:
 	static const Camera IDENTITY;
@@ -241,6 +273,11 @@ public:
 
 	Camera& operator= (const CameraIntern& camera);
 
+	Camera GetScaled(REAL s) const; // return a camera scaled by the given factor
+	Camera GetScaled(const cv::Size& size, const cv::Size& newSize) const; // return a camera scaled to the given resolution
+
+	Matrix4x4 GetP() const; // the composed projection matrix (4x4) assuming valid P
+	Matrix4x4 GetRC() const; // the composed transform matrix (4x4)
 	void ComposeP_RC(); // compose P from R and C only
 	void ComposeP(); // compose P from K, R and C
 	void DecomposeP_RC(); // decompose P in R and C, keep K unchanged
@@ -276,6 +313,14 @@ public:
 	template <typename TYPE>
 	inline TPoint3<TYPE> ProjectPointP3(const TPoint3<TYPE>& X) const {
 		const REAL* const p(P.val);
+		return TPoint3<TYPE>(
+			(TYPE)(p[0*4+0]*X.x + p[0*4+1]*X.y + p[0*4+2]*X.z + p[0*4+3]),
+			(TYPE)(p[1*4+0]*X.x + p[1*4+1]*X.y + p[1*4+2]*X.z + p[1*4+3]),
+			(TYPE)(p[2*4+0]*X.x + p[2*4+1]*X.y + p[2*4+2]*X.z + p[2*4+3]));
+	}
+	template <typename TYPE>
+	inline TPoint3<TYPE> ProjectPointP3f(const TPoint3<TYPE>& X) const {
+		const float* __restrict const p(Pf.val);
 		return TPoint3<TYPE>(
 			(TYPE)(p[0*4+0]*X.x + p[0*4+1]*X.y + p[0*4+2]*X.z + p[0*4+3]),
 			(TYPE)(p[1*4+0]*X.x + p[1*4+1]*X.y + p[1*4+2]*X.z + p[1*4+3]),
@@ -402,6 +447,26 @@ public:
 		return TransformPointOrthoC2I(TransformPointW2C(X));
 	}
 
+	// compute the projection scale in this camera of the given world point
+	template <typename TYPE>
+	inline TYPE GetFootprintImage(TYPE depth) const {
+		return static_cast<TYPE>(GetFocalLength() / depth);
+	}
+	template <typename TYPE>
+	inline TYPE GetFootprintImage(const TPoint3<TYPE>& X) const {
+		return GetFootprintImage(PointDepth(X));
+	}
+	// compute the surface the projected pixel covers at the given depth
+	template <typename TYPE>
+	inline TYPE GetFootprintWorld(TYPE depth) const {
+		return static_cast<TYPE>(depth / GetFocalLength());
+	}
+	// same as above, but the 3D point is given
+	template <typename TYPE>
+	inline TYPE GetFootprintWorld(const TPoint3<TYPE>& X) const {
+		return GetFootprintWorld(PointDepth(X));
+	}
+
 	#ifdef _USE_BOOST
 	// implement BOOST serialization
 	template<class Archive>
@@ -423,6 +488,7 @@ MVS_API void DecomposeProjectionMatrix(const PMatrix& P, KMatrix& K, RMatrix& R,
 MVS_API void DecomposeProjectionMatrix(const PMatrix& P, RMatrix& R, CMatrix& C);
 MVS_API void AssembleProjectionMatrix(const KMatrix& K, const RMatrix& R, const CMatrix& C, PMatrix& P);
 MVS_API void AssembleProjectionMatrix(const RMatrix& R, const CMatrix& C, PMatrix& P);
+MVS_API Point3 ComputeCamerasFocusPoint(const CameraArr& cameras, const Point3* pInitialFocus=NULL);
 /*----------------------------------------------------------------*/
 
 } // namespace MVS

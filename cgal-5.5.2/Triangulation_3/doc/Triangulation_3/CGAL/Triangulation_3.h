@@ -1634,7 +1634,7 @@ output iterator `vertices`. If `t.dimension() < 0`, then do
 nothing. Returns the resulting output iterator.
 \pre `v != Vertex_handle()`, `t.is_vertex(v)`.
 */
-template <class OutputIterator>
+template <bool Dim3OrMore = false, class OutputIterator>
 OutputIterator
 adjacent_vertices(Vertex_handle v, OutputIterator vertices) const;
 

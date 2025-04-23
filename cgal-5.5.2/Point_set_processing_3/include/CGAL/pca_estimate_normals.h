@@ -63,8 +63,8 @@ pca_estimate_normal(const typename NeighborQuery::Kernel::Point_3& query, ///< p
   typedef typename Kernel::Point_3  Point;
   typedef typename Kernel::Plane_3  Plane;
 
-  boost::container::small_vector<Point, 17> points;
-  neighbor_query.get_points (query, k, neighbor_radius, boost::container::back_emplacer(points));
+  std::vector<Point> points;
+  neighbor_query.get_points (query, k, neighbor_radius, std::back_inserter(points));
 
   // performs plane fitting by point-based PCA
   Plane plane;

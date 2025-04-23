@@ -29,6 +29,7 @@
  *      containing it.
  */
 
+// TODO: Add archive-type 2
 #include "../../libs/MVS/Common.h"
 #include "../../libs/MVS/Scene.h"
 #include <boost/program_options.hpp>
@@ -119,7 +120,9 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("min-point-distance,d", boost::program_options::value(&OPT::fDistInsert)->default_value(2.5f), "minimum distance in pixels between the projection of two 3D points to consider them different while triangulating (0 - disabled)")
 		("integrate-only-roi", boost::program_options::value(&OPT::bUseOnlyROI)->default_value(false), "use only the points inside the ROI")
 		("constant-weight", boost::program_options::value(&OPT::bUseConstantWeight)->default_value(true), "considers all view weights 1 instead of the available weight")
+#if 0 // JPB WIP Not supported
 		("free-space-support,f", boost::program_options::value(&OPT::bUseFreeSpaceSupport)->default_value(false), "exploits the free-space support in order to reconstruct weakly-represented surfaces")
+#endif
 		("thickness-factor", boost::program_options::value(&OPT::fThicknessFactor)->default_value(1.f), "multiplier adjusting the minimum thickness considered during visibility weighting")
 		("quality-factor", boost::program_options::value(&OPT::fQualityFactor)->default_value(1.f), "multiplier adjusting the quality weight considered during graph-cut")
 		;
@@ -215,9 +218,11 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 }
 
 // finalize application instance
-void Finalize()
+void TFinalize()
 {
-	#if TD_VERBOSE != TD_VERBOSE_OFF
+	MVS::Finalize();
+
+#if TD_VERBOSE != TD_VERBOSE_OFF
 	// print memory statistics
 	Util::LogMemoryInfo();
 	#endif
@@ -314,7 +319,7 @@ bool Export3DProjections(Scene& scene, const String& inputFileName) {
 	const Mesh::Octree octree(scene.mesh.vertices, [](Mesh::Octree::IDX_TYPE size, Mesh::Octree::Type /*radius*/) {
 		return size > 256;
 	});
-	scene.mesh.ListIncidenteFaces();
+	scene.mesh.ListIncidentFaces();
 
 	// save 3D coord in the output file
 	const Image& imgToExport = scene.images[imgID];
@@ -352,7 +357,7 @@ int main(int argc, LPCTSTR* argv)
 		Mesh::FacesChunkArr chunks;
 		if (scene.mesh.Split(chunks, OPT::fSplitMaxArea))
 			scene.mesh.Save(chunks, baseFileName);
-		Finalize();
+		TFinalize();
 		return EXIT_SUCCESS;
 	}
 
@@ -420,7 +425,7 @@ int main(int argc, LPCTSTR* argv)
 			TD_TIMER_START();
 			if (OPT::bUseConstantWeight)
 				scene.pointcloud.ReleaseWeights();
-			if (!scene.ReconstructMesh(OPT::fDistInsert, OPT::bUseFreeSpaceSupport, OPT::bUseOnlyROI, 4, OPT::fThicknessFactor, OPT::fQualityFactor))
+			if (!scene.ReconstructMesh(OPT::fDistInsert, false /* JPB Not supported OPT::bUseFreeSpaceSupport */, OPT::bUseOnlyROI, 4, OPT::fThicknessFactor, OPT::fQualityFactor))
 				return EXIT_FAILURE;
 			VERBOSE("Mesh reconstruction completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 			#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -463,7 +468,7 @@ int main(int argc, LPCTSTR* argv)
 		return EXIT_SUCCESS;
 	}
 
-	Finalize();
+	TFinalize();
 	return EXIT_SUCCESS;
 }
 /*----------------------------------------------------------------*/

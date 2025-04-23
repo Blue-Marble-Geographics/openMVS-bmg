@@ -103,7 +103,7 @@ FORCEINLINE long double randomGaussianld() {
 struct Random {
 	using result_type = uint32_t;
 	static result_type default_seed() { return std::mt19937::default_seed; }
-	constexpr result_type max() { return std::numeric_limits<result_type>::max(); }
+	static result_type max() { return std::numeric_limits<result_type>::max(); }
 	uint64_t state;
 	result_type operator()()
 	{

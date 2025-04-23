@@ -48,6 +48,7 @@
 
 #include <emmintrin.h>
 #define _Data __m128
+#define _DataD __m128d
 #define _DataI __m128i
 #define _CastIF _mm_castps_si128
 #define _CastFI _mm_castsi128_ps
@@ -71,6 +72,7 @@
 // This should be retested
 #define _SetFirstUnsafe _mm_set_ss
 #define _SetN(a,b,c,d) _mm_set_ps((d),(c),(b),(a))
+#define _SetND(a,b) _mm_set_pd((b),(a))
 #define _SetNI(a,b,c,d) _mm_set_epi32((d),(c),(b),(a))
 #define _SetNDeltas(a,b) _SetN((a), ((a)+(b)), (a)+(b)*2.f, (a)+(b)*3.f)
 #define _SetNMemory(a,b) _SetN((a)[0], (a)[b], (a)[2*(b)], (a)[3*(b)])
@@ -80,11 +82,13 @@
 #define _UnpackLow(a,b) _mm_unpacklo_ps((a), (b))
 #define _UnpackHigh(a,b) _mm_unpackhi_ps((a), (b))
 #define _SetI _mm_set1_epi32
+#define _SetD _mm_set_sd
 #define _SetS _mm_set1_epi16
 #define _Load _mm_loadu_ps
 #define _LoadA _mm_load_ps
 #define _LoadI _mm_load_si128
 #define _vFirst _mm_cvtss_f32
+#define _vFirstD _mm_cvtsd_f64
 #define _Store _mm_storeu_ps
 #define _StoreA _mm_store_ps
 #define _And _mm_and_ps
@@ -97,10 +101,13 @@
 #define _ShiftRI _mm_srai_epi32
 #define _ShiftRU _mm_srli_epi32
 #define _Add _mm_add_ps
+#define _AddD _mm_add_pd
 #define _AddI _mm_add_epi32
 #define _Sub _mm_sub_ps
+#define _SubD _mm_sub_pd
 #define _SubI _mm_sub_epi32
 #define _Mul _mm_mul_ps
+#define _MulD _mm_mul_pd
 #define _MulI _mm_mul_epi32
 #define _Div _mm_div_ps
 #define _Sqrt _mm_sqrt_ps
@@ -364,6 +371,31 @@ static  __forceinline _Data FastExpAlwaysNegative(_Data vX)
   return _Div(_CastFI(s), _CastFI(t));
 }
 
+// Paired to reduce load store delays.
+static  __forceinline void FastExpAlwaysNegativePair(_Data& vExp, _Data& vExp2, _Data vX, _Data vX2)
+{
+  /* https://stackoverflow.com/questions/47025373/fastest-implementation-of-the-natural-exponential-function-using-sse */
+  /* Of the several at the above link, this is the only consistently reliable version. */
+  /* Clamping added manually. */
+  vX                  = _Max(vX, vLow);
+  vX2                  = _Max(vX2, vLow);
+
+  const _DataI r      = _ConvertIF(_Mul(vExpFactor, vX));
+  const _DataI r2      = _ConvertIF(_Mul(vExpFactor, vX2));
+  const _DataI s      = _AddI(_CastIF(vExpC), r);
+  const _DataI s2      = _AddI(_CastIF(vExpC), r2);
+  const _DataI t      = _SubI(_CastIF(vExpC), r);
+  const _DataI t2      = _SubI(_CastIF(vExpC), r2);
+
+  const _Data is = _CastFI(s);
+  const _Data it = _CastFI(t);
+  const _Data is2 = _CastFI(s2);
+  const _Data it2 = _CastFI(t2);
+
+  vExp = _Div(is, it);
+  vExp2 = _Div(is2, it2);
+}
+
 
 static  __forceinline _Data FastExpAlwaysPositive(_Data vX)
 {
@@ -513,7 +545,7 @@ static __forceinline _Data Mod2PILimited(_Data x)
 
 static __forceinline float FastAbsS(float x)
 {
-  return std::max(0.f - x, x);
+  return (std::max)(0.f - x, x);
 }
 
 static __forceinline _Data FastAbs(_Data vX)

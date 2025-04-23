@@ -23,6 +23,8 @@
 #include <curand_kernel.h>
 #include <vector_types.h>
 
+#include "UtilCUDADevice.h"
+
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -65,9 +67,8 @@ inline CUresult __reportCudaError(CUresult result, LPCSTR errorMessage) {
 	ASSERT("CudaError" == NULL);
 	return result;
 }
-#define reportCudaError(val) CUDA::__reportCudaError(val, #val)
-
-#define checkCudaError(val) { const CUresult ret(CUDA::__reportCudaError(val, #val)); if (ret != CUDA_SUCCESS) return ret; }
+#define reportCudaError(val) SEACAVE::CUDA::__reportCudaError(val, #val)
+#define checkCudaError(val) { const CUresult ret(SEACAVE::CUDA::__reportCudaError(val, #val)); if (ret != CUDA_SUCCESS) return ret; }
 
 // outputs the proper CUDA error code and abort in the event that a CUDA host call returns an error
 inline void __ensureCudaResult(CUresult result, LPCSTR errorMessage) {
@@ -76,19 +77,8 @@ inline void __ensureCudaResult(CUresult result, LPCSTR errorMessage) {
 	ASSERT("CudaAbort" == NULL);
 	exit(EXIT_FAILURE);
 }
-#define ensureCudaResult(val) CUDA::__ensureCudaResult(val, #val)
-
-inline void checkCudaCall(const cudaError_t error) {
-	if (error == cudaSuccess)
-		return;
-	#ifdef _DEBUG
-	VERBOSE("CUDA error at %s:%d: %s (code %d)", __FILE__, __LINE__, cudaGetErrorString(error), error);
-	#else
-	DEBUG("CUDA error: %s (code %d)", cudaGetErrorString(error), error);
-	#endif
-	ASSERT("CudaError" == NULL);
-	exit(EXIT_FAILURE);
-}
+#define ensureCudaResult(val) SEACAVE::CUDA::__ensureCudaResult(val, #val)
+/*----------------------------------------------------------------*/
 
 // rounds up addr to the align boundary
 template <typename T>
@@ -316,7 +306,6 @@ public:
 	inline KernelRT() : hKernel(NULL) {}
 	inline KernelRT(const ModuleRTPtr& _ptrModule, LPCSTR functionName) : ptrModule(_ptrModule) { Reset(functionName); }
 	inline KernelRT(LPCSTR program, LPCSTR functionName, int mode=JIT::AUTO) { Reset(program, functionName, mode); }
-	inline ~KernelRT() { Release(); }
 
 	inline bool IsValid() const {
 		ASSERT(hKernel == NULL || (ptrModule != NULL && ptrModule->IsValid()));
@@ -479,7 +468,7 @@ protected:
 
 public:
 	inline TArrayRT() : hArray(NULL) {}
-	inline TArrayRT(const Image8U::Size& size, unsigned flags=0) : hArray(NULL) { reportCudaError(Reset(size, flags)); }
+	inline TArrayRT(const cv::Size& size, unsigned flags=0) : hArray(NULL) { reportCudaError(Reset(size, flags)); }
 	inline TArrayRT(unsigned width, unsigned height, unsigned depth=0, unsigned flags=0) : hArray(NULL) { reportCudaError(Reset(width, height, depth, flags)); }
 	inline ~TArrayRT() { Release(); }
 
@@ -499,7 +488,7 @@ public:
 			hArray = NULL;
 		}
 	}
-	inline CUresult Reset(const Image8U::Size& size, unsigned flags=0) {
+	inline CUresult Reset(const cv::Size& size, unsigned flags=0) {
 		return Reset((unsigned)size.width, (unsigned)size.height, 0, flags);
 	}
 	CUresult Reset(unsigned width, unsigned height, unsigned depth=0, unsigned flags=0) {

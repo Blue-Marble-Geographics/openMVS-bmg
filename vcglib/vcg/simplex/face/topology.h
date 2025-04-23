@@ -502,6 +502,7 @@ bool FFLinkCondition(FaceType &f, const int z)
  *       |__________\|
  *          f02      delV
  */
+// JPB WIP Not called.
 template <class MeshType>
 void FFEdgeCollapse(MeshType &m, typename MeshType::FaceType &f, const int z)
 {

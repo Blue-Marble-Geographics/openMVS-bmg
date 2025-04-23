@@ -1,3 +1,4 @@
+#if 0 // JPB WIP BUG
 /*
  * Scene.cpp
  *
@@ -797,3 +798,4 @@ void Scene::CastRay(const Ray3& ray, int action)
 	}
 }
 /*----------------------------------------------------------------*/
+#endif

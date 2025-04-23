@@ -117,6 +117,7 @@ public:
 
 	STATIC_ASSERT(sizeof(int64_t)==sizeof(LONGLONG));
 	static inline int64_t safeInc(volatile int64_t& v) { return InterlockedIncrement64((volatile LONGLONG*)&v); };
+	static inline int64_t safeAdd(volatile int64_t& v, int64_t value) { return InterlockedAdd64((volatile LONGLONG*)&v, value); };
 	static inline int64_t safeDec(volatile int64_t& v) { return InterlockedDecrement64((volatile LONGLONG*)&v); };
 	static inline int64_t safeExchange(volatile int64_t& target, int64_t value) { return InterlockedExchange64((volatile LONGLONG*)&target, value); };
 	static inline int64_t safeCompareExchange(volatile int64_t& target, int64_t comp, int64_t value) { return InterlockedCompareExchange64((volatile LONGLONG*)&target, value, comp); };

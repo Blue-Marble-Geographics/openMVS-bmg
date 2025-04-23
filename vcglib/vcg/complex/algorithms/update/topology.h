@@ -29,6 +29,10 @@
 #include <vcg/complex/base.h>
 #include <vcg/simplex/face/topology.h>
 #include <vcg/simplex/edge/pos.h>
+#include <execution>
+
+#define FAST_FILLEDGEVECTOR
+#define FAST_VERTEXFACE
 
 namespace vcg {
 namespace tri {
@@ -196,21 +200,60 @@ public:
 /// Fill a vector with all the edges of the mesh.
 /// each edge is stored in the vector the number of times that it appears in the mesh, with the referring face.
 /// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
-
 static void FillEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true)
 {
-  edgeVec.reserve(m.fn*3);
-  for(FaceIterator fi=m.face.begin();fi!=m.face.end();++fi)
+ #ifdef FAST_FILLEDGEVECTOR
+    edgeVec.reserve(m.fn * 3);
+
+    // Per-thread edge buffers
+    std::vector<std::vector<PEdge>> localEdges;
+
+    #pragma omp parallel
+    {
+      const int id = omp_get_thread_num();
+
+      // Let the first thread resize.
+      #pragma omp single
+      {
+          const int numThreads = omp_get_num_threads();
+          localEdges.resize(numThreads);
+      }
+
+      auto& localVec = localEdges[id];
+
+      const int64_t cnt = (int64_t)m.face.size();
+      #pragma omp for schedule(static)
+      for (int64_t i = 0; i < cnt; ++i) {
+        auto& f = m.face[i];
+        if (f.IsD()) continue;
+
+        const int vn = f.VN();
+        for (int j = 0; j < vn; ++j) {
+          if (includeFauxEdge || !f.IsF(j)) {
+            localVec.emplace_back(&f, j);
+          }
+        }
+      }
+    }
+
+    // Flatten thread-local vectors into edgeVec
+    for (const auto& vec : localEdges) {
+      edgeVec.insert(edgeVec.end(), vec.begin(), vec.end());
+    }
+#else
+    edgeVec.reserve(m.fn*3);
+    for(FaceIterator fi=m.face.begin();fi!=m.face.end();++fi)
     if( ! (*fi).IsD() )
       for(int j=0;j<(*fi).VN();++j)
         if(includeFauxEdge || !(*fi).IsF(j))
           edgeVec.push_back(PEdge(&*fi,j));
+#endif
 }
 
 static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true, bool computeBorderFlag=false)
 {
     FillEdgeVector(m,edgeVec,includeFauxEdge);
-    sort(edgeVec.begin(), edgeVec.end()); // oredering by vertex
+    sort(std::execution::par,edgeVec.begin(),edgeVec.end()); // oredering by vertex
 
     if (computeBorderFlag) {
         for (size_t i=0; i<edgeVec.size(); i++)
@@ -221,7 +264,7 @@ static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool 
         }
     }
 
-    typename std::vector< PEdge>::iterator newEnd = std::unique(edgeVec.begin(), edgeVec.end());
+    typename std::vector< PEdge>::iterator newEnd = std::unique(std::execution::par,edgeVec.begin(),edgeVec.end());
 
     edgeVec.resize(newEnd-edgeVec.begin()); // redundant! remove?
 }
@@ -263,16 +306,25 @@ static void AllocateEdge(MeshType &m)
   // Setup adjacency relations
   if(tri::HasEVAdjacency(m))
   {
-    for(size_t i=0; i< Edges.size(); ++i)
-    {
-      m.edge[i].V(0) = Edges[i].v[0];
-      m.edge[i].V(1) = Edges[i].v[1];
+    const int64_t cnt = (int64_t) Edges.size();
+    bool hasPerEdgeFlags = tri::HasPerEdgeFlags(m);
+#pragma omp parallel for // No conditional
+    for (int64_t i = 0; i < cnt; ++i) {
+      const auto& srcEdge = Edges[i];
+			auto& dstEdge = m.edge[i];
+      const auto v1 = srcEdge.v[0];
+      const auto v2 = srcEdge.v[1];
+      dstEdge.V(0) = v1;
+      dstEdge.V(1) = v2;
+      if (hasPerEdgeFlags) {
+        if (srcEdge.isBorder) dstEdge.SetB(); else dstEdge.ClearB();
+      }
     }
-  }
-
-  if (tri::HasPerEdgeFlags(m)){
-    for(size_t i=0; i< Edges.size(); ++i) {
-        if (Edges[i].isBorder) m.edge[i].SetB(); else m.edge[i].ClearB();
+  } else {
+    if (tri::HasPerEdgeFlags(m)){
+      for(size_t i=0; i< Edges.size(); ++i) {
+          if (Edges[i].isBorder) m.edge[i].SetB(); else m.edge[i].ClearB();
+      }
     }
   }
 
@@ -401,7 +453,7 @@ static void FaceFace(MeshType &m)
 
   std::vector<PEdge> e;
   FillEdgeVector(m,e);
-  sort(e.begin(), e.end());							// Lo ordino per vertici
+  sort(std::execution::par, e.begin(), e.end());							// Lo ordino per vertici
 
   int ne = 0;											// Numero di edge reali
 
@@ -472,6 +524,31 @@ static void VertexFace(MeshType &m)
 {
   RequireVFAdjacency(m);
 
+#ifdef FAST_VERTEXFACE
+  const int64_t numVertices = (int64_t) m.vn;
+#pragma omp parallel for
+   for (int64_t i = 0; i < numVertices; ++i) {
+      auto& vi = m.vert[i];
+      vi.VFp() = 0;
+      vi.VFi() = 0; // note that (0,-1) means uninitiazlied while 0,0 is the valid initialized values for isolated vertices.
+   }
+
+  const int64_t numFaces = (int64_t) m.fn;
+#pragma omp parallel for
+   for (int64_t i = 0; i < numFaces; ++i) {
+     auto& f = m.face[i];
+     if( ! f.IsD() )
+     {
+       for(int j=0,cnt=f.VN();j<cnt;++j)
+       {
+         f.VFp(j) = f.V(j)->VFp();
+         f.VFi(j) = f.V(j)->VFi();
+         f.V(j)->VFp() = &f;
+         f.V(j)->VFi() = j;
+       }
+     }
+   }
+#else
   for(VertexIterator vi=m.vert.begin();vi!=m.vert.end();++vi)
   {
     (*vi).VFp() = 0;
@@ -489,6 +566,7 @@ static void VertexFace(MeshType &m)
         (*fi).V(j)->VFi() = j;
       }
     }
+#endif
 }
 
 

@@ -200,9 +200,11 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 }
 
 // finalize application instance
-void Finalize()
+void TFinalize()
 {
-	#if TD_VERBOSE != TD_VERBOSE_OFF
+	MVS::Finalize();
+
+#if TD_VERBOSE != TD_VERBOSE_OFF
 	// print memory statistics
 	Util::LogMemoryInfo();
 	#endif
@@ -269,7 +271,7 @@ int main(int argc, LPCTSTR* argv)
 		scene.ExportCamerasMLP(baseFileName+_T(".mlp"), baseFileName+OPT::strExportType);
 	#endif
 
-	Finalize();
+	TFinalize();
 	return EXIT_SUCCESS;
 }
 /*----------------------------------------------------------------*/

@@ -30,6 +30,11 @@
 #include <stack>
 #include <limits>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
+#include <boost/container/options.hpp>
+#include <boost/unordered/unordered_map.hpp>
+
 #include <boost/unordered_set.hpp>
 #include <CGAL/utility.h>
 #include <CGAL/iterator.h>
@@ -96,7 +101,9 @@ public:
   class Cell_data {
     unsigned char conflict_state;
   public:
-    Cell_data() : conflict_state(0) {}
+      uint16_t marker;
+
+    Cell_data() : conflict_state(0), marker(0) {}
 
     void clear()            { conflict_state = 0; }
     void mark_in_conflict() { conflict_state = 1; }
@@ -325,7 +332,7 @@ public:
   Cell_handle create_cell(Vertex_handle v0, Vertex_handle v1,
                           Vertex_handle v2, Vertex_handle v3)
     {
-      return cells().emplace(v0, v1, v2, v3);
+      return cells().emplace(v0,v1,v2,v3);
     }
 
   Cell_handle create_cell(Vertex_handle v0, Vertex_handle v1,
@@ -346,7 +353,7 @@ public:
                           Vertex_handle v2)
     {
       CGAL_triangulation_precondition(dimension()<3);
-      return cells().emplace(v0, v1, v2, Vertex_handle());
+      return cells().emplace(v0,v1,v2,Vertex_handle());
     }
 
   // The following functions come from TDS_2.
@@ -554,7 +561,13 @@ public:
     CGAL_assertion(facets.size() < (std::numeric_limits<unsigned char>::max)());
     CGAL_STATIC_THREAD_LOCAL_VARIABLE_0(Vertex_pair_facet_map, vertex_pair_facet_map);
     Vertex_handle nv = create_vertex();
-    std::array <Cell_handle, maximal_nb_of_facets_of_small_hole> new_cells;
+    union Cell_handle_union {
+      Cell_handle h;
+      void* p;
+       Cell_handle_union() {}
+    };
+
+    Cell_handle_union new_cells[maximal_nb_of_facets_of_small_hole];
     for (unsigned char local_facet_index = 0, end = static_cast<unsigned char>(facets.size());
          local_facet_index < end; ++local_facet_index) {
       const Facet f = mirror_facet(facets[local_facet_index]);
@@ -566,7 +579,7 @@ public:
       v->set_cell(f.first);
       w->set_cell(f.first);
       const Cell_handle nc = create_cell(v, u, w, nv);
-      new_cells[local_facet_index] = nc;
+      new_cells[local_facet_index].h = nc;
       nv->set_cell(nc);
       nc->set_neighbor(3, f.first);
       f.first->set_neighbor(f.second, nc);
@@ -582,10 +595,10 @@ public:
     for(auto it = vertex_pair_facet_map.begin(); it != vertex_pair_facet_map.end(); ++it){
       const std::pair<Vertex_pair,Local_facet>& ef = *it;
       if(ef.first.first < ef.first.second){
-        const Facet f = Facet{new_cells[ef.second.first], ef.second.second};
+        const Facet f = Facet{new_cells[ef.second.first].h, ef.second.second};
         vertex_pair_facet_map.clear(it);
         const auto p = vertex_pair_facet_map.get_and_erase(std::make_pair(ef.first.second, ef.first.first));
-        const Facet n = Facet{new_cells[p.first], p.second};
+        const Facet n = Facet{new_cells[p.first].h, p.second};
         f.first->set_neighbor(f.second, n.first);
         n.first->set_neighbor(n.second, f.first);
       }
@@ -794,38 +807,82 @@ public:
   // around a vertex
 private:
 
-  template <class IncidentCellIterator, class IncidentFacetIterator>
-  std::pair<IncidentCellIterator, IncidentFacetIterator>
-  incident_cells_3(Vertex_handle v, Cell_handle d,
-                                 std::pair<IncidentCellIterator,
-                                 IncidentFacetIterator> it) const
+  union Cell_handle_union
+  {
+      Cell_handle_union() {}
+      Cell_handle h;
+      void* p;
+  };
+
+  template<class T, int N>
+  struct HybridArray
+  {
+    HybridArray() :
+     mStart(mData),
+     mCapacity(N)
+    {}
+    
+    void resize(int curSize, int newCapacity)
+    {
+     auto newBlock = std::unique_ptr<T[]>(new T[newCapacity]);
+     if (!mDynamicData) {
+        ::memcpy(newBlock.get(), mData, sizeof(T)*curSize);
+     } else {
+        ::memcpy(newBlock.get(), mDynamicData.get(), sizeof(T)*curSize);
+     }
+     mDynamicData = std::move(newBlock);
+     mStart = mDynamicData.get();
+     mCapacity = newCapacity;
+    }
+    
+    void reset()
+    {
+     mStart = mData;
+     mCapacity = N;
+     mDynamicData.reset();
+    }
+    
+    T* mStart;
+    T mData[N];
+    std::unique_ptr<T[]> mDynamicData;
+    int mCapacity;
+  };
+
+  template <class IncidentCellIterator>
+  void
+  incident_cells_3(Vertex_handle v, Cell_handle d, IncidentCellIterator it) const
   {
         CGAL_triangulation_precondition(dimension() == 3);
 
-        std::stack<Cell_handle> cell_stack;
-        cell_stack.push(d);
+        HybridArray<Cell_handle_union, 8192> cell_stack;
+        Cell_handle_union* __restrict pCell_stack = cell_stack.mData;
+        pCell_stack->h = d;
+        ++pCell_stack;
         d->tds_data().mark_in_conflict();
-        *it.first++ = d;
-
+        *it++ = d;
+        int balance = 0;
         do {
-                Cell_handle c = cell_stack.top();
-                cell_stack.pop();
+                Cell_handle_union c = *--pCell_stack;
 
                 for (int i=0; i<4; ++i) {
-                        if (c->vertex(i) == v)
+                        if (c.h->vertex(i) == v)
                                 continue;
-                        Cell_handle next = c->neighbor(i);
-                        if (c < next)
-                                *it.second++ = Facet(c, i); // Incident facet.
+                        Cell_handle next = c.h->neighbor(i);
                         if (! next->tds_data().is_clear())
                                 continue;
-                        cell_stack.push(next);
+                        pCell_stack->h = next;
+                        ++pCell_stack;
                         next->tds_data().mark_in_conflict();
-                        *it.first++ = next;
+                        *it++ = next;
                 }
-        } while(!cell_stack.empty());
+                if (!(++balance & 0xFF)) {
+                    size_t cnt = pCell_stack - cell_stack.mStart;
+                    if (cnt >= (cell_stack.mCapacity * 7)/10) {
+                        cell_stack.resize(cnt, cell_stack.mCapacity*2);
+                    }
+                }
 
-        return it;
+        } while(cell_stack.mStart != pCell_stack);
   }
 
   template <class IncidentFacetIterator>
@@ -1036,7 +1093,7 @@ public:
   template<class Treatment, class OutputIterator, class Filter>
   class Vertex_extractor<Treatment,OutputIterator,Filter,true> {
     Vertex_handle v;
-    std::vector<Vertex_handle> tmp_vertices;
+    boost::container::small_vector<Vertex_handle, 64> tmp_vertices;
 
     Treatment treat;
     const Tds* t;
@@ -1044,7 +1101,6 @@ public:
   public:
     Vertex_extractor(Vertex_handle _v, OutputIterator _output, const Tds* _t, Filter _filter):
     v(_v), treat(_output), t(_t), filter(_filter) {
-      tmp_vertices.reserve(64);
     }
 
     void operator()(Cell_handle c) {
@@ -1118,11 +1174,11 @@ public:
     }
   };
 
-  template <class Filter, class OutputIterator>
+  template <bool Dim3OrMore = false, class Filter, class OutputIterator>
   OutputIterator
   incident_cells(Vertex_handle v, OutputIterator cells, Filter f = Filter()) const
   {
-    return visit_incident_cells<Cell_extractor<OutputIterator, Filter>,
+    return visit_incident_cells<Dim3OrMore, Cell_extractor<OutputIterator, Filter>,
       OutputIterator>(v, cells, f);
   }
 
@@ -1133,6 +1189,7 @@ public:
     return incident_cells<False_filter>(v, cells);
   }
 
+#if 0
   // This version only works for vectors and only in 3D
   void incident_cells_3(Vertex_handle v,
                         std::vector<Cell_handle>& cells) const
@@ -1146,6 +1203,7 @@ public:
       (*cit)->tds_data().clear();
     }
   }
+#endif
 
   template <class Filter, class OutputIterator>
   OutputIterator
@@ -1269,7 +1327,7 @@ public:
     return incident_edges_threadsafe<False_filter>(v, edges);
   }
 
-  template <class Filter, class OutputIterator>
+  template <bool Dim3OrMore = false, class Filter, class OutputIterator>
   OutputIterator
   adjacent_vertices(Vertex_handle v, OutputIterator vertices, Filter f = Filter()) const
   {
@@ -1278,16 +1336,16 @@ public:
     CGAL_triangulation_expensive_precondition( is_vertex(v) );
     CGAL_triangulation_expensive_precondition( is_valid() );
 
-    if (dimension() == -1)
+    if (!Dim3OrMore && dimension() == -1)
     return vertices;
 
-    if (dimension() == 0) {
+    if (!Dim3OrMore && dimension() == 0) {
       Vertex_handle v1 = v->cell()->neighbor(0)->vertex(0);
       if(!f(v1)) *vertices++ = v1;
       return vertices;
     }
 
-    if (dimension() == 1) {
+    if (!Dim3OrMore && dimension() == 1) {
       CGAL_triangulation_assertion( number_of_vertices() >= 3);
       Cell_handle n0 = v->cell();
       const int index_v_in_n0 = n0->index(v);
@@ -1301,7 +1359,7 @@ public:
       if(!f(v2)) *vertices++ = v2;
       return vertices;
     }
-    return visit_incident_cells<Vertex_extractor<Vertex_feeder_treatment<OutputIterator>,
+    return visit_incident_cells<Dim3OrMore, Vertex_extractor<Vertex_feeder_treatment<OutputIterator>,
                                 OutputIterator, Filter,
                                 internal::Has_member_visited<Vertex>::value>,
     OutputIterator>(v, vertices, f);
@@ -1316,11 +1374,11 @@ public:
   }
 
   // correct name
-  template <class OutputIterator>
+  template <bool Dim3OrMore = false, class OutputIterator>
   OutputIterator
   adjacent_vertices(Vertex_handle v, OutputIterator vertices) const
   {
-    return adjacent_vertices<False_filter>(v, vertices);
+    return adjacent_vertices<Dim3OrMore, False_filter>(v, vertices);
   }
 
   template <class OutputIterator>
@@ -1369,33 +1427,33 @@ public:
       OutputIterator>(v, vertices, f);
   }
 
-  template <class Visitor, class OutputIterator, class Filter>
+  template <bool Dim3OrMore = false, class Visitor, class OutputIterator, class Filter>
   OutputIterator
   visit_incident_cells(Vertex_handle v, OutputIterator output, Filter f) const
   {
     CGAL_triangulation_precondition( v != Vertex_handle() );
     CGAL_triangulation_expensive_precondition( is_vertex(v) );
 
-    if ( dimension() < 2 )
+    if ( !Dim3OrMore && dimension() < 2 )
     return output;
 
     Visitor visit(v, output, this, f);
 
-    std::vector<Cell_handle> tmp_cells;
-    tmp_cells.reserve(64);
-    if ( dimension() == 3 )
-    incident_cells_3(v, v->cell(), std::make_pair(std::back_inserter(tmp_cells), visit.facet_it()));
+    boost::container::small_vector<Cell_handle, 16384> tmp_cells;
+    if (Dim3OrMore || dimension() == 3)
+        incident_cells_3(v, v->cell(), std::back_inserter(tmp_cells));
     else
-    incident_cells_2(v, v->cell(), std::back_inserter(tmp_cells));
+    	incident_cells_2(v, v->cell(), std::back_inserter(tmp_cells));
 
-    typename std::vector<Cell_handle>::iterator cit;
-    for(cit = tmp_cells.begin();
+
+    for(auto cit = tmp_cells.begin();
         cit != tmp_cells.end();
         ++cit)
     {
       (*cit)->tds_data().clear();
       visit(*cit);
     }
+
 
     return visit.result();
   }
@@ -1432,7 +1490,8 @@ public:
     return visit.result();
   }
 
-  template <class Visitor, class OutputIterator, class Filter>
+#if 0 // Unused
+  template <bool Dim3OrMore = false, class Visitor, class OutputIterator, class Filter>
   OutputIterator
   visit_incident_cells(Vertex_handle v, OutputIterator output,
                        std::vector<Cell_handle> &cells, Filter f) const
@@ -1440,12 +1499,12 @@ public:
     CGAL_triangulation_precondition( v != Vertex_handle() );
     CGAL_triangulation_expensive_precondition( is_vertex(v) );
 
-    if ( dimension() < 2 )
+    if ( !Dim3OrMore && dimension() < 2 )
     return output;
 
     Visitor visit(v, output, this, f);
 
-    if ( dimension() == 3 )
+    if ( !Dim3OrMore && dimension() == 3 )
     incident_cells_3(v, v->cell(), std::make_pair(std::back_inserter(cells), visit.facet_it()));
     else
     incident_cells_2(v, v->cell(), std::back_inserter(cells));
@@ -1460,6 +1519,7 @@ public:
     }
     return visit.result();
   }
+#endif
 
   template <class Visitor, class OutputIterator, class Filter>
   OutputIterator
@@ -1473,8 +1533,7 @@ public:
 
     Visitor visit(v, output, this, f);
 
-    std::vector<Cell_handle> tmp_cells;
-    tmp_cells.reserve(64);
+    std::small_vector<Cell_handle, 64> tmp_cells;
 
     if ( dimension() == 3 )
       just_incident_cells_3(v, tmp_cells);
@@ -1826,7 +1885,9 @@ non_recursive_create_star_3(Vertex_handle v, Cell_handle c, int li, int prev_ind
     Cell_handle c_li = c->neighbor(li);
     set_adjacency(cnew, li, c_li, c_li->index(c));
 
-    std::stack<iAdjacency_info> adjacency_info_stack;
+    typedef boost::container::small_vector<iAdjacency_info,512> SV;
+    SV sv;
+    std::stack<iAdjacency_info, SV> adjacency_info_stack(sv);
 
     int ii=0;
     do

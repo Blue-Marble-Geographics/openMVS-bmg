@@ -35,6 +35,7 @@
 #include <CGAL/assertions.h>
 
 #include <boost/mpl/if.hpp>
+#include <boost/container/small_vector.hpp>
 
 // An STL like container with the following properties :
 // - to achieve compactness, it requires access to a pointer stored in T,
@@ -675,7 +676,7 @@ private:
   // by walking through the block till its end.
   // This opens up the possibility for the compiler to optimize the clear()
   // function considerably when has_trivial_destructor<T>.
-  using All_items = std::vector<std::pair<pointer, size_type> >;
+  using All_items = boost::container::small_vector<std::pair<pointer, size_type>, 16384>;
 
   using time_stamp_t = std::atomic<std::size_t>;
 

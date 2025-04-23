@@ -951,7 +951,7 @@ output iterator `vertices`. If `tds.dimension()` \f$ <0\f$, then do
 nothing. Returns the resulting output iterator.
 \pre `v` \f$ \neq\f$ `Vertex_handle()`, `tds.is_vertex(v)`.
 */
-template <class OutputIterator>
+template <bool Dim3OrMore = false, class OutputIterator>
 OutputIterator
 adjacent_vertices(Vertex_handle v, OutputIterator vertices) const;
 

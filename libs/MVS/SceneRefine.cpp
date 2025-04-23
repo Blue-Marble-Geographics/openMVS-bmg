@@ -111,9 +111,9 @@ public:
 			faceMap.memset((uint8_t)NO_ID);
 			baryMap.memset(0);
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(bary));
-			const Depth z(ComputeDepth(pbary));
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+			const Depth z(ComputeDepth(t, pbary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == 0 || depth > z) {
@@ -399,11 +399,11 @@ bool MeshRefine::InitImages(Real scale, Real sigma)
 void MeshRefine::ListVertexFacesPre()
 {
 	scene.mesh.EmptyExtra();
-	scene.mesh.ListIncidenteFaces();
+	scene.mesh.ListIncidentFaces();
 }
 void MeshRefine::ListVertexFacesPost()
 {
-	scene.mesh.ListIncidenteVertices();
+	scene.mesh.ListIncidentVertices();
 	scene.mesh.ListBoundaryVertices();
 }
 
@@ -419,8 +419,7 @@ void MeshRefine::ListCameraFaces()
 			const Image& imageData = images[ID];
 			if (!imageData.IsValid())
 				continue;
-			typedef TFrustum<float,5> Frustum;
-			const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
+			const TFrustum<float,5> frustum(Matrix3x4f(imageData.camera.P), (float)imageData.width, (float)imageData.height);
 			Mesh::FacesInserter inserter(arrCameraFaces[ID]);
 			octree.Traverse(frustum, inserter);
 		}
@@ -735,11 +734,13 @@ void MeshRefine::ProjectMesh(
 	baryMap.create(size);
 	// project all triangles on this image and keep the closest ones
 	RasterMesh rasterer(vertices, camera, depthMap, faceMap, baryMap);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
 	for (auto idxFace : cameraFaces) {
 		const Face& facet = faces[idxFace];
 		rasterer.idxFace = idxFace;
-		rasterer.Project(facet);
+		rasterer.Project(facet, triangleRasterizer);
 	}
 }
 
@@ -1056,9 +1057,9 @@ void MeshRefine::ThSelectNeighbors(uint32_t idxImage, std::unordered_set<uint64_
 	ViewScoreArr neighbors(imageData.neighbors);
 	Scene::FilterNeighborViews(neighbors, fMinArea, fMinScale, fMaxScale, fMinAngle, fMaxAngle, nMaxViews);
 	Lock l(cs);
-	FOREACHPTR(pNeighbor, neighbors) {
-		ASSERT(images[pNeighbor->idx.ID].IsValid());
-		mapPairs.insert(MakePairIdx((uint32_t)idxImage, pNeighbor->idx.ID));
+	for (const ViewScore& neighbor: neighbors) {
+		ASSERT(images[neighbor.ID].IsValid());
+		mapPairs.insert(MakePairIdx((uint32_t)idxImage, neighbor.ID));
 	}
 }
 void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma)
@@ -1280,7 +1281,7 @@ protected:
 bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsigned nMaxViews,
 					   float fDecimateMesh, unsigned nCloseHoles, unsigned nEnsureEdgeSize, unsigned nMaxFaceArea,
 					   unsigned nScales, float fScaleStep,
-					   unsigned nReduceMemory, unsigned nAlternatePair, float fRegularityWeight, float fRatioRigidityElasticity, float fThPlanarVertex, float fGradientStep)
+					   unsigned nAlternatePair, float fRegularityWeight, float fRatioRigidityElasticity, float fGradientStep, float fThPlanarVertex, unsigned nReduceMemory)
 {
 	if (pointcloud.IsEmpty() && !ImagesHaveNeighbors())
 		SampleMeshWithVisibility();

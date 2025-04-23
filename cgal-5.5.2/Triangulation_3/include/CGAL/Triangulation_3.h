@@ -920,8 +920,7 @@ public:
   Cell_handle
   locate(const Point& p,
          Locate_type& lt, int& li, int& lj,
-         Cell_handle start = Cell_handle(),
-         bool *could_lock_zone = nullptr) const;
+         Cell_handle start = Cell_handle()) const;
 #else // no CGAL_NO_STRUCTURAL_FILTERING
 #  ifndef CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS
 #    define CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS 2500
@@ -930,38 +929,31 @@ public:
 public:
   Cell_handle inexact_locate(const Point& p,
                              Cell_handle start = Cell_handle(),
-                             int max_num_cells = CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS,
-                             bool *could_lock_zone = nullptr) const;
+                             int max_num_cells = CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS) const;
 protected:
   Cell_handle exact_locate(const Point& p,
                            Locate_type& lt,
                            int& li, int& lj,
-                           Cell_handle start,
-                           bool *could_lock_zone = nullptr) const;
+                           Cell_handle start) const;
 
   Cell_handle generic_locate(const Point& p,
                              Locate_type& lt,
                              int& li, int& lj,
                              Cell_handle start,
-                             internal::Structural_filtering_3_tag,
-                             bool *could_lock_zone = nullptr) const
+                             internal::Structural_filtering_3_tag) const
   {
     Cell_handle ch = inexact_locate(
-                       p, start, CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS, could_lock_zone);
-    if(could_lock_zone && *could_lock_zone == false)
-      return ch; // = Cell_handle() here
-    else
-      return exact_locate(p, lt, li, lj, ch, could_lock_zone);
+                       p, start, CGAL_T3_STRUCTURAL_FILTERING_MAX_VISITED_CELLS);
+    return exact_locate(p, lt, li, lj, ch);
   }
 
   Cell_handle generic_locate(const Point& p,
                              Locate_type& lt,
                              int& li, int& lj,
                              Cell_handle start,
-                             internal::No_structural_filtering_3_tag,
-                             bool *could_lock_zone = nullptr) const
+                             internal::No_structural_filtering_3_tag) const
   {
-    return exact_locate(p, lt, li, lj, start, could_lock_zone);
+    return exact_locate(p, lt, li, lj, start);
   }
 
 public:
@@ -1005,41 +997,38 @@ public:
   }
 
 public:
+// JPB Zoning support largely removed for P2P.
+
   Cell_handle locate(const Point& p,
                      Locate_type& lt, int& li, int& lj,
-                     Cell_handle start = Cell_handle(),
-                     bool *could_lock_zone = nullptr) const
+                     Cell_handle start = Cell_handle()) const
   {
     typedef Triangulation_structural_filtering_traits<Geom_traits> TSFT;
     typedef typename internal::Structural_filtering_selector_3<
         TSFT::Use_structural_filtering_tag::value >::Tag           Should_filter_tag;
 
-    return generic_locate(p, lt, li, lj, start, Should_filter_tag(), could_lock_zone);
+    return generic_locate(p, lt, li, lj, start, Should_filter_tag());
   }
 #endif // no CGAL_NO_STRUCTURAL_FILTERING
 
   Cell_handle locate(const Point& p,
-                     Cell_handle start = Cell_handle(),
-                     bool *could_lock_zone = nullptr) const
+                     Cell_handle start = Cell_handle()) const
   {
     Locate_type lt;
     int li, lj;
-    return locate(p, lt, li, lj, start, could_lock_zone);
+    return locate(p, lt, li, lj, start);
   }
 
   Cell_handle locate(const Point& p,
-                     Locate_type& lt, int& li, int& lj, Vertex_handle hint,
-                     bool *could_lock_zone = nullptr) const
+                     Locate_type& lt, int& li, int& lj, Vertex_handle hint) const
   {
     return locate(p, lt, li, lj,
-                  hint == Vertex_handle() ? infinite_cell() : hint->cell(),
-                  could_lock_zone);
+                  hint == Vertex_handle() ? infinite_cell() : hint->cell());
   }
 
-  Cell_handle locate(const Point& p, Vertex_handle hint, bool *could_lock_zone = nullptr) const
+  Cell_handle locate(const Point& p, Vertex_handle hint) const
   {
-    return locate(p, hint == Vertex_handle() ? infinite_cell() : hint->cell(),
-                  could_lock_zone);
+    return locate(p, hint == Vertex_handle() ? infinite_cell() : hint->cell());
   }
 
   // PREDICATES ON POINTS ``TEMPLATED'' by the geom traits
@@ -1138,8 +1127,7 @@ public:
                                           Locate_type lt,
                                           Cell_handle c, int li, int lj,
                                           const Conflict_tester& tester,
-                                          Hidden_points_visitor& hider,
-                                          bool *could_lock_zone = nullptr);
+                                          Hidden_points_visitor& hider);
 
 
 #ifndef CGAL_TRIANGULATION_3_DONT_INSERT_RANGE_OF_POINTS_WITH_INFO
@@ -1330,24 +1318,10 @@ protected:
                  bool *the_facet_is_in_its_cz = nullptr) const
   {
     CGAL_triangulation_precondition(dimension()>=2);
-
-    if(the_facet_is_in_its_cz)
-      *the_facet_is_in_its_cz = false;
-
-    if(could_lock_zone)
-    {
-      *could_lock_zone = true;
-      if(!this->try_lock_cell(d))
-      {
-        *could_lock_zone = false;
-        return it;
-      }
-    }
-
     CGAL_triangulation_precondition(tester(d));
 
     // To store the boundary cells, in case we need to rollback
-    typedef boost::container::small_vector<Cell_handle,64> SV;
+    typedef boost::container::small_vector<Cell_handle,8192> SV;
     SV sv;
     std::stack<Cell_handle, SV > cell_stack(sv);
 
@@ -1372,12 +1346,6 @@ protected:
         if(test->tds_data().is_in_conflict())
         {
           Facet f(c, i); // Internal facet.
-          // Is it the facet where're looking for?
-          if(this_facet_must_be_in_the_cz && the_facet_is_in_its_cz &&
-              f == *this_facet_must_be_in_the_cz)
-          {
-            *the_facet_is_in_its_cz = true;
-          }
           if(c < test)
           {
             *it.third++ = f;
@@ -1388,25 +1356,7 @@ protected:
         {
           if(tester(test))
           {
-            // "test" is in the conflict zone
-            if(could_lock_zone)
-            {
-              if(!this->try_lock_cell(test))
-              {
-                *could_lock_zone = false;
-                // Unlock
-                return it;
-              }
-            }
-
             Facet f(c, i); // Internal facet.
-            // Is it the facet where're looking for?
-            if(this_facet_must_be_in_the_cz && the_facet_is_in_its_cz &&
-                f == *this_facet_must_be_in_the_cz)
-            {
-              *the_facet_is_in_its_cz = true;
-            }
-
             if(c < test)
             {
               *it.third++ = f;
@@ -1420,22 +1370,14 @@ protected:
 
           test->tds_data().mark_on_boundary();
         }
-
+        
         Facet f(c, i); // Boundary facet.
-        // Is it the facet where're looking for?
-        if(this_facet_must_be_in_the_cz && the_facet_is_in_its_cz &&
-            (mirror_facet(f) == *this_facet_must_be_in_the_cz ||
-             f == *this_facet_must_be_in_the_cz))
-        {
-          *the_facet_is_in_its_cz = true;
-        }
-
         *it.first++ = f;
       }
     }
     while(!cell_stack.empty());
-
-    return it;
+    
+    return it; 
   }
 
   // This one takes a function object to recursively determine the cells in
@@ -1447,9 +1389,7 @@ protected:
     CGAL_triangulation_precondition(c != Cell_handle());
     CGAL_triangulation_precondition(tester(c));
 
-    std::vector<Cell_handle> cells;
-    cells.reserve(32);
-
+    boost::container::small_vector<Cell_handle, 512> cells;
     Facet facet;
 
     // Find the cells in conflict
@@ -1515,8 +1455,7 @@ protected:
   bool test_dim_down(Vertex_handle v) const;
   bool test_dim_down_using_incident_cells_3(Vertex_handle v,
                                             std::vector<Cell_handle>& incident_cells,
-                                            std::vector<Vertex_handle>& adj_vertices,
-                                            bool *could_lock_zone = nullptr) const;
+                                            std::vector<Vertex_handle>& adj_vertices) const;
 
   // REMOVAL
   template < class VertexRemover >
@@ -1529,7 +1468,7 @@ protected:
   // * returns false if the vertex wasn't removed since it would decrease
   //   the dimension => needs to be done sequentially
   template < class VertexRemover >
-  bool remove(Vertex_handle v, VertexRemover& remover, bool *could_lock_zone);
+  bool remove(Vertex_handle v, VertexRemover& remover);
 
   template < class VertexRemover, class OutputItCells >
   void remove_and_give_new_cells(Vertex_handle v, VertexRemover& remover,
@@ -2146,10 +2085,10 @@ public:
   }
 
   // correct name
-  template <class OutputIterator>
+  template <bool Dim3OrMore = false, class OutputIterator>
   OutputIterator adjacent_vertices(Vertex_handle v, OutputIterator vertices) const
   {
-    return _tds.adjacent_vertices(v, vertices);
+    return _tds.adjacent_vertices<Dim3OrMore>(v, vertices);
   }
 
   template <class OutputIterator>
@@ -2772,10 +2711,10 @@ typename Triangulation_3<GT,Tds,Lds>::Cell_handle
 Triangulation_3<GT,Tds,Lds>::
 #ifdef CGAL_NO_STRUCTURAL_FILTERING
 locate(const Point& p, Locate_type& lt, int& li, int& lj,
-       Cell_handle start, bool *could_lock_zone) const
+       Cell_handle start) const
 #else
 exact_locate(const Point& p, Locate_type& lt, int& li, int& lj,
-             Cell_handle start, bool *could_lock_zone) const
+             Cell_handle start) const
 #endif
 {
   // Returns the (finite or infinite) cell p lies in.
@@ -2791,9 +2730,6 @@ exact_locate(const Point& p, Locate_type& lt, int& li, int& lj,
   // lt = OUTSIDE_AFFINE_HULL if p is not coplanar with the triangulation
 
   CGAL_triangulation_expensive_assertion(start == Cell_handle() || tds().is_simplex(start));
-
-  if(could_lock_zone)
-    *could_lock_zone = true;
 
   if(dimension() >= 1)
   {
@@ -2820,15 +2756,6 @@ exact_locate(const Point& p, Locate_type& lt, int& li, int& lj,
       // Remembers the previous cell to avoid useless orientation tests.
       Cell_handle previous = Cell_handle();
       Cell_handle c = start;
-
-      if(could_lock_zone)
-      {
-        if(!this->try_lock_cell(c))
-        {
-          *could_lock_zone = false;
-          return Cell_handle();
-        }
-      }
 
       // Stores the results of the 4 orientation tests.  It will be used
       // at the end to decide if p lies on a face/edge/vertex/interior.
@@ -2888,16 +2815,6 @@ exact_locate(const Point& p, Locate_type& lt, int& li, int& lj,
               }
               previous = c;
               c = next;
-              if(could_lock_zone)
-              {
-                //previous->unlock(); // DON'T do that, "c" may be in
-                // the same locking cell as "previous"
-                if(!this->try_lock_cell(c))
-                {
-                  *could_lock_zone = false;
-                  return Cell_handle();
-                }
-              }
               try_next_cell = true;
             }
           }
@@ -3125,14 +3042,10 @@ template < class Gt, class Tds, class Lds >
 inline
 typename Triangulation_3<Gt, Tds, Lds>::Cell_handle
 Triangulation_3<Gt, Tds, Lds>::
-inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
-               bool *could_lock_zone) const
+inexact_locate(const Point& t, Cell_handle start, int n_of_turns) const
 {
   CGAL_triangulation_expensive_assertion(start == Cell_handle() ||
                                          tds().is_simplex(start));
-
-  if(could_lock_zone)
-    *could_lock_zone = true;
 
   if(dimension() < 3)
     return start;
@@ -3140,16 +3053,6 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   // Make sure we continue from here with a finite cell.
   if(start == Cell_handle())
     start = infinite_cell();
-
-  // CJTODO: useless?
-  if(could_lock_zone)
-  {
-    if(!this->try_lock_cell(start))
-    {
-      *could_lock_zone = false;
-      return Cell_handle();
-    }
-  }
 
   int ind_inf;
   if(start->has_vertex(infinite, ind_inf))
@@ -3164,15 +3067,6 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   // Remembers the previous cell to avoid useless orientation tests.
   Cell_handle previous = Cell_handle();
   Cell_handle c = start;
-
-  if(could_lock_zone)
-  {
-    if(!this->try_lock_cell(c))
-    {
-      *could_lock_zone = false;
-      return Cell_handle();
-    }
-  }
 
   // Now treat the cell c.
 try_next_cell:
@@ -3210,16 +3104,6 @@ try_next_cell:
 
     previous = c;
     c = next;
-    if(could_lock_zone)
-    {
-      //previous->unlock(); // DON'T do that, "c" may be in
-      // the same locking cell as "previous"
-      if(!this->try_lock_cell(c))
-      {
-        *could_lock_zone = false;
-        return Cell_handle();
-      }
-    }
 
     if(n_of_turns) goto try_next_cell;
   }
@@ -3890,6 +3774,8 @@ insert(const Point& p, Locate_type lt, Cell_handle c, int li, int lj)
   }
 }
 
+// JPB Zoning support largely removed for P2P.
+
 template < class GT, class Tds, class Lds >
 template < class Conflict_tester, class Hidden_points_visitor >
 typename Triangulation_3<GT,Tds,Lds>::Vertex_handle
@@ -3897,12 +3783,8 @@ Triangulation_3<GT,Tds,Lds>::
 insert_in_conflict(const Point& p,
                    Locate_type lt, Cell_handle c, int li, int /*lj*/,
                    const Conflict_tester& tester,
-                   Hidden_points_visitor& hider,
-                   bool *could_lock_zone)
+                   Hidden_points_visitor& hider)
 {
-  if(could_lock_zone)
-    *could_lock_zone = true;
-
   switch(dimension())
   {
     case 3:
@@ -3921,46 +3803,18 @@ insert_in_conflict(const Point& p,
 
       // Ok, we really insert the point now.
       // First, find the conflict region.
-      boost::container::small_vector<Cell_handle,32> cells;
+      boost::container::small_vector<Cell_handle, 16384> cells;
       Facet facet;
 
-      boost::container::small_vector<Facet,32> facets;
+      boost::container::small_vector<Facet, 32768> facets;
 
-      // Parallel
-      if(could_lock_zone)
-      {
-
-        find_conflicts(c,
-                       tester,
-                       make_triple(std::back_inserter(facets),
-                                   std::back_inserter(cells),
-                                   Emptyset_iterator()),
-                       could_lock_zone);
-
-        if(*could_lock_zone == false)
-        {
-          for(Cell_handle ch : cells)
-          {
-            ch->tds_data().clear();
-          }
-
-          for(Facet& f : facets)
-          {
-            f.first->neighbor(f.second)->tds_data().clear();
-          }
-          return Vertex_handle();
-        }
-      }
       // Sequential
-      else
-      {
-        find_conflicts(c,
-                       tester,
-                       make_triple(
-                         std::back_inserter(facets),
-                         std::back_inserter(cells),
-                         Emptyset_iterator()));
-      }
+      find_conflicts(c,
+                     tester,
+                     make_triple(
+                       std::back_inserter(facets),
+                       std::back_inserter(cells),
+                       Emptyset_iterator()));
 
       facet = facets.back();
 
@@ -3968,6 +3822,7 @@ insert_in_conflict(const Point& p,
       // as they will be deleted during the insertion.
       hider.process_cells_in_conflict(cells.begin(), cells.end());
 
+      // Small hole insertion is an optimization.
       Vertex_handle v =
         tds().is_small_hole(facets.size()) ?
         _insert_in_small_hole(p, cells, facets) :
@@ -3998,8 +3853,7 @@ insert_in_conflict(const Point& p,
 
       // Ok, we really insert the point now.
       // First, find the conflict region.
-      std::vector<Cell_handle> cells;
-      cells.reserve(32);
+      boost::container::small_vector<Cell_handle, 256> cells;
       Facet facet;
 
       find_conflicts(c, tester, make_triple(Oneset_iterator<Facet>(facet),
@@ -4471,26 +4325,15 @@ bool
 Triangulation_3<GT,Tds,Lds>::
 test_dim_down_using_incident_cells_3(Vertex_handle v,
                                      std::vector<Cell_handle>& incident_cells,
-                                     std::vector<Vertex_handle>& adj_vertices,
-                                     bool *could_lock_zone) const
+                                     std::vector<Vertex_handle>& adj_vertices) const
 {
   CGAL_triangulation_precondition(dimension() == 3);
   CGAL_triangulation_precondition(! is_infinite(v));
 
   // Collect all vertices on the boundary
   // and all incident cells
-  if(could_lock_zone)
-  {
-    *could_lock_zone = try_lock_and_get_adjacent_vertices_and_cells_3(
-                         v, std::back_inserter(adj_vertices), incident_cells);
-    if(*could_lock_zone == false)
-      return false;
-  }
-  else
-  {
-    adjacent_vertices_and_cells_3(v, std::back_inserter(adj_vertices),
-                                  incident_cells);
-  }
+  adjacent_vertices_and_cells_3(v, std::back_inserter(adj_vertices),
+                                incident_cells);
 
   typedef Filter_iterator< typename std::vector<Vertex_handle>::const_iterator,
                            Infinite_tester> Finite_vertex_iterator;
@@ -5459,7 +5302,7 @@ template < class Gt, class Tds, class Lds >
 template < class VertexRemover >
 bool
 Triangulation_3<Gt, Tds, Lds>::
-remove(Vertex_handle v, VertexRemover& remover, bool *could_lock_zone)
+remove(Vertex_handle v, VertexRemover& remover)
 {
   // N.B.: dimension doesn't need to be atomic since the parallel removal
   //       will never decrease the dimension (the last few removes are done
@@ -5479,7 +5322,6 @@ remove(Vertex_handle v, VertexRemover& remover, bool *could_lock_zone)
   // Locking vertex v is a good start
   if(!this->try_lock_vertex(v))
   {
-    *could_lock_zone = false;
 #ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
     bcounter.increment_branch_2(); // THIS is an early withdrawal!
 #endif
@@ -5491,25 +5333,10 @@ remove(Vertex_handle v, VertexRemover& remover, bool *could_lock_zone)
     std::vector<Vertex_handle> adj_vertices;
     adj_vertices.reserve(64);
     bool dim_down = test_dim_down_using_incident_cells_3(
-                      v, incident_cells, adj_vertices, could_lock_zone);
-
-    if(*could_lock_zone)
-    {
-      if(dim_down)
-        removed = false;
-      else
-        remove_3D (v, remover, incident_cells, adj_vertices);
-    }
+                      v, incident_cells, adj_vertices);
   }
 
 #ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
-  if(could_lock_zone)
-  {
-    if(*could_lock_zone)
-      ++bcounter;
-    else
-      bcounter.increment_branch_1(); // THIS is a late withdrawal!
-  }
 #endif
 
   return removed;

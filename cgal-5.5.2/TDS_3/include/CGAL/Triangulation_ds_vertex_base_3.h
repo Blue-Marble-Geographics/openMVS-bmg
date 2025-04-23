@@ -33,11 +33,11 @@ public:
 
 
   Triangulation_ds_vertex_base_3()
-    : _c(), visited_for_vertex_extractor(false)
+    : _c(), visited_for_vertex_extractor(0)
   {}
 
   Triangulation_ds_vertex_base_3(Cell_handle c)
-    : _c(c), visited_for_vertex_extractor(false)
+    : _c(c), visited_for_vertex_extractor(0)
   {}
 
   Cell_handle cell() const
@@ -69,8 +69,8 @@ private:
   // The names are chooses complicated so that we do not have to document them
   // (privacy by obfuscation)
   public:
-  typedef bool Has_visited_for_vertex_extractor;
-  bool visited_for_vertex_extractor;
+  typedef uint16_t Has_visited_for_vertex_extractor;
+  uint16_t visited_for_vertex_extractor;
 };
 
 template < class TDS >

@@ -10,6 +10,8 @@
 
 // Configure everything that needs to be globally known
 
+#include "ConfigLocal.h"
+
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -124,7 +126,7 @@
 #define GENERAL_TPL
 
 // Define platform type
-#if __x86_64__ || __ppc64__
+#if defined(__x86_64__) || defined(__ppc64__) || defined(__aarch64__) || defined(__arm64__) || defined(__mips64)
 #define _ENVIRONMENT64
 #else
 #define _ENVIRONMENT32
@@ -145,6 +147,9 @@
 #if __cplusplus >= 202002L || __clang_major__ >= 10
 #define _SUPPORT_CPP20
 #endif
+#if __cplusplus >= 202302L || __clang_major__ >= 16
+#define _SUPPORT_CPP23
+#endif
 
 
 #if defined(__powerpc__)
@@ -159,7 +164,6 @@
 #if !defined(_DEBUG) && !defined(_PROFILE)
 #define _RELEASE // exclude code useful only for debug
 #endif
-
 
 
 //optimization flags
@@ -204,9 +208,6 @@
 #	define FORCEINLINE inline
 #endif
 
-#ifndef _SUPPORT_CPP11
-#	define constexpr inline
-#endif
 #ifdef _SUPPORT_CPP17
 #	undef MAYBEUNUSED
 #	define MAYBEUNUSED [[maybe_unused]]
@@ -218,6 +219,8 @@
 #define SAFE_RELEASE(p)		{ if (p!=NULL) { (p)->Release(); (p)=NULL; } }
 
 
+#define PRINT_ASSERT_MSG(exp, ...)
+
 #ifdef _DEBUG
 
 #ifdef _MSC_VER
@@ -226,33 +229,38 @@
 #include <cstdlib>
 #include <crtdbg.h>
 #ifdef _INC_CRTDBG
-#define ASSERT(exp)	{if (!(exp) && 1 == _CrtDbgReport(_CRT_ASSERT, __FILE__, __LINE__, NULL, #exp)) _CrtDbgBreak();}
+#define SIMPLE_ASSERT(exp) {if (!(exp) && 1 == _CrtDbgReport(_CRT_ASSERT, __FILE__, __LINE__, NULL, #exp)) _CrtDbgBreak();}
+#define ASSERT(exp, ...) {static bool bIgnore(false); if (!bIgnore && !(exp)) {PRINT_ASSERT_MSG(exp, ##__VA_ARGS__); if (!(bIgnore = !(1 == _CrtDbgReport(_CRT_ASSERT, __FILE__, __LINE__, NULL, #exp)))) _CrtDbgBreak();}}
 #else
-#define ASSERT(exp)	{if (!(exp)) __debugbreak();}
+#define SIMPLE_ASSERT(exp) {if (!(exp)) __debugbreak();}
+#define ASSERT(exp, ...) {if (!(exp)) {PRINT_ASSERT_MSG(exp, ##__VA_ARGS__); __debugbreak();}}
 #endif // _INC_CRTDBG
 #define TRACE(...) {TCHAR buffer[2048];	_sntprintf(buffer, 2048, __VA_ARGS__); OutputDebugString(buffer);}
 #else // _MSC_VER
 #include <assert.h>
-#define ASSERT(exp)	assert(exp)
+#define SIMPLE_ASSERT(exp) {if (!(exp)) assert(exp);}
+#define ASSERT(exp, ...) {if (!(exp)) {PRINT_ASSERT_MSG(exp, ##__VA_ARGS__); assert(exp);}}
 #define TRACE(...)
 #endif // _MSC_VER
 
 #else
 
 #ifdef _RELEASE
-#define ASSERT(exp)
+#define SIMPLE_ASSERT(exp)
+#define ASSERT(exp, ...)
 #else
 #ifdef _MSC_VER
-#define ASSERT(exp) {if (!(exp)) __debugbreak();}
+#define SIMPLE_ASSERT(exp) {if (!(exp)) __debugbreak();}
+#define ASSERT(exp, ...) {if (!(exp)) {PRINT_ASSERT_MSG(exp, ##__VA_ARGS__); __debugbreak();}}
 #else // _MSC_VER
-#define ASSERT(exp) {if (!(exp)) __builtin_trap();}
+#define SIMPLE_ASSERT(exp) {if (!(exp)) __builtin_trap();}
+#define ASSERT(exp, ...) {if (!(exp)) {PRINT_ASSERT_MSG(exp, ##__VA_ARGS__); __builtin_trap();}}
 #endif // _MSC_VER
 #endif
 #define TRACE(...)
 
 #endif // _DEBUG
 
-#define ASSERTM(exp, msg) ASSERT(exp)
 
 namespace SEACAVE_ASSERT
 {

@@ -164,6 +164,17 @@ public:
   // CHECKING
   bool is_valid(bool verbose = false, int level = 0) const;
 
+  // P2P debug support
+  std::pair<bool, int> info() const
+  {
+    constexpr int version = 1;
+#ifdef CGAL_LINKED_WITH_TBB
+    return { true, version };
+#else
+    return { false, version };
+#endif
+  }
+
   // INSERT REMOVE
   Vertex_handle insert(const Point &p, Vertex_handle hint)
   {

@@ -1,3 +1,4 @@
+#include "Plane.h"
 ////////////////////////////////////////////////////////////////////
 // Plane.inl
 //
@@ -27,7 +28,7 @@ inline TPlane<TYPE,DIMS>::TPlane(const VECTOR& vN, const POINT& p)
 }
 // Construct plane given three points on the plane.
 template <typename TYPE, int DIMS>
-inline TPlane<TYPE,DIMS>::TPlane(const POINT& p0, const POINT& p1, const POINT& p2)
+__forceinline TPlane<TYPE,DIMS>::TPlane(const POINT& p0, const POINT& p1, const POINT& p2)
 {
 	Set(p0, p1, p2);
 }
@@ -36,6 +37,12 @@ template <typename TYPE, int DIMS>
 inline TPlane<TYPE,DIMS>::TPlane(const TYPE p[DIMS+1])
 {
 	Set(p);
+}
+// Construct plane given its standard equation: Ax + By + Cz + D = 0
+template <typename TYPE, int DIMS>
+inline TPlane<TYPE,DIMS>::TPlane(const Eigen::Matrix<TYPE,DIMS+1,1>& v)
+{
+	Set(v);
 } // constructors
 /*----------------------------------------------------------------*/
 
@@ -52,7 +59,7 @@ inline void TPlane<TYPE,DIMS>::Set(const VECTOR& vN, const POINT& p)
 	m_fD = -vN.dot(p);
 }
 template <typename TYPE, int DIMS>
-inline void TPlane<TYPE,DIMS>::Set(const POINT& p0, const POINT& p1, const POINT& p2)
+__forceinline void TPlane<TYPE,DIMS>::Set(const POINT& p0, const POINT& p1, const POINT& p2)
 {
 	const VECTOR vcEdge1 = p1 - p0;
 	const VECTOR vcEdge2 = p2 - p0;
@@ -64,8 +71,81 @@ inline void TPlane<TYPE,DIMS>::Set(const TYPE p[DIMS+1])
 {
 	const Eigen::Map<const VECTOR> vN(p);
 	const TYPE invD(INVERT(vN.norm()));
-	Set(vN*invD, p[3]*invD);
+	Set(vN*invD, p[DIMS]*invD);
+}
+template <typename TYPE, int DIMS>
+inline void TPlane<TYPE,DIMS>::Set(const Eigen::Matrix<TYPE,DIMS+1,1>& v)
+{
+	const VECTOR vN = v.template topLeftCorner<3,1>();
+	const TYPE invD(INVERT(vN.norm()));
+	Set(vN*invD, v(DIMS)*invD);
 } // Set
+/*----------------------------------------------------------------*/
+
+
+// least squares refinement of the given plane to the 3D point set
+// (return the number of iterations)
+template <typename TYPE, int DIMS>
+template <typename RobustNormFunctor>
+int TPlane<TYPE,DIMS>::Optimize(const POINT* points, size_t size, const RobustNormFunctor& robust, int maxIters)
+{
+	ASSERT(DIMS == 3);
+	ASSERT(size >= numParams);
+	struct OptimizationFunctor {
+		const POINT* points;
+		const size_t size;
+		const RobustNormFunctor& robust;
+		// construct with the data points
+		OptimizationFunctor(const POINT* _points, size_t _size, const RobustNormFunctor& _robust)
+			: points(_points), size(_size), robust(_robust) { ASSERT(size < (size_t)std::numeric_limits<int>::max()); }
+		static void Residuals(const double* x, int nPoints, const void* pData, double* fvec, double* fjac, int* /*info*/) {
+			const OptimizationFunctor& data = *reinterpret_cast<const OptimizationFunctor*>(pData);
+			ASSERT((size_t)nPoints == data.size && fvec != NULL && fjac == NULL);
+			TPlane<double,3> plane; {
+				Point3d N;
+				plane.m_fD = x[0];
+				Dir2Normal(reinterpret_cast<const Point2d&>(x[1]), N);
+				plane.m_vN = N;
+			}
+			for (size_t i=0; i<data.size; ++i)
+				fvec[i] = data.robust(plane.Distance(data.points[i].template cast<double>()));
+		}
+	} functor(points, size, robust);
+	double arrParams[numParams]; {
+		arrParams[0] = (double)m_fD;
+		const Point3d N(m_vN.x(), m_vN.y(), m_vN.z());
+		Normal2Dir(N, reinterpret_cast<Point2d&>(arrParams[1]));
+	}
+	lm_control_struct control = {1.e-6, 1.e-7, 1.e-8, 1.e-7, 100.0, maxIters}; // lm_control_float;
+	lm_status_struct status;
+	lmmin(numParams, arrParams, (int)size, &functor, OptimizationFunctor::Residuals, &control, &status);
+	switch (status.info) {
+	//case 4:
+	case 5:
+	case 6:
+	case 7:
+	case 8:
+	case 9:
+	case 10:
+	case 11:
+	case 12:
+		DEBUG_ULTIMATE("error: refine plane: %s", lm_infmsg[status.info]);
+		return 0;
+	}
+	// set plane
+	{
+		Point3d N;
+		Dir2Normal(reinterpret_cast<const Point2d&>(arrParams[1]), N);
+		Set(Cast<TYPE>(N), (TYPE)arrParams[0]);
+	}
+	return status.nfev;
+}
+template <typename TYPE, int DIMS>
+int TPlane<TYPE,DIMS>::Optimize(const POINT* points, size_t size, int maxIters)
+{
+	const auto identity = [](double x) { return x; };
+	return Optimize(points, size, identity, maxIters);
+} // Optimize
 /*----------------------------------------------------------------*/
 
 
@@ -93,6 +173,22 @@ inline TPlane<TYPE,DIMS> TPlane<TYPE,DIMS>::Negated() const
 {
 	return TPlane(-m_vN, -m_fD);
 } // Negated
+/*----------------------------------------------------------------*/
+
+
+// transform plane from one coordinate system to another
+template <typename TYPE, int DIMS>
+inline TPlane<TYPE,DIMS> TPlane<TYPE,DIMS>::Transformed(const MATRIX& m) const
+{
+	const POINT p(m_vN * -m_fD);
+	const POINT pt((m * p.homogeneous()).hnormalized());
+	return TPlane(m.template topLeftCorner<DIMS,DIMS>() * m_vN, pt);
+} // Transformed
+template <typename TYPE, int DIMS>
+inline TPlane<TYPE,DIMS>& TPlane<TYPE,DIMS>::Transform(const MATRIX& m)
+{
+	return *this = Transformed(m);
+} // Transform
 /*----------------------------------------------------------------*/
 
 
@@ -131,8 +227,8 @@ template <typename TYPE, int DIMS>
 inline GCLASS TPlane<TYPE,DIMS>::Classify(const POINT& p) const
 {
 	const TYPE f(Distance(p));
-	if (f >  ZEROTOLERANCE<TYPE,DIMS>()) return FRONT;
-	if (f < -ZEROTOLERANCE<TYPE,DIMS>()) return BACK;
+	if (f >  ZEROTOLERANCE<TYPE>()) return FRONT;
+	if (f < -ZEROTOLERANCE<TYPE>()) return BACK;
 	return PLANAR;
 }
 /*----------------------------------------------------------------*/
@@ -187,7 +283,7 @@ bool TPlane<TYPE,DIMS>::Intersects(const TPlane& plane, RAY& ray) const
 	// if crossproduct of normals 0 than planes parallel
 	const VECTOR vCross(m_vN.cross(plane.m_vN));
 	const TYPE fSqrLength(vCross.squaredNorm());
-	if (fSqrLength < ZEROTOLERANCE<TYPE,DIMS>()) 
+	if (fSqrLength < ZEROTOLERANCE<TYPE>()) 
 		return false;
 
 	// find line of intersection
@@ -281,13 +377,13 @@ bool TPlane<TYPE,DIMS>::Intersects(const AABB& aabb) const
 
 
 // same as above, but online version
-template <typename TYPE, typename TYPEW>
-FitPlaneOnline<TYPE,TYPEW>::FitPlaneOnline()
+template <typename TYPE, typename TYPEW, bool bFitLineMode>
+FitPlaneOnline<TYPE,TYPEW,bFitLineMode>::FitPlaneOnline()
 	: sumX(0), sumSqX(0), sumXY(0), sumXZ(0), sumY(0), sumSqY(0), sumYZ(0), sumZ(0), sumSqZ(0), size(0)
 {
 }
-template <typename TYPE, typename TYPEW>
-void FitPlaneOnline<TYPE,TYPEW>::Update(const TPoint3<TYPE>& P)
+template <typename TYPE, typename TYPEW, bool bFitLineMode>
+void FitPlaneOnline<TYPE,TYPEW,bFitLineMode>::Update(const TPoint3<TYPE>& P)
 {
 	const TYPEW X((TYPEW)P.x), Y((TYPEW)P.y), Z((TYPEW)P.z);
 	sumX += X; sumSqX += X*X; sumXY += X*Y; sumXZ += X*Z;
@@ -295,8 +391,8 @@ void FitPlaneOnline<TYPE,TYPEW>::Update(const TPoint3<TYPE>& P)
 	sumZ += Z; sumSqZ += Z*Z;
 	++size;
 }
-template <typename TYPE, typename TYPEW>
-TPoint3<TYPEW> FitPlaneOnline<TYPE,TYPEW>::GetPlane(TPoint3<TYPEW>& avg, TPoint3<TYPEW>& dir) const
+template <typename TYPE, typename TYPEW, bool bFitLineMode>
+TPoint3<TYPEW> FitPlaneOnline<TYPE,TYPEW,bFitLineMode>::GetModel(TPoint3<TYPEW>& avg, TPoint3<TYPEW>& dir) const
 {
 	const TYPEW avgX(sumX/(TYPEW)size), avgY(sumY/(TYPEW)size), avgZ(sumZ/(TYPEW)size);
 	// assemble covariance (lower-triangular) matrix
@@ -309,20 +405,21 @@ TPoint3<TYPEW> FitPlaneOnline<TYPE,TYPEW>::GetPlane(TPoint3<TYPEW>& avg, TPoint3
 	A(2,1) = sumYZ - sumY*avgZ - avgY*sumZ + avgY*avgZ*(TYPEW)size;
 	A(2,2) = sumSqZ - TYPEW(2)*sumZ*avgZ + avgZ*avgZ*(TYPEW)size;
 	// the plane normal is simply the eigenvector corresponding to least eigenvalue
+	const int nAxis(bFitLineMode ? 2 : 0);
 	const Eigen::SelfAdjointEigenSolver<Mat3x3> es(A);
-	ASSERT(ISEQUAL(es.eigenvectors().col(0).norm(), TYPEW(1)));
+	ASSERT(ISEQUAL(es.eigenvectors().col(nAxis).norm(), TYPEW(1)));
 	avg = TPoint3<TYPEW>(avgX,avgY,avgZ);
-	dir = es.eigenvectors().col(0);
+	dir = es.eigenvectors().col(nAxis);
 	const TYPEW* const vals(es.eigenvalues().data());
 	ASSERT(vals[0] <= vals[1] && vals[1] <= vals[2]);
 	return *reinterpret_cast<const TPoint3<TYPEW>*>(vals);
 }
-template <typename TYPE, typename TYPEW>
+template <typename TYPE, typename TYPEW, bool bFitLineMode>
 template <typename TYPEE>
-TPoint3<TYPEE> FitPlaneOnline<TYPE,TYPEW>::GetPlane(TPlane<TYPEE,3>& plane) const
+TPoint3<TYPEE> FitPlaneOnline<TYPE,TYPEW,bFitLineMode>::GetPlane(TPlane<TYPEE,3>& plane) const
 {
 	TPoint3<TYPEW> avg, dir;
-	const TPoint3<TYPEW> quality(GetPlane(avg, dir));
+	const TPoint3<TYPEW> quality(GetModel(avg, dir));
 	plane.Set(TPoint3<TYPEE>(dir), TPoint3<TYPEE>(avg));
 	return TPoint3<TYPEE>(quality);
 }
@@ -370,16 +467,6 @@ TYPE FitPlane(const TPoint3<TYPE>* points, size_t size, TPlane<TYPE>& plane) {
 
 // Construct frustum given a projection matrix.
 template <typename TYPE, int DIMS>
-inline TFrustum<TYPE,DIMS>::TFrustum(const MATRIX4x4& m)
-{
-	Set<0>(m);
-}
-template <typename TYPE, int DIMS>
-inline TFrustum<TYPE,DIMS>::TFrustum(const MATRIX3x4& m)
-{
-	Set<0>(m);
-}
-template <typename TYPE, int DIMS>
 inline TFrustum<TYPE,DIMS>::TFrustum(const MATRIX4x4& m, TYPE w, TYPE h, TYPE n, TYPE f)
 {
 	Set(m, w, h, n, f);
@@ -392,124 +479,66 @@ inline TFrustum<TYPE,DIMS>::TFrustum(const MATRIX3x4& m, TYPE w, TYPE h, TYPE n,
 /*----------------------------------------------------------------*/
 
 
-/**
- * Retrieve active frustum planes, normals pointing outwards.
- * -> IN/OUT: RDFRUSTUM - address to 6 planes
- */
-template <typename TYPE, int DIMS>
-template <int MODE>
-void TFrustum<TYPE,DIMS>::Set(const MATRIX4x4& m)
-{
-	// left plane
-	m_planes[0].Set(-(m.col(3)+m.col(0)));
-	// right plane
-	if (DIMS > 1)
-	m_planes[1].Set(-(m.col(3)-m.col(0)));
-	// top plane
-	if (DIMS > 2)
-	m_planes[2].Set(-(m.col(3)+m.col(1)));
-	// bottom plane
-	if (DIMS > 3)
-	m_planes[3].Set(-(m.col(3)-m.col(1)));
-	// near plane
-	if (DIMS > 4)
-	m_planes[4].Set(MODE ? -(m.col(3)+m.col(2)) : -m.col(2));
-	// far plane
-	if (DIMS > 5)
-	m_planes[5].Set(-(m.col(3)-m.col(2)));
-}
-// same as above, but the last row of the matrix is (0,0,0,1)
-template <typename TYPE, int DIMS>
-template <int MODE>
-void TFrustum<TYPE,DIMS>::Set(const MATRIX3x4& m)
-{
-	// left plane
-	m_planes[0].Set(VECTOR4(
-		-(m(0,3)+m(0,0)),
-		-(m(1,3)+m(1,0)),
-		-(m(2,3)+m(2,0)),
-		-TYPE(1)
-	));
-	// right plane
-	if (DIMS > 1)
-	m_planes[1].Set(VECTOR4(
-		-(m(0,3)-m(0,0)),
-		-(m(1,3)-m(1,0)),
-		-(m(2,3)-m(2,0)),
-		-TYPE(1)
-	));
-	// top plane
-	if (DIMS > 2)
-	m_planes[2].Set(VECTOR4(
-		-(m(0,3)+m(0,1)),
-		-(m(1,3)+m(1,1)),
-		-(m(2,3)+m(2,1)),
-		-TYPE(1)
-	));
-	// bottom plane
-	if (DIMS > 3)
-	m_planes[3].Set(VECTOR4(
-		-(m(0,3)-m(0,1)),
-		-(m(1,3)-m(1,1)),
-		-(m(2,3)-m(2,1)),
-		-TYPE(1)
-	));
-	// near plane
-	if (DIMS > 4)
-	m_planes[4].Set(MODE ?
-		VECTOR4(
-		-(m(0,3)+m(0,2)),
-		-(m(1,3)+m(1,2)),
-		-(m(2,3)+m(2,2)),
-		-TYPE(1))
-		:
-		VECTOR4(
-		-m(0,2),
-		-m(1,2),
-		-m(2,2),
-		TYPE(0))
-	);
-	// far plane
-	if (DIMS > 5)
-	m_planes[5].Set(VECTOR4(
-		-(m(0,3)-m(0,2)),
-		-(m(1,3)-m(1,2)),
-		-(m(2,3)-m(2,2)),
-		-TYPE(1)
-	));
-}
-// same as above, but from SfM projection matrix and image plane details
+// Set frustum planes, normals pointing outwards, from SfM projection matrix and image plane details
 template <typename TYPE, int DIMS>
 void TFrustum<TYPE,DIMS>::Set(const MATRIX4x4& m, TYPE w, TYPE h, TYPE n, TYPE f)
 {
-	const VECTOR4 ltn(0,0,n,1), rtn(w*n,0,n,1), lbn(0,h*n,n,1), rbn(w*n,h*n,n,1);
-	const VECTOR4 ltf(0,0,f,1), rtf(w*f,0,f,1), lbf(0,h*f,f,1), rbf(w*f,h*f,f,1);
+	const VECTOR ltn(0,0,n), rtn(w*n,0,n), lbn(0,h*n,n), rbn(w*n,h*n,n);
+	const VECTOR ltf(0,0,f), rtf(w*f,0,f), lbf(0,h*f,f), rbf(w*f,h*f,f);
 	const MATRIX4x4 inv(m.inverse());
-	const VECTOR4 ltn3D(inv*ltn), rtn3D(inv*rtn), lbn3D(inv*lbn), rbn3D(inv*rbn);
-	const VECTOR4 ltf3D(inv*ltf), rtf3D(inv*rtf), lbf3D(inv*lbf), rbf3D(inv*rbf);
-	m_planes[0].Set(ltn3D.template topRows<3>(), ltf3D.template topRows<3>(), lbf3D.template topRows<3>());
-	if (DIMS > 1)
-	m_planes[1].Set(rtn3D.template topRows<3>(), rbf3D.template topRows<3>(), rtf3D.template topRows<3>());
-	if (DIMS > 2)
-	m_planes[2].Set(ltn3D.template topRows<3>(), rtf3D.template topRows<3>(), ltf3D.template topRows<3>());
-	if (DIMS > 3)
-	m_planes[3].Set(lbn3D.template topRows<3>(), lbf3D.template topRows<3>(), rbf3D.template topRows<3>());
-	if (DIMS > 4)
-	m_planes[4].Set(ltn3D.template topRows<3>(), lbn3D.template topRows<3>(), rbn3D.template topRows<3>());
-	if (DIMS > 5)
-	m_planes[5].Set(ltf3D.template topRows<3>(), rtf3D.template topRows<3>(), rbf3D.template topRows<3>());
+	const VECTOR corners[] = {
+		(inv*ltn.homogeneous()).template topRows<3>(),
+		(inv*rtn.homogeneous()).template topRows<3>(),
+		(inv*lbn.homogeneous()).template topRows<3>(),
+		(inv*rbn.homogeneous()).template topRows<3>(),
+		(inv*ltf.homogeneous()).template topRows<3>(),
+		(inv*rtf.homogeneous()).template topRows<3>(),
+		(inv*lbf.homogeneous()).template topRows<3>(),
+		(inv*rbf.homogeneous()).template topRows<3>()
+	};
+	Set(corners);
 }
 template <typename TYPE, int DIMS>
 void TFrustum<TYPE,DIMS>::Set(const MATRIX3x4& m, TYPE w, TYPE h, TYPE n, TYPE f)
 {
 	MATRIX4x4 M(MATRIX4x4::Identity());
-	#ifdef __GNUC__
-	M.topLeftCorner(3,4) = m;
-	#else
 	M.template topLeftCorner<3,4>() = m;
-	#endif
 	Set(M, w, h, n, f);
+}
+// Set frustum planes, normals pointing outwards, from the given corners
+template <typename TYPE, int DIMS>
+void TFrustum<TYPE,DIMS>::Set(const VECTOR corners[numCorners])
+{
+	// left clipping plane
+	m_planes[0].Set(corners[0], corners[4], corners[6]);
+	if (DIMS > 1) // right clipping plane
+	m_planes[1].Set(corners[1], corners[7], corners[5]);
+	if (DIMS > 2) // top clipping plane
+	m_planes[2].Set(corners[0], corners[5], corners[4]);
+	if (DIMS > 3) // bottom clipping plane
+	m_planes[3].Set(corners[2], corners[6], corners[7]);
+	if (DIMS > 4) // near clipping plane
+	m_planes[4].Set(corners[0], corners[2], corners[3]);
+	if (DIMS > 5) // far clipping plane
+	m_planes[5].Set(corners[4], corners[5], corners[7]);
 } // Set
+// Set frustum planes, normals pointing outwards, from the OpenGL projection-view matrix
+template <typename TYPE, int DIMS>
+void TFrustum<TYPE,DIMS>::SetProjectionGL(const MATRIX4x4& mProjectionView)
+{
+	// left clipping plane
+	m_planes[0].Set(-mProjectionView.row(3) - mProjectionView.row(0));
+	if (DIMS > 1) // right clipping plane
+	m_planes[1].Set(-mProjectionView.row(3) + mProjectionView.row(0));
+	if (DIMS > 2) // top clipping plane
+	m_planes[2].Set(-mProjectionView.row(3) + mProjectionView.row(1));
+	if (DIMS > 3) // bottom clipping plane
+	m_planes[3].Set(-mProjectionView.row(3) - mProjectionView.row(1));
+	if (DIMS > 4) // near clipping plane
+	m_planes[4].Set(-mProjectionView.row(3) - mProjectionView.row(2));
+	if (DIMS > 5) // far clipping plane
+	m_planes[5].Set(-mProjectionView.row(3) + mProjectionView.row(2));
+}
 /*----------------------------------------------------------------*/
 
 

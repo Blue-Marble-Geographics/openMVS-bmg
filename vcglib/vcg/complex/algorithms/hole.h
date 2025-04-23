@@ -24,6 +24,7 @@
 #define __VCG_TRI_UPDATE_HOLE
 
 #include <vcg/complex/algorithms/clean.h>
+#include <boost/container/small_vector.hpp>
 
 // This file contains three Ear Classes
 // - TrivialEar
@@ -470,6 +471,10 @@ public:
  * It uses a priority queue to choose the best ear to be closed          
  */
         
+template <typename T, typename Compare = std::less<T>>
+using small_vector_priority_queue = std::priority_queue<T, boost::container::small_vector<T, 64>, Compare>;
+
+
 template<class EAR>
     static void FillHoleEar(MESH &m, // The mesh to be filled
                             const PosType &p, // the particular hole to be filled
@@ -481,7 +486,7 @@ template<class EAR>
       int holeSize = EAR::InitNonManifoldBitOnHoleBoundary(p);
       FaceIterator f = tri::Allocator<MESH>::AddFaces(m, holeSize-2, facePointersToBeUpdated);
 
-      std::priority_queue< EAR > EarHeap;
+      small_vector_priority_queue<EAR> EarHeap;
       PosType fp = p;
       do{
         EAR appEar = EAR(fp);
@@ -554,10 +559,12 @@ template<class EAR>
 /// Main Hole Filling function.
 /// Given a mesh search for all the holes smaller than a given size and fill them
 /// It returns the number of filled holes.
-
 template<class EAR>
     static int EarCuttingIntersectionFill(MESH &m, const int maxSizeHole, bool Selected, CallBackPos *cb=0)
     {
+      // Put this first as later the stored iterators will become invalid.
+      // JPB WIP BUG m.face.reserve(m.fn*2);
+
       std::vector<Info > vinfo;
       GetInfo(m, Selected,vinfo);
       typename std::vector<Info>::iterator ith;
@@ -602,8 +609,6 @@ template<class EAR>
       }
       return holeCnt;
     }
-
-
 
     static void GetInfo(MESH &m, bool Selected ,std::vector<Info >& VHI)
         {

@@ -82,8 +82,13 @@ public:
     {
         RequirePerVertexFlags(m);
         int andMask = ~FlagMask;
-        for(VertexIterator vi=m.vert.begin(); vi!=m.vert.end(); ++vi)
-            if(!(*vi).IsD()) (*vi).Flags() &= andMask ;
+
+        const auto numVertices = m.vn;
+        #pragma omp parallel for
+          for (int64_t i = 0; i < numVertices; ++i) {
+            auto& vi = m.vert[i];
+            if(!vi.IsD()) vi.Flags() &= andMask;
+          }
     }
 
     static void EdgeClear(MeshType &m, unsigned int FlagMask = 0xffffffff)

@@ -13,6 +13,7 @@
 #ifndef CGAL_INTERNAL_STATIC_FILTERS_SIDE_OF_ORIENTED_SPHERE_3_H
 #define CGAL_INTERNAL_STATIC_FILTERS_SIDE_OF_ORIENTED_SPHERE_3_H
 
+#define CGAL_USE_SSE2_MAX // JPB WIP BUG
 #include <CGAL/Profile_counter.h>
 #include <CGAL/Filtered_kernel/internal/Static_filters/Static_filter_error.h>
 

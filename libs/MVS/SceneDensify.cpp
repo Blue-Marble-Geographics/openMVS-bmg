@@ -161,9 +161,9 @@ bool DepthMapsData::SelectViews(IIndexArr& images, IIndexArr& imagesMap, IIndexA
 		ASSERT(neighbors.GetSize() <= OPTDENSE::nMaxViews);
 		// register edges
 		FOREACHPTR(pNeighbor, neighbors) {
-			const IIndex idx2(pNeighbor->idx.ID);
+			const IIndex idx2(pNeighbor->ID);
 			ASSERT(imagesMap[idx2] != NO_ID);
-			edges[MakePairIdx(idx,idx2)] = pNeighbor->idx.area;
+			edges[MakePairIdx(idx,idx2)] = pNeighbor->area;
 			totScore += pNeighbor->score;
 			++numScores;
 		}
@@ -201,17 +201,17 @@ bool DepthMapsData::SelectViews(IIndexArr& images, IIndexArr& imagesMap, IIndexA
 		const ViewScoreArr& neighborsJ(arrDepthData[pair.j].neighbors);
 		arrPairwise.Empty();
 		FOREACHPTR(pNj, neighborsJ) {
-			const IIndex i(pNj->idx.ID);
-			const float areaJ(area/pNj->idx.area);
+			const IIndex i(pNj->ID);
+			const float areaJ(area/pNj->area);
 			FOREACHPTR(pNi, neighborsI) {
-				const IIndex j(pNi->idx.ID);
-				const float areaI(area/pNi->idx.area);
+				const IIndex j(pNi->ID);
+				const float areaI(area/pNi->area);
 				arrPairwise.Insert(pair.i == i && pair.j == j ? fSamePairwise : fPairwiseMul*(areaI+areaJ));
 			}
 			arrPairwise.Insert(fEmptyPairwise+fPairwiseMul*areaJ);
 		}
 		for (const ViewScore& Ni: neighborsI) {
-			const float areaI(area/Ni.idx.area);
+			const float areaI(area/Ni.area);
 			arrPairwise.Insert(fPairwiseMul*areaI+fEmptyPairwise);
 		}
 		arrPairwise.Insert(fEmptyPairwise*2);
@@ -247,7 +247,7 @@ bool DepthMapsData::SelectViews(IIndexArr& images, IIndexArr& imagesMap, IIndexA
 			idxNeighbor = NO_ID; // empty
 		} else {
 			idxNeighbor = label;
-			DEBUG_ULTIMATE("\treference image %3u paired with target image %3u (idx %2u)", images[n], neighbors[label].idx.ID, label);
+			DEBUG_ULTIMATE("\treference image %3u paired with target image %3u (idx %2u)", images[n], neighbors[label].ID, label);
 		}
 	}
 
@@ -321,20 +321,20 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 		// set target image as the given neighbor
 		const ViewScore& neighbor = depthData.neighbors[idxNeighbor];
 		DepthData::ViewData& viewTrg = depthData.images.AddEmpty();
-		viewTrg.pImageData = &scene.images[neighbor.idx.ID];
-		viewTrg.scale = neighbor.idx.scale;
+		viewTrg.pImageData = &scene.images[neighbor.ID];
+		viewTrg.scale = neighbor.scale;
 		viewTrg.camera = viewTrg.pImageData->camera;
 		if (loadImages) {
 #ifdef DPC_IMAGE_CACHE
 			Image32F* found = nullptr;
 			for (auto& i : greyImages) {
-				if (i.first == neighbor.idx.ID) {
+				if (i.first == neighbor.ID) {
 					found = i.second.get();
 					break;
 				}
 			}
 			if (!found) {
-				greyImages.emplace_back(neighbor.idx.ID, std::make_unique<Image32F>(viewTrg.image));
+				greyImages.emplace_back(neighbor.ID, std::make_unique<Image32F>(viewTrg.image));
 				viewTrg.pImageData->image.toGray(*greyImages.back().second, cv::COLOR_BGR2GRAY, true);
 				found = greyImages.back().second.get();
 			}
@@ -349,7 +349,7 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 			if (DepthData::ViewData::NeedScaleImage(viewTrg.scale))
 				viewTrg.camera = viewTrg.pImageData->GetCamera(scene.platforms, Image8U::computeResize(viewTrg.pImageData->image.size(), viewTrg.scale));
 		}
-		DEBUG_EXTRA("Reference image %3u paired with image %3u", idxImage, neighbor.idx.ID);
+		DEBUG_EXTRA("Reference image %3u paired with image %3u", idxImage, neighbor.ID);
 	} else {
 		// initialize all neighbor views too (global reconstruction is used)
 		const float fMinScore(MAXF(depthData.neighbors.First().score*OPTDENSE::fViewMinScoreRatio, OPTDENSE::fViewMinScore));
@@ -359,20 +359,20 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 				(neighbor.score < fMinScore))
 				break;
 			DepthData::ViewData& viewTrg = depthData.images.AddEmpty();
-			viewTrg.pImageData = &scene.images[neighbor.idx.ID];
-			viewTrg.scale = neighbor.idx.scale;
+			viewTrg.pImageData = &scene.images[neighbor.ID];
+			viewTrg.scale = neighbor.scale;
 			viewTrg.camera = viewTrg.pImageData->camera;
 			if (loadImages) {
 #ifdef DPC_IMAGE_CACHE
 				Image32F* found = nullptr;
 				for (auto& i : greyImages) {
-					if (i.first == neighbor.idx.ID) {
+					if (i.first == neighbor.ID) {
 						found = i.second.get();
 						break;
 					}
 				}
 				if (!found) {
-					greyImages.emplace_back(neighbor.idx.ID, std::make_unique<Image32F>(viewTrg.image));
+					greyImages.emplace_back(neighbor.ID, std::make_unique<Image32F>(viewTrg.image));
 	 				viewTrg.pImageData->image.toGray(*greyImages.back().second, cv::COLOR_BGR2GRAY, true);
 					found = greyImages.back().second.get();
 				}
@@ -994,7 +994,7 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 		#endif
 		if (prevDepthMapSize != size || OPTDENSE::nIgnoreMaskLabel >= 0) {
 			BitMatrix mask;
-			if (OPTDENSE::nIgnoreMaskLabel >= 0 && DepthEstimator::ImportIgnoreMask(*image.pImageData, depthData.depthMap.size(), mask, (uint16_t)OPTDENSE::nIgnoreMaskLabel))
+			if (OPTDENSE::nIgnoreMaskLabel >= 0 && DepthEstimator::ImportIgnoreMask(*image.pImageData, depthData.depthMap.size(), (uint8_t)OPTDENSE::nIgnoreMaskLabel, mask))
 				depthData.ApplyIgnoreMask(mask);
 			DepthEstimator::MapMatrix2ZigzagIdx(size, coords, mask, MAXF(64,(int)nMaxThreads*8));
 			#if 0
@@ -1442,7 +1442,7 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 			confMap.create(sizeRef);
 			confMap.memset(0);
 		}
-		const IIndex idxView = depthDataRef.neighbors[idxNeighbors[(IIndex)n]].idx.ID;
+		const IIndex idxView = depthDataRef.neighbors[idxNeighbors[(IIndex)n]].ID;
 		const DepthData& depthData = arrDepthData[idxView];
 		const Camera& camera = depthData.images.First().camera;
 		const Image8U::Size size(depthData.depthMap.size());
@@ -1549,7 +1549,7 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 							negConf += confMaps[n](xRef);
 						} else {
 							// free-space violation
-							const DepthData& depthData = arrDepthData[depthDataRef.neighbors[idxNeighbors[n]].idx.ID];
+							const DepthData& depthData = arrDepthData[depthDataRef.neighbors[idxNeighbors[n]].ID];
 							const Camera& camera = depthData.images.First().camera;
 							const Point3 X(cameraRef.TransformPointI2W(Point3(xRef.x,xRef.y,depth)));
 							const ImageRef x(ROUND2INT(camera.TransformPointW2I(X)));
@@ -1894,10 +1894,10 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 		const DepthData& depthData(arrDepthData[idxImage]);
 		ASSERT(!depthData.images.IsEmpty() && !depthData.neighbors.IsEmpty());
 		for (const ViewScore& neighbor: depthData.neighbors) {
-			DepthIndex& depthIdxs = arrDepthIdx[neighbor.idx.ID];
+			DepthIndex& depthIdxs = arrDepthIdx[neighbor.ID];
 			if (!depthIdxs.empty())
 				continue;
-			const DepthData& depthDataB(arrDepthData[neighbor.idx.ID]);
+			const DepthData& depthDataB(arrDepthData[neighbor.ID]);
 			ASSERT(!depthDataB.IsEmpty());
 			depthIdxs.create(depthDataB.depthMap.size());
 			depthIdxs.memset((uint8_t)NO_ID);
@@ -2091,7 +2091,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 				for (int i = 0, cnt = depthData.neighbors.size(); i < cnt; ++i) {
 					const auto pNeighbor = &depthData.neighbors[i];
 
-					const IIndex idxImageB(pNeighbor->idx.ID);
+					const IIndex idxImageB(pNeighbor->ID);
 					const Image& imageDataB = scene.images[idxImageB];
 					const auto& imageDataBCameraPt = imagesCameraPt[idxImageB];
 					DepthData& depthDataB = arrDepthData[idxImageB];
@@ -3195,7 +3195,7 @@ void Scene::DenseReconstructionFilter(void* pData)
 			const unsigned numMaxNeighbors(8);
 			IIndexArr idxNeighbors(0, depthData.neighbors.GetSize());
 			FOREACH(n, depthData.neighbors) {
-				const IIndex idxView = depthData.neighbors[n].idx.ID;
+				const IIndex idxView = depthData.neighbors[n].ID;
 				DepthData& depthDataPair = data.depthMaps.arrDepthData[idxView];
 				if (!depthDataPair.IsValid())
 					continue;
@@ -3215,7 +3215,7 @@ void Scene::DenseReconstructionFilter(void* pData)
 			}
 			// unload referenced depth-maps
 			FOREACHPTR(pIdxNeighbor, idxNeighbors) {
-				const IIndex idxView = depthData.neighbors[*pIdxNeighbor].idx.ID;
+				const IIndex idxView = depthData.neighbors[*pIdxNeighbor].ID;
 				DepthData& depthDataPair = data.depthMaps.arrDepthData[idxView];
 				depthDataPair.DecRef();
 			}

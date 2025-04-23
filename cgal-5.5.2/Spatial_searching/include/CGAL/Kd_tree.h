@@ -117,7 +117,7 @@ private:
 
   Node_handle tree_root;
 
-  Kd_tree_rectangle<FT,D> bbox;
+  Kd_tree_rectangle<FT,D>* bbox;
   std::vector<Point_d> pts;
 
   // Store a contiguous copy of the point coordinates
@@ -129,7 +129,6 @@ private:
   // and we only store an iterator range in the Kd_tree_node.
   //
   std::vector<const Point_d*> data;
-
 
   // Dimension of the points
   int dim_;
@@ -176,7 +175,7 @@ private:
 #endif
   }
 
-  // TODO: Similar to the leaf_init function above, a part of the code should be
+  // TODO: Similiar to the leaf_init function above, a part of the code should be
   //       moved to a the class Kd_tree_node.
   //       It is not proper yet, but the goal was to see if there is
   //       a potential performance gain through the Compact_container
@@ -294,7 +293,7 @@ public:
 
   void build()
   {
-    build<Parallel_tag>();
+    build<Sequential_tag>();
   }
 
   /*
@@ -329,6 +328,7 @@ public:
     const Point_d& p = *pts.begin();
     typename SearchTraits::Construct_cartesian_const_iterator_d ccci=traits_.construct_cartesian_const_iterator_d_object();
     dim_ = static_cast<int>(std::distance(ccci(p), ccci(p,0)));
+
     data.reserve(pts.size());
     for(std::size_t i = 0; i < pts.size(); i++){
       data.push_back(&pts[i]);
@@ -340,8 +340,7 @@ public:
 #endif
 
     Point_container c(dim_, data.begin(), data.end(),traits_);
-
-    bbox = c.bounding_box();
+    bbox = new Kd_tree_rectangle<FT,D>(c.bounding_box());
     if (c.size() <= split.bucket_size()){
       tree_root = create_leaf_node(c);
     }else {
@@ -349,27 +348,24 @@ public:
        create_internal_node (tree_root, c, ConcurrencyTag());
     }
 
-    const std::size_t cnt = pts.size();
-
     //Reorder vector for spatial locality
     std::vector<Point_d> ptstmp;
-    ptstmp.resize(cnt);
-    for (std::size_t i = 0; i < cnt; ++i)
+    ptstmp.resize(pts.size());
+    for (std::size_t i = 0; i < pts.size(); ++i)
       ptstmp[i] = *data[i];
 
     // Cache?
     if (Enable_points_cache::value)
     {
       typename SearchTraits::Construct_cartesian_const_iterator_d construct_it = traits_.construct_cartesian_const_iterator_d_object();
-      points_cache.reserve(dim_ * cnt);
-      for (const auto& pt : ptstmp) {
-        points_cache.insert(points_cache.end(), construct_it(pt), construct_it(pt, 0));
-      }
+      points_cache.reserve(dim_ * pts.size());
+      for (std::size_t i = 0; i < pts.size(); ++i)
+        points_cache.insert(points_cache.end(), construct_it(ptstmp[i]), construct_it(ptstmp[i], 0));
     }
 
-    for (auto& ln : leaf_nodes) {
-      std::ptrdiff_t tmp = ln.begin() - pts.begin();
-      ln.data = ptstmp.begin() + tmp;
+    for(std::size_t i = 0; i < leaf_nodes.size(); ++i){
+      std::ptrdiff_t tmp = leaf_nodes[i].begin() - pts.begin();
+      leaf_nodes[i].data = ptstmp.begin() + tmp;
     }
     pts.swap(ptstmp);
 
@@ -450,6 +446,7 @@ public:
       internal_nodes.clear();
       leaf_nodes.clear();
       data.clear();
+      delete bbox;
       built_ = false;
     }
   }
@@ -589,7 +586,7 @@ public:
       if(! is_built()){
         const_build();
       }
-      Kd_tree_rectangle<FT, D> b(bbox);
+      Kd_tree_rectangle<FT,D> b(*bbox);
       return tree_root->search(it,q,b,begin(),cache_begin(),dim_);
     }
     return it;
@@ -605,7 +602,7 @@ public:
       if(! is_built()){
         const_build();
       }
-      Kd_tree_rectangle<FT, D> b(bbox);
+      Kd_tree_rectangle<FT,D> b(*bbox);
       return tree_root->search_any_point(q,b,begin(),cache_begin(),dim_);
     }
     return boost::none;
@@ -613,6 +610,9 @@ public:
 
 
   ~Kd_tree() {
+    if(is_built()){
+      delete bbox;
+    }
   }
 
 
@@ -659,7 +659,7 @@ public:
     if(! is_built()){
       const_build();
     }
-    return bbox;
+    return *bbox;
   }
 
 

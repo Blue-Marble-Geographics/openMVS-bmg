@@ -42,7 +42,7 @@ class bounded_priority_queue
 public:
 
   typedef T value_type;
-  typedef typename boost::container::small_vector<value_type, 17>::const_iterator const_iterator;
+  typedef typename std::vector<value_type>::const_iterator const_iterator;
 
   bounded_priority_queue(const Compare& comp = Compare())
     : m_comp(comp)
@@ -130,7 +130,7 @@ std::sort(m_data.begin(), boost::next(m_data.begin(),m_count), m_comp);
 protected:
 
   unsigned int m_count;
-  boost::container::small_vector<value_type, 17> m_data;
+  std::vector<value_type> m_data;
   Compare m_comp;
 };
 

@@ -311,6 +311,40 @@ unsigned DepthData::DecRef()
 
 // S T R U C T S ///////////////////////////////////////////////////
 
+#if 1 // New version
+// try to load and apply mask to the depth map;
+// the mask for each image is stored in the MVS scene or next to each image with '.mask.png' extension;
+// the mask marks as false (or 0) pixels that should be ignored
+//  - pMask: optional output mask; if defined, the mask is returned in this image instead of the BitMatrix
+bool DepthEstimator::ImportIgnoreMask(const Image& image0, const cv::Size& size, uint8_t nIgnoreMaskLabel, BitMatrix& bmask, Image8U* pMask)
+{
+	ASSERT(image0.IsValid());
+	if (image0.maskName.empty())
+		return false;
+	Image8U mask;
+	if (!mask.Load(image0.maskName)) {
+		DEBUG("warning: can not load the segmentation mask '%s'", image0.maskName.c_str());
+		return false;
+	}
+	cv::resize(mask, mask, size, 0, 0, cv::INTER_NEAREST);
+	if (pMask) {
+		*pMask = (mask != nIgnoreMaskLabel);
+	} else {
+		bmask.create(size);
+		bmask.memset(0xFF);
+		for (int r=0; r<size.height; ++r) {
+			for (int c=0; c<size.width; ++c) {
+				if (mask(r,c) == nIgnoreMaskLabel)
+					bmask.unset(r,c);
+			}
+		}
+	}
+	if (mask.empty())
+		mask.release();
+
+	return true;
+} // ImportIgnoreMask
+#else
 // try to load and apply mask to the depth map;
 // the mask marks as false pixels that should be ignored
 bool DepthEstimator::ImportIgnoreMask(const Image& image0, const Image8U::Size& size, BitMatrix& bmask, uint16_t nIgnoreMaskLabel)
@@ -334,6 +368,7 @@ bool DepthEstimator::ImportIgnoreMask(const Image& image0, const Image8U::Size& 
 	}
 	return true;
 } // ImportIgnoreMask
+#endif
 
 // create the map for converting index to matrix position
 //                         1 2 3
@@ -2692,6 +2727,149 @@ std::pair<float,float> TriangulatePointsDelaunay(const DepthData::ViewData& imag
 	return depthBounds;
 }
 
+#if 1 // New version
+// roughly estimate depth and normal maps by triangulating the sparse point-cloud
+// and interpolating normal and depth for all pixels
+bool MVS::TriangulatePoints2DepthMap(
+	const DepthData::ViewData& image, const PointCloud& pointcloud, const IndexArr& points,
+	DepthMap& depthMap, NormalMap& normalMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly)
+{
+	ASSERT(image.pImageData != NULL);
+
+	// triangulate in-view points
+	Mesh mesh;
+	Point2fArr projs;
+	const std::pair<float,float> thDepth(TriangulatePointsDelaunay(image, pointcloud, points, mesh, projs, bAddCorners));
+	dMin = thDepth.first;
+	dMax = thDepth.second;
+
+	// create rough depth-map by interpolating inside triangles
+	const Camera& camera = image.camera;
+	mesh.ComputeNormalVertices();
+	depthMap.create(image.image.size());
+	normalMap.create(image.image.size());
+	if (!bAddCorners || bSparseOnly) {
+		depthMap.memset(0);
+		normalMap.memset(0);
+	}
+	if (bSparseOnly) {
+		// just project sparse pointcloud onto depthmap
+		FOREACH(i, mesh.vertices) {
+			const Point2f& x(projs[i]);
+			const Point2i ix(FLOOR2INT(x));
+			const Depth z(mesh.vertices[i].z);
+			const Normal& normal(mesh.vertexNormals[i]);
+			for (const Point2i dx : {Point2i(0,0),Point2i(1,0),Point2i(0,1),Point2i(1,1)}) {
+				const Point2i ax(ix + dx);
+				if (!depthMap.isInside(ax))
+					continue;
+				depthMap(ax) = z;
+				normalMap(ax) = normal;
+			}
+		}
+	} else {
+		// rasterize triangles onto depthmap
+		struct RasterDepth : TRasterMeshBase<RasterDepth> {
+			typedef TRasterMeshBase<RasterDepth> Base;
+			using Base::Triangle;
+			using Base::camera;
+			using Base::depthMap;
+			const Mesh::NormalArr& vertexNormals;
+			NormalMap& normalMap;
+			Mesh::Face face;
+			RasterDepth(const Mesh::NormalArr& _vertexNormals, const Camera& _camera, DepthMap& _depthMap, NormalMap& _normalMap)
+				: Base(_camera, _depthMap), vertexNormals(_vertexNormals), normalMap(_normalMap) {}
+			inline void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+				const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+				const Depth z(ComputeDepth(t, pbary));
+				ASSERT(z > Depth(0));
+				depthMap(pt) = z;
+				normalMap(pt) = normalized(
+					vertexNormals[face[0]] * pbary[0]+
+					vertexNormals[face[1]] * pbary[1]+
+					vertexNormals[face[2]] * pbary[2]
+				);
+			}
+		};
+		RasterDepth rasterer {mesh.vertexNormals, camera, depthMap, normalMap};
+		RasterDepth::Triangle triangle;
+		RasterDepth::TriangleRasterizer triangleRasterizer(triangle, rasterer);
+		for (const Mesh::Face& face : mesh.faces) {
+			rasterer.face = face;
+			triangle.ptc[0].z = mesh.vertices[face[0]].z;
+			triangle.ptc[1].z = mesh.vertices[face[1]].z;
+			triangle.ptc[2].z = mesh.vertices[face[2]].z;
+			Image8U::RasterizeTriangleBary(
+				projs[face[0]],
+				projs[face[1]],
+				projs[face[2]], triangleRasterizer);
+		}
+	}
+	return true;
+} // TriangulatePoints2DepthMap
+// same as above, but does not estimate the normal-map
+bool MVS::TriangulatePoints2DepthMap(
+	const DepthData::ViewData& image, const PointCloud& pointcloud, const IndexArr& points,
+	DepthMap& depthMap, Depth& dMin, Depth& dMax, bool bAddCorners, bool bSparseOnly)
+{
+	ASSERT(image.pImageData != NULL);
+
+	// triangulate in-view points
+	Mesh mesh;
+	Point2fArr projs;
+	const std::pair<float,float> thDepth(TriangulatePointsDelaunay(image, pointcloud, points, mesh, projs, bAddCorners));
+	dMin = thDepth.first;
+	dMax = thDepth.second;
+
+	// create rough depth-map by interpolating inside triangles
+	const Camera& camera = image.camera;
+	depthMap.create(image.image.size());
+	if (!bAddCorners || bSparseOnly)
+		depthMap.memset(0);
+	if (bSparseOnly) {
+		// just project sparse pointcloud onto depthmap
+		FOREACH(i, mesh.vertices) {
+			const Point2f& x(projs[i]);
+			const Point2i ix(FLOOR2INT(x));
+			const Depth z(mesh.vertices[i].z);
+			for (const Point2i dx : {Point2i(0,0),Point2i(1,0),Point2i(0,1),Point2i(1,1)}) {
+				const Point2i ax(ix + dx);
+				if (!depthMap.isInside(ax))
+					continue;
+				depthMap(ax) = z;
+			}
+		}
+	} else {
+		// rasterize triangles onto depthmap
+		struct RasterDepth : TRasterMeshBase<RasterDepth> {
+			typedef TRasterMeshBase<RasterDepth> Base;
+			using Base::depthMap;
+			RasterDepth(const Camera& _camera, DepthMap& _depthMap)
+				: Base(_camera, _depthMap) {}
+			inline void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+				const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+				const Depth z(ComputeDepth(t, pbary));
+				ASSERT(z > Depth(0));
+				depthMap(pt) = z;
+			}
+		};
+		RasterDepth rasterer {camera, depthMap};
+		RasterDepth::Triangle triangle;
+		RasterDepth::TriangleRasterizer triangleRasterizer(triangle, rasterer);
+		for (const Mesh::Face& face : mesh.faces) {
+			triangle.ptc[0].z = mesh.vertices[face[0]].z;
+			triangle.ptc[1].z = mesh.vertices[face[1]].z;
+			triangle.ptc[2].z = mesh.vertices[face[2]].z;
+			Image8U::RasterizeTriangleBary(
+				projs[face[0]],
+				projs[face[1]],
+				projs[face[2]], triangleRasterizer);
+		}
+	}
+	return true;
+} // TriangulatePoints2DepthMap
+
+#else
 // roughly estimate depth and normal maps by triangulating the sparse point cloud
 // and interpolating normal and depth for all pixels
 bool MVS::TriangulatePoints2DepthMap(
@@ -2829,6 +3007,7 @@ bool MVS::TriangulatePoints2DepthMap(
 	}
 	return true;
 } // TriangulatePoints2DepthMap
+#endif
 /*----------------------------------------------------------------*/
 
 
