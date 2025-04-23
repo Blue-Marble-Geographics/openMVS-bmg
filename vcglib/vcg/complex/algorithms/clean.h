@@ -458,10 +458,12 @@ public:
 #ifdef FAST_REMOVEUNREFVERTEX
 		tri::RequirePerVertexFlags(m);
 
-		const int64_t nVerts = m.vn;
+		const int64_t nVerts = m.vert.size(); // Not m.vn
 		std::vector<std::atomic_bool> referredVec(nVerts);  // atomic for thread-safe writes
 
-		const int64_t numFaces = (int64_t) m.fn;
+		const int64_t numFaces = (int64_t) std::distance(std::begin(m.face), std::end(m.face)); // Not m.fn
+		// memory_order_relaxed lets us write safely to the flags, but only because none of the
+		// other threads read this data.
 #pragma omp parallel for schedule(static)
 		for (int i = 0; i < numFaces; ++i) {
 			const FaceType &f = m.face[i];
@@ -470,7 +472,7 @@ public:
 				referredVec[tri::Index(m, f.V(j))].store(true, std::memory_order_relaxed);
 		}
 
-		const int64_t numEdges = (int64_t) m.en;
+		const int64_t numEdges = std::distance(std::begin(m.edge), std::end(m.edge)); // Not m.en
 #pragma omp parallel for schedule(static)
 		for (int i = 0; i < numEdges; ++i) {
 			const auto &e = m.edge[i];

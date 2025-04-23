@@ -118,18 +118,14 @@ public:
 		graph.initSize((int)numNodes, (int)numNodes*2);
 	}
 
-	inline float AddNode(const void* n, double source, double sink) {
+	inline void AddNode(const void* n, double source, double sink) {
 		ASSERT(ISFINITE(source) && source >= 0 && ISFINITE(sink) && sink >= 0);
-		return graph.addNode(n, source, sink);
+		graph.addNode(n, source, sink);
 	}
 
 	inline void AddEdge(const void* nhf, const void* nht, double capacity, double reverseCapacity) {
 		ASSERT(ISFINITE(capacity) && capacity >= 0 && ISFINITE(reverseCapacity) && reverseCapacity >= 0);
 		graph.addEdge(nhf, nht, capacity, reverseCapacity);
-	}
-
-	inline void InitFlow(double flow) {
-		graph.initFlow(flow);
 	}
 
 	double ComputeMaxFlow() {
@@ -337,6 +333,7 @@ typedef delaunay_t::Cell_handle cell_handle_t;
 typedef delaunay_t::Facet facet_t;
 typedef delaunay_t::Edge edge_t;
 
+// Read-only mt
 struct camera_cell_t {
 	cell_handle_t cell; // cell containing the camera
 	std::vector<facet_t> facets; // all facets on the convex-hull in view of the camera (ordered by importance)
@@ -1072,7 +1069,6 @@ void graphcut(std::vector<delaunay_t::All_cells_iterator>& cellIterators, delaun
 
 	MaxFlow<cell_size_t,float> graph(delaunay.number_of_cells());
 	const __int64 idxCount = cellIterators.size();
-	double flow = 0;
 	{
 #ifdef CUT_TIMINGS
 		TD_TIMER_STARTD();
@@ -1080,7 +1076,6 @@ void graphcut(std::vector<delaunay_t::All_cells_iterator>& cellIterators, delaun
 		// create graph
 		// set weights
 		constexpr float maxCap(FLT_MAX*0.0001f);
-		// JPB WIP OPT Revisit for parallel
 		for (__int64 i = 0; i < idxCount; ++i) {
 			auto ci = cellIterators[i];
 			const cell_size_t ciID(ci->info());
@@ -1112,7 +1107,6 @@ void graphcut(std::vector<delaunay_t::All_cells_iterator>& cellIterators, delaun
 
 		infoCells.clear();
 		// find graph-cut solution
-		graph.InitFlow(flow);
 		maxFlow = graph.ComputeMaxFlow();
 #ifdef CUT_TIMINGS
 		DEBUG_EXTRA("%s", TD_TIMER_GET_FMT().c_str());

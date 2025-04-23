@@ -255,11 +255,6 @@ void IBFSGraph::initGraphFast()
 		}
 	}
 
-	for (x=nodes; x < nodeEnd; x++) {
-		x->endArc = (x+1)->firstArc;
-	}
-	nodeEnd->endArc = nullptr;
-
 	// check consistency
 	if (IBTEST) {
 		IBDEBUG("c initFast test");
@@ -478,6 +473,7 @@ void IBFSGraph::adoption()
 	while (orphanFirst != IB_ORPHANS_END)
 	{
 		x = orphanFirst;
+		_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
 		orphanFirst = x->nextPtr;
 		//x->nextOrphan = NULL;
 		testNode(x);
@@ -502,7 +498,7 @@ void IBFSGraph::adoption()
 			x->isParentCurr = 1;
 		}
 		x->parent = NULL;
-		aEnd = x->endArc; // (x+1)->firstArc;
+		aEnd = (x+1)->firstArc;
 		if (x->label.load(std::memory_order_relaxed) != (sTree ? 1 : -1))
 		{
 			minLabel = x->label.load(std::memory_order_relaxed) - (sTree ? 1 : -1);
@@ -596,12 +592,13 @@ void IBFSGraph::adoption3Pass()
 		while ((x = orphanBuckets.popFront(level)) != NULL)
 		{
 			testNode(x);
-			aEnd = x->endArc; // (x+1)->firstArc;
+			_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
 
 			// pass 2: find lowest level parent
 			if (x->parent == NULL) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
 				destLabel = x->label.load(std::memory_order_relaxed) - (sTree ? 1 : -1);
+				aEnd = (x+1)->firstArc;
 				for (a=x->firstArc; a != aEnd; a++) {
 					y = a->head;
 					if ((sTree ? a->isRevResidual : a->rCap) &&
@@ -629,6 +626,7 @@ void IBFSGraph::adoption3Pass()
 			if (x->label.load(std::memory_order_relaxed) != (sTree ? topLevelS : -topLevelT))
 			{
 				minLabel = x->label.load(std::memory_order_relaxed) + (sTree ? 1 : -1);
+				aEnd = (x+1)->firstArc;
 				for (a=x->firstArc; a != aEnd; a++) {
 					y = a->head;
 
@@ -674,6 +672,7 @@ void IBFSGraph::growth()
 	{
 		// get active node
 		x = (*active);
+		_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
 		testNode(x);
 
 		// node no longer at level
@@ -684,7 +683,7 @@ void IBFSGraph::growth()
 		// grow or augment
 		if (dirS) stats.incGrowthS();
 		else stats.incGrowthT();
-		aEnd = x->endArc; // (x+1)->firstArc;
+		aEnd = (x+1)->firstArc;
 		for (a=x->firstArc; a != aEnd; a++)
 		{
 			stats.incGrowthArcs();

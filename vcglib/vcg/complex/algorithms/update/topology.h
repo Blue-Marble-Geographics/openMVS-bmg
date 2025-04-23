@@ -221,7 +221,7 @@ static void FillEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includ
 
       auto& localVec = localEdges[id];
 
-      const int64_t cnt = (int64_t)m.face.size();
+      const int64_t cnt = (int64_t) m.face.size();
       #pragma omp for schedule(static)
       for (int64_t i = 0; i < cnt; ++i) {
         auto& f = m.face[i];
@@ -525,28 +525,12 @@ static void VertexFace(MeshType &m)
   RequireVFAdjacency(m);
 
 #ifdef FAST_VERTEXFACE
-  const int64_t numVertices = (int64_t) m.vn;
+  const int64_t numVertices = (int64_t) std::distance(std::begin(m.vert), std::end(m.vert)); // Not m.vn
 #pragma omp parallel for
    for (int64_t i = 0; i < numVertices; ++i) {
       auto& vi = m.vert[i];
       vi.VFp() = 0;
       vi.VFi() = 0; // note that (0,-1) means uninitiazlied while 0,0 is the valid initialized values for isolated vertices.
-   }
-
-  const int64_t numFaces = (int64_t) m.fn;
-#pragma omp parallel for
-   for (int64_t i = 0; i < numFaces; ++i) {
-     auto& f = m.face[i];
-     if( ! f.IsD() )
-     {
-       for(int j=0,cnt=f.VN();j<cnt;++j)
-       {
-         f.VFp(j) = f.V(j)->VFp();
-         f.VFi(j) = f.V(j)->VFi();
-         f.V(j)->VFp() = &f;
-         f.V(j)->VFi() = j;
-       }
-     }
    }
 #else
   for(VertexIterator vi=m.vert.begin();vi!=m.vert.end();++vi)
@@ -554,11 +538,12 @@ static void VertexFace(MeshType &m)
     (*vi).VFp() = 0;
     (*vi).VFi() = 0; // note that (0,-1) means uninitiazlied while 0,0 is the valid initialized values for isolated vertices.
   }
+#endif
 
-  for(FaceIterator fi=m.face.begin();fi!=m.face.end();++fi)
+  for(FaceIterator fi=m.face.begin(), fe = m.face.end();fi!=fe;++fi)
     if( ! (*fi).IsD() )
     {
-      for(int j=0;j<(*fi).VN();++j)
+      for(int j=0, cnt = (*fi).VN();j<cnt;++j)
       {
         (*fi).VFp(j) = (*fi).V(j)->VFp();
         (*fi).VFi(j) = (*fi).V(j)->VFi();
@@ -566,7 +551,6 @@ static void VertexFace(MeshType &m)
         (*fi).V(j)->VFi() = j;
       }
     }
-#endif
 }
 
 

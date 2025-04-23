@@ -206,7 +206,7 @@ public:
 	void initSize(int numNodes, int numEdges);
 #ifdef GC_OPTS
 	void addEdge(const void* nodeIndexFrom, const void* nodeIndexTo, double capacity, double reverseCapacity);
-	EdgeCap addNode(const void* node, double capacityFromSource, double capacityToSink);
+	void addNode(const void* node, double capacityFromSource, double capacityToSink);
 	void initFlow(double f) { flow = doubleToEdgeCap(f); }
 #else
 	void addEdge(int nodeIndexFrom, int nodeIndexTo, EdgeCap capacity, EdgeCap reverseCapacity);
@@ -264,7 +264,6 @@ private:
 		int			lastAugTimestamp:31;
 		int			isParentCurr:1;
 		Arc			*firstArc;
-		Arc         *endArc;
 		Arc			*parent;
 		Node		*firstSon;
 		Node		*nextPtr;
@@ -414,11 +413,7 @@ private:
 	};
 	char	*memArcs;
 	TmpEdge	*tmpEdges;
-#ifdef GC_OPTS
-	std::atomic<TmpEdge*> tmpEdgeLast;
-#else
 	TmpEdge *tmpEdgeLast;
-#endif
 	TmpArc	*tmpArcs;
 	bool compactSlowInitMode;
 	void initGraphFast();
@@ -439,7 +434,7 @@ private:
 };
 
 #ifdef GC_OPTS
-inline EdgeCap IBFSGraph::addNode(const void* n, double capacitySource, double capacitySink)
+inline void IBFSGraph::addNode(const void* n, double capacitySource, double capacitySink)
 {
 	Node* node = (Node*) n;
 	const double f = edgeCapToDouble(node->excess);
@@ -455,7 +450,6 @@ inline EdgeCap IBFSGraph::addNode(const void* n, double capacitySource, double c
 	}
 
 	node->excess = doubleToEdgeCap(capacitySource - capacitySink);
-	return flow;
 }
 #else
 inline void IBFSGraph::addNode(int nodeIndex, EdgeCap capacitySource, EdgeCap capacitySink)
@@ -479,12 +473,11 @@ inline void IBFSGraph::addNode(int nodeIndex, EdgeCap capacitySource, EdgeCap ca
 inline void IBFSGraph::addEdge(const void* nodeIndexFrom, const void* nodeIndexTo, double capacity, double reverseCapacity)
 {
 	assert((void*)tmpEdgeLast < (void*)tmpArcs);
-	TmpEdge* t = tmpEdgeLast.fetch_add(1); // increment atomically.
-	t->tail = (Node*) nodeIndexFrom;
-	t->head = (Node*) nodeIndexTo;
-	t->cap = doubleToEdgeCap(capacity);
-	t->revCap = doubleToEdgeCap(reverseCapacity);
-
+	tmpEdgeLast->tail = (Node*) nodeIndexFrom;
+	tmpEdgeLast->head = (Node*) nodeIndexTo;
+	tmpEdgeLast->cap = doubleToEdgeCap(capacity);
+	tmpEdgeLast->revCap = doubleToEdgeCap(reverseCapacity);
+	++tmpEdgeLast;
 	// use label as a temporary storage
 	// to count the out degree of nodes
 	((Node*) nodeIndexFrom)->label++;
