@@ -94,9 +94,11 @@ using namespace std::chrono_literals;
 // (faster, but not clear license policy)
 #define DELAUNAY_MAXFLOW_IBFS
 
+#undef MANIFOLD_TIMES
 #define FASTER_WEIGHTING
 #define FASTER_ADJ_VERTICES
 #define FASTER_ESTIMATES // Verified the same (Sigma value) 30% faster
+#define FAST_GRAPHCUT_SETUP
 #undef USE_PARALLEL_GRAPHCUT_FIXUP
 
 // S T R U C T S ///////////////////////////////////////////////////
@@ -285,33 +287,26 @@ struct vert_info_t {
 	typedef edge_cap_t Type;
 	struct view_t {
 		PointCloud::View idxView; // view index
-		float weight;
+		//float weight;
 		inline view_t() {}
-		inline view_t(PointCloud::View _idxView, Type _weight) : idxView(_idxView), weight(_weight) {}
+		inline view_t(PointCloud::View _idxView) : idxView(_idxView) {}
 		inline bool operator <(const view_t& v) const { return idxView < v.idxView; }
 		inline operator PointCloud::View() const { return idxView; }
 	};
-	typedef SEACAVE::cList<view_t,const view_t&,0,4,uint32_t> view_vec_t;
-	view_vec_t views; // faces' weight from the cell outwards
+
+	// The format of this container is very sensitive to sizing.
+	// Ideally we would like to make this large so there are no dynamic
+	// allocations; however, doing so appears to lower performance as
+	// there is too much memory being used.
+	// We size it exactly to the length of a cache line.
+	typedef boost::container::small_vector<uint32_t, 10> view_vec_t;
+	alignas(64) view_vec_t views; // faces' weight from the cell outwards
+
+	// Simply record the views associated with the point.
+	// We are only supporting a constant weight and there may be duplicates.
 	void InsertViews(const PointCloudStreaming& pc, PointCloud::Index idxPoint) {
-		const uint32_t* _views = pc.ViewsStream(idxPoint);
-		const uint32_t cnt = (uint32_t) pc.ViewsStreamSize(idxPoint);
-		for (uint32_t i = 0; i < cnt; ++i) {
-			const PointCloud::View viewID(_views[i]);
-			// insert viewID in increasing order
-			const uint32_t idx(views.FindFirstEqlGreater(viewID));
-			if (idx < views.GetSize() && views[idx] == viewID) {
-				// the new view is already in the array
-				ASSERT(views.FindFirst(viewID) == idx);
-				// update point's weight
-				views[idx].weight++;
-			} else {
-				// the new view is not in the array,
-				// insert it
-				views.InsertAt(idx, view_t(viewID, 1.f));
-				ASSERT(views.IsSorted());
-			}
-		}
+		const uint32_t* __restrict _views = pc.ViewsStream(idxPoint);
+		std::copy(_views, _views+(uint32_t) pc.ViewsStreamSize(idxPoint), std::back_inserter(views));
 	}
 };
 
@@ -1076,6 +1071,102 @@ void graphcut(std::vector<delaunay_t::All_cells_iterator>& cellIterators, delaun
 		// create graph
 		// set weights
 		constexpr float maxCap(FLT_MAX*0.0001f);
+
+#ifdef FAST_GRAPHCUT_SETUP
+		struct PendingNode {
+				const void* handle;
+				edge_cap_t s, t;
+		};
+
+		struct PendingEdge {
+				const void* a;
+				const void* b;
+				edge_cap_t capAB;
+				edge_cap_t capBA;
+		};
+
+    const size_t idxCount = cellIterators.size();
+    const int threadCount = omp_get_max_threads();
+
+    std::vector<size_t> nodeCounts(threadCount, 0);
+    std::vector<size_t> edgeCounts(threadCount, 0);
+
+    #pragma omp parallel
+    {
+        const int id = omp_get_thread_num();
+        size_t nodes = 0, edges = 0;
+
+        #pragma omp for schedule(static)
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(idxCount); ++i) {
+            nodes += 1;
+
+            auto& ci = cellIterators[i];
+            const cell_size_t ciID = ci->info();
+            for (int j = 0; j < 4; ++j) {
+                const cell_handle_t cj = ci->neighbor(j);
+                const cell_size_t cjID = cj->info();
+                if (cjID < ciID) continue;
+                edges += 1;
+            }
+        }
+
+        nodeCounts[id] = nodes;
+        edgeCounts[id] = edges;
+    }
+
+    std::vector<size_t> nodeOffsets(threadCount + 1, 0);
+    std::vector<size_t> edgeOffsets(threadCount + 1, 0);
+
+    std::partial_sum(std::begin(nodeCounts), std::end(nodeCounts), std::begin(nodeOffsets) + 1);
+    std::partial_sum(std::begin(edgeCounts), std::end(edgeCounts), std::begin(edgeOffsets) + 1);
+
+    const size_t totalNodes = nodeOffsets.back();
+    const size_t totalEdges = edgeOffsets.back();
+
+    std::vector<PendingNode> pendingNodes(totalNodes);
+    std::vector<PendingEdge> pendingEdges(totalEdges);
+
+    // Step 3: Fill phase (parallel, lock-free)
+    #pragma omp parallel
+    {
+        int id = omp_get_thread_num();
+        size_t nodeWritePos = nodeOffsets[id];
+        size_t edgeWritePos = edgeOffsets[id];
+
+        #pragma omp for schedule(static)
+        for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(idxCount); ++i) {
+            auto ci = cellIterators[i];
+            const cell_size_t ciID = ci->info();
+            const void* nhi = graph.NodeHandle(ciID);
+            const cell_info_t& ciInfo = infoCells[ciID];
+
+            pendingNodes[nodeWritePos++] = PendingNode{nhi, ciInfo.s, MINF(ciInfo.t, maxCap)};
+
+            for (int j = 0; j < 4; ++j) {
+                const cell_handle_t cj = ci->neighbor(j);
+                const cell_size_t cjID = cj->info();
+                if (cjID < ciID) continue;
+
+                const void* nhj = graph.NodeHandle(cjID);
+                const cell_info_t& cjInfo = infoCells[cjID];
+                const int k = cj->index(ci);
+
+                const float angle1 = computePlaneSphereAngle(delaunay, facet_t(ci, j));
+                const float angle2 = computePlaneSphereAngle(delaunay, facet_t(cj, k));
+                const edge_cap_t q = (1.f - CLAMP(MINF(angle1, angle2), -1.f, 1.f)) * kQual;
+
+                pendingEdges[edgeWritePos++] = PendingEdge{nhi, nhj, ciInfo.f[j] + q, cjInfo.f[k] + q};
+            }
+        }
+    }
+
+    // Final single-threaded graph insertion
+    for (const auto& node : pendingNodes)
+        graph.AddNode(node.handle, node.s, node.t);
+
+    for (const auto& edge : pendingEdges)
+        graph.AddEdge(edge.a, edge.b, edge.capAB, edge.capBA);
+#else
 		for (__int64 i = 0; i < idxCount; ++i) {
 			auto ci = cellIterators[i];
 			const cell_size_t ciID(ci->info());
@@ -1093,6 +1184,7 @@ void graphcut(std::vector<delaunay_t::All_cells_iterator>& cellIterators, delaun
 				graph.AddEdge(nhi, nhj, ciInfo.f[j]+q, cjInfo.f[k]+q);
 			}
 		}
+#endif
 #ifdef CUT_TIMINGS
 		DEBUG_EXTRA("%s", TD_TIMER_GET_FMT().c_str());
 #endif
@@ -1352,42 +1444,6 @@ static inline float JPBEXP( float p )
 	return fasterpow2( 1.442695040f * p );
 }
 
-// Not complete in itself, but used to store space for fixed storage
-// that can promote to dynamic storage as needed.
-template<class T, int N>
-struct HybridArray
-{
-  HybridArray() :
-   mStart(mData),
-   mCapacity(N)
-  {}
-
-  void resize(int curSize, int newCapacity)
-  {
-   auto newBlock = std::unique_ptr<T[]>(new T[newCapacity]);
-   if (!mDynamicData) {
-      ::memcpy(newBlock.get(), mData, sizeof(T)*curSize);
-   } else {
-      ::memcpy(newBlock.get(), mDynamicData.get(), sizeof(T)*curSize);
-   }
-   mDynamicData = std::move(newBlock);
-   mStart = mDynamicData.get();
-   mCapacity = newCapacity;
-  }
-  
-  void reset()
-  {
-   mStart = mData;
-   mCapacity = N;
-   mDynamicData.reset();
-  }
-  
-  T* mStart;
-  T mData[N];
-  std::unique_ptr<T[]> mDynamicData;
-  int mCapacity;
-};
-
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
 // iif the point to be inserted is not closer than distInsert pixels in at least one of its views to
 // the projection of any of already inserted points.
@@ -1466,7 +1522,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// delaunay.info() is parallel can be used to make sure
 		// we are compiling and using the work with TBB.
 		DEBUG("----------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.0");
+		DEBUG("ReconstructMesh optimization version 1.1");
 		const auto [isParallel, CGALversion] = delaunay.info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -1478,9 +1534,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		ASSERT(hint != vertex_handle_t());
 		hint->info().InsertViews(pointcloud, idx);
 
-		// JPB WIP BUG Expand as needed.
-		alignas(64) cell_handle_t cell_stack[8192];
-		alignas(64) cell_handle_t incident_cells[16384];
+		// Fixed storage is slightly faster, but difficult to maintain.
+		constexpr size_t kMaxCells = 16384;
+		std::vector<cell_handle_t> cell_stack;
+		cell_stack.reserve(kMaxCells);
 
 		size_t cnt = 0;
 		if (distInsert <= 0) {
@@ -1545,11 +1602,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 							changed = false;
 
-							cell_handle_t* __restrict pCells = cell_stack;
+							cell_stack.clear();
 
 							// Reseed from current nearest
 							cell_handle_t seed = nearest->cell();
-							*pCells++ = seed;
+							cell_stack.push_back(seed);
 							seed->tds_data().marker = marker;
 							nearest->visited_for_vertex_extractor = marker;
 
@@ -1570,8 +1627,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							}
 							if (changed) continue;
 
-							while (pCells != cell_stack) {
-								auto c = *--pCells;
+							while (!cell_stack.empty()) {
+								auto c = cell_stack.back();
+								cell_stack.pop_back();
 
 								for (int ni = 0; ni < 4; ++ni) {
 									if (c->vertex(ni) == nearest) continue;
@@ -1580,7 +1638,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 									if (next->tds_data().marker == marker) continue;
 
 									next->tds_data().marker = marker;
-									*pCells++ = next;
+									cell_stack.push_back(next);
 
 									for (int vi = 0; vi < 4; ++vi) {
 										vertex_handle_t w = next->vertex(vi);
@@ -1893,18 +1951,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 		// compute the weights for each edge
 		Util::Progress progress(_T("Points weighted"), numDelaunayVertices);
-		// Each thread stores calculated pts/vis/dist information in an array
-		// until it reaches about 70% of its size.  Then it switches to 
-		// dynamic allocation.
-		// Note, there is no good way to manage this for performance so HybridArray
-		// just holds the data and we make the changes as necessary.
+
 		struct ThreadData
 		{
-			std::vector<facet_t> mData;
-
-			HybridArray<edge_cap_t*, 4096> mPts;
-			HybridArray<edge_cap_t, 4096> mVis;
-			HybridArray<edge_cap_t, 4096> mDist;
+			PaddedVector<facet_t> mFacets;
+			PaddedVector<edge_cap_t*> mPts;
+			PaddedVector<edge_cap_t> mVis;
+			PaddedVector<edge_cap_t> mDist;
 		};
 
 		std::vector<ThreadData> perThreadData;
@@ -1923,11 +1976,16 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			const int id = omp_get_thread_num();
 			ThreadData& td = perThreadData[id];
 
-			std::vector<facet_t>& facets = td.mData;
-			td.mData.reserve(128); // JPB WIP OPT more?
-			auto& pts = td.mPts;
-			auto& vis = td.mVis;
-			auto& dist = td.mDist;
+			auto& facets = td.mFacets.mData;
+			auto& pts = td.mPts.mData;
+			auto& vis = td.mVis.mData;
+			auto& dist = td.mDist.mData;
+
+			facets.reserve(128); // JPB WIP OPT more?
+			pts.reserve(8192);
+			vis.reserve(8192);
+			dist.reserve(8192);
+
 
 #pragma omp for schedule(static, 1024)
 			for (int64_t i=0; i<nVerts; ++i) {
@@ -1935,25 +1993,41 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 #pragma omp critical
 				vi = vertexIter++;
 				vert_info_t& vert(vi->info());
-				if (vert.views.IsEmpty())
+				if (vert.views.empty())//IsEmpty())
 					continue;
 				const point_t& p(vi->point());
 				const Point3 pt(CGAL2MVS<REAL>(p));
 
-				size_t cnt = 0;
-				pts.reset();
-				vis.reset();
-				dist.reset();
+				pts.clear();
+				vis.clear();
+				dist.clear();
 
-				edge_cap_t** __restrict pPts = pts.mData;
-				edge_cap_t* __restrict pVis = vis.mData;
-				edge_cap_t* __restrict pDist = dist.mData;
+				// To accelerate the vert.views creation, we just store
+				// them as fast as possible.
+				// Here, because there may be duplicates we sort them
+				// and assign a (constant) weight to the point which equals
+				// the number of views.
+				std::sort(
+					std::begin(vert.views),
+					std::end(vert.views),
+					[](const auto lhs, const auto rhs) {
+						return lhs < rhs;
+					}
+				);
 
-				FOREACH(v, vert.views)
-				{
-					const typename vert_info_t::view_t view(vert.views[v]);
-					const uint32_t imageID(view.idxView);
-					const edge_cap_t alpha_vis(view.weight);
+				auto it = std::begin(vert.views);
+				const auto end = std::end(vert.views);
+				while (it != end) {
+
+					// Advance past duplicates
+					auto first = it;
+					auto current = *it;
+					while (it != end && *it == current) {
+						++it;
+					}
+
+					const uint32_t imageID(current);
+					const edge_cap_t alpha_vis(std::distance(first, it));
 					const Image& imageData = images[imageID];
 					ASSERT(imageData.IsValid());
 					const Camera& camera = imageData.camera;
@@ -1975,10 +2049,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					do {
 						// assign score, weighted by the distance from the point to the intersection
 						edge_cap_t& f(infoCells[inter.facet.first->info()].f[inter.facet.second]);
-						pPts[cnt] = &f;
-						pVis[cnt] = alpha_vis;
-						pDist[cnt] = (edge_cap_t)inter.dist;
-						++cnt;
+						pts.push_back(&f);
+						vis.push_back(alpha_vis);
+						dist.push_back((edge_cap_t)inter.dist);
 					}
 					while (intersect(delaunay, segCamPoint, segDiff, segDiffN, facets, facets, inter));
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
@@ -2004,25 +2077,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						// assign score, weighted by the distance from the point to the intersection
 						const facet_t& mf(delaunay.mirror_facet(inter.facet));
 						edge_cap_t& f(infoCells[mf.first->info()].f[mf.second]);
-						// The hybrid array makes these very fast stores.
-						pPts[cnt] = &f;
-						pVis[cnt] = alpha_vis;
-						pDist[cnt] = (edge_cap_t)inter.dist;
-						++cnt;
+						pts.push_back(&f);
+						vis.push_back(alpha_vis);
+						dist.push_back((edge_cap_t)inter.dist);
 					}
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
-
-					// When we complete the ray, see if we need to switch to or
-					// expand dynamic storage.
-					if (cnt >= (pts.mCapacity * 7)/10) {
-						pts.resize((int)cnt, pts.mCapacity*2);
-						vis.resize((int)cnt, pts.mCapacity*2);
-						dist.resize((int)cnt, pts.mCapacity*2);
-
-						pPts = pts.mDynamicData.get();
-						pVis = vis.mDynamicData.get();
-						pDist = dist.mDynamicData.get();
-					}
 				}
 
 				// Here we apply the deferred intersection results to the edges all at once.
@@ -2031,11 +2090,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				// This allows us to unfold the vectorize most of the instructions as well.
 				const _Data vInv2SigmaSq = _Set(inv2SigmaSq);
 
-				const size_t numEights = cnt/8;
-				const size_t numRemaining = cnt & 7;
-				float** __restrict pp = pPts;
-				float* __restrict v = pVis;
-				float* __restrict d = pDist;
+				const size_t numEights = pts.size()/8;
+				const size_t numRemaining = pts.size() & 7;
+				float** __restrict pp = pts.data();
+				float* __restrict v = vis.data();
+				float* __restrict d = dist.data(); 
 
 				const _Data vOne = { 1.f, 1.f, 1.f, 1.f };
 
@@ -2199,8 +2258,19 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	// run graph-cut and extract the mesh
 	graphcut(cellIterators, delaunay, infoCells, mesh, kQual);
 
+#ifdef MANIFOLD_TIMES
+	{
+		TD_TIMER_STARTD();
+#endif
+
 	// fix non-manifold vertices and edges
 	mesh.FixNonManifold();
+
+#ifdef MANIFOLD_TIMES
+		DEBUG_EXTRA("Manifold time (%s)", TD_TIMER_GET_FMT().c_str());
+	}
+#endif
+
 	return true;
 }
 /*----------------------------------------------------------------*/

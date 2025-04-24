@@ -13,6 +13,7 @@
 #ifndef CGAL_INTERNAL_STATIC_FILTERS_SIDE_OF_ORIENTED_SPHERE_3_H
 #define CGAL_INTERNAL_STATIC_FILTERS_SIDE_OF_ORIENTED_SPHERE_3_H
 
+#define FASTER_SIDE_ORIENTED_SPHERE
 #define CGAL_USE_SSE2_MAX // JPB WIP BUG
 #include <CGAL/Profile_counter.h>
 #include <CGAL/Filtered_kernel/internal/Static_filters/Static_filter_error.h>
@@ -32,6 +33,70 @@ public:
   operator()(const Point_3 &p, const Point_3 &q, const Point_3 &r,
              const Point_3 &s, const Point_3 &t) const
   {
+#ifdef FASTER_SIDE_ORIENTED_SPHERE
+    CGAL_BRANCH_PROFILER_3("semi-static failures/attempts/calls to   : Side_of_oriented_sphere_3", tmp);
+
+    double px, py, pz, qx, qy, qz, rx, ry, rz, sx, sy, sz, tx, ty, tz;
+
+    if (fit_in_double(p.x(), px) && fit_in_double(p.y(), py) && fit_in_double(p.z(), pz) &&
+        fit_in_double(q.x(), qx) && fit_in_double(q.y(), qy) && fit_in_double(q.z(), qz) &&
+        fit_in_double(r.x(), rx) && fit_in_double(r.y(), ry) && fit_in_double(r.z(), rz) &&
+        fit_in_double(s.x(), sx) && fit_in_double(s.y(), sy) && fit_in_double(s.z(), sz) &&
+        fit_in_double(t.x(), tx) && fit_in_double(t.y(), ty) && fit_in_double(t.z(), tz))
+    {
+        CGAL_BRANCH_PROFILER_BRANCH_1(tmp);
+
+        // Shift all points relative to t
+        const double ptx = px - tx, pty = py - ty, ptz = pz - tz;
+        const double qtx = qx - tx, qty = qy - ty, qtz = qz - tz;
+        const double rtx = rx - tx, rty = ry - ty, rtz = rz - tz;
+        const double stx = sx - tx, sty = sy - ty, stz = sz - tz;
+
+        const double pt2 = CGAL_NTS square(ptx) + CGAL_NTS square(pty) + CGAL_NTS square(ptz);
+        const double qt2 = CGAL_NTS square(qtx) + CGAL_NTS square(qty) + CGAL_NTS square(qtz);
+        const double rt2 = CGAL_NTS square(rtx) + CGAL_NTS square(rty) + CGAL_NTS square(rtz);
+        const double st2 = CGAL_NTS square(stx) + CGAL_NTS square(sty) + CGAL_NTS square(stz);
+
+        // Compute determinant first
+        const double det = CGAL::determinant(
+            ptx, pty, ptz, pt2,
+            rtx, rty, rtz, rt2,
+            qtx, qty, qtz, qt2,
+            stx, sty, stz, st2);
+
+        const double abs_det = std::abs(det);
+
+        // Fast path: most inputs will exit here
+        constexpr double fast_threshold = 1e-10;  // Tunable
+        if (abs_det > fast_threshold)
+            return (det > 0.0) ? ON_POSITIVE_SIDE : ON_NEGATIVE_SIDE;
+
+        // Now compute bounding box deltas (for refined epsilon)
+        double maxx = std::max({std::abs(ptx), std::abs(qtx), std::abs(rtx), std::abs(stx)});
+        if (maxx == 0.0)
+            return ON_ORIENTED_BOUNDARY;  // Degenerate
+
+        double maxy = std::max({std::abs(pty), std::abs(qty), std::abs(rty), std::abs(sty)});
+        double maxz = std::max({std::abs(ptz), std::abs(qtz), std::abs(rtz), std::abs(stz)});
+
+        // Sort maxx < maxy < maxz
+        if (maxx > maxz) std::swap(maxx, maxz);
+        if (maxy > maxz) std::swap(maxy, maxz);
+        else if (maxy < maxx) std::swap(maxx, maxy);
+
+        double eps = 1.2466136531027298e-13 * maxx * maxy * maxz;
+
+        if (maxz < 1e61) {
+            eps *= (maxz * maxz);
+            if (det > eps)  return ON_POSITIVE_SIDE;
+            if (det < -eps) return ON_NEGATIVE_SIDE;
+        }
+
+        CGAL_BRANCH_PROFILER_BRANCH_2(tmp);
+    }
+
+    return Base::operator()(p, q, r, s, t);
+#else
       CGAL_BRANCH_PROFILER_3("semi-static failures/attempts/calls to   : Side_of_oriented_sphere_3", tmp);
 
       double px, py, pz, qx, qy, qz, rx, ry, rz, sx, sy, sz, tx, ty, tz;
@@ -62,7 +127,7 @@ public:
           double rtx = rx - tx;
           double rty = ry - ty;
           double rtz = rz - tz;
-         double rt2 = CGAL_NTS square(rtx) + CGAL_NTS square(rty)
+          double rt2 = CGAL_NTS square(rtx) + CGAL_NTS square(rty)
                      + CGAL_NTS square(rtz);
           double stx = sx - tx;
           double sty = sy - ty;
@@ -147,6 +212,7 @@ public:
           CGAL_BRANCH_PROFILER_BRANCH_2(tmp);
       }
       return Base::operator()(p, q, r, s, t);
+#endif
   }
 
   // Computes the epsilon for Side_of_oriented_sphere_3.

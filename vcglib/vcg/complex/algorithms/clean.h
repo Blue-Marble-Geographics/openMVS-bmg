@@ -46,7 +46,7 @@ namespace tri{
 
 static int Info()
 {
-	constexpr int version = 1;
+	constexpr int version = 2;
 
 	return version;
 }

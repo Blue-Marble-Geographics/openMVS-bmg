@@ -220,6 +220,7 @@ static void FillEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includ
       }
 
       auto& localVec = localEdges[id];
+      localVec.reserve((m.fn * 3 * 11) / (omp_get_num_threads() * 10)); // Roughly even
 
       const int64_t cnt = (int64_t) m.face.size();
       #pragma omp for schedule(static)

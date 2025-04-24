@@ -167,7 +167,7 @@ public:
   // P2P debug support
   std::pair<bool, int> info() const
   {
-    constexpr int version = 1;
+    constexpr int version = 2;
 #ifdef CGAL_LINKED_WITH_TBB
     return { true, version };
 #else
