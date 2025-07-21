@@ -99,7 +99,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 			), "verbosity level")
 		#endif
 		#ifdef _USE_CUDA
-		("cuda-device", boost::program_options::value(&CUDA::desiredDeviceID)->default_value(-2), "CUDA device number to be used for mesh refinement (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
+		("cuda-device", boost::program_options::value(&SEACAVE::CUDA::desiredDeviceID)->default_value(-2), "CUDA device number to be used for mesh refinement (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
 		#endif
 		;
 
@@ -240,7 +240,7 @@ int main(int argc, LPCTSTR* argv)
 	}
 	TD_TIMER_START();
 	#ifdef _USE_CUDA
-	if (CUDA::desiredDeviceID < -1 ||
+	if (SEACAVE::CUDA::desiredDeviceID < -1 ||
 		!scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 							  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,
 							  OPT::nMaxFaceArea,
