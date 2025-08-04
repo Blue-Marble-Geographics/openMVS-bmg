@@ -2,6 +2,10 @@ if((NOT OpenMVS_USE_OPENGL) OR (NOT _USE_OPENGL))
 	RETURN()
 endif()
 
+if (NO_VIEWER)
+	RETURN()
+endif()
+
 if(NOT VIEWER_NAME)
 	set(VIEWER_NAME "Viewer")
 endif()
