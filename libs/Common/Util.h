@@ -767,19 +767,51 @@ public:
 			process();
 		}
 		void process() {
-			// make sure we don't print the progress too often
-			const Timer::Type elapsed(Timer::SysTime2TimeMs(Timer::GetSysTime()-start));
-			if (elapsed-lastElapsed < slp)
+			const Timer::Type now = Timer::GetSysTime();
+			const Timer::Type elapsed = Timer::SysTime2TimeMs(now - start);
+
+			// Throttle progress updates
+			if (elapsed < lastElapsed + slp)
 				return;
 			lastElapsed = elapsed;
-			// compute percentage, elapsed and ETA
-			const size_t done(processed);
-			const float percentage((float)done/(float)total);
-			const Timer::Type remaining(percentage<0.01f && (done<10 || elapsed<10*1000) ? Timer::Type(0) : elapsed/percentage - elapsed);
-			// display progress
-			print(String::FormatString(_T("%s %u (%.2f%%, %s, ETA %s)..."), msg.c_str(), done, percentage*100.f, formatTime((int64_t)elapsed,1).c_str(), formatTime((int64_t)remaining,2).c_str()));
+
+			const size_t done = processed;
+			if (done > total)
+				return;
+
+			const float percentage = static_cast<float>(done) / static_cast<float>(total);
+			const float clampedPct = std::min(percentage, 0.999f);
+
+			Timer::Type remaining = 0;
+
+			// Option 1: traditional formula with clamping
+			if (clampedPct > 0.01f && done >= 10 && elapsed > 1000) {
+				remaining = static_cast<Timer::Type>((elapsed / clampedPct) - elapsed);
+			}
+
+			// Optional: Option 2 – smoothed ETA (comment out Option 1 if using this)
+			/*
+			static double avgSpeed = 0.0;
+			double currentSpeed = (double)done / (elapsed / 1000.0);  // units/sec
+			avgSpeed = 0.9 * avgSpeed + 0.1 * currentSpeed;
+			if (avgSpeed > 0 && done < total) {
+				remaining = static_cast<Timer::Type>(((total - done) / avgSpeed) * 1000.0);
+			}
+			*/
+
+			// Final ETA = 0 only when fully done
+			if (done == total) {
+				remaining = 0;
+			}
+
+			print(String::FormatString(_T("%s %u (%.2f%%, %s, ETA %s)..."),
+				msg.c_str(),
+				done,
+				percentage * 100.f,
+				formatTime(static_cast<int64_t>(elapsed), 1).c_str(),
+				formatTime(static_cast<int64_t>(remaining), 2).c_str()));
 		}
-		void close() {
+	void close() {
 			// make sure we print the complete progress
 			const Timer::Type elapsed(Timer::SysTime2TimeMs(Timer::GetSysTime()-start));
 			// display progress

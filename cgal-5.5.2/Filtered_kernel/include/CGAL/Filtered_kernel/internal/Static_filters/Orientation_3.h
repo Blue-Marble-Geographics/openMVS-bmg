@@ -12,9 +12,7 @@
 
 #ifndef CGAL_INTERNAL_STATIC_FILTERS_ORIENTATION_3_H
 #define CGAL_INTERNAL_STATIC_FILTERS_ORIENTATION_3_H
-
 #define CGAL_USE_SSE2_MAX
-#undef FASTER_ORIENTATION // Not noticeably faster.
 
 #include <CGAL/Profile_counter.h>
 #include <CGAL/Filtered_kernel/internal/Static_filters/Static_filter_error.h>
@@ -45,65 +43,6 @@ public:
   operator()(const Point_3 &p, const Point_3 &q,
              const Point_3 &r, const Point_3 &s) const
   {
-#ifdef FASTER_ORIENTATION
-  CGAL_BRANCH_PROFILER_3("semi-static failures/attempts/calls to   : Orientation_3", tmp);
-
-  double px, py, pz, qx, qy, qz, rx, ry, rz, sx, sy, sz;
-
-  if (fit_in_double(p.x(), px) && fit_in_double(p.y(), py) && fit_in_double(p.z(), pz) &&
-      fit_in_double(q.x(), qx) && fit_in_double(q.y(), qy) && fit_in_double(q.z(), qz) &&
-      fit_in_double(r.x(), rx) && fit_in_double(r.y(), ry) && fit_in_double(r.z(), rz) &&
-      fit_in_double(s.x(), sx) && fit_in_double(s.y(), sy) && fit_in_double(s.z(), sz))
-  {
-    CGAL_BRANCH_PROFILER_BRANCH_1(tmp);
-
-    // Step 1: shift vectors relative to p
-    const double pqx = qx - px, pqy = qy - py, pqz = qz - pz;
-    const double prx = rx - px, pry = ry - py, prz = rz - pz;
-    const double psx = sx - px, psy = sy - py, psz = sz - pz;
-
-    // Step 2: compute determinant
-    const double det = CGAL::determinant(pqx, pqy, pqz,
-                                         prx, pry, prz,
-                                         psx, psy, psz);
-
-    const double abs_det = std::abs(det);
-
-    // Early fast path
-    constexpr double fast_threshold = 1e-10;  // Tunable threshold
-    if (abs_det > fast_threshold)
-      return (det > 0.0) ? POSITIVE : NEGATIVE;
-
-    // Step 3: bounding box deltas (delayed until now)
-    double maxx = std::max({std::abs(pqx), std::abs(prx), std::abs(psx)});
-    if (maxx == 0.0)
-      return ZERO;  // Fully degenerate case
-
-    double maxy = std::max({std::abs(pqy), std::abs(pry), std::abs(psy)});
-    double maxz = std::max({std::abs(pqz), std::abs(prz), std::abs(psz)});
-
-    // Sort maxx < maxy < maxz (only now)
-#if defined(CGAL_USE_SSE2_MAX)
-    sse2minmax(maxx, maxy, maxz);  // assumes fast SIMD fallback
-#else
-    if (maxx > maxz) std::swap(maxx, maxz);
-    if (maxy > maxz) std::swap(maxy, maxz);
-    else if (maxy < maxx) std::swap(maxx, maxy);
-#endif
-
-    // Step 4: compute refined epsilon
-    double eps = 5.1107127829973299e-15 * maxx * maxy * maxz;
-
-    if (maxz < 1e102) {  // Hadamard overflow safe bound
-      if (det > eps) return POSITIVE;
-      if (det < -eps) return NEGATIVE;
-    }
-
-    CGAL_BRANCH_PROFILER_BRANCH_2(tmp);
-  }
-
-  return Base::operator()(p, q, r, s);  // fallback to exact
-#else
       CGAL_BRANCH_PROFILER_3("semi-static failures/attempts/calls to   : Orientation_3", tmp);
 
       double px, py, pz, qx, qy, qz, rx, ry, rz, sx, sy, sz;
@@ -198,7 +137,6 @@ public:
       }
 
       return Base::operator()(p, q, r, s);
-#endif
   }
 
   // Computes the epsilon for Orientation_3.

@@ -37,6 +37,7 @@ If you require another license, please contact the above.
 
 using namespace IBFS;
 
+constexpr float kMinResidual = 0.025f;  // Half of the smallest quantized step (0.05)
 
 //
 // Orphan handling
@@ -71,177 +72,28 @@ else												\
 
 
 
-IBFSGraph::IBFSGraph()
-{
+IBFSGraph::IBFSGraph() {
 	numNodes = 0;
 	uniqOrphansS = uniqOrphansT = 0;
 	augTimestamp = 0;
 	verbose = IBTEST;
-	compactSlowInitMode = false;
-	arcs = arcEnd = NULL;
-	nodes = nodeEnd = NULL;
-	topLevelS = topLevelT = 0;
 	flow = 0;
-	orphanFirst = orphanLast = NULL;
-	memArcs = NULL;
-	tmpArcs = NULL;
-	tmpEdges = tmpEdgeLast = NULL;
+  orphanFirst = orphanLast = nullptr;
+  nodes = nodeEnd = nullptr;
 }
 
-
-IBFSGraph::~IBFSGraph()
-{
+IBFSGraph::~IBFSGraph() {
 	active0.release();
 	activeS1.release();
 	activeT1.release();
 	orphanBuckets.release();
-	delete[] memArcs;
 	delete[] nodes;
 }
 
-void IBFSGraph::initGraph()
-{
-	if (compactSlowInitMode) {
-		initGraphCompact();
-	} else {
-		initGraphFast();
-	}
-}
 
-
-void IBFSGraph::initSize(int numNodes, int numEdges)
-{
-	// allocate nodes
-	if (verbose) {
-		fprintf(stdout, "c allocating nodes... \t [%zu]\n", sizeof(Node)*(numNodes+1));
-		fflush(stdout);
-	}
-	this->numNodes = numNodes;
-	nodes = new Node[numNodes+1];
-	memset(nodes, 0, sizeof(Node)*(numNodes+1)); // JPB Must be initialized this way.
-	nodeEnd = nodes+numNodes;
-	active0.init(numNodes);
-	activeS1.init(numNodes);
-	activeT1.init(numNodes);
-	orphanBuckets.init(nodes, numNodes);
-
-	// allocate arcs
-	size_t arcMemsize = sizeof(TmpArc)*(numEdges*2) + sizeof(TmpEdge)*numEdges;
-	if (arcMemsize < sizeof(Arc)*(numEdges*2)) {
-		arcMemsize = sizeof(Arc)*(numEdges*2);
-	}
-	if (verbose) {
-		fprintf(stdout, "c allocating arcs... \t [%zu]\n", arcMemsize);
-		fflush(stdout);
-	}
-	memArcs = new char[arcMemsize];
-	memset(memArcs, 0, sizeof(char)*arcMemsize);
-	tmpEdges = (TmpEdge*)(memArcs);
-	tmpEdgeLast = tmpEdges; // will advance as edges are added
-	tmpArcs = (TmpArc*)(memArcs +sizeof(TmpEdge)*numEdges);
-	arcs = (Arc*)memArcs;
-	arcEnd = arcs + numEdges*2;
-
-	// init members
-	flow = 0;
-
-	if (verbose) {
-		fprintf(stdout, "c sizeof(ptr) = %zu bytes\n", sizeof(Node*));
-		fprintf(stdout, "c sizeof(node) = %zu bytes\n", sizeof(Node));
-		fprintf(stdout, "c sizeof(arc) = %zu bytes\n", sizeof(Arc));
-		fprintf(stdout, "c #nodes = %zu \n", nodeEnd-nodes);
-		fprintf(stdout, "c #arcs = %zu \n", (arcEnd-arcs) + (nodeEnd-nodes));
-		fprintf(stdout, "c #grid_arcs = %zu \n", arcEnd-arcs);
-	}
-}
-
-
-void IBFSGraph::initGraphFast()
-{
-	Node *x;
-	Arc *a;
-	TmpArc *ta, *taEnd;
-	TmpEdge *te;
-
-	// tmpEdges:			edges read
-	// node.label:			out degree
-
-	// calculate start arc offsets every node
-	nodes->firstArc = (Arc*)(tmpArcs);
-	for (x=nodes; x != nodeEnd; x++) {
-		(x+1)->firstArc = (Arc*)(((TmpArc*)(x->firstArc)) + x->label.load(std::memory_order_relaxed));
-		x->label.store((int) (( (TmpArc*) ( x->firstArc ) ) - tmpArcs), std::memory_order_relaxed );
-	}
-	nodeEnd->label.store((int) ( arcEnd - arcs ), std::memory_order_relaxed );
-
-	// tmpEdges:				edges read
-	// node.label: 				index into arcs array of first out arc
-	// node.firstArc-tmpArcs: 	index into arcs array of next out arc to be allocated
-	//							(initially the first out arc)
-
-	// copy to temp arcs memory
-	if (verbose) {
-		IBDEBUG("c initFast copy1");
-	}
-	for (te=tmpEdges; te != tmpEdgeLast; te++) {
-		ta = (TmpArc*)(te->tail->firstArc);
-		ta->cap = te->cap;
-		ta->rev = (TmpArc*)(te->head->firstArc);
-
-		ta = (TmpArc*)(te->head->firstArc);
-		ta->cap = te->revCap;
-		ta->rev = (TmpArc*)(te->tail->firstArc);
-
-		te->tail->firstArc = (Arc*)(((TmpArc*)(te->tail->firstArc))+1);
-		te->head->firstArc = (Arc*)(((TmpArc*)(te->head->firstArc))+1);
-	}
-
-	// tmpEdges:				edges read
-	// tmpArcs:					arcs with reverse pointer but no node id
-	// node.label: 				index into arcs array of first out arc
-	// node.firstArc-tmpArcs: 	index into arcs array of last allocated out arc
-
-	// copy to permanent arcs array, but saving tail instead of head
-	if (verbose) {
-		IBDEBUG("c initFast copy2");
-	}
-	a = arcs;
-	x = nodes;
-	taEnd = (tmpArcs+(arcEnd-arcs));
-	for (ta=tmpArcs; ta != taEnd; ta++) {
-		while (x->label.load(std::memory_order_relaxed) <= (ta-tmpArcs)) x++;
-		a->head = (x-1);
-		a->rCap = ta->cap;
-		a->rev = arcs + (ta->rev-tmpArcs);
-		a++;
-	}
-
-	// tmpEdges:				overwritten
-	// tmpArcs:					overwritten
-	// arcs:					arcs array
-	// node.label: 				index into arcs array of first out arc
-	// node.firstArc-tmpArcs: 	index into arcs array of last allocated out arc
-	// arc.head = tail of arc
-
-	// swap the head and tail pointers and set isRevResidual
-	if (verbose) {
-		IBDEBUG("c initFast copy3");
-	}
-	for (a=arcs; a != arcEnd; a++) {
-		if (a->rev <= a) continue;
-		x = a->head;
-		a->head = a->rev->head;
-		a->rev->head = x;
-		a->isRevResidual = a->rev->rCap != 0;
-		a->rev->isRevResidual = a->rCap != 0;
-	}
-
-	// set firstArc pointers in nodes array
-	if (verbose) {
-		IBDEBUG("c initFast nodes");
-	}
-	for (x=nodes; x <= nodeEnd; x++) {
-		x->firstArc = (arcs + x->label);
+void IBFSGraph::initGraph() {
+	// Must be after nodes are added.
+  for (Node* x = nodes; x < nodeEnd; ++x) {
 		if (x->excess == 0) {
 			x->label = numNodes;
 			continue;
@@ -254,111 +106,43 @@ void IBFSGraph::initGraphFast()
 			activeT1.add(x);
 		}
 	}
-
-	// check consistency
-	if (IBTEST) {
-		IBDEBUG("c initFast test");
-		for (x=nodes; x != nodeEnd; x++) {
-			if ((x+1)->firstArc < x->firstArc) {
-				fprintf(stderr, "INIT CONSISTENCY: arc pointers descending");
-				exit(1);
-			}
-			for (a=x->firstArc; a !=(x+1)->firstArc; a++) {
-				if (a->rev->head != x) {
-					fprintf(stderr, "INIT CONSISTENCY: arc head pointer inconsistent");
-					exit(1);
-				}
-				if (a->rev->rev != a) {
-					fprintf(stderr, "INIT CONSISTENCY: arc reverse pointer inconsistent");
-					exit(1);
-				}
-			}
-		}
-	}
+  topLevelS = topLevelT = 1;
 }
 
 
-void IBFSGraph::initGraphCompact()
+void IBFSGraph::initSize(int n, int)
 {
-#if 0
-	Arc *a, aTmp;
-	Node *x, *y;
-
-	// calculate start arc offsets every node
-	for (x=(nodes+1); x != nodeEnd; x++) {
-		x->label += (x-1)->label.load(std::memory_order_relaxed);
+  numNodes = n;
+  nodes = new Node[n];
+  memset(nodes, 0, sizeof(Node) * n);
+  nodeEnd = nodes + n;
+  active0.init(n);
+  activeS1.init(n);
+  activeT1.init(n);
+  orphanBuckets.init(nodes, n);
+  flow = 0;
 	}
-	for (x=nodeEnd; x>nodes; x--) {
-		x->label.store((x-1)->label.load(std::memory_order_relaxed), std::memory_order_relaxed);
-		x->firstArc = arcs + x->label.load(std::memory_order_relaxed);
-	}
-	nodes->label = 0;
-	nodes->firstArc = arcs;
-
-	// swap arcs
-	for (x=nodes; x != nodeEnd; x++)
-	{
-		for (; x->firstArc != (arcs+((x+1)->label.load(std::memory_order_relaxed))); x->firstArc++)
-		{
-			for (y = x->firstArc->rev->head; y != x; y = x->firstArc->rev->head)
-			{
-				// get and advance last arc fwd in proper node
-				a = y->firstArc;
-				y->firstArc++;
-
-				// prepare sister pointers
-				if (a->rev == x->firstArc)
-				{
-					x->firstArc->rev = x->firstArc;
-					a->rev = a;
-				}
-				else
-				{
-					a->rev->rev = x->firstArc;
-					x->firstArc->rev->rev = a;
-				}
-
-				// swap
-				aTmp = (*(x->firstArc));
-				(*(x->firstArc)) = (*a);
-				(*a) = aTmp;
-			}
-		}
-	}
-
-	// reset first arc pointers
-	// and sister_rCap
-	for (x=nodes; x <= nodeEnd; x++)
-	{
-		if (x != nodeEnd) {
-			x->firstArc = arcs + x->label.load(std::memory_order_relaxed);
-			x->label = 0;
-		}
-		if (x != nodes) {
-			for (a=(x-1)->firstArc; a != x->firstArc; a++)
-			{
-				if (a->rev->rCap == 0) {
-					a->isRevResidual = 0;
-				} else {
-					a->isRevResidual = 1;
-				}
-			}
-		}
-	}
-#endif
-}
-
 
 template <bool sTree>
-void IBFSGraph::augmentTree(Node *x, EdgeCap bottleneck)
-{
-	Node *y;
-	Arc *a;
+void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
+  Node* y;
+  Arc* a;
+  int hopCount = 0;
 
-	for (; ; x=a->head)
-	{
-		if (x->excess) break;
-		a = x->parent;
+  while (true) {
+    if (x->excess) break;
+
+    a = x->parent;
+    if (!a || !a->head) {
+      fprintf(stderr, "ERROR: augmentTree - node %ld has invalid parent\n", x - nodes);
+      break;
+	}
+
+    if (++hopCount > numNodes) {
+      fprintf(stderr, "ERROR: augmentTree - exceeded max hops, likely cycle\n");
+      break;
+				}
+
 		if (sTree) {
 			a->rCap += bottleneck;
 			a->rev->isRevResidual = 1;
@@ -369,24 +153,31 @@ void IBFSGraph::augmentTree(Node *x, EdgeCap bottleneck)
 			a->rCap -= bottleneck;
 		}
 
-		// saturated?
-		if ((sTree ? (a->rev->rCap) : (a->rCap)) == 0)
-		{
+    if ((sTree ? a->rev->rCap : a->rCap) == 0) {
 			if (sTree) a->isRevResidual = 0;
 			else a->rev->isRevResidual = 0;
-			y=x->parent->head->firstSon;
+
+      y = a->head->firstSon;
 			if (y == x) {
-				x->parent->head->firstSon = x->nextPtr;
+        a->head->firstSon = x->nextPtr;
 			} else {
-				for (; y->nextPtr != x; y = y->nextPtr);
-				y->nextPtr = x->nextPtr;
+        for (; y && y->nextPtr != x; y = y->nextPtr);
+        if (y) y->nextPtr = x->nextPtr;
 			}
-			ADD_ORPHAN_FRONT(x);
+
+      x->nextPtr = IB_ORPHANS_END;
+      if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
+      else orphanFirst = orphanLast = x;
 		}
+
+    x = a->head;
 	}
+
 	x->excess += (sTree ? -bottleneck : bottleneck);
 	if (x->excess == 0) {
-		ADD_ORPHAN_FRONT(x);
+    x->nextPtr = IB_ORPHANS_END;
+    if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
+    else orphanFirst = orphanLast = x;
 	}
 }
 
@@ -463,22 +254,17 @@ template <bool sTree>
 void IBFSGraph::adoption()
 {
 	Node *x, *y, *z;
-	Arc *a, *aEnd;
-	bool threePass;
-	int minLabel, numOrphans, numOrphansUniq;
+  Arc *a;
+  bool threePass = false;
+  int minLabel, numOrphans = 0, numOrphansUniq = 0;
 
-	threePass=false;
-	numOrphans=0;
-	numOrphansUniq=0;
-	while (orphanFirst != IB_ORPHANS_END)
-	{
+  while (orphanFirst != IB_ORPHANS_END) {
 		x = orphanFirst;
-		_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
 		orphanFirst = x->nextPtr;
-		//x->nextOrphan = NULL;
 		testNode(x);
 		stats.incOrphans();
 		numOrphans++;
+
 		if (x->lastAugTimestamp != augTimestamp) {
 			x->lastAugTimestamp = augTimestamp;
 			if (sTree) uniqOrphansS++;
@@ -486,29 +272,25 @@ void IBFSGraph::adoption()
 			numOrphansUniq++;
 		}
 		if (numOrphans >= 3*numOrphansUniq) {
-			// switch to 3pass
 			threePass = true;
 		}
 
-		// check for same level connection
+    // check for same-level parent
 		if (x->isParentCurr) {
 			a = x->parent;
 		} else {
-			a = x->firstArc;
 			x->isParentCurr = 1;
+      a = nullptr;
 		}
-		x->parent = NULL;
-		aEnd = (x+1)->firstArc;
-		if (x->label.load(std::memory_order_relaxed) != (sTree ? 1 : -1))
-		{
-			minLabel = x->label.load(std::memory_order_relaxed) - (sTree ? 1 : -1);
-			for (; a != aEnd; a++)
-			{
+    x->parent = nullptr;
+
+    if (x->label != (sTree ? 1 : -1)) {
+      minLabel = x->label - (sTree ? 1 : -1);
+      for (int i = 0; i < x->arcCount; ++i) {
+        a = &x->arcs[i];
 				stats.incOrphanArcs1();
 				y = a->head;
-				if ((sTree ? a->isRevResidual : a->rCap) != 0 &&
-					y->label.load(std::memory_order_relaxed) == minLabel)
-				{
+        if ((sTree ? a->isRevResidual : a->rCap) && y->label == minLabel) {
 					x->parent = a;
 					x->nextPtr = y->firstSon;
 					y->firstSon = x;
@@ -516,62 +298,52 @@ void IBFSGraph::adoption()
 				}
 			}
 		}
-		if (x->parent != NULL) continue;
+    if (x->parent != nullptr) continue;
 
-		// give up on same level - relabel it!
-		// (1) create orphan sons
-		for (y=x->firstSon; y != NULL; y=z)
-		{
+    // orphan children
+    for (y = x->firstSon; y != nullptr; y = z) {
 			stats.incOrphanArcs3();
 			z=y->nextPtr;
 			ADD_ORPHAN_BACK(y);
 		}
-		x->firstSon = NULL;
+    x->firstSon = nullptr;
 
-		// on the top level there is no need to relabel
-		if (x->label.load(std::memory_order_relaxed) == (sTree ? topLevelS : -topLevelT)) {
-			x->label.store(numNodes, std::memory_order_relaxed);
+    if (x->label == (sTree ? topLevelS : -topLevelT)) {
+      x->label = numNodes;
 			continue;
 		}
 
-		// 3pass relabeling: move to buckets structure
 		if (threePass) {
-			const auto tmp = x->label.load(std::memory_order_relaxed);
-			x->label.store(tmp + (sTree ? 1 : -1));
+      x->label += (sTree ? 1 : -1);
 			orphanBuckets.add<sTree>(x);
 			continue;
 		}
 
-		// (2) relabel: find the lowest level parent
+    // relabel
 		minLabel = (sTree ? topLevelS : -topLevelT);
-		if (x->label.load(std::memory_order_relaxed) != minLabel) for (a=x->firstArc; a != aEnd; a++)
-		{
+    if (x->label != minLabel) {
+      for (int i = 0; i < x->arcCount; ++i) {
+        a = &x->arcs[i];
 			stats.incOrphanArcs2();
 			y = a->head;
 			if ((sTree ? a->isRevResidual : a->rCap) &&
-				// y->label != numNodes ---> holds implicitly
-				(sTree ? (y->label.load(std::memory_order_relaxed) > 0) : (y->label.load(std::memory_order_relaxed) < 0)) &&
-				(sTree ? (y->label.load(std::memory_order_relaxed) < minLabel) : (y->label.load(std::memory_order_relaxed) > minLabel)))
-			{
-				minLabel = y->label.load(std::memory_order_relaxed);
+            (sTree ? y->label > 0 : y->label < 0) &&
+            (sTree ? y->label < minLabel : y->label > minLabel)) {
+          minLabel = y->label;
 				x->parent = a;
-				if (minLabel == x->label.load(std::memory_order_relaxed)) break;
+          if (minLabel == x->label) break;
+        }
 			}
 		}
 
-		// (3) relabel onto new parent
-		if (x->parent != NULL) {
-			x->label.store(minLabel + ( sTree ? 1 : -1 ), std::memory_order_relaxed);
+    if (x->parent != nullptr) {
+      x->label = minLabel + (sTree ? 1 : -1);
 			x->nextPtr = x->parent->head->firstSon;
 			x->parent->head->firstSon = x;
-			// add to active list of the next growth phase
-			if (sTree) {
-				if (x->label.load(std::memory_order_relaxed) == topLevelS) activeS1.add(x);
+      if (sTree && x->label == topLevelS) activeS1.add(x);
+      else if (!sTree && x->label == -topLevelT) activeT1.add(x);
 			} else {
-				if (x->label.load(std::memory_order_relaxed) == -topLevelT) activeT1.add(x);
-			}
-		} else {
-			x->label.store(numNodes,std::memory_order_relaxed);
+      x->label = numNodes;
 		}
 	}
 
@@ -583,61 +355,56 @@ void IBFSGraph::adoption()
 template <bool sTree>
 void IBFSGraph::adoption3Pass()
 {
-	Arc *a, *aEnd;
+	Arc *a;
 	Node *x, *y;
 	int minLabel, destLabel;
 
-	for (int level=2; level <= orphanBuckets.maxBucket; level++)
-	{
-		while ((x = orphanBuckets.popFront(level)) != NULL)
-		{
+	for (int level=2; level <= orphanBuckets.maxBucket; level++) {
+		while ((x = orphanBuckets.popFront(level)) != NULL) {
 			testNode(x);
-			_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
-
 			// pass 2: find lowest level parent
 			if (x->parent == NULL) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
-				destLabel = x->label.load(std::memory_order_relaxed) - (sTree ? 1 : -1);
-				aEnd = (x+1)->firstArc;
-				for (a=x->firstArc; a != aEnd; a++) {
+				destLabel = x->label - (sTree ? 1 : -1);
+				for (int i = 0; i < x->arcCount; ++i) {
+					a = &x->arcs[i];
 					y = a->head;
 					if ((sTree ? a->isRevResidual : a->rCap) &&
 						(y->excess || y->parent != NULL) &&
 						//!y->isOrphan() &&
-						(sTree ? (y->label.load(std::memory_order_relaxed) > 0) : (y->label.load(std::memory_order_relaxed) < 0)) &&
-						(sTree ? (y->label.load(std::memory_order_relaxed) < minLabel) : (y->label.load(std::memory_order_relaxed) > minLabel)))
+						(sTree ? (y->label > 0) : (y->label < 0)) &&
+						(sTree ? (y->label < minLabel) : (y->label > minLabel)))
 					{
 						x->parent = a;
-						if ((minLabel = y->label.load(std::memory_order_relaxed)) == destLabel) break;
+						if ((minLabel = y->label) == destLabel) break;
 					}
 				}
 				if (x->parent == NULL) {
-					x->label.store(numNodes, std::memory_order_relaxed);
+					x->label = numNodes;
 					continue;
 				}
-				x->label.store(minLabel + ( sTree ? 1 : -1 ), std::memory_order_relaxed);
-				if (x->label.load(std::memory_order_relaxed) != (sTree ? level : -level)) {
+				x->label = minLabel + (sTree ? 1 : -1);
+				if (x->label != (sTree ? level : -level)) {
 					orphanBuckets.add<sTree>(x);
 					continue;
 				}
 			}
 
 			// pass 3: lower potential sons and/or find first parent
-			if (x->label.load(std::memory_order_relaxed) != (sTree ? topLevelS : -topLevelT))
-			{
-				minLabel = x->label.load(std::memory_order_relaxed) + (sTree ? 1 : -1);
-				aEnd = (x+1)->firstArc;
-				for (a=x->firstArc; a != aEnd; a++) {
+			if (x->label != (sTree ? topLevelS : -topLevelT)) {
+				minLabel = x->label + (sTree ? 1 : -1);
+				for (int i = 0; i < x->arcCount; ++i) {
+					a = &x->arcs[i];
 					y = a->head;
 
 					// lower potential sons
 					if ((sTree ? a->rCap : a->isRevResidual) &&
-						((!sTree && y->label.load(std::memory_order_relaxed) == numNodes) ||
+						((!sTree && y->label == numNodes) ||
 						// the above implicitly holds by condition below when sTree=true
-						(sTree ? (minLabel < y->label.load(std::memory_order_relaxed)) : (minLabel > y->label.load(std::memory_order_relaxed)))))
+						(sTree ? (minLabel < y->label) : (minLabel > y->label))))
 					{
-						if (y->label.load(std::memory_order_relaxed) != numNodes) orphanBuckets.remove<sTree>(y);
-						y->label.store(minLabel, std::memory_order_relaxed);
+						if (y->label != numNodes) orphanBuckets.remove<sTree>(y);
+						y->label = minLabel;
 						y->parent = a->rev;
 						orphanBuckets.add<sTree>(y);
 					}
@@ -650,9 +417,9 @@ void IBFSGraph::adoption3Pass()
 			x->isParentCurr = 0;
 			// add to active list of the next growth phase
 			if (sTree) {
-				if (x->label.load(std::memory_order_relaxed) == topLevelS) activeS1.add(x);
+				if (x->label == topLevelS) activeS1.add(x);
 			} else {
-				if (x->label.load(std::memory_order_relaxed) == -topLevelT) activeT1.add(x);
+				if (x->label == -topLevelT) activeT1.add(x);
 			}
 		}
 	}
@@ -662,146 +429,71 @@ void IBFSGraph::adoption3Pass()
 
 
 template <bool dirS>
-void IBFSGraph::growth()
-{
+void IBFSGraph::growth() {
 	Node *x, *y;
-	Arc *a, *aEnd;
 
-	//Node** __restrict pActiveList = dirS ? (activeS1.list + activeS1.len) : (activeT1.list + activeT1.len);
-	for (Node **active=active0.list; active != (active0.list + active0.len); active++)
-	{
-		// get active node
-		x = (*active);
-		_mm_prefetch((char*) (x+1)->firstArc, _MM_HINT_T0);
-		testNode(x);
+  for (Node** active = active0.list; active != active0.list + active0.len; ++active) {
+    x = *active;
 
-		// node no longer at level
-		if (x->label.load(std::memory_order_relaxed) != (dirS ? (topLevelS-1): -(topLevelT-1))) {
-			continue;
-		}
+    if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1))) continue;
 
-		// grow or augment
 		if (dirS) stats.incGrowthS();
 		else stats.incGrowthT();
-		aEnd = (x+1)->firstArc;
-		for (a=x->firstArc; a != aEnd; a++)
-		{
-			stats.incGrowthArcs();
+
+    for (int i = 0; i < x->arcCount; ++i) {
+      Arc* a = &x->arcs[i];
+
 			if ((dirS ? a->rCap : a->isRevResidual) == 0) continue;
+
 			y = a->head;
-			if (y->label.load(std::memory_order_relaxed) == numNodes)
-			{
-				// grow node
-				testNode(y);
+
+      if (y->label == numNodes) {
 				y->isParentCurr = 0;
-				y->label.store(x->label.load(std::memory_order_relaxed) + (dirS ? 1 : -1), std::memory_order_relaxed);
+        y->label = x->label + (dirS ? 1 : -1);
 				y->parent = a->rev;
 				y->nextPtr = x->firstSon;
 				x->firstSon = y;
-				//*pActiveList++ = y;
 				if (dirS) activeS1.add(y);
 				else activeT1.add(y);
-			}
-			else if (dirS ? (y->label.load(std::memory_order_relaxed) < 0) : (y->label.load(std::memory_order_relaxed) > 0))
-			{
-				// augment
-				augment(dirS ? a : (a->rev));
-				if (x->label.load(std::memory_order_relaxed) != (dirS ? (topLevelS-1) : -(topLevelT-1))) {
-					break;
-				}
-				if (dirS ? (a->rCap) : (a->isRevResidual)) a--;
+      } else if (dirS ? (y->label < 0) : (y->label > 0)) {
+        augment(dirS ? a : a->rev);
+
+        if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1))) break;
+        if ((dirS ? a->rCap : a->isRevResidual)) --i;
 			}
 		}
 	}
-	//dirS ? (activeS1.len = pActiveList - activeS1.list) : (activeT1.len = pActiveList - activeT1.list);
 
 	active0.clear();
 }
 
 
-void IBFSGraph::testTree()
-{
-	Node *x;
-	Arc *a;
-
-	for (x=nodes; x != nodeEnd; x++) {
-		if (x->label != numNodes && (x->label > topLevelS || x->label < -topLevelT)) {
-			IBDEBUG("ILLEGAL LABEL!");
-			testExit();
-		}
-		if (x->parent == NULL) continue;
-		bool sTree = (x->label > 0);
-		if (x->label == (sTree ? topLevelS : -topLevelT)) {
-			continue;
-		}
-		for (a=x->firstArc; a != (x+1)->firstArc; a++) {
-			if (x->isParentCurr &&
-					(sTree ? a->isRevResidual : a->rCap) &&
-					(sTree ? (a->head->label > 0) : (a->head->label < 0)) &&
-					a->head->label == (sTree ? (x->label-1) : (x->label+1)) &&
-					a < x->parent) {
-				IBDEBUG("ILLEGAL CURRENT ARC!");
-				testExit();
-			}
-			if (!(sTree ? a->rCap : a->isRevResidual)) continue;
-			if (a->head->parent == NULL) {
-				IBDEBUG("CROSS OUT NODE!");
-				testExit();
-			}
-			if (sTree ? (a->head->label < 0) : (a->head->label > 0)) {
-				IBDEBUG("CROSS NODE!");
-				testExit();
-			}
-			if (sTree ? (a->head->label > (x->label+1)) : (a->head->label < (x->label-1))) {
-				IBDEBUG("EXTENDED ARC!");
-				testExit();
-			}
-		}
-	}
-}
-
-double IBFSGraph::computeMaxFlow()
-{
-	// init
+EdgeCap IBFSGraph::computeMaxFlow() {
 	orphanFirst = IB_ORPHANS_END;
-	topLevelS = topLevelT = 1;
 	bool dirS = true;
 	ActiveList::swapLists(&active0, &activeS1);
 
-	//
-	// IBFS
-	//
-	while (true)
-	{
-		// BFS level
+  while (true) {
 		if (dirS) topLevelS++;
 		else topLevelT++;
+
 		if (dirS) growth<true>();
 		else growth<false>();
-		if (IBTEST) {
-			testTree();
-			fprintf(stdout, "dirS=%d aug=%d   S %d / T %d\n", dirS, augTimestamp, uniqOrphansS, uniqOrphansT);
-			fflush(stdout);
-		}
 
-		// switch to next level
-		if (activeS1.len == 0 || activeT1.len == 0) {
-			break;
-		}
+    if (activeS1.len == 0 || activeT1.len == 0) break;
+
 		if ((!IB_ALTERNATE_SMART && dirS) ||
 			(IB_ALTERNATE_SMART && uniqOrphansT == uniqOrphansS && dirS) ||
 			(IB_ALTERNATE_SMART && uniqOrphansT < uniqOrphansS)) {
-			// grow T
 			ActiveList::swapLists(&active0, &activeT1);
 			dirS=false;
 		} else {
-			// grow S
 			ActiveList::swapLists(&active0, &activeS1);
 			dirS=true;
 		}
 	}
 	
-	return edgeCapToDouble(flow);
+  return flow;
 }
 
 

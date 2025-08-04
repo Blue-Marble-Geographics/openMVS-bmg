@@ -164,17 +164,6 @@ public:
   // CHECKING
   bool is_valid(bool verbose = false, int level = 0) const;
 
-  // P2P debug support
-  std::pair<bool, int> info() const
-  {
-    constexpr int version = 2;
-#ifdef CGAL_LINKED_WITH_TBB
-    return { true, version };
-#else
-    return { false, version };
-#endif
-  }
-
   // INSERT REMOVE
   Vertex_handle insert(const Point &p, Vertex_handle hint)
   {
@@ -866,10 +855,22 @@ int
 Triangulation_hierarchy_3<Tr>::
 random_level()
 {
+#if 0 // JPB WIP BUG This is not allocating the level properly.  It results in unused higher-order hierarchies. 
+  // 58.471, 57.098
+  int level = 0;
+  constexpr double invRandMax = (1./RAND_MAX);
+  constexpr double p = 1.0 / double(ratio);
+
+  while (level < maxlevel - 1 && (double(random()) * invRandMax) < p)
+      ++level;
+
+  return level;
+#else
   boost::geometric_distribution<> proba(1.0/double(ratio));
   boost::variate_generator<boost::rand48&, boost::geometric_distribution<> > die(random, proba);
 
   return (std::min)(die(), (int)maxlevel)-1;
+#endif
 }
 
 } //namespace CGAL

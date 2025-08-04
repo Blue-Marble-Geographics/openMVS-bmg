@@ -79,7 +79,6 @@ If you require another license, please contact the above.
 #include <string.h>
 #include <assert.h>
 
-#define GC_OPTS
 
 #ifndef IBIO
 #define IBIO 0
@@ -91,13 +90,13 @@ If you require another license, please contact the above.
 #define IBSTATS 0
 #endif
 #ifndef IBDEBUG
-#define IBDEBUG(X) /*fprintf(stdout, X"\n"); fflush(stdout) */
+#define IBDEBUG(X) fprintf(stdout, X"\n"); fflush(stdout)
 #endif
 
 #define IB_ALTERNATE_SMART 1
 #define IB_ORPHANS_END ((Node*)1)
 
-#pragma pack(push, 1)
+
 namespace IBFS {
 
 typedef float Real;
@@ -163,112 +162,60 @@ private:
 	Real augLenMax;
 };
 
-double __forceinline edgeCapToDouble(EdgeCap f)
-{
-	if constexpr (std::is_same_v<EdgeCap, int32_t>) {
-		constexpr double C = (1. / 16.);
-		return f * C;
-	} else if constexpr(std::is_same_v<EdgeCap, int64_t>) {
-		constexpr double C = (1. / (65536.*65536.));
-		return f * C;
-	} else if constexpr(std::is_same_v<EdgeCap, float>) {
-		return f;
-	} else if constexpr(std::is_same_v<EdgeCap, double>) {
-		return f;
-	}
-}
 
-EdgeCap __forceinline doubleToEdgeCap(double f)
-{
-	if constexpr (std::is_same_v<EdgeCap, int32_t>) {
-		constexpr double C = 16.;
-		return f * C;
-	} else if constexpr (std::is_same_v<EdgeCap, int64_t>) {
-		constexpr double C = (65536.*65536.);
-		return f * C;
-	} else if constexpr(std::is_same_v<EdgeCap, float>) {
-		return f;
-	} else if constexpr(std::is_same_v<EdgeCap, double>) {
-		return f;
-	}
-}
 
 class IBFSGraph
 {
 public:
 	IBFSGraph();
 	~IBFSGraph();
-
 	void setVerbose(bool a_verbose) {
 		verbose = a_verbose;
 	}
 
 	void initSize(int numNodes, int numEdges);
-#ifdef GC_OPTS
-	void addEdge(const void* nodeIndexFrom, const void* nodeIndexTo, double capacity, double reverseCapacity);
-	void addNode(const void* node, double capacityFromSource, double capacityToSink);
-	void initFlow(double f) { flow = doubleToEdgeCap(f); }
-#else
 	void addEdge(int nodeIndexFrom, int nodeIndexTo, EdgeCap capacity, EdgeCap reverseCapacity);
 	void addNode(int nodeIndex, EdgeCap capacityFromSource, EdgeCap capacityToSink);
-#endif
 
 	void setCompactSlowInitMode(bool a_compactSlowInitMode) {
 		compactSlowInitMode = a_compactSlowInitMode;
 	}
 	void initGraph();
-	double computeMaxFlow();
+	EdgeCap computeMaxFlow();
 
 	inline IBFSStats getStats() {
 		return stats;
 	}
-	inline double getFlow() {
-		return edgeCapToDouble(flow);
-	}
-	inline size_t getNumNodes() {
-		return nodeEnd-nodes;
-	}
-	inline size_t getNumArcs() {
-		return arcEnd-arcs;
+	inline EdgeCap getFlow() {
+		return flow;
 	}
 
-#ifdef GC_OPTS
-	bool isNodeOnSrcSide(const void* node) const;
-#else
 	bool isNodeOnSrcSide(int nodeIndex) const;
-#endif
 
-#ifdef GC_OPTS
-	const void* nodeHandle(int n) const { return nodes + n; }
-#endif
-
-private:
 	struct Node;
-	struct Arc;
 
-	struct Arc
-	{
+  struct Arc {
 		Node*		head;
 		Arc*		rev;
-		#if 0
-		int			isRevResidual :1;
-		int			rCap :31;
-		#else
 		EdgeCap			rCap;
 		unsigned char	isRevResidual;
-		#endif
 	};
 
-	struct alignas(64) Node // 229 -> 222 without this
-	{
+  struct Node {
+    static constexpr int kMaxArcs = 4;
+
 		int			lastAugTimestamp:31;
 		int			isParentCurr:1;
-		Arc			*firstArc;
+
 		Arc			*parent;
 		Node		*firstSon;
 		Node		*nextPtr;
-		std::atomic<int>			label;	// label > 0: distance from s, label < 0: -distance from t
-		EdgeCap		excess;	 // excess > 0: capacity from s, excess < 0: -capacity to t
+
+    int label;
+    EdgeCap excess;
+
+    Arc arcs[kMaxArcs];
+    int arcCount;
 	};
 
 	class ActiveList
@@ -332,7 +279,7 @@ private:
 			}
 		}
 		template <bool sTree> inline void add(Node* x) {
-			int bucket = (sTree ? (x->label.load()) : (-x->label.load()));
+			int bucket = (sTree ? (x->label) : (-x->label));
 			if (buckets[bucket] == NULL || buckets[bucket] == IB_ORPHANS_END) {
 				x->nextPtr = IB_ORPHANS_END;
 			} else {
@@ -350,7 +297,7 @@ private:
 			return x;
 		}
 		template <bool sTree> inline void remove(Node *x) {
-			int bucket = (sTree ? (x->label.load()) : (-x->label.load()));
+			int bucket = (sTree ? (x->label) : (-x->label));
 			if (buckets[bucket] == x) {
 				buckets[bucket] = x->nextPtr;
 			} else {
@@ -368,17 +315,17 @@ private:
 
 	// members
 	IBFSStats stats;
-	Node	*nodes, *nodeEnd;
-	Arc		*arcs, *arcEnd;
+  Node* nodes;
+  Node* nodeEnd;
 	int 	numNodes;
-public: // JPB WIP BUG
 	EdgeCap	flow;
-private:
+
 	unsigned short augTimestamp;
 	unsigned int uniqOrphansS, uniqOrphansT;
 	Node* orphanFirst;
 	Node* orphanLast;
 	int topLevelS, topLevelT;
+
 	ActiveList active0, activeS1, activeT1;
 	Buckets orphanBuckets;
 	bool verbose;
@@ -412,8 +359,7 @@ private:
 		EdgeCap		cap;
 	};
 	char	*memArcs;
-	TmpEdge	*tmpEdges;
-	TmpEdge *tmpEdgeLast;
+	TmpEdge	*tmpEdges, *tmpEdgeLast;
 	TmpArc	*tmpArcs;
 	bool compactSlowInitMode;
 	void initGraphFast();
@@ -433,128 +379,47 @@ private:
 	}
 };
 
-#ifdef GC_OPTS
-inline void IBFSGraph::addNode(const void* n, double capacitySource, double capacitySink)
-{
-	Node* node = (Node*) n;
-	const double f = edgeCapToDouble(node->excess);
-	if (f > 0) {
-		capacitySource += f;
-	} else {
-		capacitySink -= f;
-	}
-	if (capacitySource < capacitySink) {
-		flow += capacitySource;
-	} else {
-		flow += capacitySink;
-	}
 
-	node->excess = doubleToEdgeCap(capacitySource - capacitySink);
-}
-#else
-inline void IBFSGraph::addNode(int nodeIndex, EdgeCap capacitySource, EdgeCap capacitySink)
+inline void IBFSGraph::addNode(int nodeIndex, EdgeCap capFromSource, EdgeCap capToSink)
 {
 	EdgeCap f = nodes[nodeIndex].excess;
-	if (f > 0) {
-		capacitySource += f;
-	} else {
-		capacitySink -= f;
-	}
-	if (capacitySource < capacitySink) {
-		flow += capacitySource;
-	} else {
-		flow += capacitySink;
-	}
-	nodes[nodeIndex].excess = capacitySource - capacitySink;
+  if (f > 0) capFromSource += f;
+  else capToSink -= f;
+  flow += (capFromSource < capToSink ? capFromSource : capToSink);
+  nodes[nodeIndex].excess = capFromSource - capToSink;
 }
-#endif
 
-#ifdef GC_OPTS
-inline void IBFSGraph::addEdge(const void* nodeIndexFrom, const void* nodeIndexTo, double capacity, double reverseCapacity)
-{
-	assert((void*)tmpEdgeLast < (void*)tmpArcs);
-	tmpEdgeLast->tail = (Node*) nodeIndexFrom;
-	tmpEdgeLast->head = (Node*) nodeIndexTo;
-	tmpEdgeLast->cap = doubleToEdgeCap(capacity);
-	tmpEdgeLast->revCap = doubleToEdgeCap(reverseCapacity);
-	++tmpEdgeLast;
-	// use label as a temporary storage
-	// to count the out degree of nodes
-	((Node*) nodeIndexFrom)->label++;
-	((Node*) nodeIndexTo)->label++;
+inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
+  Node* u = &nodes[from];
+  Node* v = &nodes[to];
 
-	/*
-	Arc *aFwd = arcLast;
-	arcLast++;
-	Arc *aRev = arcLast;
-	arcLast++;
+	if (u->arcCount >= Node::kMaxArcs)
+		__debugbreak();
+  if (v->arcCount >= Node::kMaxArcs)
+		__debugbreak();
 
-	Node* x = nodes + nodeIndexFrom;
-	x->label++;
-	Node* y = nodes + nodeIndexTo;
-	y->label++;
+  Arc* uv = &u->arcs[u->arcCount++];
+  Arc* vu = &v->arcs[v->arcCount++];
 
-	aRev->rev = aFwd;
-	aFwd->rev = aRev;
-	aFwd->rCap = capacity;
-	aRev->rCap = reverseCapacity;
-	aFwd->head = y;
-	aRev->head = x;*/
+  uv->head = v;
+  uv->rev = vu;
+  uv->rCap = cap;
+  uv->isRevResidual = (revCap > 0);
+
+  vu->head = u;
+  vu->rev = uv;
+  vu->rCap = revCap;
+  vu->isRevResidual = (cap > 0);
 }
-#else
-inline void IBFSGraph::addEdge(int nodeIndexFrom, int nodeIndexTo, EdgeCap capacity, EdgeCap reverseCapacity)
-{
-	assert((void*)tmpEdgeLast < (void*)tmpArcs);
-	tmpEdgeLast->tail = nodes + nodeIndexFrom;
-	tmpEdgeLast->head = nodes + nodeIndexTo;
-	tmpEdgeLast->cap = capacity;
-	tmpEdgeLast->revCap = reverseCapacity;
-	tmpEdgeLast++;
 
-	// use label as a temporary storage
-	// to count the out degree of nodes
-	nodes[nodeIndexFrom].label++;
-	nodes[nodeIndexTo].label++;
 
-	/*
-	Arc *aFwd = arcLast;
-	arcLast++;
-	Arc *aRev = arcLast;
-	arcLast++;
-
-	Node* x = nodes + nodeIndexFrom;
-	x->label++;
-	Node* y = nodes + nodeIndexTo;
-	y->label++;
-
-	aRev->rev = aFwd;
-	aFwd->rev = aRev;
-	aFwd->rCap = capacity;
-	aRev->rCap = reverseCapacity;
-	aFwd->head = y;
-	aRev->head = x;*/
-}
-#endif
-
-#ifdef GC_OPTS
-inline bool IBFSGraph::isNodeOnSrcSide(const void* node) const
-{
-	if (((Node*) node)->label == numNodes || ((Node*) node)->label == 0) {
-		return activeT1.len == 0;
-	}
-	return ((Node*) node)->label > 0;
-}
-#else
 inline bool IBFSGraph::isNodeOnSrcSide(int nodeIndex) const
 {
-	if (nodes[nodeIndex].label == numNodes || nodes[nodeIndex].label == 0) {
-		return activeT1.len == 0;
+  const Node& x = nodes[nodeIndex];
+  if (x.label == numNodes || x.label == 0) return activeT1.len == 0;
+  return x.label > 0;
 	}
-	return (nodes[nodeIndex].label > 0);
-}
-#endif
 
 } // namespace IBFS
 
-#pragma pack(pop)
 #endif

@@ -93,6 +93,37 @@ struct Triangulation_utils_3
     return tab_vertex_triple_index[i][j];
   }
 
+  struct FacetVertexIndices {
+    int i0, i1, i2;
+  };
+
+#if 1
+  // Compile-time indexed mapping
+// 16-byte aligned, flat layout for prefetch and fused loads
+alignas(16) static constexpr int kFacetVertexLUT[4 * 3] = {
+  1, 3, 2,  // facet 0
+  0, 2, 3,  // facet 1
+  0, 3, 1,  // facet 2
+  0, 1, 2   // facet 3
+};
+
+// Return pointer to base of 3 indices
+__forceinline const int* getFacetVertexIndices(int facetIndex) const {
+  _ASSERTE((unsigned)facetIndex < 4); // MSVC debug-only
+  return &kFacetVertexLUT[facetIndex * 3];
+}
+#else
+  constexpr FacetVertexIndices getFacetVertexIndices(int facetIndex) const
+  {
+    switch (facetIndex) {
+      case 0: return {1, 3, 2}; // facet opposite vertex 0 [1, 2, 3]
+      case 1: return {0, 2, 3}; // opposite 1 [0, 2, 3]
+      case 2: return {0, 3, 1}; // opposite 2 [0, 1, 3]
+      case 3: return {0, 1, 2}; // opposite 3 [0, 1, 2]
+      default: return {-1, -1, -1}; // optionally assert or throw
+    }
+  }
+#endif
 };
 
 } //namespace CGAL

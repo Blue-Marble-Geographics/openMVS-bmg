@@ -65,7 +65,6 @@ public:
             stx, sty, stz, st2);
 
         const double abs_det = std::abs(det);
-
         // Fast path: most inputs will exit here
         constexpr double fast_threshold = 1e-10;  // Tunable
         if (abs_det > fast_threshold)

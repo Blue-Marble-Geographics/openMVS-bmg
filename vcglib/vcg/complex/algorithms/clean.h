@@ -232,7 +232,7 @@ public:
 
 		RemoveDuplicateVert_Compare c_obj;
 
-		std::sort(std::execution::par, perm.begin(),perm.end(),c_obj);
+		std::sort(std::execution::par_unseq, perm.begin(),perm.end(),c_obj);
 
 		j = 0;
 		i = j;
@@ -375,7 +375,7 @@ public:
 			fvec.end()
 		);
 
-		std::sort(std::execution::par, fvec.begin(), fvec.end());
+		std::sort(std::execution::par_unseq, fvec.begin(), fvec.end());
 
 		// Step 4: Detect duplicates and delete faces (serialized deletion)
 		int total = 0;
@@ -429,7 +429,7 @@ public:
 			{
 				eVec.emplace_back(tri::Index(m,(*ei).V(0)), tri::Index(m,(*ei).V(1)), &*ei);
 			}
-		std::sort(std::execution::par,eVec.begin(),eVec.end());
+		std::sort(std::execution::par_unseq,eVec.begin(),eVec.end());
 		int total=0;
 		for(int i=0;i<int(eVec.size())-1;++i)
 		{
@@ -930,16 +930,26 @@ public:
 		int count_fd = 0;
 		std::vector<FacePointer> ToDelVec;
 
-		for(fi=m.face.begin(); fi!=m.face.end();++fi)
-			if (!fi->IsD())
-			{
-				if ((!IsManifold(*fi,0))||
-				    (!IsManifold(*fi,1))||
-				    (!IsManifold(*fi,2)))
-					ToDelVec.push_back(&*fi);
-			}
+		int64_t cnt = (int64_t)std::distance(std::begin(m.face), std::end(m.face));
+		ToDelVec.resize(cnt);
 
-		std::sort(ToDelVec.begin(),ToDelVec.end(),CompareAreaFP());
+		std::atomic<int64_t> awcnt = 0;
+
+#pragma omp parallel
+		for (int64_t i = 0; i < cnt; ++i) {
+			FaceType& fi = m.face[i];
+			if (!fi.IsD()) {
+				if ((!IsManifold(fi, 0))||
+					(!IsManifold(fi, 1))||
+					(!IsManifold(fi, 2))) {
+					ToDelVec[awcnt++] = &fi;
+				}
+			}
+		}
+
+		ToDelVec.resize(awcnt);
+
+		std::sort(std::execution::par_unseq, std::begin(ToDelVec),std::end(ToDelVec),CompareAreaFP());
 
 		// JPB WIP BUG check what this is doing...
 		for(size_t i=0;i<ToDelVec.size();++i)

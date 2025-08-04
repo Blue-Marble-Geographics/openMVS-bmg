@@ -12,7 +12,6 @@
 
 #ifndef CGAL_UTILS_CLASSES_H
 #define CGAL_UTILS_CLASSES_H
-
 #define CGAL_USE_SSE2_MAX // JPB WIP BUG
 
 #include <CGAL/config.h>

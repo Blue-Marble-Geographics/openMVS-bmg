@@ -86,11 +86,13 @@
 #define _SetS _mm_set1_epi16
 #define _Load _mm_loadu_ps
 #define _LoadA _mm_load_ps
+#define _LoadD _mm_loadu_pd
 #define _LoadI _mm_load_si128
 #define _vFirst _mm_cvtss_f32
 #define _vFirstD _mm_cvtsd_f64
 #define _Store _mm_storeu_ps
 #define _StoreA _mm_store_ps
+#define _StoreD _mm_storeu_pd
 #define _And _mm_and_ps
 #define _AndI _mm_and_si128
 #define _AndNot _mm_andnot_ps
@@ -332,6 +334,25 @@ _Data __forceinline BetterFastExpSse(_Data vX)
   return _Div(_CastFI(s), _CastFI(t));
 }
 
+void __forceinline BetterFastExpSsePair(_Data& vExp, _Data& vExp2, _Data vX, _Data vX2)
+{
+  /* https://stackoverflow.com/questions/47025373/fastest-implementation-of-the-natural-exponential-function-using-sse */
+  /* Of the several at the above link, this is the only consistently reliable version. */
+  /* Clamping added manually. */
+  vX                    = FastClamp(vX, vLow, vHigh); // JPB WIP OPT
+  vX2                    = FastClamp(vX2, vLow, vHigh);
+
+  _DataI r              = _ConvertIF(_Mul(vExpFactor, vX));
+  _DataI r2              = _ConvertIF(_Mul(vExpFactor, vX2));
+  _DataI s              = _AddI(_CastIF(vExpC), r);
+  _DataI s2             = _AddI(_CastIF(vExpC), r2);
+  _DataI t              = _SubI(_CastIF(vExpC), r);
+  _DataI t2              = _SubI(_CastIF(vExpC), r2);
+
+  vExp = _Div(_CastFI(s), _CastFI(t));
+  vExp2 = _Div(_CastFI(s2), _CastFI(t2));
+}
+
 static inline _DataI muly(const _DataI &a, const _DataI &b)
 {
   _DataI tmp1           = _mm_mul_epu32(a,b); /* mul 2,0*/
@@ -522,7 +543,17 @@ static __forceinline float FastMinS(float a, float b)
   return a < b ? a : b;
 }
 
+static __forceinline double FastMinD(double a, double b)
+{
+  return a < b ? a : b;
+}
+
 static __forceinline float FastMaxS(float a, float b)
+{
+  return a > b ? a : b;
+}
+
+static __forceinline double FastMaxD(double a, double b)
 {
   return a > b ? a : b;
 }

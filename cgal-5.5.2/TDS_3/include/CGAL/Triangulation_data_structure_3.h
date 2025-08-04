@@ -34,8 +34,9 @@
 #include <boost/container/static_vector.hpp>
 #include <boost/container/options.hpp>
 #include <boost/unordered/unordered_map.hpp>
-
 #include <boost/unordered_set.hpp>
+#include <boost/sort/spreadsort/integer_sort.hpp>
+
 #include <CGAL/utility.h>
 #include <CGAL/iterator.h>
 #include <CGAL/STL_Extension/internal/Has_member_visited.h>
@@ -99,12 +100,12 @@ public:
   typedef typename Cb::template Rebind_TDS<Tds>::Other  Cell;
 
   class Cell_data {
+public:
+    uint32_t marker;
+
     unsigned char conflict_state;
-  public:
-    uint8_t marker;
 
     Cell_data() : conflict_state(0), marker(0) {}
-
     void clear()            { conflict_state = 0; }
     void mark_in_conflict() { conflict_state = 1; }
     void mark_on_boundary() { conflict_state = 2; }
@@ -202,7 +203,6 @@ public:
     }
 
   };
-
   static const int maximal_nb_of_facets_of_small_hole = 128;
   typedef Small_unordered_map<Vertex_pair, Local_facet,
                               Small_pair_hash, maximal_nb_of_facets_of_small_hole *8> Vertex_pair_facet_map;
@@ -332,7 +332,7 @@ public:
   Cell_handle create_cell(Vertex_handle v0, Vertex_handle v1,
                           Vertex_handle v2, Vertex_handle v3)
     {
-      return cells().emplace(v0,v1,v2,v3);
+      return cells().emplace(v0, v1, v2, v3);
     }
 
   Cell_handle create_cell(Vertex_handle v0, Vertex_handle v1,
@@ -353,7 +353,7 @@ public:
                           Vertex_handle v2)
     {
       CGAL_triangulation_precondition(dimension()<3);
-      return cells().emplace(v0,v1,v2,Vertex_handle());
+      return cells().emplace(v0, v1, v2, Vertex_handle());
     }
 
   // The following functions come from TDS_2.
@@ -425,7 +425,7 @@ public:
   void delete_cells(InputIterator begin, InputIterator end)
   {
       for(; begin != end; ++begin)
-          delete_cell(*begin);
+        delete_cell(*begin);
   }
 
   // QUERIES
@@ -555,6 +555,151 @@ public:
       return insert_in_hole(cell_begin, cell_end, begin, i, create_vertex());
   }
 
+#if 1
+
+  template <typename T>
+  void radixSort64(T& keys) {
+    const size_t n = keys.size();
+    T tmp(n);
+    constexpr int passes = 8;
+    constexpr int radix = 256;
+    constexpr uint64_t mask = 0xFF;
+
+    for (int pass = 0; pass < passes; ++pass) {
+      int shift = pass * 8;
+      size_t count[radix] = {};
+      size_t offset[radix] = {};
+
+      for (size_t i = 0; i < n; ++i)
+        ++count[(keys[i].first >> shift) & mask];
+
+      offset[0] = 0;
+      for (int i = 1; i < radix; ++i)
+        offset[i] = offset[i - 1] + count[i - 1];
+
+      for (size_t i = 0; i < n; ++i)
+        tmp[offset[(keys[i].first >> shift) & mask]++] = keys[i];
+
+      std::swap(keys, tmp);
+    }
+  }
+
+  template<typename T, typename U>
+  void applyPermutation(T& edges, U& keys) {
+    T sorted(edges.size());
+    for (size_t i = 0; i < edges.size(); ++i)
+      sorted[i] = edges[keys[i].second];
+    edges.swap(sorted);
+  }
+
+// Insert vertex in small hole using flat array instead of hash map
+template <class Cells, class Facets>
+Vertex_handle _insert_in_small_hole(const Cells& cells, const Facets& facets)
+{
+    CGAL_assertion(facets.size() < (std::numeric_limits<unsigned char>::max)());
+    static Vertex_pair_facet_map vertex_pair_facet_map; // CGAL_STATIC_THREAD_LOCAL_VARIABLE_0(Vertex_pair_facet_map, vertex_pair_facet_map);
+    Vertex_handle nv = create_vertex();
+    union Cell_handle_union {
+      Cell_handle h;
+      void* p;
+      Cell_handle_union() {}
+    };
+
+    vertex_pair_facet_map.clear();
+
+    Cell_handle_union new_cells[maximal_nb_of_facets_of_small_hole];
+    for (unsigned char local_facet_index = 0, end = (unsigned char) (facets.size());
+         local_facet_index < end; ++local_facet_index) {
+      const Facet& f = facets[local_facet_index]; // mirror_facet(facets[local_facet_index]);
+      Cell_handle c = f.first;
+      c->tds_data().clear(); // was on boundary
+
+      const int* __restrict indices = getFacetVertexIndices(f.second);
+
+      const Vertex_handle u = c->vertex(indices[0]);
+      const Vertex_handle v = c->vertex(indices[1]);
+      const Vertex_handle w = c->vertex(indices[2]);
+      const Cell_handle nc = create_cell(v, u, w, nv);
+      u->set_cell(nc);
+      v->set_cell(nc);
+      w->set_cell(nc);
+      new_cells[local_facet_index].h = nc;
+      if (nv->cell() == Cell_handle())
+        nv->set_cell(nc);
+      nc->set_neighbor(3, f.first);
+      c->set_neighbor(f.second, nc);
+
+#if 0
+    std::size_t operator()(const Vertex_pair& k) const
+    {
+      std::size_t hf = boost::hash<Vertex_handle>()(k.first);
+      std::size_t hs = boost::hash<Vertex_handle>()(k.second);
+
+      return hf ^ 419 * hs;
+    }
+#endif
+
+      Vertex_pair v0(u, v);
+      Vertex_pair v1(v, w);
+      Vertex_pair v2(w, u);
+
+      std::size_t a0 = boost::hash<Vertex_handle>()(v0.first);
+      std::size_t a1 = boost::hash<Vertex_handle>()(v0.second);
+      std::size_t b0 = boost::hash<Vertex_handle>()(v1.first);
+      std::size_t b1 = boost::hash<Vertex_handle>()(v1.second);
+      std::size_t c0 = boost::hash<Vertex_handle>()(v2.first);
+      std::size_t c1 = boost::hash<Vertex_handle>()(v2.second);
+
+      // Compute hashes: fast multiply + xor
+      constexpr uint64_t kMul = 11400714819323198485ull;
+
+      size_t outA = (a0 ^ kMul * a1) & 1023;
+      size_t outB = (b0 ^ kMul * b1) & 1023;
+      size_t outC = (c0 ^ kMul * c1) & 1023;
+
+// notice we remove the nc->index(x) as we know the insertion index from create_cell above.
+      vertex_pair_facet_map.set2(v0, {local_facet_index,
+                                         static_cast<unsigned char>(2)}, outA);
+      vertex_pair_facet_map.set2(v1, {local_facet_index,
+                                         static_cast<unsigned char>(1)}, outB);
+      vertex_pair_facet_map.set2(v2, {local_facet_index,
+                                         static_cast<unsigned char>(0)}, outC);
+    }
+
+    for(auto it = vertex_pair_facet_map.begin(), itEnd = vertex_pair_facet_map.end(); it != itEnd; ++it){
+      const std::pair<Vertex_pair,Local_facet>& ef = *it;
+      if(ef.first.first < ef.first.second){
+        Cell_handle fa = new_cells[ef.second.first].h;
+        vertex_pair_facet_map.clear(it);
+        // Although it erases, you can take its reference as the map won't change before we
+        // complete the loop.
+              Vertex_pair v0(ef.first.second, ef.first.first);
+      std::size_t a0 = boost::hash<Vertex_handle>()(v0.first);
+      std::size_t a1 = boost::hash<Vertex_handle>()(v0.second);
+
+      constexpr uint64_t kMul = 11400714819323198485ull;
+
+size_t outA = (a0 ^ kMul * a1) & 1023;
+
+        const auto& p = vertex_pair_facet_map.get_and_erase2(v0, outA);
+        Cell_handle fb = new_cells[p.first].h;
+        fa->set_neighbor(ef.second.second, fb);
+        fb->set_neighbor(p.second, fa);
+      }
+    }
+
+    // No need, as they are deleted and we keep no user data that's needed.
+    //for(Cell_handle c : cells){
+    //  c->tds_data().clear(); // was in conflict
+    //}
+
+    delete_cells(cells.begin(), cells.end());
+
+    vertex_pair_facet_map.clear();
+    return nv;
+}
+#else
+
   template <class Cells, class Facets>
   Vertex_handle _insert_in_small_hole(const Cells& cells, const Facets& facets)
   {
@@ -568,21 +713,25 @@ public:
     };
 
     Cell_handle_union new_cells[maximal_nb_of_facets_of_small_hole];
-    for (unsigned char local_facet_index = 0, end = static_cast<unsigned char>(facets.size());
+    for (unsigned char local_facet_index = 0, end = (unsigned char) (facets.size());
          local_facet_index < end; ++local_facet_index) {
-      const Facet f = mirror_facet(facets[local_facet_index]);
-      f.first->tds_data().clear(); // was on boundary
-      const Vertex_handle u = f.first->vertex(vertex_triple_index(f.second, 0));
-      const Vertex_handle v = f.first->vertex(vertex_triple_index(f.second, 1));
-      const Vertex_handle w = f.first->vertex(vertex_triple_index(f.second, 2));
-      u->set_cell(f.first);
-      v->set_cell(f.first);
-      w->set_cell(f.first);
+      const Facet& f = facets[local_facet_index]; // mirror_facet(facets[local_facet_index]);
+      Cell_handle c = f.first;
+      c->tds_data().clear(); // was on boundary
+
+      auto indices = getFacetVertexIndices(f.second);
+
+      const Vertex_handle u = c->vertex(indices.i0);
+      const Vertex_handle v = c->vertex(indices.i1);
+      const Vertex_handle w = c->vertex(indices.i2);
       const Cell_handle nc = create_cell(v, u, w, nv);
+      u->set_cell(nc);
+      v->set_cell(nc);
+      w->set_cell(nc);
       new_cells[local_facet_index].h = nc;
       nv->set_cell(nc);
       nc->set_neighbor(3, f.first);
-      f.first->set_neighbor(f.second, nc);
+      c->set_neighbor(f.second, nc);
 
       vertex_pair_facet_map.set({u, v}, {local_facet_index,
                                          static_cast<unsigned char>(nc->index(w))});
@@ -592,25 +741,28 @@ public:
                                          static_cast<unsigned char>(nc->index(v))});
     }
 
-    for(auto it = vertex_pair_facet_map.begin(); it != vertex_pair_facet_map.end(); ++it){
+    for(auto it = vertex_pair_facet_map.begin(), itEnd = vertex_pair_facet_map.end(); it != itEnd; ++it){
       const std::pair<Vertex_pair,Local_facet>& ef = *it;
       if(ef.first.first < ef.first.second){
-        const Facet f = Facet{new_cells[ef.second.first].h, ef.second.second};
+        Cell_handle fa = new_cells[ef.second.first].h;
         vertex_pair_facet_map.clear(it);
-        const auto p = vertex_pair_facet_map.get_and_erase(std::make_pair(ef.first.second, ef.first.first));
-        const Facet n = Facet{new_cells[p.first].h, p.second};
-        f.first->set_neighbor(f.second, n.first);
-        n.first->set_neighbor(n.second, f.first);
+        const auto p = vertex_pair_facet_map.get_and_erase({ ef.first.second, ef.first.first });
+        Cell_handle fb = new_cells[p.first].h;
+        fa->set_neighbor(ef.second.second, fb);
+        fb->set_neighbor(p.second, fa);
       }
     }
-    for(Cell_handle c : cells){
-      c->tds_data().clear(); // was in conflict
-    }
+
+    //for(Cell_handle c : cells){
+    //  c->tds_data().clear(); // was in conflict
+    //}
+
     delete_cells(cells.begin(), cells.end());
+
     vertex_pair_facet_map.clear();
     return nv;
   }
-
+#endif
 
   //INSERTION
 
@@ -662,8 +814,8 @@ public:
 
   Cell_iterator cells_begin() const
   {
-    if ( dimension() < 3 )
-        return cells_end();
+    if (dimension() < 3)
+      return cells_end();
     return cells().begin();
   }
 
@@ -807,7 +959,7 @@ public:
   // around a vertex
 private:
 
-  union Cell_handle_union
+ union Cell_handle_union
   {
       Cell_handle_union() {}
       Cell_handle h;
@@ -848,6 +1000,53 @@ private:
     int mCapacity;
   };
 
+#if 1
+  template <class IncidentCellIterator>
+  void
+  incident_cells_3(Vertex_handle v, Cell_handle d, IncidentCellIterator it) const
+  {
+    CGAL_triangulation_precondition(dimension() == 3);
+
+    HybridArray<Cell_handle_union, 8192> cell_stack;
+    Cell_handle_union* __restrict pCell_stack = cell_stack.mData;
+    pCell_stack->h = d;
+    ++pCell_stack;
+    d->tds_data().mark_in_conflict();
+    *it++ = d;
+    int balance = 0;
+    do {
+      Cell_handle_union c = *--pCell_stack;
+
+      #define TRY_NEIGHBOR(i) do { \
+        if (c.h->vertex(i) != v) { \
+          Cell_handle next = c.h->neighbor(i); \
+          if (next->tds_data().is_clear()) { \
+            pCell_stack->h = next; \
+            ++pCell_stack; \
+            next->tds_data().mark_in_conflict(); \
+            *it++ = next; \
+          } \
+        } \
+      } while (0)
+
+      TRY_NEIGHBOR(0);
+      TRY_NEIGHBOR(1);
+      TRY_NEIGHBOR(2);
+      TRY_NEIGHBOR(3);
+
+      #undef TRY_NEIGHBOR
+
+      if (!(++balance & 0xFF)) {
+        size_t cnt = pCell_stack - cell_stack.mStart;
+        if (cnt >= (cell_stack.mCapacity * 7)/10) {
+          cell_stack.resize(cnt, cell_stack.mCapacity*2);
+        }
+      }
+
+    } while(cell_stack.mStart != pCell_stack);
+  }
+
+#else
   template <class IncidentCellIterator>
   void
   incident_cells_3(Vertex_handle v, Cell_handle d, IncidentCellIterator it) const
@@ -884,6 +1083,7 @@ private:
 
         } while(cell_stack.mStart != pCell_stack);
   }
+#endif
 
   template <class IncidentFacetIterator>
   void
@@ -1186,10 +1386,9 @@ public:
   OutputIterator
   incident_cells(Vertex_handle v, OutputIterator cells) const
   {
-    return incident_cells<False_filter>(v, cells);
+    return incident_cells<false, False_filter>(v, cells);
   }
-
-#if 0
+  
   // This version only works for vectors and only in 3D
   void incident_cells_3(Vertex_handle v,
                         std::vector<Cell_handle>& cells) const
@@ -1203,7 +1402,6 @@ public:
       (*cit)->tds_data().clear();
     }
   }
-#endif
 
   template <class Filter, class OutputIterator>
   OutputIterator
@@ -1490,8 +1688,8 @@ public:
     return visit.result();
   }
 
-#if 0 // Unused
-  template <bool Dim3OrMore = false, class Visitor, class OutputIterator, class Filter>
+  #if 0 // Unused
+template <class Visitor, class OutputIterator, class Filter>
   OutputIterator
   visit_incident_cells(Vertex_handle v, OutputIterator output,
                        std::vector<Cell_handle> &cells, Filter f) const
@@ -1499,12 +1697,12 @@ public:
     CGAL_triangulation_precondition( v != Vertex_handle() );
     CGAL_triangulation_expensive_precondition( is_vertex(v) );
 
-    if ( !Dim3OrMore && dimension() < 2 )
+    if ( dimension() < 2 )
     return output;
 
     Visitor visit(v, output, this, f);
 
-    if ( !Dim3OrMore && dimension() == 3 )
+    if ( dimension() == 3 )
     incident_cells_3(v, v->cell(), std::make_pair(std::back_inserter(cells), visit.facet_it()));
     else
     incident_cells_2(v, v->cell(), std::back_inserter(cells));
@@ -1519,7 +1717,7 @@ public:
     }
     return visit.result();
   }
-#endif
+  #endif
 
   template <class Visitor, class OutputIterator, class Filter>
   OutputIterator
@@ -1534,6 +1732,7 @@ public:
     Visitor visit(v, output, this, f);
 
     std::small_vector<Cell_handle, 64> tmp_cells;
+
 
     if ( dimension() == 3 )
       just_incident_cells_3(v, tmp_cells);
@@ -1885,7 +2084,7 @@ non_recursive_create_star_3(Vertex_handle v, Cell_handle c, int li, int prev_ind
     Cell_handle c_li = c->neighbor(li);
     set_adjacency(cnew, li, c_li, c_li->index(c));
 
-    typedef boost::container::small_vector<iAdjacency_info,512> SV;
+    typedef boost::container::small_vector<iAdjacency_info,8192> SV;
     SV sv;
     std::stack<iAdjacency_info, SV> adjacency_info_stack(sv);
 
@@ -3188,8 +3387,7 @@ insert_increase_dimension(Vertex_handle star)
     {
       // used to store the new cells, in order to be able to traverse only
       // them to find the missing neighbors.
-      std::vector<Cell_handle > new_cells;
-      new_cells.reserve(16);
+      boost::container::small_vector<Cell_handle , 512> new_cells;
 
       Cell_iterator it = cells_begin();
       // allowed since the dimension has already been set to 3
@@ -3216,7 +3414,7 @@ insert_increase_dimension(Vertex_handle star)
       }
 
       // traversal of the new cells only, to add missing neighbors
-      for(typename std::vector<Cell_handle>::iterator ncit = new_cells.begin();
+      for(auto ncit = new_cells.begin();
            ncit != new_cells.end(); ++ncit) {
         Cell_handle n = (*ncit)->neighbor(3); // opposite to star
         for ( int i=0; i<3; i++ ) {

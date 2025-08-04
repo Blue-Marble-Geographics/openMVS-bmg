@@ -67,6 +67,22 @@ struct Construct_array
   }
 };
 
+#if 1
+template <typename T, std::size_t... Is, typename... Args>
+constexpr std::array<T, sizeof...(Is)>
+make_filled_array_aux(std::index_sequence<Is...>, Args&&... args)
+{
+  return { (static_cast<void>(Is), T(std::forward<Args>(args)...))... };
+}
+
+template <std::size_t N, typename T, typename... Args>
+constexpr std::array<T, N> make_filled_array(Args&&... args)
+{
+  return make_filled_array_aux<T>(
+    std::make_index_sequence<N>{}, std::forward<Args>(args)...);
+}
+#else
+
 template <std::size_t...Is, typename T>
 constexpr std::array<T, sizeof...(Is)>
 make_filled_array_aux(const T& value, std::index_sequence<Is...>)
@@ -79,6 +95,7 @@ constexpr std::array<T, N> make_filled_array(const T& value)
 {
   return make_filled_array_aux(value, std::make_index_sequence<N>());
 }
+#endif
 
 } //namespace CGAL
 

@@ -64,6 +64,11 @@ public:
 
   // ACCESS FUNCTIONS
 
+  const Vertex_handle* raw_vertices() const
+  {
+    return V;
+  }
+
   Vertex_handle vertex(int i) const
   {
     CGAL_triangulation_precondition( i >= 0 && i <= 3 );

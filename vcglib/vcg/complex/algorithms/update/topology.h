@@ -254,7 +254,7 @@ static void FillEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includ
 static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true, bool computeBorderFlag=false)
 {
     FillEdgeVector(m,edgeVec,includeFauxEdge);
-    sort(std::execution::par,edgeVec.begin(),edgeVec.end()); // oredering by vertex
+    sort(std::execution::par_unseq,edgeVec.begin(),edgeVec.end()); // oredering by vertex
 
     if (computeBorderFlag) {
         for (size_t i=0; i<edgeVec.size(); i++)
@@ -265,7 +265,7 @@ static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool 
         }
     }
 
-    typename std::vector< PEdge>::iterator newEnd = std::unique(std::execution::par,edgeVec.begin(),edgeVec.end());
+    typename std::vector< PEdge>::iterator newEnd = std::unique(std::execution::par_unseq,edgeVec.begin(),edgeVec.end());
 
     edgeVec.resize(newEnd-edgeVec.begin()); // redundant! remove?
 }
@@ -454,7 +454,7 @@ static void FaceFace(MeshType &m)
 
   std::vector<PEdge> e;
   FillEdgeVector(m,e);
-  sort(std::execution::par, e.begin(), e.end());							// Lo ordino per vertici
+  sort(std::execution::par_unseq, e.begin(), e.end());							// Lo ordino per vertici
 
   int ne = 0;											// Numero di edge reali
 

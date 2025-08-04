@@ -170,6 +170,7 @@ public:
   using Tr_Base::construct_segment;
   using Tr_Base::incident_facets;
   using Tr_Base::insert_in_conflict;
+  using Tr_Base::insert_in_conflict2;
   using Tr_Base::is_infinite;
   using Tr_Base::is_valid_finite;
   using Tr_Base::locate;
@@ -505,14 +506,20 @@ public:
   }
 #endif //CGAL_TRIANGULATION_3_DONT_INSERT_RANGE_OF_POINTS_WITH_INFO
 
-  Vertex_handle insert(const Point& p, Vertex_handle hint)
+  Vertex_handle insert(const Point& p, Vertex_handle hint, bool *could_lock_zone = nullptr)
   {
-    return insert(p, hint == Vertex_handle() ? this->infinite_cell() : hint->cell());
+    return insert(p, hint == Vertex_handle() ? this->infinite_cell() : hint->cell(),
+                  could_lock_zone);
   }
 
-  Vertex_handle insert(const Point& p, Cell_handle start = Cell_handle());
+  Vertex_handle insert(const Point& p, Cell_handle start = Cell_handle(),
+                       bool *could_lock_zone = nullptr);
 
   Vertex_handle insert(const Point& p, Locate_type lt,
+                       Cell_handle c, int li, int,
+                       bool *could_lock_zone = nullptr);
+
+  Vertex_handle insert2(const Point& p, Locate_type lt,
                        Cell_handle c, int li, int);
 
 public: // internal methods
@@ -542,7 +549,8 @@ public:
   find_conflicts(const Point& p, Cell_handle c,
                  OutputIteratorBoundaryFacets bfit,
                  OutputIteratorCells cit,
-                 OutputIteratorInternalFacets ifit) const
+                 OutputIteratorInternalFacets ifit,
+                 bool *could_lock_zone = nullptr) const
   {
     CGAL_triangulation_precondition(dimension() >= 2);
 
@@ -557,7 +565,7 @@ public:
       ifit = Tr_Base::find_conflicts(c, tester,
                                      make_triple(std::back_inserter(facets),
                                                  std::back_inserter(cells),
-                                                 ifit)).third;
+                                                 ifit), could_lock_zone).third;
     }
     else
     {
@@ -565,7 +573,7 @@ public:
       ifit = Tr_Base::find_conflicts(c, tester,
                                      make_triple(std::back_inserter(facets),
                                                  std::back_inserter(cells),
-                                                 ifit)).third;
+                                                 ifit), could_lock_zone).third;
     }
 
     // Reset the conflict flag on the boundary.
@@ -590,12 +598,14 @@ public:
   std::pair<OutputIteratorBoundaryFacets, OutputIteratorCells>
   find_conflicts(const Point& p, Cell_handle c,
                  OutputIteratorBoundaryFacets bfit,
-                 OutputIteratorCells cit) const
+                 OutputIteratorCells cit,
+                 bool *could_lock_zone = nullptr) const
   {
       Triple<OutputIteratorBoundaryFacets,
              OutputIteratorCells,
              Emptyset_iterator> t = find_conflicts(p, c, bfit, cit,
-                                                   Emptyset_iterator());
+                                                   Emptyset_iterator(),
+                                                   could_lock_zone);
       return std::make_pair(t.first, t.second);
   }
 
@@ -649,6 +659,9 @@ public:
 
   // REMOVE
   void remove(Vertex_handle v);
+  // Concurrency-safe
+  // See Triangulation_3::remove for more information
+  bool remove(Vertex_handle v, bool *could_lock_zone);
 
   // return new cells (internal)
   template <class OutputItCells>
@@ -743,6 +756,7 @@ public:
   Bounded_side side_of_circle(Cell_handle c, int i, const Point& p, bool perturb = false) const;
 
   Vertex_handle nearest_vertex_in_cell(const Point& p, Cell_handle c) const;
+  Vertex_handle nearest_vertex_in_cell3(const Point& p, Cell_handle c) const;
   Vertex_handle nearest_vertex(const Point& p, Cell_handle c = Cell_handle()) const;
 
   bool is_Gabriel(Cell_handle c, int i) const;
@@ -895,9 +909,25 @@ protected:
         {
           if(m_dt.try_lock_vertex(hint) && m_dt.try_lock_point(m_points[i_point]))
           {
-            Vertex_handle new_hint = m_dt.insert(m_points[i_point], hint);
+            bool could_lock_zone;
+            Vertex_handle new_hint = m_dt.insert(m_points[i_point], hint, &could_lock_zone);
 
             m_dt.unlock_all_elements();
+
+            if(could_lock_zone)
+            {
+              hint = new_hint;
+              success = true;
+#ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
+              ++bcounter;
+#endif
+            }
+#ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
+            else
+            {
+              bcounter.increment_branch_1(); // THIS is a late withdrawal!
+            }
+#endif
           }
           else
           {
@@ -956,9 +986,26 @@ protected:
         {
           if(m_dt.try_lock_vertex(hint) && m_dt.try_lock_point(p))
           {
-            Vertex_handle new_hint = m_dt.insert(p, hint);
+            bool could_lock_zone;
+            Vertex_handle new_hint = m_dt.insert(p, hint, &could_lock_zone);
 
             m_dt.unlock_all_elements();
+
+            if(could_lock_zone)
+            {
+              hint = new_hint;
+              if(hint!=Vertex_handle()) hint->info()=m_infos[i_point];
+              success = true;
+#ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
+              ++bcounter;
+#endif
+            }
+#ifdef CGAL_CONCURRENT_TRIANGULATION_3_PROFILING
+            else
+            {
+              bcounter.increment_branch_1(); // THIS is a late withdrawal!
+            }
+#endif
           }
           else
           {
@@ -1000,6 +1047,16 @@ protected:
       for(size_t i_vertex = r.begin() ; i_vertex != r.end() ; ++i_vertex)
       {
         Vertex_handle v = m_vertices[i_vertex];
+        bool could_lock_zone, needs_to_be_done_sequentially;
+        do
+        {
+          needs_to_be_done_sequentially =
+            !m_dt.remove(v, &could_lock_zone);
+          m_dt.unlock_all_elements();
+        }
+        while(!could_lock_zone);
+
+        if(needs_to_be_done_sequentially)
           m_vertices_to_remove_sequentially.push_back(v);
       }
     }
@@ -1021,21 +1078,32 @@ protected:
 template < class Gt, class Tds, class Lds >
 typename Delaunay_triangulation_3<Gt,Tds,Default,Lds>::Vertex_handle
 Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
-insert(const Point& p, Cell_handle start)
+insert(const Point& p, Cell_handle start, bool *could_lock_zone)
 {
   Locate_type lt;
   int li, lj;
 
+  // Parallel
+  if(could_lock_zone)
+  {
+    Cell_handle c = locate(p, lt, li, lj, start, could_lock_zone);
+    if(*could_lock_zone)
+      return insert(p, lt, c, li, lj, could_lock_zone);
+    else
+      return Vertex_handle();
+  }
   // Sequential
+  else
+  {
     Cell_handle c = locate(p, lt, li, lj, start);
     return insert(p, lt, c, li, lj);
 }
+}
 
-// JPB Zoning support largely removed for P2P.
 template < class Gt, class Tds, class Lds >
 typename Delaunay_triangulation_3<Gt,Tds,Default,Lds>::Vertex_handle
 Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
-insert(const Point& p, Locate_type lt, Cell_handle c, int li, int lj)
+insert(const Point& p, Locate_type lt, Cell_handle c, int li, int lj, bool *could_lock_zone)
 {
   switch(dimension())
   {
@@ -1043,20 +1111,29 @@ insert(const Point& p, Locate_type lt, Cell_handle c, int li, int lj)
     {
       Conflict_tester_3 tester(p, this);
       Vertex_handle v = insert_in_conflict(p, lt, c, li, lj,
-                                           tester, hidden_point_visitor);
+                                           tester, hidden_point_visitor, could_lock_zone);
       return v;
     }// dim 3
     case 2:
     {
       Conflict_tester_2 tester(p, this);
       return insert_in_conflict(p, lt, c, li, lj,
-                                tester, hidden_point_visitor);
+                                tester, hidden_point_visitor, could_lock_zone);
     }//dim 2
     default :
       // dimension <= 1
       // Do not use the generic insert.
       return Tr_Base::insert(p, c);
   }
+}
+
+template < class Gt, class Tds, class Lds >
+typename Delaunay_triangulation_3<Gt,Tds,Default,Lds>::Vertex_handle
+Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
+insert2(const Point& p, Locate_type lt, Cell_handle c, int li, int lj)
+{
+  Conflict_tester_3 tester(p, this);
+  return insert_in_conflict2(p, lt, c, li, lj, tester, hidden_point_visitor);
 }
 
 template < class Gt, class Tds, class Lds >
@@ -1239,6 +1316,19 @@ remove(Vertex_handle v)
   Tr_Base::remove(v, remover);
 
   CGAL_triangulation_expensive_postcondition(is_valid());
+}
+
+template < class Gt, class Tds, class Lds >
+bool
+Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
+remove(Vertex_handle v, bool *could_lock_zone)
+{
+  Self tmp;
+  Vertex_remover<Self> remover(tmp);
+  bool ret = Tr_Base::remove(v, remover, could_lock_zone);
+
+  CGAL_triangulation_expensive_postcondition(is_valid());
+  return ret;
 }
 
 template < class Gt, class Tds, class Lds >
@@ -1549,6 +1639,66 @@ nearest_vertex_in_cell(const Point& p, Cell_handle c) const
       nearest = nearest_vertex(p, nearest, c->vertex(3));
   }
   return nearest;
+}
+
+#include "P2PUtils.h"
+
+template < class Gt, class Tds, class Lds >
+typename Delaunay_triangulation_3<Gt,Tds,Default,Lds>::Vertex_handle
+Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
+nearest_vertex_in_cell3(const Point& p, Cell_handle c) const
+{
+// Returns the finite vertex of the cell c which is the closest to p.
+  CGAL_triangulation_precondition(dimension() >= 0);
+
+#if 1
+  const double px = p.x(), py = p.y(), pz = p.z();
+  const __m128d vPx = _mm_set1_pd(px);
+  const __m128d vPy = _mm_set1_pd(py);
+  const __m128d vPz = _mm_set1_pd(pz);
+
+  const Vertex_handle v[4] = {
+    c->vertex(0), c->vertex(1), c->vertex(2), c->vertex(3)
+  };
+
+  alignas(16) double vx[4], vy[4], vz[4];
+  for (int i = 0; i < 4; ++i) {
+    const auto& q = v[i]->point();
+    vx[i] = q.x(); vy[i] = q.y(); vz[i] = q.z();
+  }
+
+  __m128d dx01 = _mm_sub_pd(_mm_loadu_pd(&vx[0]), vPx);
+  __m128d dy01 = _mm_sub_pd(_mm_loadu_pd(&vy[0]), vPy);
+  __m128d dz01 = _mm_sub_pd(_mm_loadu_pd(&vz[0]), vPz);
+  __m128d d2_01 = _mm_add_pd(_mm_add_pd(_mm_mul_pd(dx01, dx01), _mm_mul_pd(dy01, dy01)), _mm_mul_pd(dz01, dz01));
+
+  __m128d dx23 = _mm_sub_pd(_mm_loadu_pd(&vx[2]), vPx);
+  __m128d dy23 = _mm_sub_pd(_mm_loadu_pd(&vy[2]), vPy);
+  __m128d dz23 = _mm_sub_pd(_mm_loadu_pd(&vz[2]), vPz);
+  __m128d d2_23 = _mm_add_pd(_mm_add_pd(_mm_mul_pd(dx23, dx23), _mm_mul_pd(dy23, dy23)), _mm_mul_pd(dz23, dz23));
+
+  // Compare d0 vs d1
+  int idx01 = _mm_movemask_pd(_mm_cmplt_pd(_mm_shuffle_pd(d2_01, d2_01, 0x1), d2_01)) & 1;
+
+  // Compare d2 vs d3
+  int idx23 = (_mm_movemask_pd(_mm_cmplt_pd(_mm_shuffle_pd(d2_23, d2_23, 0x1), d2_23)) & 1) + 2;
+
+  // Store scalar comparisons only for final 2 candidates
+  alignas(16) double d01[2], d23[2];
+  _mm_storeu_pd(d01, d2_01);
+  _mm_storeu_pd(d23, d2_23);
+
+  const double best01 = d01[idx01];
+  const double best23 = d23[idx23 - 2];
+  const int minIdx = (best23 < best01) ? idx23 : idx01;
+
+  return v[minIdx];
+#else
+  Vertex_handle nearest = nearest_vertex(p, c->vertex(0), c->vertex(1));
+  nearest = nearest_vertex(p, nearest, c->vertex(2));
+  nearest = nearest_vertex(p, nearest, c->vertex(3));
+  return nearest;
+#endif
 }
 
 template < class Gt, class Tds, class Lds >

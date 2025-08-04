@@ -24,16 +24,17 @@ class Small_unordered_map{
 #ifdef    CGAL_SMALL_UNORDERED_MAP_STATS
   std::array<int,20> collisions = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 #endif
+public:
   int head = -2;
-  mutable std::array<int, M>    occupied;
-  std::array<int, M>            unfreelist;
+  mutable std::array<uint8_t,M>    occupied;
+  std::array<int16_t, M>            unfreelist;
   std::array<std::pair<K,T>, M> data;
   const H hash = {};
 
 public:
   Small_unordered_map()
   {
-    occupied.fill(-1);
+    occupied.fill(0); // fill(0); // -1);
   }
 
 #ifdef CGAL_SMALL_UNORDERED_MAP_STATS
@@ -60,7 +61,37 @@ public:
     int collision = 0;
 #endif
     do {
-      if(occupied[i]== -1){
+      if(!occupied[i]){
+        occupied[i] = 1;
+        data[i].first = k;
+        data[i].second = t;
+        unfreelist[i] = head;
+        head = i;
+#ifdef  CGAL_SMALL_UNORDERED_MAP_STATS
+        if(collision>19){
+          std::cerr << collision << " collisions" << std::endl;
+        }else{
+          ++collisions[collision];
+        }
+#endif
+        return;
+      }
+      i = (i+1)%M;
+#ifdef CGAL_SMALL_UNORDERED_MAP_STATS
+      ++collision;
+#endif
+    }while(i != h);
+    CGAL_error();
+  }
+
+  __forceinline void set2(const K& k, const T& t, unsigned int h)
+  {
+    unsigned i = h;
+#ifdef CGAL_SMALL_UNORDERED_MAP_STATS
+    int collision = 0;
+#endif
+    do {
+      if(!occupied[i]){
         occupied[i] = 1;
         data[i].first = k;
         data[i].second = t;
@@ -89,8 +120,21 @@ public:
     unsigned int h  = hash(k)%M;
     unsigned int i = h;
     do{
-      if((occupied[i] == 1) && (data[i].first == k)){
-        occupied[i] = -1;
+      if((occupied[i]) && (data[i].first == k)){
+        occupied[i] = 0;
+        return data[i].second;
+      }
+      i = (i+1)%M;
+    }while(i != h);
+    CGAL_error();
+  }
+
+  __forceinline const T& get_and_erase2(const K& k, unsigned int h) const
+  {
+    unsigned int i = h;
+    do{
+      if((occupied[i]) && (data[i].first == k)){
+        occupied[i] = 0;
         return data[i].second;
       }
       i = (i+1)%M;
@@ -149,7 +193,7 @@ public:
 
   void clear(const iterator it)
   {
-    occupied[it.pos] = -1;
+    occupied[it.pos] = 0; // -1;
   }
 
   friend struct iterator;

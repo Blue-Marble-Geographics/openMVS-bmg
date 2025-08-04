@@ -211,6 +211,8 @@ public:
     QParameter *pp=(QParameter *)_pp;    
     pp->CosineThr=cos(pp->NormalThrRad);
     h_ret.clear();
+    h_ret.reserve(m.vn*2);
+
     vcg::tri::UpdateTopology<TriMeshType>::VertexFace(m);
     vcg::tri::UpdateFlags<TriMeshType>::FaceBorderFromVF(m);
     

@@ -87,7 +87,7 @@
 namespace CGAL {
 
 #define CGAL_INIT_COMPACT_CONTAINER_BLOCK_SIZE 14
-#define CGAL_INCREMENT_COMPACT_CONTAINER_BLOCK_SIZE 16
+#define CGAL_INCREMENT_COMPACT_CONTAINER_BLOCK_SIZE 16 // better for single threaded: 4096 //16
 
 template<unsigned int first_block_size_, unsigned int block_size_increment>
 struct Addition_size_policy
@@ -546,49 +546,94 @@ public:
   /** Reserve method to ensure that the capacity of the Compact_container be
    * greater or equal than a given value n.
    */
+  template <typename T>
+  struct NoInitAllocator {
+    using value_type = T;
+    NoInitAllocator() = default;
+
+    template <class U>
+    constexpr NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+
+    T* allocate(std::size_t n) {
+      return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+
+    void deallocate(T* p, std::size_t) noexcept {
+      ::operator delete(p);
+    }
+  };
+
   void reserve(size_type n)
   {
     if ( capacity_>=n ) return;
 
-    size_type lastblock = all_items.size();
+    const size_type lastblock = all_items.size();
 
-    while ( capacity_<n )
-    { // Pb because the order of free list is no more the order of
-      // allocate_new_block();
+    // === STEP 1–2: Grow blocks (single-threaded) ===
+    while (capacity_ < n) {
       pointer new_block = alloc.allocate(block_size + 2);
       all_items.push_back(std::make_pair(new_block, block_size + 2));
       capacity_ += block_size;
-      // We insert this new block at the end.
-      if (last_item == nullptr) // First time
-      {
+
+      if (last_item == nullptr) {
         first_item = new_block;
         last_item  = new_block + block_size + 1;
         set_type(first_item, nullptr, START_END);
-      }
-      else
-      {
+      } else {
         set_type(last_item, new_block, BLOCK_BOUNDARY);
         set_type(new_block, last_item, BLOCK_BOUNDARY);
         last_item = new_block + block_size + 1;
       }
+
       set_type(last_item, nullptr, START_END);
-      // Increase the block_size for the next time.
       Increment_policy::increase_size(*this);
     }
 
-    // Now we put all the new elements on freelist, starting from the last block
-    // inserted and mark them free in reverse order, so that the insertion order
-    // will correspond to the iterator order...
-    // We don't touch the first and the last one.
-    size_type curblock=all_items.size();
-    do
-    {
-      --curblock; // We are sure we have at least create a new block
-      pointer new_block = all_items[curblock].first;
-      for (size_type i = all_items[curblock].second-2; i >= 1; --i)
-        put_on_free_list(new_block + i);
+    const size_type firstNew = lastblock;
+    const size_type lastNew = all_items.size();
+    const size_type numNewBlocks = lastNew - firstNew;
+
+    if (numNewBlocks == 0)
+      return;
+
+    // === STEP 3: Parallel freelist construction ===
+    std::vector<pointer, NoInitAllocator<pointer>> localHeads(numNewBlocks);
+    std::vector<pointer, NoInitAllocator<pointer>> localTails(numNewBlocks);
+
+#pragma omp parallel for schedule(static)
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)numNewBlocks; ++i) {
+      pointer newBlock = all_items[firstNew + i].first;
+      const size_type sz = all_items[firstNew + i].second;
+
+      pointer start = newBlock + 1;
+      pointer end   = newBlock + (sz - 1);
+
+      pointer it = start;
+      const ptrdiff_t count = end - 1 - start;
+
+      for (ptrdiff_t j = 0; j + 4 <= count; j += 4) {
+        it->for_compact_container(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>((it + 1)->for_compact_container()) & ~3ull) | 2ull));
+        (it+1)->for_compact_container(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>((it + 2)->for_compact_container()) & ~3ull) | 2ull));
+        (it+2)->for_compact_container(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>((it + 3)->for_compact_container()) & ~3ull) | 2ull));
+        (it+3)->for_compact_container(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>((it + 4)->for_compact_container()) & ~3ull) | 2ull));
+   //     *(it+1) = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(it + 2) & ~3ull) | 2ull);
+     //   *(it+2) = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(it + 3) & ~3ull) | 2ull);
+       // *(it+3) = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(it + 4) & ~3ull) | 2ull);
+        it += 4;
+      }
+
+      while (it < end - 1) {
+        it->for_compact_container(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>((it + 1)->for_compact_container()) & ~3ull) | 2ull));
+        ++it;
+      }
+
+      set_type(end - 1, nullptr, FREE); // Final terminator
+      //*(end - 1)->for_compact_container(reinterpret_cast<void*>(2ull));
+      // *(end - 1) = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(nullptr) & ~3ull) | 2ull);
+
+      localHeads[i] = start;
+      localTails[i] = end - 1;
     }
-    while ( curblock>lastblock );
   }
 
 private:
