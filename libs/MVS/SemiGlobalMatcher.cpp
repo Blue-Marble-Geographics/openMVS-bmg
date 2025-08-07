@@ -924,7 +924,9 @@ void SemiGlobalMatcher::Match(const ViewData& leftImage, const ViewData& rightIm
 		};
 		const ImageRef u(c+halfWindowSizeX,r+halfWindowSizeY);
 		// initialize pixel patch weights
+#if 0 // JPB WIP BUG Precision
 		WeightedPatch w;
+#endif
 		WeightedPatchInfo wpi;
 		wpi.normSq0 = 0;
 		float sumWeights = 0.f;

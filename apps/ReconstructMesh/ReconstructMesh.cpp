@@ -319,7 +319,7 @@ bool Export3DProjections(Scene& scene, const String& inputFileName) {
 	const Mesh::Octree octree(scene.mesh.vertices, [](Mesh::Octree::IDX_TYPE size, Mesh::Octree::Type /*radius*/) {
 		return size > 256;
 	});
-	scene.mesh.ListIncidentFaces();
+	scene.mesh.ListIncidenteFaces();
 
 	// save 3D coord in the output file
 	const Image& imgToExport = scene.images[imgID];

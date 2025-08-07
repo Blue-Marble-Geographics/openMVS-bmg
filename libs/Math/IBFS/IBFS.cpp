@@ -133,15 +133,6 @@ void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
     if (x->excess) break;
 
     a = x->parent;
-    if (!a || !a->head) {
-      fprintf(stderr, "ERROR: augmentTree - node %ld has invalid parent\n", x - nodes);
-      break;
-	}
-
-    if (++hopCount > numNodes) {
-      fprintf(stderr, "ERROR: augmentTree - exceeded max hops, likely cycle\n");
-      break;
-				}
 
 		if (sTree) {
 			a->rCap += bottleneck;

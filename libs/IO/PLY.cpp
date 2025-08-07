@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////
 // PLY.cpp
 //
-// Copyright 2023 cDc@seacave
+// Copyright 2007 cDc@seacave
 // Distributed under the Boost Software License, Version 1.0
 // (See http://www.boost.org/LICENSE_1_0.txt)
 
@@ -65,8 +65,9 @@ Exit:
 
 PLY::PLY()
 	:
+	mfp(NULL), f(NULL), ostream(NULL),
 	which_elem(NULL), other_elems(NULL), current_rules(NULL), rule_list(NULL),
-	istream(NULL), mfp(NULL), write_type_names(type_names)
+	write_type_names(type_names)
 {
 }
 
@@ -82,28 +83,17 @@ Free the memory used by a PLY file.
 
 void PLY::release()
 {
+	flush();
 	if (mfp) {
 		delete mfp;
 		mfp = NULL;
-		ostream = NULL;
-	} else
-	if (istream) {
-		if (static_cast<Stream*>(istream)->getInputStream(ISTREAM::LAYER_ID_IN)) {
-			IOSTREAM* const iostream(static_cast<Stream*>(istream)->getIOStream(ISTREAM::LAYER_ID_IN, OSTREAM::LAYER_ID_OUT));
-			if (iostream)
-				delete iostream;
-			else
-				delete istream;
-		} else {
-			ASSERT(static_cast<Stream*>(ostream)->getOutputStream(OSTREAM::LAYER_ID_OUT));
-			IOSTREAM* const iostream(static_cast<Stream*>(ostream)->getIOStream(ISTREAM::LAYER_ID_IN, OSTREAM::LAYER_ID_OUT));
-			if (iostream)
-				delete iostream;
-			else
+	}
+	f = NULL;
+	if (!filename.empty()) {
+		filename.clear();
 				delete ostream;
 		}
-		istream = NULL;
-	}
+	ostream = NULL;
 	if (!elems.empty()) {
 		for (size_t i=0; i<elems.size(); ++i) {
 			PlyElement* elem = elems[i];
@@ -117,13 +107,13 @@ void PLY::release()
 		}
 		elems.clear();
 	}
-	if (other_elems) {
+	if (other_elems != NULL) {
 		for (size_t i=0; i<other_elems->other_list.size(); ++i) {
 			OtherElem& elem = other_elems->other_list[i];
 			delete[] elem.other_data;
 			delete elem.other_props;
 		}
-		delete other_elems; other_elems = NULL;
+		delete other_elems;
 	}
 	comments.clear();
 	obj_info.clear();
@@ -141,61 +131,46 @@ void PLY::release()
 Given a file pointer, get ready to write PLY data to the file.
 
 Entry:
-fp         - the given file pointer
+f          - the given file pointer
 nelems     - number of elements in object
 elem_names - list of element names
 file_type  - file type, either ascii or binary
-memBufferSize - memory file initial size (useful if the ply size is unknown)
 
 Exit:
 returns a pointer to a PlyFile, used to refer to this file, or NULL if error
 ******************************************************************************/
 
-bool PLY::write(LPCSTR _filename, int nelems, LPCSTR* elem_names, int _file_type, size_t memBufferSize)
+bool PLY::write(LPCSTR filename, int nelems, LPCSTR* elem_names, int file_type, size_t bufferSize)
 {
-	filename = _filename;
-	if (memBufferSize == 0) {
-		// create output file now
-		File* const pf(new File(filename.c_str(), File::WRITE, File::CREATE | File::TRUNCATE));
-		if (!pf->isOpen())
-			return false;
-		return write(new BufferedOutputStream<true>(pf, 64*1024), nelems, elem_names, _file_type, memBufferSize);
-	}
-	return write((OSTREAM*)NULL, nelems, elem_names, _file_type, memBufferSize);
+	this->filename = filename;
+	return write(ostream, nelems, elem_names, file_type, bufferSize);
 }
 
-bool PLY::write(OSTREAM* fp, int nelems, LPCSTR* elem_names, int _file_type, size_t memBufferSize)
+bool PLY::write(OSTREAM* f, int nelems, LPCSTR* elem_names, int file_type, size_t bufferSize)
 {
-	// create a record for this object 
-	file_type = _file_type;
-	version = 1.0;
-	other_elems = NULL;
+	/* create a record for this object */
+	this->file_type = file_type;
+	this->version = 1.0;
+	this->ostream = f;
+	this->other_elems = NULL;
 
-	if (memBufferSize > 0) {
-		// write ply into a memory buffer, and save it to disk at the end;
-		// useful in case the number of ply elements is not know from the start
-		// in order to avoid an additional file copy operation
-		ASSERT(fp == NULL && !filename.empty());
-		mfp = new MemFile(memBufferSize);
-		ostream = mfp;
+	/* init buffer if requested */
+	if (bufferSize > 0) {
+		mfp = new MemFile(bufferSize);
+		this->f = mfp;
 	} else {
-		// directly write ply data to disk;
-		// in case the number of ply elements is unknown from the start,
-		// they are written into a temporary file and the header is written
-		// at the end using a file copy operation
-		ASSERT(fp != NULL);
-		ostream = fp;
-		mfp = NULL;
+		this->f = f;
 	}
 
-	// tuck aside the names of the elements 
-	elems.resize(nelems);
+	/* tuck aside the names of the elements */
+	this->elems.resize(nelems);
 	for (int i = 0; i < nelems; ++i) {
 		PlyElement* elem = new PlyElement;
 		elem->name = elem_names[i];
 		elem->num = 0;
-		elems[i] = elem;
+		this->elems[i] = elem;
 	}
+
 	return true;
 }
 
@@ -218,13 +193,13 @@ void PLY::element_layout(
 	PlyProperty* prop_list
 	)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL)
 		abort_ply("error: element_layout: can't find element '%s'", elem_name);
 	elem->num = nelems;
 
-	// copy the list of properties 
+	/* copy the list of properties */
 	elem->props.resize(nprops);
 	elem->store_prop.resize(nprops);
 
@@ -247,19 +222,19 @@ prop      - the new property
 
 void PLY::describe_property(const char* elem_name, const PlyProperty& prop)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	put_element_setup(elem_name);
 
-	// describe property 
+	/* describe property */
 	describe_property(prop);
 }
 
 void PLY::describe_property(const char* elem_name, int nprops, const PlyProperty* props)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	put_element_setup(elem_name);
 
-	// describe properties 
+	/* describe properties */
 	for (int i=0; i<nprops; ++i)
 		describe_property(props[i]);
 }
@@ -275,7 +250,7 @@ nelems    - number of elements of this type to be written
 
 void PLY::element_count(const char* elem_name, int nelems)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL)
 		abort_ply("error: element_count: can't find element '%s'", elem_name);
@@ -287,36 +262,22 @@ void PLY::element_count(const char* elem_name, int nelems)
 Signal that we've described everything a PLY file's header and that the
 header should be written to the file.
 
-This function can be also called at the end, in which case the file is close,
-the header is written in a new file and the already written content is copied
-from the temporary file.
+If buffered mode used, call this function at the end, when everything
+was written already.
 ******************************************************************************/
 
 bool PLY::header_complete()
 {
-	std::string filenameTmp;
-	if (mfp != NULL) {
-		// ply data was written into a memory buffer,
-		// now write the header to disk and append the data in memory
-		ostream = NULL;
-	} else if (!filename.empty() && ostream->getPos() > 0) {
-		// close this file, rename it, and open a new file to write the header 
-		delete ostream; ostream = NULL;
-		filenameTmp = filename+".tmp";
-		if (!File::renameFile(filename.c_str(), filenameTmp.c_str()))
+	if (!filename.empty()) {
+		ostream = new File(filename.c_str(), File::WRITE, File::CREATE | File::TRUNCATE);
+		if (!((File*)ostream)->isOpen())
 			return false;
-	}
-	if (ostream == NULL) {
-		File* const pf(new File(filename.c_str(), File::WRITE, File::CREATE | File::TRUNCATE));
-		if (!pf->isOpen())
-			return false;
-		ostream = new BufferedOutputStream<true>(pf, 64*1024);
+		ostream = new BufferedOutputStream<true>(ostream, FILE_WRITE_MINBUF_SIZE);
 	}
 
-	// write header 
 	ostream->print("ply\n");
 
-	switch (file_type) {
+	switch (this->file_type) {
 	case ASCII:
 		ostream->print("format ascii 1.0\n");
 		break;
@@ -327,38 +288,39 @@ bool PLY::header_complete()
 		ostream->print("format binary_little_endian 1.0\n");
 		break;
 	default:
-		abort_ply("error: ply_header_complete: bad file type = %d\n", file_type);
+		abort_ply("error: ply_header_complete: bad file type = %d\n", this->file_type);
 	}
 
-	// write out the comments 
-	for (size_t i = 0; i < comments.size(); ++i)
-		ostream->print("comment %s\n", comments[i].c_str());
+	/* write out the comments */
+	for (size_t i = 0; i < this->comments.size(); ++i)
+		ostream->print("comment %s\n", this->comments[i].c_str());
 
-	// write out object information 
-	for (size_t i = 0; i < obj_info.size(); ++i)
-		ostream->print("obj_info %s\n", obj_info[i].c_str());
+	/* write out object information */
+	for (size_t i = 0; i < this->obj_info.size(); ++i)
+		ostream->print("obj_info %s\n", this->obj_info[i].c_str());
 
-	// write out information about each element 
-	for (size_t i = 0; i < elems.size(); ++i) {
-		PlyElement *elem = elems[i];
-		ASSERT(elem->num > 0);
+	/* write out information about each element */
+	for (size_t i = 0; i < this->elems.size(); ++i) {
+		PlyElement *elem = this->elems[i];
 		ostream->print("element %s %d\n", elem->name.c_str(), elem->num);
 
-		// write out each property 
+		/* write out each property */
 		for (size_t j = 0; j < elem->props.size(); ++j) {
 			PlyProperty *prop = elem->props[j];
 			if (prop->is_list == LIST) {
 				ostream->print("property list ");
-				write_scalar_type(prop->count_external);
+				write_scalar_type(ostream, prop->count_external);
 				ostream->print(" ");
-				write_scalar_type(prop->external_type);
+				write_scalar_type(ostream, prop->external_type);
 				ostream->print(" %s\n", prop->name.c_str());
-			} else if (prop->is_list == STRING) {
+			}
+			else if (prop->is_list == STRING) {
 				ostream->print("property string");
 				ostream->print(" %s\n", prop->name.c_str());
-			} else {
+			}
+			else {
 				ostream->print("property ");
-				write_scalar_type(prop->external_type);
+				write_scalar_type(ostream, prop->external_type);
 				ostream->print(" %s\n", prop->name.c_str());
 			}
 		}
@@ -366,26 +328,12 @@ bool PLY::header_complete()
 
 	ostream->print("end_header\n");
 
-	if (mfp != NULL) {
-		// now write the ply data from memory to disk
+	/* write the body also if fully buffered */
+	if (mfp && mfp->getSize() > 0) {
 		ostream->write(mfp->getBuffer(), mfp->getSize());
 		delete mfp; mfp = NULL;
-	} else if (!filenameTmp.empty()) {
-		// append the body of the ply from the temp file, and delete it 
-		File ftmp(filenameTmp.c_str(), File::READ, File::OPEN);
-		if (!ftmp.isOpen())
-			return false;
-		Unsigned8Arr buffer(256 * 1024);
-		size_t len;
-		while ((len = ftmp.read(buffer.data(), buffer.size())) > 0)
-			ostream->write(buffer.data(), len);
-		ftmp.close();
-		File::deleteFile(filenameTmp.c_str());
-	} else {
-		// element writing is starting next, reset counters 
-		for (size_t i = 0; i < elems.size(); ++i)
-			elems[i]->num = 0;
 	}
+
 	return true;
 }
 
@@ -403,7 +351,7 @@ void PLY::put_element_setup(const char* elem_name)
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL)
 		abort_ply("error: put_element_setup: can't find element '%s'", elem_name);
-	which_elem = elem;
+	this->which_elem = elem;
 }
 
 
@@ -424,17 +372,17 @@ void PLY::put_element(const void* elem_ptr)
 	ValueType val;
 	char **other_ptr;
 
-	PlyElement *elem = which_elem;
+	PlyElement *elem = this->which_elem;
 	elem_data = (char*)elem_ptr;
-	other_ptr = (char**)(elem_data + elem->other_offset);
+	other_ptr = (char **)(((char *)elem_ptr) + elem->other_offset);
 
-	// write out either to an ascii or binary file 
-	if (file_type == ASCII) {
+	/* write out either to an ascii or binary file */
+	if (this->file_type == ASCII) {
 
-		// write an ascii file 
+		/* write an ascii file */
 
-		// write out each property of the element 
-		for (size_t j = 0; j < elem->props.size(); ++j) {
+		/* write out each property of the element */
+		for (size_t j = 0, cnt = elem->props.size(); j < cnt; ++j) {
 
 			PlyProperty *prop = elem->props[j];
 
@@ -444,13 +392,13 @@ void PLY::put_element(const void* elem_ptr)
 				elem_data = (char*)elem_ptr;
 
 			switch (prop->is_list) {
-			case SCALAR: {  // scalar 
+			case SCALAR: {  /* scalar */
 				item = elem_data + prop->offset;
 				get_stored_item((void*)item, prop->internal_type, val);
 				write_ascii_item(val, prop->internal_type, prop->external_type);
 				break;
 			}
-			case LIST: {   // list 
+			case LIST: {   /* list */
 				item = elem_data + prop->count_offset;
 				get_stored_item((void*)item, prop->count_internal, val);
 				write_ascii_item(val, prop->count_internal, prop->count_external);
@@ -465,10 +413,10 @@ void PLY::put_element(const void* elem_ptr)
 				}
 				break;
 			}
-			case STRING: {  // string 
+			case STRING: {  /* string */
 				item = elem_data + prop->offset;
 				char** str = (char**)item;
-				ostream->print("\"%s\"", *str);
+				f->print("\"%s\"", *str);
 				break;
 			}
 			default:
@@ -476,10 +424,11 @@ void PLY::put_element(const void* elem_ptr)
 			}
 		}
 
-		ostream->print("\n");
-	} else {
+		f->print("\n");
+	}
+	else {
 
-		// write a binary file 
+		/* write a binary file */
 
 		/* write out each property of the element */
 		for (size_t j = 0, cnt = elem->props.size(); j < cnt; ++j) {
@@ -489,13 +438,13 @@ void PLY::put_element(const void* elem_ptr)
 			else
 				elem_data = (char*)elem_ptr;
 			switch (prop->is_list) {
-			case SCALAR: {  // scalar 
+			case SCALAR: {  /* scalar */
 				item = elem_data + prop->offset;
 				get_stored_item((void*)item, prop->internal_type, val);
 				write_binary_item(val, prop->internal_type, prop->external_type);
 				break;
 			}
-			case LIST: {    // list 
+			case LIST: {    /* list */
 				item = elem_data + prop->count_offset;
 				int item_size = ply_type_size[prop->count_internal];
 				get_stored_item((void*)item, prop->count_internal, val);
@@ -511,16 +460,16 @@ void PLY::put_element(const void* elem_ptr)
 				}
 				break;
 			}
-			case STRING: {  // string 
+			case STRING: {  /* string */
 				item = elem_data + prop->offset;
 				char** str = (char**)item;
 
-				// write the length 
-				const int len = (int)_tcslen(*str) + 1;
-				ostream->write(&len, sizeof(int));
+				/* write the length */
+				const int len = (int)strlen(*str) + 1;
+				f->write(&len, sizeof(int));
 
-				// write the string, including the null character 
-				ostream->write(*str, len);
+				/* write the string, including the null character */
+				f->write(*str, len);
 				break;
 			}
 			default:
@@ -529,8 +478,17 @@ void PLY::put_element(const void* elem_ptr)
 		}
 	}
 
-	// count element items 
+	/* if buffered mode, count element items */
+	if (mfp) {
+		if (ostream != NULL) {
+			if (mfp->getSizeBuffer()-mfp->getSize() < 256) {
+				ostream->write(mfp->getBuffer(), mfp->getSize());
+				mfp->setSize(0);
+			}
+		} else {
 	elem->num++;
+}
+	}
 }
 
 
@@ -544,7 +502,7 @@ void PLY::put_element(const void* elem_ptr)
 Given a file pointer, get ready to read PLY data from the file.
 
 Entry:
-fp - the given file pointer
+f          - the given file pointer
 
 Exit:
 nelems     - number of elements in object
@@ -552,24 +510,24 @@ elem_names - list of element names
 returns a pointer to a PlyFile, used to refer to this file, or NULL if error
 ******************************************************************************/
 
-bool PLY::read(LPCSTR _filename)
+bool PLY::read(LPCSTR filename)
 {
-	filename = _filename;
-	File* const pf(new File(_filename, File::READ, File::OPEN));
-	if (!pf->isOpen())
+	this->filename = filename;
+	istream = new File(filename, File::READ, File::OPEN);
+	if (!((File*)istream)->isOpen())
 		return false;
-	return read(new BufferedInputStream<true>(pf, 64*1024));
+	return read(new BufferedInputStream<true>(istream, FILE_READ_MINBUF_SIZE));
 }
 
-bool PLY::read(ISTREAM* fp)
+bool PLY::read(ISTREAM* f)
 {
-	// create record for this object 
+	/* create record for this object */
 	ASSERT(elems.empty());
-	other_elems = NULL;
-	rule_list = NULL;
-	istream = fp;
+	this->istream = f;
+	this->other_elems = NULL;
+	this->rule_list = NULL;
 
-	// read and parse the file's header 
+	/* read and parse the file's header */
 	int nwords;
 	char *orig_line;
 	STRISTREAM sfp(istream);
@@ -582,21 +540,22 @@ bool PLY::read(ISTREAM* fp)
 	}
 	free(words);
 
-	// parse words 
+	/* parse words */
 	while ((words = get_words(sfp, &nwords, &orig_line)) != NULL) {
 		if (equal_strings(words[0], "format")) {
 			if (nwords != 3)
 				return false;
 			if (equal_strings(words[1], "ascii"))
-				file_type = ASCII;
+				this->file_type = ASCII;
 			else if (equal_strings(words[1], "binary_big_endian"))
-				file_type = BINARY_BE;
+				this->file_type = BINARY_BE;
 			else if (equal_strings(words[1], "binary_little_endian"))
-				file_type = BINARY_LE;
+				this->file_type = BINARY_LE;
 			else
 				return false;
-			version = (float)atof(words[2]);
-		} else if (equal_strings(words[0], "element"))
+			this->version = (float)atof(words[2]);
+		}
+		else if (equal_strings(words[0], "element"))
 			add_element((const char**)words, nwords);
 		else if (equal_strings(words[0], "property"))
 			add_property((const char**)words, nwords);
@@ -612,15 +571,16 @@ bool PLY::read(ISTREAM* fp)
 	}
 	sfp.emptyBuffer();
 
-	// create tags for each property of each element, to be used 
-	// later to say whether or not to store each property for the user 
-	for (size_t i = 0; i < elems.size(); ++i) {
-		PlyElement *elem = elems[i];
+	/* create tags for each property of each element, to be used */
+	/* later to say whether or not to store each property for the user */
+	for (size_t i = 0; i < this->elems.size(); ++i) {
+		PlyElement *elem = this->elems[i];
 		elem->store_prop.resize(elem->props.size());
 		for (size_t j = 0; j < elem->props.size(); ++j)
 			elem->store_prop[j] = DONT_STORE_PROP;
-		elem->other_offset = NO_OTHER_PROPS; // no "other" props by default 
+		elem->other_offset = NO_OTHER_PROPS; /* no "other" props by default */
 	}
+
 	return true;
 }
 
@@ -638,12 +598,12 @@ returns number of elements of this type in the file
 
 int PLY::get_element_description(const char* elem_name, std::vector<PlyProperty*>& prop_list) const
 {
-	// find information about the element 
+	/* find information about the element */
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL)
 		return 0;
 
-	// make a copy of the element's property list 
+	/* make a copy of the element's property list */
 	prop_list.resize(elem->props.size());
 	for (size_t i = 0; i < elem->props.size(); ++i) {
 		PlyProperty *prop = new PlyProperty;
@@ -671,27 +631,27 @@ void PLY::get_element_setup(
 	PlyProperty* prop_list
 	)
 {
-	// find information about the element 
+	/* find information about the element */
 	PlyElement *elem = find_element(elem_name);
-	which_elem = elem;
+	this->which_elem = elem;
 
-	// deposit the property information into the element's description 
+	/* deposit the property information into the element's description */
 	for (int i = 0; i < nprops; ++i) {
-		// look for actual property 
+		/* look for actual property */
 		int index = find_property(elem, prop_list[i].name.c_str());
 		if (index == -1) {
 			DEBUG("warning: Can't find property '%s' in element '%s'", prop_list[i].name.c_str(), elem_name);
 			continue;
 		}
 
-		// store its description 
+		/* store its description */
 		PlyProperty *prop = elem->props[index];
 		prop->internal_type = prop_list[i].internal_type;
 		prop->offset = prop_list[i].offset;
 		prop->count_internal = prop_list[i].count_internal;
 		prop->count_offset = prop_list[i].count_offset;
 
-		// specify that the user wants this property 
+		/* specify that the user wants this property */
 		elem->store_prop[index] = STORE_PROP;
 	}
 }
@@ -708,13 +668,16 @@ elem_name - which element we're talking about
 prop      - property to add to those that will be returned
 ******************************************************************************/
 
-void PLY::get_property(const char* elem_name, PlyProperty* prop)
+void PLY::get_property(
+	const char *elem_name,
+	PlyProperty *prop
+	)
 {
-	// find information about the element 
+	/* find information about the element */
 	PlyElement *elem = find_element(elem_name);
-	which_elem = elem;
+	this->which_elem = elem;
 
-	// deposit the property information into the element's description 
+	/* deposit the property information into the element's description */
 	int index = find_property(elem, prop->name.c_str());
 	if (index == -1) {
 		DEBUG("warning: Can't find property '%s' in element '%s'", prop->name.c_str(), elem_name);
@@ -726,7 +689,7 @@ void PLY::get_property(const char* elem_name, PlyProperty* prop)
 	prop_ptr->count_internal = prop->count_internal;
 	prop_ptr->count_offset   = prop->count_offset;
 
-	// specify that the user wants this property 
+	/* specify that the user wants this property */
 	elem->store_prop[index] = STORE_PROP;
 }
 
@@ -742,7 +705,7 @@ elem_ptr - pointer to location where the element information should be put
 
 void PLY::get_element(void* elem_ptr)
 {
-	if (file_type == ASCII)
+	if (this->file_type == ASCII)
 		ascii_get_element((uint8_t*)elem_ptr);
 	else
 		binary_get_element((uint8_t*)elem_ptr);
@@ -760,7 +723,7 @@ returns the list of comments
 
 std::vector<std::string>& PLY::get_comments()
 {
-	return comments;
+	return (this->comments);
 }
 
 
@@ -776,7 +739,7 @@ returns the list of object info lines
 
 std::vector<std::string>& PLY::get_obj_info()
 {
-	return obj_info;
+	return (this->obj_info);
 }
 
 
@@ -794,49 +757,49 @@ void PLY::setup_other_props(PlyElement* elem)
 {
 	int size = 0;
 
-	// Examine each property in decreasing order of size. 
-	// We do this so that all data types will be aligned by 
-	// word, half-word, or whatever within the structure. 
+	/* Examine each property in decreasing order of size. */
+	/* We do this so that all data types will be aligned by */
+	/* word, half-word, or whatever within the structure. */
 	for (int type_size = 8; type_size > 0; type_size /= 2) {
 
-		// add up the space taken by each property, and save this information 
-		// away in the property descriptor 
+		/* add up the space taken by each property, and save this information */
+		/* away in the property descriptor */
 		for (size_t i = 0; i < elem->props.size(); ++i) {
 
-			// don't bother with properties we've been asked to store explicitly 
+			/* don't bother with properties we've been asked to store explicitly */
 			if (elem->store_prop[i])
 				continue;
 
 			PlyProperty *prop = elem->props[i];
 
-			// internal types will be same as external 
+			/* internal types will be same as external */
 			prop->internal_type = prop->external_type;
 			prop->count_internal = prop->count_external;
 
-			// list case 
+			/* list case */
 			if (prop->is_list == LIST) {
 
-				// pointer to list 
+				/* pointer to list */
 				if (type_size == sizeof(void *)) {
 					prop->offset = size;
-					size += sizeof(void *);    // always use size of a pointer here 
+					size += sizeof (void *);    /* always use size of a pointer here */
 				}
 
-				// count of number of list elements 
+				/* count of number of list elements */
 				if (type_size == ply_type_size[prop->count_external]) {
 					prop->count_offset = size;
 					size += ply_type_size[prop->count_external];
 				}
 			}
-			// string 
+			/* string */
 			else if (prop->is_list == STRING) {
-				// pointer to string 
+				/* pointer to string */
 				if (type_size == sizeof(char*)) {
 					prop->offset = size;
 					size += sizeof(char*);
 				}
 			}
-			// scalar 
+			/* scalar */
 			else if (type_size == ply_type_size[prop->external_type]) {
 				prop->offset = size;
 				size += ply_type_size[prop->external_type];
@@ -845,7 +808,7 @@ void PLY::setup_other_props(PlyElement* elem)
 
 	}
 
-	// save the size for the other_props structure 
+	/* save the size for the other_props structure */
 	elem->other_size = size;
 }
 
@@ -864,16 +827,16 @@ returns pointer to structure containing description of other_props
 
 PLY::PlyOtherProp* PLY::get_other_properties(PlyElement* elem, int offset)
 {
-	// remember that this is the "current" element 
-	which_elem = elem;
+	/* remember that this is the "current" element */
+	this->which_elem = elem;
 
-	// save the offset to where to store the other_props 
+	/* save the offset to where to store the other_props */
 	elem->other_offset = offset;
 
-	// place the appropriate pointers, etc. in the element's property list 
+	/* place the appropriate pointers, etc. in the element's property list */
 	setup_other_props(elem);
 
-	// create structure for describing other_props 
+	/* create structure for describing other_props */
 	PlyOtherProp *other = new PlyOtherProp;
 	other->name = elem->name;
 	#if 0
@@ -881,13 +844,13 @@ PLY::PlyOtherProp* PLY::get_other_properties(PlyElement* elem, int offset)
 		other->size = 0;
 		other->props = NULL;
 		other->nprops = 0;
-		return other;
+		return (other);
 	}
 	#endif
 	other->size = elem->other_size;
 	other->props.reserve(elem->props.size());
 
-	// save descriptions of each "other" property 
+	/* save descriptions of each "other" property */
 	for (size_t i = 0; i < elem->props.size(); ++i) {
 		if (elem->store_prop[i])
 			continue;
@@ -896,11 +859,11 @@ PLY::PlyOtherProp* PLY::get_other_properties(PlyElement* elem, int offset)
 		other->props.push_back(prop);
 	}
 
-	// set other_offset pointer appropriately if there are NO other properties 
+	/* set other_offset pointer appropriately if there are NO other properties */
 	if (other->props.empty())
 		elem->other_offset = NO_OTHER_PROPS;
 
-	// return structure 
+	/* return structure */
 	return other;
 }
 
@@ -918,17 +881,20 @@ Exit:
 returns pointer to structure containing description of other_props
 ******************************************************************************/
 
-PLY::PlyOtherProp* PLY::get_other_properties(const char* elem_name, int offset)
+PLY::PlyOtherProp* PLY::get_other_properties(
+	const char *elem_name,
+	int offset
+	)
 {
-	// find information about the element 
+	/* find information about the element */
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL) {
 		DEBUG("warning: get_other_properties: Can't find element '%s'", elem_name);
-		return NULL;
+		return (NULL);
 	}
 
 	PlyOtherProp *other = get_other_properties(elem, offset);
-	return other;
+	return (other);
 }
 
 
@@ -954,36 +920,36 @@ returns pointer to ALL the "other" element data for this PLY file
 
 PLY::PlyOtherElems* PLY::get_other_element()
 {
-	PlyElement *elem = which_elem;
+	PlyElement *elem = this->which_elem;
 
-	// create room for the new "other" element, initializing the 
-	// other data structure if necessary 
+	/* create room for the new "other" element, initializing the */
+	/* other data structure if necessary */
 	OtherElem other;
 
-	// count of element instances in file 
+	/* count of element instances in file */
 	other.elem_count = elem->num;
 
-	// save name of element 
+	/* save name of element */
 	other.elem_name = elem->name;
 
-	// create a list to hold all the current elements 
+	/* create a list to hold all the current elements */
 	other.other_data = new OtherData*[other.elem_count];
 
-	// set up for getting elements 
+	/* set up for getting elements */
 	other.other_props = get_other_properties(elem->name.c_str(), offsetof(OtherData,other_props));
 
-	// grab all these elements 
+	/* grab all these elements */
 	for (int i = 0; i < other.elem_count; ++i) {
-		// grab and element from the file 
+		/* grab and element from the file */
 		other.other_data[i] = new OtherData;
 		get_element((uint8_t*)other.other_data[i]);
 	}
 
-	// return pointer to the other elements data 
+	/* return pointer to the other elements data */
 	if (other_elems == NULL)
 		other_elems = new PlyOtherElems;
 	other_elems->other_list.push_back(other);
-	return other_elems;
+	return (other_elems);
 }
 
 
@@ -995,16 +961,16 @@ Entry:
 
 void PLY::put_other_elements()
 {
-	// make sure we have other elements to write 
-	if (other_elems == NULL)
+	/* make sure we have other elements to write */
+	if (this->other_elems == NULL)
 		return;
 
-	// write out the data for each "other" element 
-	for (size_t i = 0; i < other_elems->other_list.size(); ++i) {
-		OtherElem *other = &(other_elems->other_list[i]);
+	/* write out the data for each "other" element */
+	for (size_t i = 0; i < this->other_elems->other_list.size(); ++i) {
+		OtherElem *other = &(this->other_elems->other_list[i]);
 		put_element_setup(other->elem_name.c_str());
 
-		// write out each instance of the current element 
+		/* write out each instance of the current element */
 		for (int j = 0; j < other->elem_count; ++j)
 			put_element(other->other_data[j]);
 	}
@@ -1015,6 +981,22 @@ void PLY::put_other_elements()
 /*******************/
 /*  Miscellaneous  */
 /*******************/
+
+
+/******************************************************************************
+Flush a PLY file.
+******************************************************************************/
+
+void PLY::flush()
+{
+	if (ostream != NULL) {
+		if (mfp != NULL) {
+			ostream->write(mfp->getBuffer(), mfp->getSize());
+			mfp->setSize(0);
+		}
+		ostream->flush();
+	}
+}
 
 
 /******************************************************************************
@@ -1037,10 +1019,10 @@ version - version of the file
 file_type - PLY_ASCII, PLY_BINARY_BE, or PLY_BINARY_LE
 ******************************************************************************/
 
-void PLY::get_info(float* _version, int* _file_type)
+void PLY::get_info(float *version, int *file_type)
 {
-	*_version = version;
-	*_file_type = file_type;
+	*version = this->version;
+	*file_type = this->file_type;
 }
 
 
@@ -1099,19 +1081,19 @@ void PLY::ascii_get_element(uint8_t* elem_ptr)
 	char *other_data(NULL);
 	int other_flag(0);
 
-	// the kind of element we're reading currently 
-	PlyElement *elem = which_elem;
+	/* the kind of element we're reading currently */
+	PlyElement *elem = this->which_elem;
 
-	// do we need to setup for other_props? 
+	/* do we need to setup for other_props? */
 	if (elem->other_offset != NO_OTHER_PROPS) {
 		other_flag = 1;
-		// make room for other_props 
+		/* make room for other_props */
 		other_data = new char[elem->other_size];
-		// store pointer in user's structure to the other_props 
+		/* store pointer in user's structure to the other_props */
 		*((char**)(elem_ptr + elem->other_offset)) = other_data;
 	}
 
-	// read in the element 
+	/* read in the element */
 	int nwords;
 	char **words;
 	{
@@ -1127,27 +1109,28 @@ void PLY::ascii_get_element(uint8_t* elem_ptr)
 		PlyProperty *prop = elem->props[j];
 		const int store_it(elem->store_prop[j] | other_flag);
 
-		// store either in the user's structure or in other_props 
+		/* store either in the user's structure or in other_props */
 		if (elem->store_prop[j])
 			elem_data = (char*)elem_ptr;
 		else
 			elem_data = other_data;
 
-		if (prop->is_list == LIST) {       // a list 
-			// get and store the number of items in the list 
+		if (prop->is_list == LIST) {       /* a list */
+			/* get and store the number of items in the list */
 			get_ascii_item(words[which_word++], prop->count_external, val);
 			if (store_it) {
 				item = elem_data + prop->count_offset;
 				store_item(item, prop->count_internal, val, prop->count_external);
 			}
 
-			// allocate space for an array of items and store a ptr to the array 
+			/* allocate space for an array of items and store a ptr to the array */
 			const int list_count(ValueType2Type<int>(val, prop->count_external));
 			char** store_array = (char**)(elem_data + prop->offset);
 			if (list_count == 0) {
 				if (store_it)
 					*store_array = NULL;
-			} else {
+			}
+			else {
 				const int item_size(ply_type_size[prop->internal_type]);
 
 				if (store_it) {
@@ -1156,7 +1139,7 @@ void PLY::ascii_get_element(uint8_t* elem_ptr)
 					*store_array = item_ptr;
 				}
 
-				// read items and store them into the array 
+				/* read items and store them into the array */
 				for (int k = 0; k < list_count; k++) {
 					get_ascii_item(words[which_word++], prop->external_type, val);
 					if (store_it) {
@@ -1165,14 +1148,18 @@ void PLY::ascii_get_element(uint8_t* elem_ptr)
 					}
 				}
 			}
-		} else if (prop->is_list == STRING) {   // a string 
+
+		}
+		else if (prop->is_list == STRING) {   /* a string */
 			if (store_it) {
 				item = elem_data + prop->offset;
 				*((char**)item) = strdup(words[which_word++]);
-			} else {
+			}
+			else {
 				which_word++;
 			}
-		} else {                               // a scalar 
+		}
+		else {                               /* a scalar */
 			get_ascii_item(words[which_word++], prop->external_type, val);
 			if (store_it) {
 				item = elem_data + prop->offset;
@@ -1201,61 +1188,65 @@ void PLY::binary_get_element(uint8_t* elem_ptr)
 	char *other_data(NULL);
 	int other_flag(0);
 
-	// the kind of element we're reading currently 
-	PlyElement* elem = which_elem;
+	/* the kind of element we're reading currently */
+	PlyElement *elem = this->which_elem;
 
-	// do we need to setup for other_props? 
+	/* do we need to setup for other_props? */
 	if (elem->other_offset != NO_OTHER_PROPS) {
 		other_flag = 1;
-		// make room for other_props 
+		/* make room for other_props */
 		other_data = new char[elem->other_size];
-		// store pointer in user's structure to the other_props 
+		/* store pointer in user's structure to the other_props */
 		*((char**)(elem_ptr + elem->other_offset)) = other_data;
 	}
 
-	// read in a number of elements 
+	/* read in a number of elements */
 	for (size_t j = 0; j < elem->props.size(); ++j) {
 		PlyProperty *prop = elem->props[j];
 		const int store_it(elem->store_prop[j] | other_flag);
 
-		// store either in the user's structure or in other_props 
+		/* store either in the user's structure or in other_props */
 		if (elem->store_prop[j])
 			elem_data = (char*)elem_ptr;
 		else
 			elem_data = other_data;
 
-		if (prop->is_list == LIST) {          // list 
-			// get and store the number of items in the list 
-			get_binary_item(prop->count_external, val);
+		if (prop->is_list == LIST) {          /* list */
+
+			/* get and store the number of items in the list */
+			get_binary_item(istream, prop->count_external, val);
 			if (store_it) {
 				item = elem_data + prop->count_offset;
 				store_item(item, prop->count_internal, val, prop->count_external);
 			}
 
-			// allocate space for an array of items and store a ptr to the array 
+			/* allocate space for an array of items and store a ptr to the array */
 			const int list_count(ValueType2Type<int>(val, prop->count_external));
 			const int item_size(ply_type_size[prop->internal_type]);
 			char** store_array = (char**)(elem_data + prop->offset);
 			if (list_count == 0) {
 				if (store_it)
 					*store_array = NULL;
-			} else {
+			}
+			else {
 				if (store_it) {
 					item_ptr = new char[item_size * list_count];
 					item = item_ptr;
 					*store_array = item_ptr;
 				}
 
-				// read items and store them into the array 
+				/* read items and store them into the array */
 				for (int k = 0; k < list_count; k++) {
-					get_binary_item(prop->external_type, val);
+					get_binary_item(istream, prop->external_type, val);
 					if (store_it) {
 						store_item(item, prop->internal_type, val, prop->external_type);
 						item += item_size;
 					}
 				}
 			}
-		} else if (prop->is_list == STRING) {     // string 
+
+		}
+		else if (prop->is_list == STRING) {     /* string */
 			int len;
 			istream->read(&len, sizeof(int));
 			char *str = new char[len];
@@ -1264,8 +1255,9 @@ void PLY::binary_get_element(uint8_t* elem_ptr)
 				item = elem_data + prop->offset;
 				*((char**)item) = str;
 			}
-		} else {                                   // scalar 
-			get_binary_item(prop->external_type, val);
+		}
+		else {                                   /* scalar */
+			get_binary_item(istream, prop->external_type, val);
 			if (store_it) {
 				item = elem_data + prop->offset;
 				store_item(item, prop->internal_type, val, prop->external_type);
@@ -1279,17 +1271,18 @@ void PLY::binary_get_element(uint8_t* elem_ptr)
 Write to a file the word that represents a PLY data type.
 
 Entry:
+fp   - file pointer
 code - code for type
 ******************************************************************************/
 
-void PLY::write_scalar_type(int code)
+void PLY::write_scalar_type(OSTREAM* fp, int code)
 {
-	// make sure this is a valid code 
+	/* make sure this is a valid code */
 	if (code <= StartType || code >= EndType)
 		abort_ply("error: write_scalar_type: bad data code = %d", code);
 
-	// write the code to a file 
-	ostream->print("%s", write_type_names[code]);
+	/* write the code to a file */
+	fp->print("%s", write_type_names[code]);
 }
 
 
@@ -1300,7 +1293,7 @@ IMPORTANT: The calling routine should call "free" on the returned pointer once
 finished with it.
 
 Entry:
-sfp - string file to read from
+sfp       - file to read from
 
 Exit:
 nwords    - number of words returned
@@ -1320,18 +1313,18 @@ char** PLY::get_words(STRISTREAM& sfp, int* nwords, char** orig_line)
 
 	char** words = (char**)malloc(sizeof(char*) * max_words);
 
-	// read in a line 
+	/* read in a line */
 	size_t len(sfp.readLine(str, BIG_STRING-2));
 	if (len == 0 || len == STREAM_ERROR) {
 		*nwords = 0;
 		*orig_line = NULL;
 		free(words);
-		return NULL;
+		return (NULL);
 	}
 
-	// convert line-feed and tabs into spaces 
-	// (this guarantees that there will be a space before the 
-	//  null character at the end of the string) 
+	/* convert line-feed and tabs into spaces */
+	/* (this guarantees that there will be a space before the */
+	/*  null character at the end of the string) */
 	if (str[len-1] == '\r')
 		--len;
 	str[len] = '\n';
@@ -1352,60 +1345,62 @@ char** PLY::get_words(STRISTREAM& sfp, int* nwords, char** orig_line)
 	}
 	EXIT_LOOP:
 
-	// find the words in the line 
+	/* find the words in the line */
 	ptr = str;
 	while (*ptr != '\0') {
 
-		// jump over leading spaces 
+		/* jump over leading spaces */
 		while (*ptr == ' ')
 			ptr++;
 
-		// break if we reach the end 
+		/* break if we reach the end */
 		if (*ptr == '\0')
 			break;
 
-		// allocate more room for words if necessary 
+		/* allocate more room for words if necessary */
 		if (num_words >= max_words) {
 			max_words += 10;
 			words = (char**)realloc(words, sizeof(char*) * max_words);
 		}
 
-		if (*ptr == '\"') {  // a quote indicates that we have a string 
-			// skip over leading quote 
+		if (*ptr == '\"') {  /* a quote indicates that we have a string */
+
+			/* skip over leading quote */
 			ptr++;
 
-			// save pointer to beginning of word 
+			/* save pointer to beginning of word */
 			words[num_words++] = ptr;
 
-			// find trailing quote or end of line 
+			/* find trailing quote or end of line */
 			while (*ptr != '\"' && *ptr != '\0')
 				ptr++;
 
-			// replace quote with a null character to mark the end of the word 
-			// if we are not already at the end of the line 
+			/* replace quote with a null character to mark the end of the word */
+			/* if we are not already at the end of the line */
 			if (*ptr != '\0')
 				*ptr++ = '\0';
-		} else {               // non-string 
-			// save pointer to beginning of word 
+		}
+		else {               /* non-string */
+
+			/* save pointer to beginning of word */
 			words[num_words++] = ptr;
 
-			// jump over non-spaces 
+			/* jump over non-spaces */
 			while (*ptr != ' ')
 				ptr++;
 
-			// place a null character here to mark the end of the word 
+			/* place a null character here to mark the end of the word */
 			*ptr++ = '\0';
 		}
 	}
 
-	// return the list of words 
+	/* return the list of words */
 	*nwords = num_words;
 	*orig_line = str_copy;
-	return words;
+	return (words);
 }
 
 
-#if 0
 /******************************************************************************
 Write out an item to a file as raw binary bytes.
 
@@ -1414,7 +1409,7 @@ val        - item value to be written
 double_val - value type
 type       - data type to write out
 ******************************************************************************/
-
+#if 0
 void PLY::write_binary_item(
 	const ValueType& val,
 	int from_type,
@@ -1424,41 +1419,40 @@ void PLY::write_binary_item(
 	switch (to_type) {
 	case Int8: {
 		const int8_t v(ValueType2Type<int8_t>(val, from_type));
-		ostream->write(&v, 1);
+		f->write(&v, 1);
 		break; }
 	case Int16: {
 		const int16_t v(ValueType2Type<int16_t>(val, from_type));
-		ostream->write(&v, 2);
+		f->write(&v, 2);
 		break; }
 	case Int32: {
 		const int32_t v(ValueType2Type<int32_t>(val, from_type));
-		ostream->write(&v, 4);
+		f->write(&v, 4);
 		break; }
 	case Uint8: {
 		const uint8_t v(ValueType2Type<uint8_t>(val, from_type));
-		ostream->write(&v, 1);
+		f->write(&v, 1);
 		break; }
 	case Uint16: {
 		const uint16_t v(ValueType2Type<uint16_t>(val, from_type));
-		ostream->write(&v, 2);
+		f->write(&v, 2);
 		break; }
 	case Uint32: {
 		const uint32_t v(ValueType2Type<uint32_t>(val, from_type));
-		ostream->write(&v, 4);
+		f->write(&v, 4);
 		break; }
 	case Float32: {
 		const float v(ValueType2Type<float>(val, from_type));
-		ostream->write(&v, 4);
+		f->write(&v, 4);
 		break; }
 	case Float64: {
 		const double v(ValueType2Type<double>(val, from_type));
-		ostream->write(&v, 8);
+		f->write(&v, 8);
 		break; }
 	default:
 		abort_ply("error: write_binary_item: bad type = %d", to_type);
 	}
 }
-
 #endif
 
 /******************************************************************************
@@ -1480,16 +1474,16 @@ void PLY::write_ascii_item(
 	case Int8:
 	case Int16:
 	case Int32:
-		ostream->print("%d ", ValueType2Type<int32_t>(val, from_type));
+		f->print("%d ", ValueType2Type<int32_t>(val, from_type));
 		break;
 	case Uint8:
 	case Uint16:
 	case Uint32:
-		ostream->print("%u ", ValueType2Type<uint32_t>(val, from_type));
+		f->print("%u ", ValueType2Type<uint32_t>(val, from_type));
 		break;
 	case Float32:
 	case Float64:
-		ostream->print("%g ", ValueType2Type<double>(val, from_type));
+		f->print("%g ", ValueType2Type<double>(val, from_type));
 		break;
 	default:
 		abort_ply("error: write_ascii_item: bad type = %d", to_type);
@@ -1553,38 +1547,43 @@ Get the value of an item from a binary file, and place the result
 into an integer, an unsigned integer and a double.
 
 Entry:
+fp         - file to get item from
 type       - data type supposedly in the word
 
 Exit:
 val        - store value
 ******************************************************************************/
 
-void PLY::get_binary_item(int type, ValueType& val)
+void PLY::get_binary_item(
+	ISTREAM* fp,
+	int type,
+	ValueType& val
+	)
 {
 	switch (type) {
 	case Int8:
-		istream->read(&val.i8, 1);
+		fp->read(&val.i8, 1);
 		break;
 	case Uint8:
-		istream->read(&val.u8, 1);
+		fp->read(&val.u8, 1);
 		break;
 	case Int16:
-		istream->read(&val.i16, 2);
+		fp->read(&val.i16, 2);
 		break;
 	case Uint16:
-		istream->read(&val.u16, 2);
+		fp->read(&val.u16, 2);
 		break;
 	case Int32:
-		istream->read(&val.i32, 4);
+		fp->read(&val.i32, 4);
 		break;
 	case Uint32:
-		istream->read(&val.u32, 4);
+		fp->read(&val.u32, 4);
 		break;
 	case Float32:
-		istream->read(&val.f, 4);
+		fp->read(&val.f, 4);
 		break;
 	case Float64:
-		istream->read(&val.d, 8);
+		fp->read(&val.d, 8);
 		break;
 	default:
 		abort_ply("error: get_binary_item: bad type = %d", type);
@@ -1604,7 +1603,11 @@ Exit:
 val        - store value
 ******************************************************************************/
 
-void PLY::get_ascii_item(const char* word, int type, ValueType& val)
+void PLY::get_ascii_item(
+	const char* word,
+	int type,
+	ValueType& val
+	)
 {
 	switch (type) {
 	case Int8:
@@ -1697,13 +1700,13 @@ nwords  - number of words in the list
 
 void PLY::add_element(const char** words, int /*nwords*/)
 {
-	// create the new element 
+	/* create the new element */
 	PlyElement *elem = new PlyElement;
 	elem->name = words[1];
 	elem->num = atoi(words[2]);
 
-	// add the new element to the object's list 
-	elems.push_back(elem);
+	/* add the new element to the object's list */
+	this->elems.push_back(elem);
 }
 
 
@@ -1719,18 +1722,18 @@ returns integer code for property, or 0 if not found
 
 int PLY::get_prop_type(const char* type_name)
 {
-	// try to match the type name 
+	/* try to match the type name */
 	for (int i = StartType + 1; i < EndType; ++i)
 		if (equal_strings (type_name, type_names[i]))
-			return i;
+			return (i);
 
-	// see if we can match an old type name 
+	/* see if we can match an old type name */
 	for (int i = StartType + 1; i < EndType; ++i)
 		if (equal_strings (type_name, old_type_names[i]))
-			return i;
+			return (i);
 
-	// if we get here, we didn't find the type 
-	return 0;
+	/* if we get here, we didn't find the type */
+	return (0);
 }
 
 
@@ -1744,31 +1747,33 @@ nwords  - number of words in the list
 
 void PLY::add_property(const char** words, int /*nwords*/)
 {
-	// create the new property 
+	/* create the new property */
 	PlyProperty *prop = new PlyProperty;
 
-	if (equal_strings(words[1], "list")) {          // list 
+	if (equal_strings(words[1], "list")) {          /* list */
 		prop->count_external = get_prop_type (words[2]);
 		prop->external_type = get_prop_type (words[3]);
 		prop->name = words[4];
 		prop->is_list = LIST;
-	} else if (equal_strings(words[1], "string")) {   // string 
+	}
+	else if (equal_strings(words[1], "string")) {   /* string */
 		prop->count_external = Int8;
 		prop->external_type = Int8;
 		prop->name = words[2];
 		prop->is_list = STRING;
-	} else {                                           // scalar 
+	}
+	else {                                           /* scalar */
 		prop->external_type = get_prop_type (words[1]);
 		prop->name = words[2];
 		prop->is_list = SCALAR;
 	}
 
-	// internal types are the same as external by default 
+	/* internal types are the same as external by default */
 	prop->internal_type = prop->external_type;
 	prop->count_internal = prop->count_external;
 
-	// add this property to the list of properties of the current element 
-	PlyElement *elem = elems.back();
+	/* add this property to the list of properties of the current element */
+	PlyElement *elem = this->elems.back();
 	elem->props.push_back(prop);
 }
 
@@ -1782,7 +1787,7 @@ line    - line containing comment
 
 void PLY::add_comment(const char* line)
 {
-	// skip over "comment" and leading spaces and tabs 
+	/* skip over "comment" and leading spaces and tabs */
 	int i = 7;
 	while (line[i] == ' ' || line[i] == '\t')
 		i++;
@@ -1799,7 +1804,7 @@ line    - line containing text info
 
 void PLY::add_obj_info(const char* line)
 {
-	// skip over "obj_info" and leading spaces and tabs 
+	/* skip over "obj_info" and leading spaces and tabs */
 	int i = 8;
 	while (line[i] == ' ' || line[i] == '\t')
 		i++;
@@ -1838,11 +1843,11 @@ returns the number of elements
 
 int PLY::get_element_list(std::vector<std::string>& elem_names) const
 {
-	// create the list of element names 
+	/* create the list of element names */
 	elem_names.resize(elems.size());
 	for (size_t i = 0; i < elems.size(); ++i)
 		elem_names[i] = elems[i]->name;
-	// return the number of elements and the list of element names 
+	/* return the number of elements and the list of element names */
 	return (int)elems.size();
 }
 
@@ -1856,7 +1861,7 @@ comment - the comment to append
 
 void PLY::append_comment(const char* comment)
 {
-	// add comment to list 
+	/* add comment to list */
 	comments.push_back(comment);
 }
 
@@ -1883,10 +1888,10 @@ Entry:
 obj_info - the object info to append
 ******************************************************************************/
 
-void PLY::append_obj_info(const char* _obj_info)
+void PLY::append_obj_info(const char *obj_info)
 {
-	// add info to list 
-	obj_info.push_back(_obj_info);
+	/* add info to list */
+	this->obj_info.push_back(obj_info);
 }
 
 
@@ -1920,15 +1925,15 @@ LPCSTR PLY::setup_element_read(int index, int* elem_count)
 {
 	if ((size_t)index > elems.size()) {
 		DEBUG("warning: No element with index %d", index);
-		return 0;
+		return (0);
 	}
 
 	PlyElement* elem = elems[index];
 
-	// set this to be the current element 
+	/* set this to be the current element */
 	which_elem = elem;
 
-	// return the number of such elements in the file and the element's name 
+	/* return the number of such elements in the file and the element's name */
 	*elem_count = elem->num;
 	return elem->name.c_str();
 }
@@ -1945,9 +1950,9 @@ prop    - property to add to those that will be returned
 
 void PLY::setup_property(const PlyProperty& prop)
 {
-	PlyElement *elem = which_elem;
+	PlyElement *elem = this->which_elem;
 
-	// deposit the property information into the element's description 
+	/* deposit the property information into the element's description */
 	int index = find_property(elem, prop.name.c_str());
 	if (index == -1) {
 		DEBUG("warning: Can't find property '%s' in element '%s'", prop.name.c_str(), elem->name.c_str());
@@ -1959,7 +1964,7 @@ void PLY::setup_property(const PlyProperty& prop)
 	prop_ptr->count_internal = prop.count_internal;
 	prop_ptr->count_offset   = prop.count_offset;
 
-	// specify that the user wants this property 
+	/* specify that the user wants this property */
 	elem->store_prop[index] = STORE_PROP;
 }
 
@@ -1977,7 +1982,7 @@ returns pointer to structure containing description of other_props
 
 PLY::PlyOtherProp* PLY::get_other_properties(int offset)
 {
-	return get_other_properties(which_elem, offset);
+	return get_other_properties(this->which_elem, offset);
 }
 
 
@@ -1990,17 +1995,20 @@ elem_name - name of element that information is being described
 nelems    - number of elements of this type to be written
 ******************************************************************************/
 
-void PLY::describe_element(const char* elem_name, int nelems)
+void PLY::describe_element(
+	char *elem_name,
+	int nelems
+	)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	PlyElement *elem = find_element(elem_name);
 	if (elem == NULL)
 		abort_ply("error: describe_element: can't find element '%s'",elem_name);
 
 	elem->num = nelems;
 
-	// now this element is the current element 
-	which_elem = elem;
+	/* now this element is the current element */
+	this->which_elem = elem;
 }
 
 
@@ -2013,9 +2021,9 @@ prop      - the new property
 
 void PLY::describe_property(const PlyProperty& prop)
 {
-	PlyElement *elem = which_elem;
+	PlyElement *elem = this->which_elem;
 
-	// copy the new property 
+	/* copy the new property */
 	PlyProperty *elem_prop = new PlyProperty;
 	copy_property(*elem_prop, prop);
 	elem->props.push_back(elem_prop);
@@ -2033,14 +2041,14 @@ void PLY::describe_other_properties(
 	int offset
 	)
 {
-	// look for appropriate element 
+	/* look for appropriate element */
 	PlyElement *elem = find_element(other->name.c_str());
 	if (elem == NULL) {
 		DEBUG("warning: describe_other_properties: can't find element '%s'", other->name.c_str());
 		return;
 	}
 
-	// copy the other properties 
+	/* copy the other properties */
 	for (size_t i = 0; i < other->props.size(); ++i) {
 		PlyProperty *prop = new PlyProperty;
 		copy_property(*prop, *other->props[i]);
@@ -2048,7 +2056,7 @@ void PLY::describe_other_properties(
 		elem->store_prop.push_back(OTHER_PROP);
 	}
 
-	// save other info about other properties 
+	/* save other info about other properties */
 	elem->other_size = other->size;
 	elem->other_offset = offset;
 }
@@ -2062,16 +2070,16 @@ Entry:
 other_elems - info about other elements that we want to store
 ******************************************************************************/
 
-void PLY::describe_other_elements(PlyOtherElems* _other_elems)
+void PLY::describe_other_elements(PlyOtherElems *other_elems)
 {
-	// ignore this call if there is no other element 
-	if (_other_elems == NULL)
+	/* ignore this call if there is no other element */
+	if (other_elems == NULL)
 		return;
 
-	// save pointer to this information 
-	other_elems = _other_elems;
+	/* save pointer to this information */
+	this->other_elems = other_elems;
 
-	// describe the other properties of this element 
+	/* describe the other properties of this element */
 	for (size_t i = 0; i < other_elems->other_list.size(); ++i) {
 		OtherElem *other = &(other_elems->other_list[i]);
 		element_count(other->elem_name.c_str(), other->elem_count);
@@ -2103,17 +2111,17 @@ PLY::PlyPropRules* PLY::init_rule(const char* elem_name)
 	rules->max_props = 0;
 	rules->rule_list = NULL;
 
-	// see if there are other rules we should use 
+	/* see if there are other rules we should use */
 	if (elem->props.empty())
-		return rules;
+		return (rules);
 
-	// default is to use averaging rule 
+	/* default is to use averaging rule */
 	rules->rule_list = new int[elem->props.size()];
 	for (size_t i = 0; i < elem->props.size(); ++i)
 		rules->rule_list[i] = AVERAGE_RULE;
 
-	// try to match the element, property and rule name 
-	for (PlyRuleList *list = rule_list; list != NULL; list = list->next) {
+	/* try to match the element, property and rule name */
+	for (PlyRuleList *list = this->rule_list; list != NULL; list = list->next) {
 
 		if (!equal_strings(list->element, elem->name.c_str()))
 			continue;
@@ -2124,7 +2132,7 @@ PLY::PlyPropRules* PLY::init_rule(const char* elem_name)
 
 				found_prop = 1;
 
-				// look for matching rule name 
+				/* look for matching rule name */
 				for (int j = 0; rule_name_list[j].code != -1; ++j)
 					if (equal_strings(list->name, rule_name_list[j].name.c_str())) {
 						rules->rule_list[i] = rule_name_list[j].code;
@@ -2138,7 +2146,7 @@ PLY::PlyPropRules* PLY::init_rule(const char* elem_name)
 		}
 	}
 
-	return rules;
+	return (rules);
 }
 
 
@@ -2155,14 +2163,14 @@ void PLY::modify_rule(PlyPropRules* rules, const char* prop_name, int rule_type)
 {
 	PlyElement *elem = rules->elem;
 
-	// find the property and modify its rule type 
+	/* find the property and modify its rule type */
 	for (size_t i = 0; i < elem->props.size(); ++i)
 		if (equal_strings(elem->props[i]->name.c_str(), prop_name)) {
 			rules->rule_list[i] = rule_type;
 			return;
 		}
 
-		// we didn't find the property if we get here 
+		/* we didn't find the property if we get here */
 		abort_ply("error: modify_rule: Can't find property '%s'", prop_name);
 }
 
@@ -2176,8 +2184,8 @@ rules - rules for the element
 
 void PLY::start_props(PlyPropRules* rules)
 {
-	// save pointer to the rules in the PLY object 
-	current_rules = rules;
+	/* save pointer to the rules in the PLY object */
+	this->current_rules = rules;
 }
 
 
@@ -2192,9 +2200,9 @@ other_props - the properties to use
 
 void PLY::weight_props(float weight, void* other_props)
 {
-	PlyPropRules *rules = current_rules;
+	PlyPropRules *rules = this->current_rules;
 
-	// allocate space for properties and weights, if necessary 
+	/* allocate space for properties and weights, if necessary */
 	if (rules->max_props == 0) {
 		rules->max_props = 6;
 	}
@@ -2204,7 +2212,7 @@ void PLY::weight_props(float weight, void* other_props)
 	rules->props.reserve(rules->max_props);
 	rules->weights.reserve(rules->max_props);
 
-	// remember these new properties and their weights 
+	/* remember these new properties and their weights */
 	rules->props.push_back(other_props);
 	rules->weights.push_back(weight);
 }
@@ -2221,27 +2229,31 @@ returns a pointer to the new properties
 
 void* PLY::get_new_props()
 {
-	PlyPropRules *rules = current_rules;
+	PlyPropRules *rules = this->current_rules;
 	PlyElement *elem = rules->elem;
 	PlyProperty *prop;
 	int offset;
 	int type;
 	ValueType val;
+	int random_pick;
 
-	// return NULL if we've got no "other" properties 
+	/* return NULL if we've got no "other" properties */
 	if (elem->other_size == 0)
-		return NULL;
+		return (NULL);
 
-	// create room for combined other properties 
+	/* create room for combined other properties */
 	char *new_data = new char[elem->other_size];
 
-	// make sure there is enough room to store values we're to combine 
+	/* make sure there is enough room to store values we're to combine */
 	vals.resize(rules->props.size());
 
-	// calculate the combination for each "other" property of the element 
+	/* in case we need a random choice */
+	random_pick = FLOOR2INT(SEACAVE::random() * rules->props.size());
+
+	/* calculate the combination for each "other" property of the element */
 	for (size_t i = 0; i < elem->props.size(); ++i) {
 
-		// don't bother with properties we've been asked to store explicitly 
+		/* don't bother with properties we've been asked to store explicitly */
 		if (elem->store_prop[i])
 			continue;
 
@@ -2249,7 +2261,7 @@ void* PLY::get_new_props()
 		offset = prop->offset;
 		type = prop->external_type;
 
-		// collect together all the values we're to combine 
+		/* collect together all the values we're to combine */
 		for (size_t j = 0; j < rules->props.size(); ++j) {
 			char* data = (char*)rules->props[j];
 			void* ptr = (void *)(data + offset);
@@ -2257,7 +2269,7 @@ void* PLY::get_new_props()
 			vals[j] = ValueType2Type<double>(val, type);
 		}
 
-		// calculate the combined value 
+		/* calculate the combined value */
 		switch (rules->rule_list[i]) {
 		case AVERAGE_RULE: {
 			double sum = 0;
@@ -2284,7 +2296,7 @@ void* PLY::get_new_props()
 			break;
 						  }
 		case RANDOM_RULE: {
-			val.d = vals[FLOOR2INT(SEACAVE::random() * rules->props.size())];
+			val.d = vals[random_pick];
 			break;
 						  }
 		case SAME_RULE: {
@@ -2298,11 +2310,11 @@ void* PLY::get_new_props()
 			abort_ply("error: get_new_props: Bad rule = %d", rules->rule_list[i]);
 		}
 
-		// store the combined value 
-		store_item(new_data + offset, type, val, Float64);
+		/* store the combined value */
+		store_item((void*)(new_data + offset), type, val, Float64);
 	}
 
-	return new_data;
+	return ((void*)new_data);
 }
 
 
@@ -2312,7 +2324,7 @@ Set the list of user-specified property combination rules.
 
 void PLY::set_prop_rules(PlyRuleList* prop_rules)
 {
-	rule_list = prop_rules;
+	this->rule_list = prop_rules;
 }
 
 
@@ -2337,17 +2349,18 @@ PLY::PlyRuleList* PLY::append_prop_rule(
 	char *str2;
 	char *ptr;
 
-	// find . 
+	/* find . */
 	char *str = strdup(property);
 	for (ptr = str; *ptr != '\0' && *ptr != '.'; ptr++) ;
 
-	// split string at . 
+	/* split string at . */
 	if (*ptr == '.') {
 		*ptr = '\0';
 		str2 = ptr + 1;
-	} else {
+	}
+	else {
 		DEBUG("warning: Can't find property '%s' for rule '%s'", property, name);
-		return rule_list;
+		return (rule_list);
 	}
 
 	PlyRuleList *rule = new PlyRuleList;
@@ -2356,18 +2369,18 @@ PLY::PlyRuleList* PLY::append_prop_rule(
 	rule->property = str2;
 	rule->next = NULL;
 
-	// either start rule list or append to it 
+	/* either start rule list or append to it */
 	if (rule_list == NULL)
 		rule_list = rule;
-	else {                      // append new rule to current list 
+	else {                      /* append new rule to current list */
 		PlyRuleList *rule_ptr = rule_list;
 		while (rule_ptr->next != NULL)
 			rule_ptr = rule_ptr->next;
 		rule_ptr->next = rule;
 	}
 
-	// return pointer to list 
-	return rule_list;
+	/* return pointer to list */
+	return (rule_list);
 }
 
 

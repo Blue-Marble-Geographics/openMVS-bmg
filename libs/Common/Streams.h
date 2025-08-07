@@ -19,6 +19,13 @@
 #define SIZE_NA					((size_f_t)-1)
 #define STREAM_ERROR			((size_t)-1)
 
+#define FILE_WRITE_MINBUF_SIZE	(128*1024)						// The min size the file write buffer should allocate.
+#define FILE_WRITE_MAXBUF_SIZE	(100*1024*1024)					// The max size the file write buffer should allocate.
+#define FILE_READ_MINBUF_SIZE	(512*1024)						// The min size the file read buffer should allocate.
+#define FILE_READ_MAXBUF_SIZE	(200*1024*1024)					// The max size the file read buffer should allocate.
+
+#define LAYER_BASE				0
+
 
 namespace SEACAVE {
 

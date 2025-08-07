@@ -319,7 +319,7 @@ bool PointCloud::Load(const String& fileName)
 
 	// read PLY body
 	BasicPLY::PointColNormal vertex;
-	for (int i = 0; i < ply.get_elements_count(); i++) {
+	for (int i = 0; i < (int)ply.elems.size(); i++) {
 		int elem_count;
 		LPCSTR elem_name = ply.setup_element_read(i, &elem_count);
 		if (PLY::equal_strings(BasicPLY::elem_names[0], elem_name)) {
@@ -728,7 +728,7 @@ bool PointCloudStreaming::Load(const String& fileName)
 
 	// read PLY body
 	BasicPLY::PointColNormal vertex;
-	for (int i = 0; i < (int)ply.get_elements_count(); i++) {
+	for (int i = 0; i < (int)ply.elems.size(); i++) {
 		int elem_count;
 		LPCSTR elem_name = ply.setup_element_read(i, &elem_count);
 		if (PLY::equal_strings(BasicPLY::elem_names[0], elem_name)) {

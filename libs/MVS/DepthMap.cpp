@@ -2727,7 +2727,7 @@ std::pair<float,float> TriangulatePointsDelaunay(const DepthData::ViewData& imag
 	return depthBounds;
 }
 
-#if 1 // New version
+#if 0 // New version (removed for testing)
 // roughly estimate depth and normal maps by triangulating the sparse point-cloud
 // and interpolating normal and depth for all pixels
 bool MVS::TriangulatePoints2DepthMap(

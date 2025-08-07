@@ -29,6 +29,10 @@
 *      containing it.
 */
 
+// Debugging logic: JPB WIP BUG
+#define NO_MANIFOLD_FIXUP
+
+
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
 
@@ -1569,14 +1573,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// delaunay.info() is parallel can be used to make sure
 		// we are compiling and using the work with TBB.
 #if 1
-		DEBUG("----------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.1");
+		DEBUG("------------------------------------------");
+		DEBUG("ReconstructMesh optimization version 1.1.2");
 		//const auto [isParallel, CGALversion] = delaunay.info();
 		//DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		//DEBUG("CGAL version: = %d", CGALversion);
 		//const int vcgVersion = vcg::tri::Info();
 		//DEBUG("VCG version: = %d", vcgVersion);
-		DEBUG("----------------------------------------");
+		DEBUG("------------------------------------------");
 #endif
 		// Fixed storage is slightly faster, but difficult to maintain.
 		constexpr size_t kMaxCells = 16384;
@@ -2502,51 +2506,51 @@ advance:
 		std::vector<ThreadLocalBuffer> threadBuffers(threadCount);
 
 #pragma omp parallel
-{
-		int tid = omp_get_thread_num();
-		ThreadLocalBuffer& buf = threadBuffers[tid];
+		{
+			int tid = omp_get_thread_num();
+			ThreadLocalBuffer& buf = threadBuffers[tid];
 
-		size_t est = (totalCells + threadCount - 1) / threadCount;
-		buf.nodes.reserve(est);
-		buf.edges.reserve(est * 4); // Worst case.
+			size_t est = (totalCells + threadCount - 1) / threadCount;
+			buf.nodes.reserve(est);
+			buf.edges.reserve(est * 4); // Worst case.
 
-		#pragma omp for schedule(static)
-		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
-			const auto ci = cellIterators[idx];
-			const int ciID = ci->info();
-			const auto& ciInfo = infoCells[ciID];
+#pragma omp for schedule(static)
+			for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+				const auto ci = cellIterators[idx];
+				const int ciID = ci->info();
+				const auto& ciInfo = infoCells[ciID];
 
-			// Compute terminal capacities
-			edge_cap_t s = ciInfo.s;
-			edge_cap_t t = MINF(ciInfo.t, maxCap);
+				// Compute terminal capacities
+				edge_cap_t s = ciInfo.s;
+				edge_cap_t t = MINF(ciInfo.t, maxCap);
 
-			edge_cap_t f = graph.graph.nodes[ciID].excess;
-			if (f > 0) s += f;
-			else t -= f;
+				edge_cap_t f = graph.graph.nodes[ciID].excess;
+				if (f > 0) s += f;
+				else t -= f;
 
-			edge_cap_t push = MINF(s, t);
-			buf.flow += push;
+				edge_cap_t push = MINF(s, t);
+				buf.flow += push;
 
-			buf.nodes.emplace_back(ciID, s, t);
+				buf.nodes.emplace_back(ciID, s, t);
 
-			for (int i = 0; i < 4; ++i) {
-				const auto cj = ci->neighbor(i);
-				const int cjID = cj->info();
+				for (int i = 0; i < 4; ++i) {
+					const auto cj = ci->neighbor(i);
+					const int cjID = cj->info();
 
-				if (cjID < ciID) continue;
+					if (cjID < ciID) continue;
 
-				const int j = cj->index(ci);
-				const auto& cjInfo = infoCells[cjID];
+					const int j = cj->index(ci);
+					const auto& cjInfo = infoCells[cjID];
 
-				const float angleCi = facetData.angle[idx * 4 + i];
-				const int cjIdx = facetData.cellIDToIdx[cjID];
-				const float angleCj = facetData.angle[cjIdx * 4 + j];
+					const float angleCi = facetData.angle[idx * 4 + i];
+					const int cjIdx = facetData.cellIDToIdx[cjID];
+					const float angleCj = facetData.angle[cjIdx * 4 + j];
 
-				edge_cap_t q = (1.f - MINF(angleCi, angleCj)) * kQual;
-				buf.edges.emplace_back(ciID, cjID, ciInfo.f[i] + q, cjInfo.f[j] + q);
-			}
+					edge_cap_t q = (1.f - MINF(angleCi, angleCj)) * kQual;
+					buf.edges.emplace_back(ciID, cjID, ciInfo.f[i] + q, cjInfo.f[j] + q);
 				}
 			}
+		}
 
 		for (const auto& buf : threadBuffers)
 			graph.graph.flow += buf.flow;
@@ -2706,10 +2710,13 @@ advance:
 		DEBUG_EXTRA("Delaunay tetrahedras graph-cut completed (%g flow): %u vertices, %u faces (%s)", maxflow, mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 
+#ifndef NO_MANIFOLD_FIXUP
 	// fix non-manifold vertices and edges
 	for (unsigned i=0; i<nItersFixNonManifold; ++i)
 		if (!mesh.FixNonManifold())
 			break;
+#endif
+
 	return true;
 }
 /*----------------------------------------------------------------*/
