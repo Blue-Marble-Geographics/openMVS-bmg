@@ -393,11 +393,6 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
   Node* u = &nodes[from];
   Node* v = &nodes[to];
 
-	if (u->arcCount >= Node::kMaxArcs)
-		__debugbreak();
-  if (v->arcCount >= Node::kMaxArcs)
-		__debugbreak();
-
   Arc* uv = &u->arcs[u->arcCount++];
   Arc* vu = &v->arcs[v->arcCount++];
 

@@ -41,6 +41,7 @@
 
 // D E F I N E S ///////////////////////////////////////////////////
 
+#define OPENMVS_21 // Migrated from OpenMVS 2.1
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -170,7 +171,14 @@ public:
 	void GetAdjVertices(VIndex, VertexIdxArr&) const;
 	void GetAdjVertexFaces(VIndex, VIndex, FaceIdxArr&) const;
 
+#ifdef OPENMVS_21
+	__forceinline int SmallMod3(int n) const noexcept { return (0x0924 >> (n << 1)) & 3; }
+	bool Mesh::GetEdgeOrientation(FIndex idxFace, VIndex iV0, VIndex iV1) const;
+	FIndex GetEdgeAdjacentFace(FIndex idxFace, VIndex iV0, VIndex iV1) const;
+	unsigned FixNonManifold(float magDisplacementDuplicateVertices=0.01f, VertexIdxArr* duplicatedVertices=NULL);
+#else
 	bool FixNonManifold();
+#endif
 	void Clean(float fDecimate=0.7f, float fSpurious=10.f, bool bRemoveSpikes=true, unsigned nCloseHoles=30, unsigned nSmoothMesh=2, float fEdgeLength=0, bool bLastClean=true);
 
 	void EnsureEdgeSize(float minEdge=-0.5f, float maxEdge=-4.f, float collapseRatio=0.2, float degenerate_angle_deg=150, int mode=1, int max_iters=50);

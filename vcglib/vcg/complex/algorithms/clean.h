@@ -44,7 +44,7 @@ namespace vcg {
 namespace tri{
 
 
-static int Info()
+constexpr int Info()
 {
 	constexpr int version = 2;
 

@@ -98,7 +98,6 @@ using namespace MVS;
 #include <unsupported/Eigen/BVH>
 #endif
 
-
 // S T R U C T S ///////////////////////////////////////////////////
 
 // free all memory
@@ -239,7 +238,23 @@ void Mesh::ListIncidenteVertices()
 	}
 }
 
-// extract array of triangles incident to each vertex
+// extract the (ordered) array of triangles incident to each vertex
+#ifdef OPENMVS_21
+void Mesh::ListIncidenteFaces()
+{
+	vertexFaces.clear();
+	vertexFaces.resize(vertices.size());
+	FOREACH(iF, faces) {
+		const Face& face = faces[iF];
+		for (int v=0; v<3; ++v) {
+			FaceIdxArr& vfs = vertexFaces[face[v]];
+			ASSERT(vfs.Find(iF) == FaceIdxArr::NO_INDEX || vfs.Find(iF) == vfs.size()-1/*for degenerate faces*/);
+			if (vfs.empty() || vfs.back() != iF)
+				vfs.emplace_back(iF);
+		}
+	}
+}
+#else
 void Mesh::ListIncidenteFaces()
 {
 	vertexFaces.Empty();
@@ -252,6 +267,7 @@ void Mesh::ListIncidenteFaces()
 		}
 	}
 }
+#endif
 
 // extract array face adjacencies for each face in the mesh (3 * number of faces);
 // each triple describes the adjacent face triangles for a given face
@@ -513,6 +529,170 @@ void Mesh::GetAdjVertexFaces(VIndex idxVCenter, VIndex idxVAdj, FaceIdxArr& indi
 	}
 }
 /*----------------------------------------------------------------*/
+#ifdef OPENMVS_21
+// get the edge orientation in the given face:
+// return false for backward, true for forward
+bool Mesh::GetEdgeOrientation(FIndex idxFace, VIndex iV0, VIndex iV1) const
+{
+	const Face& face = faces[idxFace];
+	const VIndex i0 = FindVertex(face, iV0);
+	ASSERT(i0 != NO_ID);
+	ASSERT(face[(i0+1)%3] == iV1 || face[(i0+2)%3] == iV1);
+	return face[SmallMod3(i0+1)] == iV1;
+}
+
+// find the adjacent face for the given face edge;
+// return NO_ID if no adjacent faces exist OR
+// more than one adjacent face exist OR
+// the edge have opposite orientations in each face
+Mesh::FIndex Mesh::GetEdgeAdjacentFace(FIndex idxFace, VIndex iV0, VIndex iV1) const
+{
+	// iterate over all faces containing the first vertex
+	ASSERT(vertexFaces.size() == vertices.size());
+	const bool edgeOrientation = GetEdgeOrientation(idxFace, iV0, iV1);
+	FIndex idxFaceAdj = NO_ID;
+	for (FIndex iF: vertexFaces[iV0]) { // JPB WIP BUG Parallel?
+		// if this adjacent face is not the analyzed face
+		if (iF != idxFace) {
+			// iterate over all face vertices
+			const Face& face = faces[iF];
+			for (int i = 0; i < 3; ++i) {
+				// if the face vertex is the second vertex
+				if (face[i] == iV1) {
+					// check if there are more than two adjacent faces (manifold constraint)
+					if (idxFaceAdj != NO_ID)
+						return NO_ID;
+					// check if edge vertices ordering is opposite in the two faces (manifold constraint)
+					if (GetEdgeOrientation(iF, iV0, iV1) == edgeOrientation)
+						return NO_ID;
+					idxFaceAdj = iF;
+				}
+			}
+		}
+	}
+	return idxFaceAdj;
+}
+
+unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxArr* duplicatedVertices)
+{
+	ASSERT(!vertices.empty() && !faces.empty());
+	if (vertexFaces.size() != vertices.size())
+		ListIncidenteFaces();
+	// iterate over all vertices and separates the components
+	// incident to the same vertex by duplicating the vertex
+	unsigned numNonManifoldIssues(0);
+	CLISTDEF0IDX(int, FIndex) components(faces.size());
+	FaceIdxArr queueFaces;
+	FOREACH(idxVert, vertices) {
+		// reset component indices to which each face connected to this vertex
+		const FaceIdxArr& vertFaces = vertexFaces[idxVert];
+		for (FIndex iF: vertFaces)
+			components[iF] = -1;
+		// find the components connected to this vertex
+		queueFaces.clear();
+		queueFaces.reserve(vertFaces.size());
+		FIndex idxFaceNext(0);
+		int component(0);
+		for ( ; ; ++component) {
+			// find one face not yet belonging to a component
+			while (idxFaceNext < vertFaces.size()) {
+				const FIndex iF(vertFaces[idxFaceNext++]);
+				if (components[iF] == -1) {
+					// add component as seed to the list
+					queueFaces.push_back(iF);
+					// mark the current face with a new component
+					components[iF] = component;
+					// process component
+					goto ProcessComponent;
+				}
+			}
+			// no more components found
+					break;
+			ProcessComponent:
+			// grow seed face component until no more connected faces found
+				do {
+				const FIndex idxFaceCurrent(queueFaces.back());
+				queueFaces.pop_back();
+				const Face& face = faces[idxFaceCurrent];
+				// go over all vertices of the current face
+				for (int i = 0; i < 3; ++i) {
+					const VIndex idxVertAdj(face[i]);
+					if (idxVertAdj == idxVert)
+			continue;
+					// if there is exactly one face adjacent to this edge
+					// tag it with the current component and add it to the queue
+					const FIndex idxFaceAdj(GetEdgeAdjacentFace(idxFaceCurrent, idxVert, idxVertAdj));
+					if (idxFaceAdj != NO_ID && components[idxFaceAdj] == -1) {
+						components[idxFaceAdj] = component;
+						queueFaces.push_back(idxFaceAdj);
+		}
+		}
+			} while (!queueFaces.empty());
+	}
+		// if there is only one component, continue with the next vertex
+		if (component <= 1)
+			continue;
+		// separate the vertex components
+		for (int c = 1; c < component; ++c) {
+			// duplicate the point to achieve the separation
+			const VIndex idxVertNew = vertices.size();
+			const Vertex v = vertices[idxVert];
+			vertices.emplace_back(v);
+			if (duplicatedVertices)
+				duplicatedVertices->emplace_back(idxVert);
+			// update the face indices of the current component
+			FaceIdxArr& vertFacesNew = vertexFaces.emplace_back();
+			FaceIdxArr& vertFaces = vertexFaces[idxVert];
+			RFOREACH(ivf, vertFaces) {
+				const FIndex idxFace = vertFaces[ivf];
+				if (components[idxFace] != c)
+						continue;
+				// link face to the new vertex and remove it from the original vertex
+				Face& face = faces[idxFace];
+				for (int i = 0; i < 3; ++i) {
+					if (face[i] == idxVert) {
+						face[i] = idxVertNew;
+						vertFacesNew.InsertAt(0, idxFace);
+				break;
+			}
+		}
+				vertFaces.RemoveAtMove(ivf);
+	}
+			++numNonManifoldIssues;
+		}
+		// adjust vertex positions
+		if (magDisplacementDuplicateVertices > 0) {
+			// list changed vertices
+			VertexIdxArr verts(component);
+			verts[0] = idxVert;
+			for (int c = 1; c < component; ++c)
+				verts[c] = vertices.size()-(component-c);
+			// adjust the position of the vertices in the direction
+			// to the center of the first ring of faces
+			FOREACH(i, verts) {
+				const VIndex idxVert(verts[i]);
+				VertexIdxArr adjVerts;
+				GetAdjVertices(idxVert, adjVerts);
+				TAccumulator<Vertex> accum;
+				for (VIndex iV: adjVerts)
+					accum.Add(vertices[iV], 1.f);
+				const Vertex bv(accum.Normalized());
+				Vertex& v(vertices[idxVert]);
+				const Vertex dir(bv-v);
+				v += dir * magDisplacementDuplicateVertices;
+				}
+			}
+		}
+
+	if (numNonManifoldIssues > 0) {
+		vertexFaces.Release();
+		DEBUG_ULTIMATE("Removed %u non-manifold issues", numNonManifoldIssues);
+		}
+	return numNonManifoldIssues;
+	}
+
+
+#else
 
 
 #if 0
@@ -1085,6 +1265,8 @@ bool Mesh::FixNonManifold()
 #undef IS_LOOP_FACE3
 #undef DEFINE_FACE_VERTS
 #endif
+
+#endif // 2.1 version
 /*----------------------------------------------------------------*/
 
 namespace CLEAN {

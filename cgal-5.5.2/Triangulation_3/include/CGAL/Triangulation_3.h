@@ -81,6 +81,17 @@
 
 namespace CGAL {
 
+    // P2P debug support
+inline std::pair<bool, int> info()
+{
+  constexpr int version = 1;
+#ifdef CGAL_LINKED_WITH_TBB
+  return { true, version };
+#else
+  return { false, version };
+#endif
+}
+
 template < class GT, class Tds = Default,
            class Lock_data_structure = Default >
 class Triangulation_3;

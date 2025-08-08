@@ -29,9 +29,7 @@
 *      containing it.
 */
 
-// Debugging logic: JPB WIP BUG
-#define NO_MANIFOLD_FIXUP
-
+#undef NO_MANIFOLD_FIXUP
 
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
@@ -50,6 +48,7 @@
 #include <CGAL/Polyhedron_3.h>
 #include <tbb/parallel_sort.h>
 #include "robin_map.h" // assumes robin_map.h is in include path
+#include <vcg/complex/algorithms/clean.h>
 
 template <typename T>
 struct NoInitAllocator
@@ -104,32 +103,37 @@ struct alignas(64) PaddedVector
 #include <windows.h>  // For SetThreadAffinityMask, Sleep
 
 // Optional: Pin to a single core for consistency
-DWORD_PTR SetAffinityToCPU0() {
+DWORD_PTR SetAffinityToCPU0()
+{
   HANDLE thread = GetCurrentThread();
   return SetThreadAffinityMask(thread, 1); // Use only CPU 0
 }
 
-void RestoreAffinity(DWORD_PTR originalMask) {
+void RestoreAffinity(DWORD_PTR originalMask)
+{
   HANDLE thread = GetCurrentThread();
   SetThreadAffinityMask(thread, originalMask);
 }
 
 // Safe, serialized RDTSC start
-inline uint64_t rdtscStart() {
+inline uint64_t rdtscStart()
+{
   int dummy;
   _mm_lfence(); // Serialize
   return __rdtscp(reinterpret_cast<unsigned int*>(&dummy));
 }
 
 // Safe, serialized RDTSC end
-inline uint64_t rdtscEnd() {
+inline uint64_t rdtscEnd()
+{
   unsigned int dummy;
   uint64_t tsc = __rdtscp(&dummy);
   _mm_lfence(); // Serialize
   return tsc;
 }
 
-double estimateCpuHz() {
+double estimateCpuHz()
+{
   //SetAffinityToCPU0(); // Optional, but improves accuracy
 
   uint64_t start = rdtscStart();
@@ -141,13 +145,12 @@ double estimateCpuHz() {
 }
 
 // Convert delta to seconds
-inline double rdtscToSeconds(uint64_t delta, double cpuHz) {
+inline double rdtscToSeconds(uint64_t delta, double cpuHz)
+{
   return static_cast<double>(delta) / cpuHz;
 }
 
-
 using namespace MVS;
-
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -180,26 +183,31 @@ public:
 	typedef IBFS::IBFSGraph graph_type;
 
 public:
-	MaxFlow(size_t numNodes) {
+	MaxFlow(size_t numNodes)
+	{
 		graph.initSize((int)numNodes, (int)numNodes*2);
 	}
 
-	inline void AddNode(node_type n, value_type source, value_type sink) {
+	inline void AddNode(node_type n, value_type source, value_type sink)
+	{
 		ASSERT(ISFINITE(source) && source >= 0 && ISFINITE(sink) && sink >= 0);
 		graph.addNode((int)n, source, sink);
 	}
 
-	inline void AddEdge(node_type n1, node_type n2, value_type capacity, value_type reverseCapacity) {
+	inline void AddEdge(node_type n1, node_type n2, value_type capacity, value_type reverseCapacity)
+	{
 		ASSERT(ISFINITE(capacity) && capacity >= 0 && ISFINITE(reverseCapacity) && reverseCapacity >= 0);
 		graph.addEdge((int)n1, (int)n2, capacity, reverseCapacity);
 	}
 
-	value_type ComputeMaxFlow() {
+	value_type ComputeMaxFlow()
+	{
 		graph.initGraph();
 		return graph.computeMaxFlow();
 	}
 
-	inline bool IsNodeOnSrcSide(node_type n) const {
+	inline bool IsNodeOnSrcSide(node_type n) const
+	{
 		return graph.isNodeOnSrcSide((int)n);
 	}
 
@@ -211,6 +219,7 @@ public:
 #include <boost/property_map/property_map.hpp>
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/boykov_kolmogorov_max_flow.hpp>
+#include <vcg/complex/algorithms/clean.h>
 template <typename NType, typename VType>
 class MaxFlow
 {
@@ -1340,6 +1349,18 @@ size_t ProcessPoints(
   return validCount;
 }
 
+float Quantize(float cap)
+{
+#if 1
+  int scaled = static_cast<int>(cap * 2.0f + 0.5f);
+  return 0.5f * scaled;
+#else
+  // Step is 0.2, so multiply by 5 and round to nearest int
+  int scaled = static_cast<int>(cap * 5.0f + 0.5f);
+  return 0.2f * scaled;
+#endif
+}
+
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
 // iif the point to be inserted is not closer than distInsert pixels in at least one of its views to
 // the projection of any of already inserted points.
@@ -1352,6 +1373,8 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	float kInf
 )
 {
+	double cpuHz = estimateCpuHz();
+
 	using namespace DELAUNAY;
 	ASSERT(!pointcloud.IsEmpty());
 	mesh.Release();
@@ -1574,12 +1597,12 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.2");
-		//const auto [isParallel, CGALversion] = delaunay.info();
-		//DEBUG("Parallel: %s", isParallel ? "true" : "false");
-		//DEBUG("CGAL version: = %d", CGALversion);
-		//const int vcgVersion = vcg::tri::Info();
-		//DEBUG("VCG version: = %d", vcgVersion);
+		DEBUG("ReconstructMesh optimization version 1.1.3");
+		const auto [isParallel, CGALversion] = CGAL::info();
+		DEBUG("Parallel: %s", isParallel ? "true" : "false");
+		DEBUG("CGAL version: = %d", CGALversion);
+		const int vcgVersion = vcg::tri::Info();
+		DEBUG("VCG version: = %d", vcgVersion);
 		DEBUG("------------------------------------------");
 #endif
 		// Fixed storage is slightly faster, but difficult to maintain.
@@ -1603,7 +1626,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				if (!(i & 255)) {
 					progress += 256;
 				}
-				}
+			}
 		} else {
 			std::vector<uint32_t> vertexMarks(numVertices);
 			uint32_t marker = 0;
@@ -1633,20 +1656,20 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				// The dt result is significantly smaller if we do refine the hint.
 				// Locate starting from last known good cell
 				cell_handle_t c = delaunay.locate(p, lt, li, lj, hint->cell());
-					vertex_handle_t nearest;
-					if (delaunay.dimension() < 3) {
-						// use a brute-force algorithm if dimension < 3
-						delaunay_t::Finite_vertices_iterator vit = delaunay.finite_vertices_begin();
-						nearest = vit;
-						++vit;
+				vertex_handle_t nearest;
+				if (delaunay.dimension() < 3) {
+					// use a brute-force algorithm if dimension < 3
+					delaunay_t::Finite_vertices_iterator vit = delaunay.finite_vertices_begin();
+					nearest = vit;
+					++vit;
 					adjacent_vertex_back_inserter_t inserter(delaunay, vertices[i], nearest);
-						for (delaunay_t::Finite_vertices_iterator end = delaunay.finite_vertices_end(); vit != end; ++vit)
-							inserter = vit;
+					for (delaunay_t::Finite_vertices_iterator end = delaunay.finite_vertices_end(); vit != end; ++vit)
+						inserter = vit;
 
 					offset = *pointViewsOffset;
 					numViews = *pointViewSizes;
 					views = pointcloud.pointViewsMemory.data() + offset;
-					} else {
+				} else {
 					offset = *pointViewsOffset;
 					numViews = *pointViewSizes;
 
@@ -1655,7 +1678,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 					views = pointcloud.pointViewsMemory.data() + offset;
 					_mm_prefetch((const char*)views, _MM_HINT_T0);
-						
+
 					const double qx = p.x(), qy = p.y(), qz = p.z();
 					const point_t& nearestPt = nearest->point();
 					double bestSq = fast_sqdist2(qx, qy, qz, nearestPt.x(), nearestPt.y(), nearestPt.z());
@@ -1666,7 +1689,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					// all adjacent cells and then looks at them.
 					// Here, we identify the adjacent cells as needed.
 					while (true) {
-							++marker;
+						++marker;
 						// 2^32 iteration limit.
 
 						vertex_handle_t best = nearest;
@@ -1730,8 +1753,8 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							} else {
 								// refinement occurred, stop immediately
 								break;
-								}
 							}
+						}
 
 refine_restart:
 						if (best == nearest)
@@ -1753,48 +1776,52 @@ refine_restart:
 				const float pxF = (float)px, pyF = (float)py, pzF = (float)pz;
 				const float nxF = (float)hint->point().x(), nyF = (float)hint->point().y(), nzF = (float)hint->point().z();
 
+				constexpr float depthThreshold = 0.01f;
+
 				bool shouldInsert = false;
 				for (size_t j = 0; j < numViews; ++j) {
-					const auto& camera = viewCameras[views[j]];
+					const float * __restrict camera = &viewCameras[views[j]][0];
 
-					float pez = camera[8]*pxF + camera[9]*pyF + camera[10]*pzF + camera[11];
+					const float pez = camera[8]*pxF + camera[9]*pyF + camera[10]*pzF + camera[11];
 					if (pez <= 0.f) continue;
 
-					float pnz = camera[8]*nxF + camera[9]*nyF + camera[10]*nzF + camera[11];
+					const float pnz = camera[8]*nxF + camera[9]*nyF + camera[10]*nzF + camera[11];
 					if (pnz <= 0.f) continue;
 
-					if (!IsDepthSimilar(pez, pnz)) {
+					if (fabsf(pnz - pez) >= depthThreshold * pez) {
 						shouldInsert = true;
 						break;
-							}
-
-					float invPez = 1.f / pez, invPnz = 1.f / pnz;
-
-					float pex = (camera[0]*pxF + camera[1]*pyF + camera[2]*pzF + camera[3]) * invPez;
-					float pnx = (camera[0]*nxF + camera[1]*nyF + camera[2]*nzF + camera[3]) * invPnz;
-
-					float pey = (camera[4]*pxF + camera[5]*pyF + camera[6]*pzF + camera[7]) * invPez;
-					float pny = (camera[4]*nxF + camera[5]*nyF + camera[6]*nzF + camera[7]) * invPnz;
-
-					float dx = pex - pnx, dy = pey - pny;
-					if (dx*dx + dy*dy > distInsertSq) {
-						shouldInsert = true;
-								break;
-						}
 					}
 
+					const float invPez = 1.f / pez;
+					const float invPnz = 1.f / pnz;
+
+					const float pex = (camera[0]*pxF + camera[1]*pyF + camera[2]*pzF + camera[3]) * invPez;
+					const float pnx = (camera[0]*nxF + camera[1]*nyF + camera[2]*nzF + camera[3]) * invPnz;
+
+					const float pey = (camera[4]*pxF + camera[5]*pyF + camera[6]*pzF + camera[7]) * invPez;
+					const float pny = (camera[4]*nxF + camera[5]*nyF + camera[6]*nzF + camera[7]) * invPnz;
+
+					const float dx = pex - pnx;
+					const float dy = pey - pny;
+					if (dx*dx + dy*dy > distInsertSq) {
+						shouldInsert = true;
+						break;
+					}
+				}
+
 				if (shouldInsert) {
-							hint = delaunay.insert(p, lt, c, li, lj);
+					hint = delaunay.insert(p, lt, c, li, lj);
 					ASSERT(anchor != vertex_handle_t());
-						}
+				}
 
 				// Visibility information not needed for the dt, but used in the next step.
 				// idx is the index of the spatially sorted point.
 				InsertViews(hint->info().idx, pointcloud, idx);
 advance:
 				if (!(i & 255)) progress += 256;
-					}
-				}
+			}
+		}
 
 		progress.process();
 		progress.close();
@@ -1899,11 +1926,13 @@ advance:
 		const point_t& p0 = idToVertex[id0]->point();
 		const point_t& p1 = idToVertex[id1]->point();
 
-		float dx = p0.x() - p1.x();
-		float dy = p0.y() - p1.y();
-		float dz = p0.z() - p1.z();
+		const double x0 = p0.x(), y0 = p0.y(), z0 = p0.z();
+		const double x1 = p1.x(), y1 = p1.y(), z1 = p1.z();
 
-		dists[i] = dx * dx + dy * dy + dz * dz;
+    const float dx = (float)(x0 - x1);
+    const float dy = (float)(y0 - y1);
+    const float dz = (float)(z0 - z1);
+    dists[i] = dx*dx + dy*dy + dz*dz;
 	}
 
 	const size_t numDistances = dists.size();
@@ -1973,8 +2002,9 @@ advance:
 		approxMedian = distsSq[totalSize/2];
 #endif
 
-		DWORD64 t1 = __rdtsc();
-		DEBUG("Median time %llu\n", t1-t0);
+		auto t1 = rdtscEnd();
+
+		DEBUG("Median time %g\n", rdtscToSeconds(t1 - t0, cpuHz));
 
 		infoCells.resize(totalCells);
 		memset(&infoCells[0], 0, sizeof(cell_info_t)*totalCells);
@@ -2433,8 +2463,6 @@ advance:
 		TD_TIMER_STARTD();
 		//DWORD_PTR originalMask = SetAffinityToCPU0();
 
-		double cpuHz = estimateCpuHz();
-
 		auto t0 = rdtscStart();
 
 		// create graph
@@ -2547,7 +2575,10 @@ advance:
 					const float angleCj = facetData.angle[cjIdx * 4 + j];
 
 					edge_cap_t q = (1.f - MINF(angleCi, angleCj)) * kQual;
-					buf.edges.emplace_back(ciID, cjID, ciInfo.f[i] + q, cjInfo.f[j] + q);
+
+					edge_cap_t iCap = (ciInfo.f[i] >= kInf) ? kInf : Quantize(ciInfo.f[i] + q);
+					edge_cap_t jCap = (cjInfo.f[j] >= kInf) ? kInf : Quantize(cjInfo.f[j] + q);
+					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
 				}
 			}
 		}
@@ -2712,9 +2743,7 @@ advance:
 
 #ifndef NO_MANIFOLD_FIXUP
 	// fix non-manifold vertices and edges
-	for (unsigned i=0; i<nItersFixNonManifold; ++i)
-		if (!mesh.FixNonManifold())
-			break;
+	mesh.FixNonManifold();
 #endif
 
 	return true;
