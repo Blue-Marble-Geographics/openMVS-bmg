@@ -200,6 +200,168 @@ class Smooth
         ScalarType cnt;
     };
 
+#if 1 // Original work JPB WIP BUG
+ static void AccumulateLaplacianInfo(MeshType &m, SimpleTempData<typename MeshType::VertContainer, LaplacianInfo> &TD, bool cotangentFlag = false)
+    {
+        float weight = 1.0f;
+
+        //if we are applying to a tetrahedral mesh:
+        ForEachTetra(m, [&](TetraType &t) {
+            for (int i = 0; i < 6; ++i)
+            {
+                VertexPointer v0, v1, vo0, vo1;
+                v0 = t.V(Tetra::VofE(i, 0));
+                v1 = t.V(Tetra::VofE(i, 1));
+
+                if (cotangentFlag)
+                {
+                    vo0 = t.V(Tetra::VofE(5 - i, 0));
+                    vo1 = t.V(Tetra::VofE(5 - i, 1));
+
+                    ScalarType angle = Tetra::DihedralAngle(t, 5 - i);
+                    ScalarType length = vcg::Distance(vo0->P(), vo1->P());
+
+                    weight = (length / 6.) * (tan(M_PI / 2. - angle));
+                }
+
+                TD[v0].sum += v1->cP() * weight;
+                TD[v1].sum += v0->cP() * weight;
+                TD[v0].cnt += weight;
+                TD[v1].cnt += weight;
+            }
+        });
+
+        ForEachTetra(m, [&](TetraType &t) {
+            for (int i = 0; i < 4; ++i)
+                if (t.IsB(i))
+                {
+                    VertexPointer v0, v1, v2;
+                    v0 = t.V(Tetra::VofF(i, 0));
+                    v1 = t.V(Tetra::VofF(i, 1));
+                    v2 = t.V(Tetra::VofF(i, 2));
+
+                    TD[v0].sum = v0->P();
+                    TD[v1].sum = v1->P();
+                    TD[v2].sum = v2->P();
+
+                    TD[v0].cnt = 1;
+                    TD[v1].cnt = 1;
+                    TD[v2].cnt = 1;
+                }
+        });
+
+//        ForEachTetra(m, [&](TetraType &t) {
+//            for (int i = 0; i < 4; ++i)
+//                if (t.IsB(i))
+//                {
+//                    VertexPointer v0, v1, v2;
+//                    v0 = t.V(Tetra::VofF(i, 0));
+//                    v1 = t.V(Tetra::VofF(i, 1));
+//                    v2 = t.V(Tetra::VofF(i, 2));
+
+//                    TD[v0].sum += v1->P();
+//                    TD[v0].sum += v2->P();
+//                    TD[v0].cnt += 2;
+
+//                    TD[v1].sum += v0->P();
+//                    TD[v1].sum += v2->P();
+//                    TD[v1].cnt += 2;
+
+//                    TD[v2].sum += v0->P();
+//                    TD[v2].sum += v1->P();
+//                    TD[v2].cnt += 2;
+//                }
+//        });
+
+        FaceIterator fi;
+        for (fi = m.face.begin(); fi != m.face.end(); ++fi)
+        {
+            if (!(*fi).IsD())
+                for (int j = 0; j < 3; ++j)
+                    if (!(*fi).IsB(j))
+                    {
+                        if (cotangentFlag)
+                        {
+                            float angle = Angle(fi->P1(j) - fi->P2(j), fi->P0(j) - fi->P2(j));
+                            weight = tan((M_PI * 0.5) - angle);
+                        }
+
+                        TD[(*fi).V0(j)].sum += (*fi).P1(j) * weight;
+                        TD[(*fi).V1(j)].sum += (*fi).P0(j) * weight;
+                        TD[(*fi).V0(j)].cnt += weight;
+                        TD[(*fi).V1(j)].cnt += weight;
+                    }
+        }
+        // si azzaera i dati per i vertici di bordo
+        for (fi = m.face.begin(); fi != m.face.end(); ++fi)
+        {
+            if (!(*fi).IsD())
+                for (int j = 0; j < 3; ++j)
+                    if ((*fi).IsB(j))
+                    {
+                        TD[(*fi).V0(j)].sum = (*fi).P0(j);
+                        TD[(*fi).V1(j)].sum = (*fi).P1(j);
+                        TD[(*fi).V0(j)].cnt = 1;
+                        TD[(*fi).V1(j)].cnt = 1;
+                    }
+        }
+
+        // se l'edge j e' di bordo si deve mediare solo con gli adiacenti
+        for (fi = m.face.begin(); fi != m.face.end(); ++fi)
+        {
+            if (!(*fi).IsD())
+                for (int j = 0; j < 3; ++j)
+                    if ((*fi).IsB(j))
+                    {
+                        TD[(*fi).V(j)].sum += (*fi).V1(j)->P();
+                        TD[(*fi).V1(j)].sum += (*fi).V(j)->P();
+                        ++TD[(*fi).V(j)].cnt;
+                        ++TD[(*fi).V1(j)].cnt;
+                    }
+        }
+    }
+
+    static void VertexCoordLaplacian(MeshType &m, int step, bool SmoothSelected = false, bool cotangentWeight = false, vcg::CallBackPos *cb = 0)
+    {
+        LaplacianInfo lpz(CoordType(0, 0, 0), 0);
+        SimpleTempData<typename MeshType::VertContainer, LaplacianInfo> TD(m.vert, lpz);
+        for (int i = 0; i < step; ++i)
+        {
+            if (cb)
+                cb(100 * i / step, "Classic Laplacian Smoothing");
+            TD.Init(lpz);
+            AccumulateLaplacianInfo(m, TD, cotangentWeight);
+            for (auto vi = m.vert.begin(); vi != m.vert.end(); ++vi)
+                if (!(*vi).IsD() && TD[*vi].cnt > 0)
+                {
+                  if (!SmoothSelected || (*vi).IsS())
+#if 0
+                  {
+                    const CoordType oldP = (*vi).P();
+                    const CoordType sum = TD[*vi].sum;
+                    const int cnt = TD[*vi].cnt;
+                    const CoordType newP = (oldP + sum) / (cnt + 1);
+
+                    // Debug print: step, vertex index, old, sum, cnt, new
+                    const std::ptrdiff_t vIdx = vi - m.vert.begin(); // if not a vector, use std::distance(...)
+                    // Optional throttle: print every Nth vertex (uncomment to reduce spam)
+                    if ((vIdx % 1000) == 0)
+                      std::printf("step=%d v=%td old=(%.6f, %.6f, %.6f) sum=(%.6f, %.6f, %.6f) cnt=%d new=(%.6f, %.6f, %.6f)\n",
+                        i, vIdx,
+                        oldP[0], oldP[1], oldP[2],
+                        sum[0], sum[1], sum[2],
+                        cnt,
+                        newP[0], newP[1], newP[2]);
+
+                    (*vi).P() = newP;
+                  }
+#else
+                        (*vi).P() = ((*vi).P() + TD[*vi].sum) / (TD[*vi].cnt + 1);
+#endif
+                }
+        }
+    }
+#else
     // Classical Laplacian Smoothing. Each vertex can be moved onto the average of the adjacent vertices.
     // Can smooth only the selected vertices and weight the smoothing according to the quality
     // In the latter case 0 means that the vertex is not moved and 1 means that the vertex is moved onto the computed position.
@@ -353,6 +515,7 @@ class Smooth
             }
         }
     }
+#endif
 
     // Same of above but moves only the vertices that do not change FaceOrientation more that the given threshold
     static void VertexCoordPlanarLaplacian(MeshType &m, int step, float AngleThrRad = math::ToRad(1.0), bool SmoothSelected = false, vcg::CallBackPos *cb = 0)

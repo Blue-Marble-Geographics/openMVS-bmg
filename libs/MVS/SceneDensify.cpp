@@ -2449,7 +2449,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 } // FuseDepthMaps
 // #pragma optimize("", on) // JPB WIP BUG
 #else
-void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, bool bEstimateNormal)
+void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimateColor, bool bEstimateNormal)
 {
 	TD_TIMER_STARTD();
 
@@ -2499,13 +2499,13 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 	ProjsArr projs(0, nPointsEstimate);
 	if (bEstimateNormal && !bNormalMap)
 		bEstimateNormal = false;
-	pointcloud.points.Reserve(nPointsEstimate);
-	pointcloud.pointViews.Reserve(nPointsEstimate);
-	pointcloud.pointWeights.Reserve(nPointsEstimate);
-	if (bEstimateColor)
-		pointcloud.colors.Reserve(nPointsEstimate);
-	if (bEstimateNormal)
-		pointcloud.normals.Reserve(nPointsEstimate);
+	// JPB WIP BUG pointcloud.points.reserve(nPointsEstimate);
+	// JPB WIP BUG pointcloud.pointViews.reserve(nPointsEstimate);
+	// JPB WIP BUG pointcloud.pointWeights.reserve(nPointsEstimate);
+	// JPB WIP BUG if (bEstimateColor)
+	// JPB WIP BUG 	pointcloud.colors.Reserve(nPointsEstimate);
+	// JPB WIP BUG if (bEstimateNormal)
+	// JPB WIP BUG 	pointcloud.normals.Reserve(nPointsEstimate);
 	Util::Progress progress(_T("Fused depth-maps"), connections.GetSize());
 	GET_LOGCONSOLE().Pause();
 	FOREACHPTR(pConnection, connections) {
@@ -2514,10 +2514,10 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 		const DepthData& depthData(arrDepthData[idxImage]);
 		ASSERT(!depthData.images.IsEmpty() && !depthData.neighbors.IsEmpty());
 		for (const ViewScore& neighbor: depthData.neighbors) {
-			DepthIndex& depthIdxs = arrDepthIdx[neighbor.idx.ID];
+			DepthIndex& depthIdxs = arrDepthIdx[neighbor.ID];
 			if (!depthIdxs.empty())
 				continue;
-			const DepthData& depthDataB(arrDepthData[neighbor.idx.ID]);
+			const DepthData& depthDataB(arrDepthData[neighbor.ID]);
 			if (depthDataB.IsEmpty())
 				continue;
 			depthIdxs.create(depthDataB.depthMap.size());
@@ -2532,7 +2532,7 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 			depthIdxs.create(Image8U::Size(imageData.width, imageData.height));
 			depthIdxs.memset((uint8_t)NO_ID);
 		}
-		const size_t nNumPointsPrev(pointcloud.points.GetSize());
+		const size_t nNumPointsPrev(pointcloud.NumPoints());
 		for (int i=0; i<sizeMap.height; ++i) {
 			for (int j=0; j<sizeMap.width; ++j) {
 				const ImageRef x(j,i);
@@ -2545,12 +2545,15 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 				if (idxPoint != NO_ID)
 					continue;
 				// create the corresponding 3D point
-				idxPoint = (uint32_t)pointcloud.points.GetSize();
-				PointCloud::Point& point = pointcloud.points.AddEmpty();
+				idxPoint = (uint32_t)pointcloud.NumPoints();
+				PointCloud::Point point;
+				//pointcloud.pointsXYZ..AddEmpty();
 				point = imageData.camera.TransformPointI2W(Point3(Point2f(x),depth));
-				PointCloud::ViewArr& views = pointcloud.pointViews.AddEmpty();
+				PointCloud::ViewArr views;
+				//= pointcloud.pointViews.AddEmpty();
 				views.Insert(idxImage);
-				PointCloud::WeightArr& weights = pointcloud.pointWeights.AddEmpty();
+				PointCloud::WeightArr weights;
+				//= pointcloud.pointWeights.AddEmpty();
 				REAL confidence(weights.emplace_back(Conf2Weight(depthData.confMap.empty() ? 1.f : depthData.confMap(x),depth)));
 				ProjArr& pointProjs = projs.AddEmpty();
 				pointProjs.Insert(Proj(x));
@@ -2562,7 +2565,7 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 				PointCloud::Normal N(normal*confidence);
 				invalidDepths.Empty();
 				FOREACHPTR(pNeighbor, depthData.neighbors) {
-					const IIndex idxImageB(pNeighbor->idx.ID);
+					const IIndex idxImageB(pNeighbor->ID);
 					DepthData& depthDataB = arrDepthData[idxImageB];
 					if (depthDataB.IsEmpty())
 						continue;
@@ -2615,34 +2618,66 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 						arrDepthIdx[idxImageB](x).idx = NO_ID;
 					}
 					projs.RemoveLast();
-					pointcloud.pointWeights.RemoveLast();
-					pointcloud.pointViews.RemoveLast();
-					pointcloud.points.RemoveLast();
+					//pointcloud.pointWeights.RemoveLast();
+					//pointcloud.pointViews.RemoveLast();
+					//pointcloud.points.RemoveLast();
 				} else {
 					// this point is valid, store it
 					const REAL nrm(REAL(1)/confidence);
 					point = X*nrm;
 					ASSERT(ISFINITE(point));
-					if (bEstimateColor)
-						pointcloud.colors.AddConstruct((C*(float)nrm).cast<uint8_t>());
-					if (bEstimateNormal)
-						pointcloud.normals.AddConstruct(normalized(N*(float)nrm));
+					pointcloud.pointsXYZ.push_back(point.x);
+					pointcloud.pointsXYZ.push_back(point.y);
+					pointcloud.pointsXYZ.push_back(point.z);
+
+					size_t index = pointcloud.pointViewsMemory.size();
+					pointcloud.pointViewsOffsets.push_back((int)index);
+
+					pointcloud.pointViewsSizes.push_back((int) views.size());
+					for (auto& v : views) {
+						pointcloud.pointViewsMemory.push_back(v);
+					}
+
+					size_t index2 = pointcloud.pointWeightsMemory.size();
+					pointcloud.pointWeightsOffsets.push_back((int)index2);
+
+					pointcloud.pointWeightsSizes.push_back((int) weights.size());
+					for (auto& w : weights) {
+						pointcloud.pointViewsMemory.push_back(w);
+					}
+
+					if (bEstimateColor) {
+						Pixel8U col = (C * (float)nrm).cast<uint8_t>();
+						uint8_t rgb[3];
+						rgb[0] = col.r;
+						rgb[1] = col.g;
+						rgb[2] = col.b;
+						pointcloud.AddColor(rgb);
+					}
+					if (bEstimateNormal) {
+						auto normal = normalized(N * (float)nrm);
+						pointcloud.AddNormal(normal);
+					}
 					// invalidate all neighbor depths that do not agree with it
 					for (Depth* pDepth: invalidDepths)
 						*pDepth = 0;
 				}
 			}
 		}
-		ASSERT(pointcloud.points.GetSize() == pointcloud.pointViews.GetSize() && pointcloud.points.GetSize() == pointcloud.pointWeights.GetSize() && pointcloud.points.GetSize() == projs.GetSize());
-		DEBUG_ULTIMATE("Depths map for reference image %3u fused using %u depths maps: %u new points (%s)", idxImage, depthData.images.GetSize()-1, pointcloud.points.GetSize()-nNumPointsPrev, TD_TIMER_GET_FMT().c_str());
+		ASSERT(pointcloud.points.GetSize() == pointcloud.pointViews.GetSize() && pointcloud.points.GetSize() == pointcloud.pointWeights.GetSize() && pointcloud.NumPoints() == projs.GetSize());
+		DEBUG_ULTIMATE("Depths map for reference image %3u fused using %u depths maps: %u new points (%s)", idxImage, depthData.images.GetSize()-1, pointcloud.NumPoints()-nNumPointsPrev, TD_TIMER_GET_FMT().c_str());
 		progress.display(pConnection-connections.Begin());
 	}
 	GET_LOGCONSOLE().Play();
 	progress.close();
 	arrDepthIdx.Release();
 
-	DEBUG_EXTRA("Depth-maps fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%) (%s)", connections.GetSize(), nDepths, pointcloud.points.GetSize(), ROUND2INT((100.f*pointcloud.points.GetSize())/nDepths), TD_TIMER_GET_FMT().c_str());
+	DEBUG_EXTRA("Depth-maps fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%) (%s)", connections.GetSize(), nDepths, pointcloud.NumPoints(), ROUND2INT((100.f*pointcloud.NumPoints())/nDepths), TD_TIMER_GET_FMT().c_str());
 
+	if (bEstimateNormal) {
+		throw std::exception("Unsupporeted");
+	}
+#if 0
 	if (bEstimateNormal && !pointcloud.points.IsEmpty() && pointcloud.normals.IsEmpty()) {
 		// estimate normal also if requested (quite expensive if normal-maps not available)
 		TD_TIMER_STARTD();
@@ -2669,7 +2704,7 @@ void DepthMapsData::FuseDepthMaps(PointCloud& pointcloud, bool bEstimateColor, b
 		}
 		DEBUG_EXTRA("Normals estimated for the dense point-cloud: %u normals (%s)", pointcloud.points.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
-
+#endif
 	// release all depth-maps
 	for (DepthData& depthData: arrDepthData)
 		if (depthData.IsValid())

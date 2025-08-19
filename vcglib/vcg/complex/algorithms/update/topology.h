@@ -30,6 +30,7 @@
 #include <vcg/simplex/face/topology.h>
 #include <vcg/simplex/edge/pos.h>
 #include <execution>
+#include <tbb/parallel_sort.h>
 
 #define FAST_FILLEDGEVECTOR
 #define FAST_VERTEXFACE
@@ -197,59 +198,114 @@ public:
   }
 };
 
+#ifdef FAST_FILLEDGEVECTOR
 /// Fill a vector with all the edges of the mesh.
 /// each edge is stored in the vector the number of times that it appears in the mesh, with the referring face.
 /// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
-static void FillEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true)
+template<bool IncludeFaux>
+static __forceinline void FillEdgeVectorImpl(MeshType& m, std::vector<PEdge>& edgeVec)
 {
- #ifdef FAST_FILLEDGEVECTOR
-    edgeVec.reserve(m.fn * 3);
+  struct alignas(64) CountSlot { size_t n; };
 
-    // Per-thread edge buffers
-    std::vector<std::vector<PEdge>> localEdges;
+  edgeVec.clear();
+  const int64_t faceCount = (int64_t)m.face.size();
 
-    #pragma omp parallel
+  std::vector<CountSlot> counts;   // sized inside the parallel region
+  std::vector<size_t> offsets;     // sized inside the parallel region
+
+#pragma omp parallel
+  {
+    const int tid = omp_get_thread_num();
+
+#pragma omp single
     {
-      const int id = omp_get_thread_num();
+      const int T = omp_get_num_threads();
+      counts.resize(T);
+      offsets.assign(T + 1, 0);
+    }
 
-      // Let the first thread resize.
-      #pragma omp single
-      {
-          const int numThreads = omp_get_num_threads();
-          localEdges.resize(numThreads);
-      }
+    // pass 1: count (no contention; each thread writes its own slot)
+    size_t local = 0;
 
-      auto& localVec = localEdges[id];
-      localVec.reserve((m.fn * 3 * 11) / (omp_get_num_threads() * 10)); // Roughly even
+#pragma omp for schedule(static) nowait
+    for (int64_t i = 0; i < faceCount; ++i) {
+      auto& f = m.face[i];
+      if (f.IsD()) continue;
 
-      const int64_t cnt = (int64_t) m.face.size();
-      #pragma omp for schedule(static)
-      for (int64_t i = 0; i < cnt; ++i) {
-        auto& f = m.face[i];
-        if (f.IsD()) continue;
-
-        const int vn = f.VN();
+      const int vn = f.VN();
+      if constexpr (IncludeFaux) {
+        local += (size_t)vn;
+      } else {
         for (int j = 0; j < vn; ++j) {
-          if (includeFauxEdge || !f.IsF(j)) {
-            localVec.emplace_back(&f, j);
-          }
+          if (!f.IsF(j)) ++local;
         }
       }
     }
 
-    // Flatten thread-local vectors into edgeVec
-    for (const auto& vec : localEdges) {
-      edgeVec.insert(edgeVec.end(), vec.begin(), vec.end());
+    counts[tid].n = local;
+
+#pragma omp barrier
+
+    // one thread computes offsets and resizes output once
+#pragma omp single
+    {
+      for (size_t t = 0; t + 1 < offsets.size(); ++t) {
+        offsets[t + 1] = offsets[t] + counts[t].n;
+      }
+      edgeVec.resize(offsets.back()); // fill will write every slot
     }
-#else
-    edgeVec.reserve(m.fn*3);
-    for(FaceIterator fi=m.face.begin();fi!=m.face.end();++fi)
-    if( ! (*fi).IsD() )
-      for(int j=0;j<(*fi).VN();++j)
-        if(includeFauxEdge || !(*fi).IsF(j))
-          edgeVec.push_back(PEdge(&*fi,j));
-#endif
+
+    // pass 2: fill directly into your slice
+    PEdge* out = edgeVec.data() + offsets[tid];
+    size_t pos = 0;
+
+#pragma omp for schedule(static)
+    for (int64_t i = 0; i < faceCount; ++i) {
+      auto& f = m.face[i];
+      if (f.IsD()) continue;
+
+      const int vn = f.VN();
+
+      if (vn == 3) {
+        if constexpr (IncludeFaux) {
+          out[pos++] = PEdge(&f, 0);
+          out[pos++] = PEdge(&f, 1);
+          out[pos++] = PEdge(&f, 2);
+        } else {
+          if (!f.IsF(0)) out[pos++] = PEdge(&f, 0);
+          if (!f.IsF(1)) out[pos++] = PEdge(&f, 1);
+          if (!f.IsF(2)) out[pos++] = PEdge(&f, 2);
+        }
+      } else {
+        if constexpr (IncludeFaux) {
+          for (int j = 0; j < vn; ++j) out[pos++] = PEdge(&f, j);
+        } else {
+          for (int j = 0; j < vn; ++j) if (!f.IsF(j)) out[pos++] = PEdge(&f, j);
+        }
+      }
+    }
+  }
 }
+
+static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includeFauxEdge = true)
+{
+  if (includeFauxEdge) {
+    FillEdgeVectorImpl<true>(m, edgeVec);
+  } else {
+    FillEdgeVectorImpl<false>(m, edgeVec);
+  }
+}
+#else
+static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includeFauxEdge=true)
+{
+  edgeVec.reserve(m.fn*3);
+  for (FaceIterator fi=m.face.begin(); fi!=m.face.end(); ++fi)
+    if (!(*fi).IsD())
+      for (int j=0; j<(*fi).VN(); ++j)
+        if (includeFauxEdge || !(*fi).IsF(j))
+          edgeVec.push_back(PEdge(&*fi, j));
+}
+#endif
 
 static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true, bool computeBorderFlag=false)
 {
@@ -454,7 +510,7 @@ static void FaceFace(MeshType &m)
 
   std::vector<PEdge> e;
   FillEdgeVector(m,e);
-  sort(std::execution::par_unseq, e.begin(), e.end());							// Lo ordino per vertici
+  tbb::parallel_sort(e.begin(), e.end());							// Lo ordino per vertici
 
   int ne = 0;											// Numero di edge reali
 
@@ -488,7 +544,6 @@ static void FaceFace(MeshType &m)
     ++pe;
   } while(true);
 }
-
 
 /// \brief Update the vertex-tetra topological relation.
 static void VertexTetra(MeshType & m)

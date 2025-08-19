@@ -84,7 +84,7 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 1;
+  constexpr int version = 2;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else
@@ -1153,12 +1153,6 @@ public:
                                           Hidden_points_visitor& hider,
                                           bool *could_lock_zone = nullptr);
 
-  template < class Conflict_tester, class Hidden_points_visitor >
-  inline Vertex_handle insert_in_conflict2(const Point& p,
-                                          Locate_type lt,
-                                          Cell_handle c, int li, int lj,
-                                          const Conflict_tester& tester,
-                                          Hidden_points_visitor& hider);
 
 #ifndef CGAL_TRIANGULATION_3_DONT_INSERT_RANGE_OF_POINTS_WITH_INFO
   template < class InputIterator >
@@ -1438,7 +1432,7 @@ protected:
 
           test->tds_data().mark_on_boundary();
         }
-        
+
         Facet f(c, i); // Boundary facet.
         // Is it the facet where're looking for?
         if(this_facet_must_be_in_the_cz && the_facet_is_in_its_cz &&
@@ -1448,99 +1442,12 @@ protected:
           *the_facet_is_in_its_cz = true;
         }
 
-        //*it.first++ = f;
-        //Facet mirror = Facet(f.first->neighbor(f.second), f.first->neighbor(f.second)->index(f.first));
-        *it.first++ = Facet(f.first->neighbor(f.second), f.first->neighbor(f.second)->index(f.first));
+        *it.first++ = f;
       }
     }
     while(!cell_stack.empty());
 
     return it;
-  }
-
-    // - c is the current cell, which must be in conflict.
-  // - tester is the function object that tests if a cell is in conflict.
-  template <class Conflict_test,
-            class OutputIteratorBoundaryFacets,
-            class OutputIteratorCells,
-            class OutputIteratorInternalFacets>
-  Triple<OutputIteratorBoundaryFacets,
-         OutputIteratorCells,
-         OutputIteratorInternalFacets>
-  find_conflicts2(Cell_handle d,
-                 const Conflict_test& tester,
-                 Triple<OutputIteratorBoundaryFacets,
-                 OutputIteratorCells,
-                 OutputIteratorInternalFacets> it) const
-  {
-    CGAL_triangulation_precondition(dimension()>=2);
-
-    CGAL_triangulation_precondition(tester(d));
-
-    // To store the boundary cells, in case we need to rollback
-    typedef boost::container::small_vector<Cell_handle,8192> SV;
-    SV sv;
-    std::stack<Cell_handle, SV > cell_stack(sv);
-
-    cell_stack.push(d);
-    d->tds_data().mark_in_conflict();
-
-    *it.second++ = d;
-
-    do
-    {
-      Cell_handle c = cell_stack.top();
-      cell_stack.pop();
-
-      // For each neighbor cell
-      for(int i=0; i<3+1; ++i)
-      {
-        Cell_handle test = c->neighbor(i);
-        auto& tds = test->tds_data();
-
-        // "test" is either in the conflict zone,
-        // either facet-adjacent to the CZ
-
-        if(tds.is_in_conflict())
-        {
-          Facet f(c, i); // Internal facet.
-          // Is it the facet where're looking for?
-          if(c < test)
-          {
-            *it.third++ = f;
-          }
-          continue; // test was already in conflict.
-        }
-        if(tds.is_clear())
-        {
-          if(tester(test))
-          {
-            // "test" is in the conflict zone
-            Facet f(c, i); // Internal facet.
-            // Is it the facet where're looking for?
-            if(c < test)
-            {
-              *it.third++ = f;
-            }
-
-            cell_stack.push(test);
-            tds.mark_in_conflict();
-            *it.second++ = test;
-            continue;
-          }
-
-          tds.mark_on_boundary();
-        }
-
-        Facet f(c, i); // Boundary facet.
-        //*it.first++ = f;
-        //Facet mirror = Facet(f.first->neighbor(f.second), f.first->neighbor(f.second)->index(f.first));
-        *it.first++ = Facet(f.first->neighbor(f.second), f.first->neighbor(f.second)->index(f.first));
-      }
-    }
-    while(!cell_stack.empty());
-    
-    return it; 
   }
 
   // This one takes a function object to recursively determine the cells in
@@ -3290,12 +3197,12 @@ inline
 typename Triangulation_3<Gt, Tds, Lds>::Cell_handle
 Triangulation_3<Gt, Tds, Lds>::
 inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
-  bool* could_lock_zone) const
+               bool *could_lock_zone) const
 {
   CGAL_triangulation_expensive_assertion(start == Cell_handle() ||
                                          tds().is_simplex(start));
 
-  if (could_lock_zone)
+  if(could_lock_zone)
     *could_lock_zone = true;
 
   if(dimension() < 3)
@@ -3306,8 +3213,10 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
     start = infinite_cell();
 
   // CJTODO: useless?
-  if (could_lock_zone) {
-    if (!this->try_lock_cell(start)) {
+  if(could_lock_zone)
+  {
+    if(!this->try_lock_cell(start))
+    {
       *could_lock_zone = false;
       return Cell_handle();
     }
@@ -3327,83 +3236,16 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   Cell_handle previous = Cell_handle();
   Cell_handle c = start;
 
-  if (could_lock_zone) {
-    if (!this->try_lock_cell(c)) {
+  if(could_lock_zone)
+  {
+    if(!this->try_lock_cell(c))
+    {
       *could_lock_zone = false;
       return Cell_handle();
     }
   }
 
   // Now treat the cell c.
-#if 0 // JPB WIP BUG Temp remove
-while (n_of_turns-- > 0) {
-  const Point& p0 = c->vertex(0)->point();
-  const Point& p1 = c->vertex(1)->point();
-  const Point& p2 = c->vertex(2)->point();
-  const Point& p3 = c->vertex(3)->point();
-
-  const double tx = t.x(), ty = t.y(), tz = t.z();
-
-  const double p0x = p0.x(), p0y = p0.y(), p0z = p0.z();
-  const double p1x = p1.x(), p1y = p1.y(), p1z = p1.z();
-  const double p2x = p2.x(), p2y = p2.y(), p2z = p2.z();
-  const double p3x = p3.x(), p3y = p3.y(), p3z = p3.z();
-
-  for (int i = 0; i < 4; ++i) {
-    Cell_handle next = c->neighbor(i);
-    if (next == previous) continue;
-
-    double det = 0.0;
-
-    if (i == 0) {
-      const double a = p1x - tx, b = p1y - ty, c1 = p1z - tz;
-      const double d = p2x - tx, e = p2y - ty, f = p2z - tz;
-      const double g = p3x - tx, h = p3y - ty, i1 = p3z - tz;
-      det = a * (e * i1 - f * h)
-          - b * (d * i1 - f * g)
-          + c1 * (d * h - e * g);
-    } else if (i == 1) {
-      const double a = tx - p0x, b = ty - p0y, c1 = tz - p0z;
-      const double d = p2x - p0x, e = p2y - p0y, f = p2z - p0z;
-      const double g = p3x - p0x, h = p3y - p0y, i1 = p3z - p0z;
-      det = a * (e * i1 - f * h)
-          - b * (d * i1 - f * g)
-          + c1 * (d * h - e * g);
-    } else if (i == 2) {
-      const double a = p1x - p0x, b = p1y - p0y, c1 = p1z - p0z;
-      const double d = tx - p0x, e = ty - p0y, f = tz - p0z;
-      const double g = p3x - p0x, h = p3y - p0y, i1 = p3z - p0z;
-      det = a * (e * i1 - f * h)
-          - b * (d * i1 - f * g)
-          + c1 * (d * h - e * g);
-    } else { // i == 3
-      const double a = p1x - p0x, b = p1y - p0y, c1 = p1z - p0z;
-      const double d = p2x - p0x, e = p2y - p0y, f = p2z - p0z;
-      const double g = tx - p0x, h = ty - p0y, i1 = tz - p0z;
-      det = a * (e * i1 - f * h)
-          - b * (d * i1 - f * g)
-          + c1 * (d * h - e * g);
-    }
-
-    if (det < 0.0) {
-      if (next->has_vertex(infinite)) return next;
-
-      previous = c;
-      c = next;
-
-      if (could_lock_zone && !this->try_lock_cell(c)) {
-        *could_lock_zone = false;
-        return Cell_handle();
-      }
-
-      goto next_turn;
-    }
-  }
-
-  break;
-next_turn:;
-}
-#else
 try_next_cell:
   n_of_turns--;
 
@@ -3417,29 +3259,34 @@ try_next_cell:
                           &(c->vertex(3)->point()) };
 
   // (non-stochastic) visibility walk
-  for (int i=0; i != 4; ++i) {
+  for(int i=0; i != 4; ++i)
+  {
     Cell_handle next = c->neighbor(i);
     if(previous == next) continue;
 
     // We temporarily put p at i's place in pts.
     const Point* backup = pts[i];
     pts[i] = &t;
-    if (inexact_orientation(*pts[0], *pts[1], *pts[2], *pts[3]) != NEGATIVE) {
+    if(inexact_orientation(*pts[0], *pts[1], *pts[2], *pts[3]) != NEGATIVE)
+    {
       pts[i] = backup;
       continue;
     }
 
-    if (next->has_vertex(infinite)) {
+    if(next->has_vertex(infinite))
+    {
       // We are outside the convex hull.
       return next;
     }
 
     previous = c;
     c = next;
-    if (could_lock_zone) {
+    if(could_lock_zone)
+    {
       //previous->unlock(); // DON'T do that, "c" may be in
       // the same locking cell as "previous"
-      if (!this->try_lock_cell(c)) {
+      if(!this->try_lock_cell(c))
+      {
         *could_lock_zone = false;
         return Cell_handle();
       }
@@ -3447,7 +3294,6 @@ try_next_cell:
 
     if(n_of_turns) goto try_next_cell;
   }
-#endif
 
   return c;
 }
@@ -4179,38 +4025,26 @@ insert_in_conflict(const Point& p,
       // Sequential
       else
       {
-      find_conflicts(c,
-                     tester,
-                     make_triple(
-                       std::back_inserter(facets),
-                       std::back_inserter(cells),
-                       Emptyset_iterator()));
+        find_conflicts(c,
+                       tester,
+                       make_triple(
+                         std::back_inserter(facets),
+                         std::back_inserter(cells),
+                         Emptyset_iterator()));
       }
+
+      facet = facets.back();
 
       // Remember the points that are hidden by the conflicting cells,
       // as they will be deleted during the insertion.
       hider.process_cells_in_conflict(cells.begin(), cells.end());
 
-      Vertex_handle v;
-      if (tds().is_small_hole(facets.size())) {
-        // Assumes compact containers is reserved large enough.
-        v = _insert_in_small_hole(p, cells, facets);
-      } else {
-        Facet facet = mirror_facet(facets.back());
-
-        v = _insert_in_hole(p,
-                        cells.begin(), cells.end(),
-                        facet.first, facet.second);
-      }
-
-#if 0
       Vertex_handle v =
-        tds().is_small_hole(facets.size()/2) ?
+        tds().is_small_hole(facets.size()) ?
         _insert_in_small_hole(p, cells, facets) :
         _insert_in_hole(p,
                         cells.begin(), cells.end(),
                         facet.first, facet.second);
-#endif
 
       // Store the hidden points in their new cells.
       hider.reinsert_vertices(v);
@@ -4318,67 +4152,6 @@ insert_in_conflict(const Point& p,
       return v;
     }
   }
-}
-
-template < class GT, class Tds, class Lds >
-template < class Conflict_tester, class Hidden_points_visitor >
-typename Triangulation_3<GT,Tds,Lds>::Vertex_handle
-Triangulation_3<GT,Tds,Lds>::
-insert_in_conflict2(const Point& p,
-  Locate_type lt, Cell_handle c, int li, int /*lj*/,
-  const Conflict_tester& tester,
-  Hidden_points_visitor& hider)
-{
-  if ((lt == VERTEX) && (tester.compare_weight(c->vertex(li)->point(), p)==0)) {
-    return c->vertex(li);
-  }
-
-  // If the new point is not in conflict with its cell, it is hidden.
-  if (!tester.test_initial_cell(c)) {
-    hider.hide_point(c, p);
-    return Vertex_handle();
-  }
-
-  // Ok, we really insert the point now.
-  // First, find the conflict region.
-  boost::container::small_vector<Cell_handle, 16384> cells;
-  boost::container::small_vector<Facet, 32768> facets;
-
-  // Sequential
-  find_conflicts2(c,
-    tester,
-    make_triple(
-      std::back_inserter(facets),
-      std::back_inserter(cells),
-      Emptyset_iterator()));
-
-  // Remember the points that are hidden by the conflicting cells,
-  // as they will be deleted during the insertion.
-  hider.process_cells_in_conflict(cells.begin(), cells.end());
-
-  Vertex_handle v;
-  if (tds().is_small_hole(facets.size())) {
-    // Assumes compact containers is reserved large enough.
-    v = _insert_in_small_hole(p, cells, facets);
-  } else {
-    Facet facet = mirror_facet(facets.back());
-    v = _insert_in_hole(p,
-      cells.begin(), cells.end(),
-      facet.first, facet.second);
-  }
-
-#if 0
-  Vertex_handle v =
-    tds().is_small_hole(facets.size()/2) ?
-    _insert_in_small_hole(p, cells, facets) :
-    _insert_in_hole(p,
-      cells.begin(), cells.end(),
-      facet.first, facet.second);
-#endif
-
-  // Store the hidden points in their new cells.
-  hider.reinsert_vertices(v);
-  return v;
 }
 
 template < class GT, class Tds, class Lds >
@@ -4786,8 +4559,8 @@ test_dim_down_using_incident_cells_3(Vertex_handle v,
   }
   else
   {
-  adjacent_vertices_and_cells_3(v, std::back_inserter(adj_vertices),
-                                incident_cells);
+    adjacent_vertices_and_cells_3(v, std::back_inserter(adj_vertices),
+                                  incident_cells);
   }
 
   typedef Filter_iterator< typename std::vector<Vertex_handle>::const_iterator,

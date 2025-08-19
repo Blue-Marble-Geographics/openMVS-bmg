@@ -170,7 +170,6 @@ public:
   using Tr_Base::construct_segment;
   using Tr_Base::incident_facets;
   using Tr_Base::insert_in_conflict;
-  using Tr_Base::insert_in_conflict2;
   using Tr_Base::is_infinite;
   using Tr_Base::is_valid_finite;
   using Tr_Base::locate;
@@ -518,9 +517,6 @@ public:
   Vertex_handle insert(const Point& p, Locate_type lt,
                        Cell_handle c, int li, int,
                        bool *could_lock_zone = nullptr);
-
-  Vertex_handle insert2(const Point& p, Locate_type lt,
-                       Cell_handle c, int li, int);
 
 public: // internal methods
   template <class OutputItCells>
@@ -1125,15 +1121,6 @@ insert(const Point& p, Locate_type lt, Cell_handle c, int li, int lj, bool *coul
       // Do not use the generic insert.
       return Tr_Base::insert(p, c);
   }
-}
-
-template < class Gt, class Tds, class Lds >
-typename Delaunay_triangulation_3<Gt,Tds,Default,Lds>::Vertex_handle
-Delaunay_triangulation_3<Gt,Tds,Default,Lds>::
-insert2(const Point& p, Locate_type lt, Cell_handle c, int li, int lj)
-{
-  Conflict_tester_3 tester(p, this);
-  return insert_in_conflict2(p, lt, c, li, lj, tester, hidden_point_visitor);
 }
 
 template < class Gt, class Tds, class Lds >

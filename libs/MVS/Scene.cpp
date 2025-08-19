@@ -819,10 +819,12 @@ bool Scene::EstimateNeighborViewsPointCloud(unsigned maxResolution)
 				const Depth depthPerturb(randomRange(minDepthPerturb, maxDepthPerturb));
 				const Point3 X(imageData.camera.TransformPointI2W(Point3(x.x, x.y, depthPerturb)));
 				const Point3 X2(imageData2.camera.TransformPointW2C(X));
-				if (X2.z < 0)
+
+				if (X2.z < 0) {
 					continue;
+				}
 				const Point2f x2(imageData2.camera.TransformPointC2I(X2));
-				if (!Image8U::isInside(x2, imageData2.GetSize()))
+				if (!Image8U::isInside(x2, imageData2.GetSize())) {
 					continue;
 				}
 				pointcloud.AddPoint(X);

@@ -29,7 +29,8 @@
 *      containing it.
 */
 
-#undef NO_MANIFOLD_FIXUP
+#define MANIFOLD_FIXUP
+#undef APPROXIMATE_GRAPHCUT
 
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
@@ -640,28 +641,55 @@ inline int checkEdges(const point_t& a, const point_t& b, const point_t& c, cons
 	return nCoplanar;
 }
 
-inline int checkEdges2(const double* __restrict negPa, const point_t& b, const point_t& c, const point_t& p, const double* __restrict qDiff, int* __restrict coplanar)
+__forceinline int checkEdges2_fast(
+  const double* __restrict negPa,
+  const point_t& b,
+  const point_t& c,
+  const point_t& p,
+  const double* __restrict qDiff,
+  int* __restrict coplanar)
 {
-	int nCoplanar(0);
-	const double aDiff[] { -negPa[0], -negPa[1], -negPa[2]};
-	const double bDiff[] { b.x()-p.x(), b.y()-p.y(), b.z()-p.z() };
+  constexpr double eps = 1e-12;
+  int nCoplanar = 0;
 
-	// pq ab
-	switch (fasterOrientation(qDiff, aDiff, bDiff)) {
-		case CGAL::POSITIVE: return -1;
-		case CGAL::COPLANAR: coplanar[nCoplanar++] = 0;
-	}
+  // Load qDiff once
+  const double qx = qDiff[0], qy = qDiff[1], qz = qDiff[2];
 
-	const double cDiff[] { c.x()-p.x(), c.y()-p.y(), c.z()-p.z() };
-	switch (fasterOrientation(qDiff, bDiff, cDiff)) {
-		case CGAL::POSITIVE: return -1;
-		case CGAL::COPLANAR: coplanar[nCoplanar++] = 1;
-	}
-	switch (fasterOrientation(qDiff, cDiff, aDiff)) {
-		case CGAL::POSITIVE: return -1;
-		case CGAL::COPLANAR: coplanar[nCoplanar++] = 2;
-	}
-	return nCoplanar;
+  // Precompute diffs once
+  const double ax = -negPa[0], ay = -negPa[1], az = -negPa[2];
+  const double bx = b.x() - p.x(), by = b.y() - p.y(), bz = b.z() - p.z();
+  const double cx = c.x() - p.x(), cy = c.y() - p.y(), cz = c.z() - p.z();
+
+  // Precompute shared 2D cross terms with q
+  const double qxa_y = qx * ay - ax * qy;
+  const double qxb_y = qx * by - bx * qy;
+  const double qxc_y = qx * cy - cx * qy;
+
+  // ---- Edge 1: pq, ab ----
+  {
+    const double t3 = ax * by - bx * ay;
+    const double det = qxa_y * bz - qxb_y * az + t3 * qz;
+    if (det > eps) return -1;
+    if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 0;
+  }
+
+  // ---- Edge 2: pq, bc ----
+  {
+    const double t3 = bx * cy - cx * by;
+    const double det = qxb_y * cz - qxc_y * bz + t3 * qz;
+    if (det > eps) return -1;
+    if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 1;
+  }
+
+  // ---- Edge 3: pq, ca ----
+  {
+    const double t3 = cx * ay - ax * cy;
+    const double det = qxc_y * az - qxa_y * cz + t3 * qz;
+    if (det > eps) return -1;
+    if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 2;
+  }
+
+  return nCoplanar;
 }
 
 #ifdef VALIDATE
@@ -914,11 +942,11 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 					// q belongs to the triangle's supporting plane
 					// p sees the triangle in counterclockwise order
 					//return checkEdges(a,b,c,p,q,coplanar);
-					return checkEdges2(pDiff,b,c,p,segDiff,coplanar);
+					return checkEdges2_fast(pDiff,b,c,p,segDiff,coplanar);
 				case CGAL::NEGATIVE:
 					// p sees the triangle in counterclockwise order
 					//return checkEdges(a,b,c,p,q,coplanar);
-					return checkEdges2(pDiff,b,c,p,segDiff,coplanar);
+					return checkEdges2_fast(pDiff,b,c,p,segDiff,coplanar);
 				default:
 					break;
 				}
@@ -927,12 +955,12 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 				case CGAL::POSITIVE:
 					// q sees the triangle in counterclockwise order
 					//return checkEdges(a,b,c,q,p,coplanar);
-					return checkEdges2(qDiff,b,c,q,segDiffN,coplanar);
+					return checkEdges2_fast(qDiff,b,c,q,segDiffN,coplanar);
 				case CGAL::COPLANAR:
 					// q belongs to the triangle's supporting plane
 					// p sees the triangle in clockwise order
 					//return checkEdges(a,b,c,q,p,coplanar);
-					return checkEdges2(qDiff,b,c,q,segDiffN,coplanar);
+					return checkEdges2_fast(qDiff,b,c,q,segDiffN,coplanar);
 				case CGAL::NEGATIVE:
 					// the segment lies in the negative open halfspaces defined by the
 					// triangle's supporting plane
@@ -945,7 +973,7 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 				case CGAL::POSITIVE:
 					// q sees the triangle in counterclockwise order
 					//return checkEdges(a,b,c,q,p,coplanar);
-					return checkEdges2(qDiff,b,c,q,segDiffN,coplanar);
+					return checkEdges2_fast(qDiff,b,c,q,segDiffN,coplanar);
 				case CGAL::COPLANAR:
 					// the segment is coplanar with the triangle's supporting plane
 					// as we know that it is inside the tetrahedron it intersects the face
@@ -954,7 +982,7 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 				case CGAL::NEGATIVE:
 					// q sees the triangle in clockwise order
 					//return checkEdges(a,b,c,p,q,coplanar);
-					return checkEdges2(pDiff,b,c,p,segDiff,coplanar);
+					return checkEdges2_fast(pDiff,b,c,p,segDiff,coplanar);
 				default:
 					break;
 				}
@@ -1195,9 +1223,9 @@ inline float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
   const auto& p2 = tri.verts[2]->point();
 
   // Convert to Point3f
-  const float x0 = p0.x(), y0 = p0.y(), z0 = p0.z();
-  const float x1 = p1.x(), y1 = p1.y(), z1 = p1.z();
-  const float x2 = p2.x(), y2 = p2.y(), z2 = p2.z();
+  const float x0 = (float) p0.x(), y0 = (float) p0.y(), z0 = (float) p0.z();
+  const float x1 = (float) p1.x(), y1 = (float) p1.y(), z1 = (float) p1.z();
+  const float x2 = (float) p2.x(), y2 = (float) p2.y(), z2 = (float) p2.z();
 
   // Compute edges
   const float ax = x1 - x0, ay = y1 - y0, az = z1 - z0;
@@ -1349,8 +1377,9 @@ size_t ProcessPoints(
   return validCount;
 }
 
-float Quantize(float cap)
+float Quantize(float cap, float maxCap)
 {
+#ifdef APPROXIMATE_GRAPHCUT
 #if 1
   int scaled = static_cast<int>(cap * 2.0f + 0.5f);
   return 0.5f * scaled;
@@ -1358,6 +1387,10 @@ float Quantize(float cap)
   // Step is 0.2, so multiply by 5 and round to nearest int
   int scaled = static_cast<int>(cap * 5.0f + 0.5f);
   return 0.2f * scaled;
+#endif
+#else
+  if (!std::isfinite(cap)) return maxCap;
+  return cap <= 0.0f ? 0.0f : (cap >= maxCap ? maxCap : cap);
 #endif
 }
 
@@ -1597,7 +1630,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.3");
+		DEBUG("ReconstructMesh optimization version 1.1.4");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2004,7 +2037,7 @@ advance:
 
 		auto t1 = rdtscEnd();
 
-		DEBUG("Median time %g\n", rdtscToSeconds(t1 - t0, cpuHz));
+		DEBUG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
 
 		infoCells.resize(totalCells);
 		memset(&infoCells[0], 0, sizeof(cell_info_t)*totalCells);
@@ -2576,8 +2609,8 @@ advance:
 
 					edge_cap_t q = (1.f - MINF(angleCi, angleCj)) * kQual;
 
-					edge_cap_t iCap = (ciInfo.f[i] >= kInf) ? kInf : Quantize(ciInfo.f[i] + q);
-					edge_cap_t jCap = (cjInfo.f[j] >= kInf) ? kInf : Quantize(cjInfo.f[j] + q);
+					edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
+					edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
 					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
 				}
 			}
@@ -2741,7 +2774,7 @@ advance:
 		DEBUG_EXTRA("Delaunay tetrahedras graph-cut completed (%g flow): %u vertices, %u faces (%s)", maxflow, mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 
-#ifndef NO_MANIFOLD_FIXUP
+#ifdef MANIFOLD_FIXUP
 	// fix non-manifold vertices and edges
 	mesh.FixNonManifold();
 #endif

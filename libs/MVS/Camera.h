@@ -319,14 +319,6 @@ public:
 			(TYPE)(p[2*4+0]*X.x + p[2*4+1]*X.y + p[2*4+2]*X.z + p[2*4+3]));
 	}
 	template <typename TYPE>
-	inline TPoint3<TYPE> ProjectPointP3f(const TPoint3<TYPE>& X) const {
-		const float* __restrict const p(Pf.val);
-		return TPoint3<TYPE>(
-			(TYPE)(p[0*4+0]*X.x + p[0*4+1]*X.y + p[0*4+2]*X.z + p[0*4+3]),
-			(TYPE)(p[1*4+0]*X.x + p[1*4+1]*X.y + p[1*4+2]*X.z + p[1*4+3]),
-			(TYPE)(p[2*4+0]*X.x + p[2*4+1]*X.y + p[2*4+2]*X.z + p[2*4+3]));
-	}
-	template <typename TYPE>
 	inline TPoint2<TYPE> ProjectPointP(const TPoint3<TYPE>& X) const {
 		const TPoint3<TYPE> q(ProjectPointP3(X));
 		const TYPE invZ(INVERT(q.z));

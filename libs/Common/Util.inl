@@ -805,11 +805,7 @@ inline T DepthSimilarity(T d0, T d1) {
 }
 template<typename T>
 inline bool IsDepthSimilar(T d0, T d1, T threshold=T(0.01)) {
-#if 1
-	  return ABS(d1 - d0) < threshold * d0;
-#else
 	return DepthSimilarity(d0, d1) < threshold;
-#endif
 }
 template<typename T>
 inline bool IsNormalSimilar(const TPoint3<T>& n0, const TPoint3<T>& n1, T threshold=T(0.996194698)/*COS(FD2R(5.f))*/) {
