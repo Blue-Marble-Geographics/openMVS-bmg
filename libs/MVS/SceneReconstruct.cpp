@@ -30,6 +30,7 @@
 */
 
 #define MANIFOLD_FIXUP
+#undef PRE_OPENMVS21
 #undef APPROXIMATE_GRAPHCUT
 
 // Easier to configure this here.
@@ -692,7 +693,7 @@ __forceinline int checkEdges2_fast(
   return nCoplanar;
 }
 
-#ifdef VALIDATE
+#if 0 // original
 static inline int orientationv(const point_t& a, const point_t& b, const point_t& c, const point_t& p)
 {
 	// inexact_orientation
@@ -911,7 +912,7 @@ bool intersectv(const delaunay_t& Tr, const segment_t& seg, const std::vector<fa
 	out_facets.clear();
 	return false;
 }
-#endif
+#else
 
 // Check intersection between a facet (f) and a segment (s)
 // (derived from CGAL::do_intersect in CGAL/Triangle_3_Segment_3_do_intersect.h)
@@ -1124,6 +1125,7 @@ bool intersect(const delaunay_t& Tr, const segment_t& seg, const double* __restr
 	out_facets.clear();
 	return false;
 }
+#endif
 
 #if 0 // JPB Freespace support removed.
 // same as above, but simplified only to find face intersection (otherwise terminate);
@@ -1630,7 +1632,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.4");
+		DEBUG("ReconstructMesh optimization version 1.1.5");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2115,7 +2117,7 @@ advance:
 		const float sigma(SQRT(approxMedian)* kSigma);
 		DEBUG_EXTRA("Sigma is %f", sigma);
 		// Notice we negate inv2SigmaSq here to aid the vector calculations below.
-		const float inv2SigmaSq(-0.5f/(sigma*sigma));
+		float inv2SigmaSq(-0.5f/(sigma*sigma));
 		// distsSq may consume a lot of memory.  Delete it now.
 		distsSq.release();
 #endif
@@ -2123,6 +2125,105 @@ advance:
 		// compute the weights for each edge
 		Util::Progress progress(_T("Points weighted"), numDelaunayVertices);
 
+#if 0 // original work
+		{
+			inv2SigmaSq = -inv2SigmaSq; // original logic needs original signma
+			std::vector<facet_t> facets;
+
+			TD_TIMER_STARTD();
+			Util::Progress progress(_T("Points weighted"), delaunay.number_of_vertices());
+			delaunay_t::Vertex_iterator vertexIter(delaunay.vertices_begin());
+			const int64_t nVerts(delaunay.number_of_vertices() + 1);
+#pragma omp parallel for private(facets)
+			for (int64_t i = 0; i < nVerts; ++i) {
+				delaunay_t::Vertex_iterator vi;
+#pragma omp critical
+				vi = vertexIter++;
+				vert_info_t& vert(vi->info());
+				auto& viewInstance = allViews[vert.idx];
+				if (viewInstance.empty())//IsEmpty())
+					continue;
+				const point_t& p(vi->point());
+				const Point3 pt(CGAL2MVS<REAL>(p));
+
+				std::vector<uint32_t> viewIdxs;
+
+				for (auto& i : viewInstance) {
+					auto* __restrict src = pointcloud.ViewsStream(i);
+					auto cnt = pointcloud.ViewsStreamSize(i);
+					std::copy(src, src + cnt, std::back_inserter(viewIdxs));
+				}
+
+				std::sort(
+					std::begin(viewIdxs),
+					std::end(viewIdxs),
+					[](const auto lhs, const auto rhs)
+					{
+						return lhs < rhs;
+					}
+				);
+
+				auto it = std::begin(viewIdxs);
+				const auto end = std::end(viewIdxs);
+				while (it != end) {
+					// Advance past duplicates
+					auto first = it;
+					auto current = *it;
+					while (it != end && *it == current) {
+						++it;
+					}
+					const uint32_t imageID(current);
+					const edge_cap_t alpha_vis(std::distance(first, it));
+					const Image& imageData = images[imageID];
+					ASSERT(imageData.IsValid());
+					const Camera& camera = imageData.camera;
+					const camera_cell_t& camCell = camCells[imageID];
+					// compute the ray used to find point intersection
+					const Point3 vecCamPoint(pt - camera.C);
+					const REAL invLenCamPoint(REAL(1) / norm(vecCamPoint));
+					intersection_t inter(pt, Point3(vecCamPoint * invLenCamPoint));
+					// find faces intersected by the camera-point segment
+					const segment_t segCamPoint(MVS2CGAL(camera.C), p);
+					if (!intersectv(delaunay, segCamPoint, camCell.facets, facets, inter))
+						continue;
+					do {
+						// assign score, weighted by the distance from the point to the intersection
+						const edge_cap_t w(alpha_vis * (1.f - EXP(-SQUARE((float)inter.dist) * inv2SigmaSq)));
+						edge_cap_t& f(infoCells[inter.facet.first->info()].f[inter.facet.second]);
+						#pragma omp atomic
+							f += w;
+					} while (intersectv(delaunay, segCamPoint, facets, facets, inter));
+					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
+
+					// cell2Cam only used for free sppace
+					// find faces intersected by the endpoint-point segment
+					inter.dist = FLT_MAX; inter.bigger = false;
+					const Point3 endPoint(pt + vecCamPoint * (invLenCamPoint * sigma));
+					const segment_t segEndPoint(MVS2CGAL(endPoint), p);
+					const cell_handle_t endCell(delaunay.locate(segEndPoint.source(), vi->cell()));
+					ASSERT(endCell != cell_handle_t());
+					fetchCellFacets<CGAL::NEGATIVE>(delaunay, hullFacets, endCell, imageData, facets);
+					edge_cap_t& t(infoCells[endCell->info()].t);
+					#pragma omp atomic
+					t += alpha_vis;
+					while (intersectv(delaunay, segEndPoint, facets, facets, inter)) {
+						// assign score, weighted by the distance from the point to the intersection
+						const facet_t& mf(delaunay.mirror_facet(inter.facet));
+						const edge_cap_t w(alpha_vis * (1.f - EXP(-SQUARE((float)inter.dist) * inv2SigmaSq)));
+						edge_cap_t& f(infoCells[mf.first->info()].f[mf.second]);
+						#pragma omp atomic
+						f += w;
+					}
+					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
+					// cell2end only used for freespace
+				}
+				++progress;
+			}
+			progress.close();
+			DEBUG_ULTIMATE("\tweighting completed in %s", TD_TIMER_GET_FMT().c_str());
+			}
+
+#else
 		struct ThreadData
 		{
 			PaddedVector<facet_t> mFacets;
@@ -2477,6 +2578,8 @@ advance:
 			}
 		} // parallel
 
+#endif
+
 		progress.process();
 		progress.close();
 
@@ -2775,8 +2878,15 @@ advance:
 	}
 
 #ifdef MANIFOLD_FIXUP
+#ifdef PRE_OPENMVS21
+	// fix non-manifold vertices and edges
+	for (unsigned i = 0; i < nItersFixNonManifold; ++i)
+		if (!mesh.FixNonManifold())
+			break;
+#else
 	// fix non-manifold vertices and edges
 	mesh.FixNonManifold();
+#endif
 #endif
 
 	return true;

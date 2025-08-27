@@ -200,7 +200,7 @@ class Smooth
         ScalarType cnt;
     };
 
-#if 1 // Original work JPB WIP BUG
+#if 0 // Original work JPB WIP BUG
  static void AccumulateLaplacianInfo(MeshType &m, SimpleTempData<typename MeshType::VertContainer, LaplacianInfo> &TD, bool cotangentFlag = false)
     {
         float weight = 1.0f;

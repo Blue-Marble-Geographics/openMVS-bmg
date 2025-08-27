@@ -240,6 +240,30 @@ void Mesh::ListIncidenteVertices()
 
 // extract the (ordered) array of triangles incident to each vertex
 #ifdef OPENMVS_21
+#ifdef FIX_OPENMVS
+// Put in Mesh or an anon namespace.
+inline bool Mesh::IsFaceSane(const Face& f) const {
+	const int a = f[0], b = f[1], c = f[2];
+	if (a == b || b == c || c == a) return false;
+	const auto n = (vertices[b] - vertices[a]).cross(vertices[c] - vertices[a]);
+	return n.dot(n) > 1e-30; // tune threshold to your scale
+}
+void Mesh::ListIncidenteFaces() {
+	vertexFaces.clear();
+	vertexFaces.resize(vertices.size());
+	FOREACH(iF, faces) {
+		const Face& face = faces[iF];
+		if (!IsFaceSane(face)) continue; // skip degenerates
+		for (int v = 0; v < 3; ++v) {
+			FaceIdxArr& vfs = vertexFaces[face[v]];
+			if (vfs.empty() || vfs.back() != iF)
+				vfs.emplace_back(iF);
+		}
+	}
+}
+
+
+#else
 void Mesh::ListIncidenteFaces()
 {
 	vertexFaces.clear();
@@ -254,6 +278,7 @@ void Mesh::ListIncidenteFaces()
 		}
 	}
 }
+#endif
 #else
 void Mesh::ListIncidenteFaces()
 {
@@ -607,10 +632,10 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 				}
 			}
 			// no more components found
-					break;
-			ProcessComponent:
+			break;
+		ProcessComponent:
 			// grow seed face component until no more connected faces found
-				do {
+			do {
 				const FIndex idxFaceCurrent(queueFaces.back());
 				queueFaces.pop_back();
 				const Face& face = faces[idxFaceCurrent];
@@ -618,17 +643,17 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 				for (int i = 0; i < 3; ++i) {
 					const VIndex idxVertAdj(face[i]);
 					if (idxVertAdj == idxVert)
-			continue;
+						continue;
 					// if there is exactly one face adjacent to this edge
 					// tag it with the current component and add it to the queue
 					const FIndex idxFaceAdj(GetEdgeAdjacentFace(idxFaceCurrent, idxVert, idxVertAdj));
 					if (idxFaceAdj != NO_ID && components[idxFaceAdj] == -1) {
 						components[idxFaceAdj] = component;
 						queueFaces.push_back(idxFaceAdj);
-		}
-		}
+					}
+				}
 			} while (!queueFaces.empty());
-	}
+		}
 		// if there is only one component, continue with the next vertex
 		if (component <= 1)
 			continue;
@@ -646,18 +671,18 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 			RFOREACH(ivf, vertFaces) {
 				const FIndex idxFace = vertFaces[ivf];
 				if (components[idxFace] != c)
-						continue;
+					continue;
 				// link face to the new vertex and remove it from the original vertex
 				Face& face = faces[idxFace];
 				for (int i = 0; i < 3; ++i) {
 					if (face[i] == idxVert) {
 						face[i] = idxVertNew;
 						vertFacesNew.InsertAt(0, idxFace);
-				break;
-			}
-		}
+						break;
+					}
+				}
 				vertFaces.RemoveAtMove(ivf);
-	}
+			}
 			++numNonManifoldIssues;
 		}
 		// adjust vertex positions
@@ -680,592 +705,16 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 				Vertex& v(vertices[idxVert]);
 				const Vertex dir(bv-v);
 				v += dir * magDisplacementDuplicateVertices;
-				}
 			}
 		}
+	}
 
 	if (numNonManifoldIssues > 0) {
 		vertexFaces.Release();
 		DEBUG_ULTIMATE("Removed %u non-manifold issues", numNonManifoldIssues);
-		}
+	}
 	return numNonManifoldIssues;
-	}
-
-
-#else
-
-
-#if 0
-#define DEFINE_FACE_VERTS(n) \
-	const Face& f##n = faces[componentFaces[n]]; \
-	const uint32_t idx##n(Mesh::FindVertex(f##n, (VIndex)v)); \
-	const VIndex v##n##1(f##n[(idx##n+1)%3]); \
-	const VIndex v##n##2(f##n[(idx##n+2)%3])
-#define IS_LOOP_FACE4(a, b, c, d) \
-	(v##a##2 == v##b##1 && v##b##2 == v##c##1 && v##c##2 == v##d##1 && v##d##2 == v##a##1)
-#define IS_LOOP_FACE3(a, b, c) \
-	(v##a##2 == v##b##1 && v##b##2 == v##c##1 && v##c##2 == v##a##1)
-
-namespace FIX_NONMANIFOLD {
-typedef Mesh::VIndex VIndex;
-typedef Mesh::FIndex FIndex;
-typedef uint32_t Index;
-struct Node;
-struct Edge {
-	Node* pPrev; // a node that points to this node
-	Node* pNext; // the next node
-	FIndex fIdx; // index of the face that generated this edge (the link from this node to the next)
-	inline Edge() : pPrev(NULL), pNext(NULL), fIdx(NO_ID) {}
-	inline bool IsEmpty() const { return (fIdx == NO_ID); }
-};
-struct Node {
-	VIndex vIdx;
-	Edge edge;
-	uint32_t idComponent;
-	inline Node(VIndex _vIdx) : vIdx(_vIdx), idComponent(NO_ID) {}
-};
-struct Graph {
-	typedef std::unordered_map<VIndex, Index> VertexMap;
-	typedef SEACAVE::cList<Node> Nodes;
-
-	VertexMap index2idx;
-	Nodes nodes;
-	UnsignedArr components;
-
-	inline void Clear() {
-		nodes.Empty();
-		components.Empty();
-		index2idx.clear();
-	}
-	inline Index NumNodes() const { return (Index)nodes.GetSize(); }
-	void AddEdge(VIndex vIdx0, VIndex vIdx1, FIndex fIdx) {
-		const auto vert0(index2idx.insert(std::make_pair(vIdx0, NumNodes())));
-		Node& n0 = (vert0.second ? nodes.AddConstruct(vIdx0) : nodes[vert0.first->second]);
-		const auto vert1(index2idx.insert(std::make_pair(vIdx1, NumNodes())));
-		Node& n1 = (vert1.second ? nodes.AddConstruct(vIdx1) : nodes[vert1.first->second]);
-		n0.edge.pNext = &n1;
-		n0.edge.fIdx = fIdx;
-		n1.edge.pPrev = &n0;
-	}
-	VIndex ComputeComponents() {
-		ASSERT(components.IsEmpty());
-		VIndex vIdxMultiComponent(NO_ID);
-		unsigned nCount(0);
-		do {
-			// find first node not visited yet
-			Node* pNode;
-			FOREACHPTR(pN, nodes) {
-				if (pN->idComponent == NO_ID) {
-					pNode = pN;
-					break;
-				}
-			}
-			const uint32_t id((uint32_t)components.GetSize());
-			unsigned& size = components.AddConstruct(0);
-			Node* const pStartNode(pNode);
-			do {
-				++size;
-				pNode->idComponent = id;
-				if (pNode->edge.pNext == NULL)
-					break;
-				ASSERT(pNode->edge.pNext->edge.pPrev != NULL);
-				if (pNode->edge.pNext->edge.pPrev != pNode)
-					vIdxMultiComponent = pNode->edge.pNext->vIdx;
-			} while ((pNode=pNode->edge.pNext) != pStartNode && pNode->idComponent == NO_ID);
-			nCount += size;
-			if (pNode != NULL && pNode->idComponent < id) {
-				const uint32_t prev_id(pNode->idComponent);
-				components.RemoveLast();
-				pNode = pStartNode;
-				do {
-					pNode->idComponent = prev_id;
-				} while ((pNode=pNode->edge.pNext)->idComponent != prev_id);
-			}
-		} while (nCount < nodes.GetSize());
-		return vIdxMultiComponent;
-	}
-};
-} // namespace FIX_NONMANIFOLD
-
-// find all non-manifold vertices and for each, duplicate the vertex,
-// assigning the new vertex to the smallest connected set of faces
-// return true if problems were found
-bool Mesh::FixNonManifold()
-{
-	TD_TIMER_STARTD();
-	using namespace FIX_NONMANIFOLD;
-	ASSERT(!vertices.IsEmpty() && !faces.IsEmpty());
-	if (vertexFaces.GetSize() != vertices.GetSize())
-		ListIncidenteFaces();
-	Graph graph;
-	IndexArr componentFaces;
-	IndexArr componentVertices;
-	std::unordered_set<FIndex> removeFaces;
-	unsigned nNonManifoldVertices(0), nPyramid3(0), nPyramid4(0);
-	FOREACH(v, vertices) {
-		const FaceIdxArr& vFaces = vertexFaces[v];
-		FOREACHPTR(pFIdx, vFaces) {
-			const Face& f(faces[*pFIdx]);
-			const uint32_t i(FindVertex(f, (VIndex)v));
-			graph.AddEdge(f[(i+1)%3], f[(i+2)%3], (uint32_t)*pFIdx);
-		}
-		// find all connected sub-graphs
-		const VIndex vIdxMultiComponent(graph.ComputeComponents());
-		if (graph.components.GetSize() <= 1) {
-			graph.Clear();
-			continue;
-		}
-		// there are at least two connected components (usually exactly two);
-		// duplicate the vertex and assign the duplicate to the smallest component
-		ASSERT(graph.components.GetSize() > 1);
-		size_t nLongestCompIdx(0);
-		FOREACH(c, graph.components) {
-			if (graph.components[nLongestCompIdx] < graph.components[c])
-				nLongestCompIdx = c;
-		}
-		FOREACH(c, graph.components) {
-			if (c == nLongestCompIdx)
-				continue;
-			ASSERT(componentVertices.IsEmpty() && componentFaces.IsEmpty());
-			FOREACHPTR(pNode, graph.nodes) {
-				if (pNode->idComponent != c)
-			continue;
-				ASSERT(!pNode->edge.IsEmpty());
-				componentVertices.Insert(pNode->vIdx);
-				componentFaces.Insert(pNode->edge.fIdx);
-			}
-			if (componentFaces.GetSize() == 3 && componentVertices.GetSize() == 3 && graph.components.GetSize() == 2 && vFaces.GetSize() > 6) {
-				// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-				// having the apex this vertex and the base formed by 3 vertices;
-				// check that 3 faces form a loop
-				DEFINE_FACE_VERTS(0);
-				DEFINE_FACE_VERTS(1);
-				DEFINE_FACE_VERTS(2);
-				ASSERT(IS_LOOP_FACE3(0,1,2));
-				// to find the right vertex order for the new face,
-				// set first two vertices in the order appearing in any of the three existing faces,
-				// and the third as the remaining one
-				faces.AddConstruct(
-					v01,
-					v02,
-					(v02 == v11 ? v12 : v22)
-				);
-				// remove component faces and create a new face from the three component vertices
-				ASSERT(componentVertices.GetSize() == graph.components[c]);
-				FOREACHPTR(pFIdx, componentFaces)
-					removeFaces.insert(*pFIdx);
-				++nPyramid3;
-			#if 1
-			} else if (componentFaces.GetSize() == 4 && componentVertices.GetSize() == 4 && graph.components.GetSize() == 2 && vFaces.GetSize() > 8) {
-				// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-				// having the apex this vertex and the base formed by 4 vertices;
-				// check that 3 faces form a loop
-				DEFINE_FACE_VERTS(0);
-				DEFINE_FACE_VERTS(1);
-				DEFINE_FACE_VERTS(2);
-				DEFINE_FACE_VERTS(3);
-				// to find the right vertex order for the new faces,
-				// use the fact that the faces are already in link order,
-				// so set first new face as the linked vertices of the first two faces
-				// and second new face as the linked vertices of the last two faces
-				ASSERT(IS_LOOP_FACE4(0,1,2,3));
-				faces.AddConstruct(v01, v02, v12);
-				faces.AddConstruct(v21, v22, v32);
-				// remove component faces and create two new faces from the four component vertices
-				ASSERT(componentVertices.GetSize() == graph.components[c]);
-				FOREACHPTR(pFIdx, componentFaces)
-					removeFaces.insert(*pFIdx);
-				++nPyramid4;
-			#endif
-			} else {
-				// simply duplicate the vertex and assign it to the component faces
-				const VIndex newIndex((VIndex)vertices.GetSize());
-				Vertex& pos(vertices.AddEmpty());
-				pos = vertices[v];
-				FOREACHPTR(pFIdx, componentFaces)
-					GetVertex(faces[*pFIdx], (VIndex)v) = newIndex;
-			}
-			componentVertices.Empty();
-			componentFaces.Empty();
-		}
-		graph.Clear();
-		++nNonManifoldVertices;
-	}
-	if (!removeFaces.empty()) {
-		// remove old faces;
-		// delete them in reverse order since the remove operation is simply replacing the removed item with the last item
-		std::vector<FIndex> orderedRemoveFaces;
-		orderedRemoveFaces.reserve(removeFaces.size());
-		for (FIndex fIdx: removeFaces)
-			orderedRemoveFaces.push_back(fIdx);
-		std::sort(orderedRemoveFaces.begin(), orderedRemoveFaces.end());
-		std::vector<FIndex>::const_iterator it(orderedRemoveFaces.cend());
-		do {
-			faces.RemoveAt(*(--it));
-		} while (it != orderedRemoveFaces.cbegin());
-	}
-	DEBUG("Fixed %u non-manifold vertices and %u faces removed: %u pyramid3 and %u pyramid4 (%s)", nNonManifoldVertices, removeFaces.size(), nPyramid3, nPyramid4, TD_TIMER_GET_FMT().c_str());
-	return (nNonManifoldVertices > 0);
-} // FixNonManifold
-#undef IS_LINK_FACE3
-#undef IS_LOOP_FACE3
-#undef IS_LOOP_FACE4
-#undef DEFINE_FACE_VERTS
-#else
-#define DEFINE_FACE_VERTS(n) \
-	const Face& f##n = faces[*itFace++]; \
-	const uint32_t idx##n(Mesh::FindVertex(f##n, (VIndex)v)); \
-	const VIndex v##n##1(f##n[(idx##n+1)%3]); \
-	const VIndex v##n##2(f##n[(idx##n+2)%3])
-#define IS_LOOP_FACE3(a, b, c) \
-	(v##a##2 == v##b##1 && v##b##2 == v##c##1 && v##c##2 == v##a##1)
-#define IS_LINK_FACE3(a, b, c) \
-	(v##a##2 == v##b##1 && v##b##2 == v##c##1)
-#define DEFINE_FACES4(a, b, c, d, go2) \
-	if (IS_LINK_FACE3(a,b,c)) { \
-		if (!IS_LINK_FACE3(c,d,a)) \
-			goto go2; \
-		faces.AddConstruct(v##a##1, v##a##2, v##b##2); \
-		faces.AddConstruct(v##c##1, v##c##2, v##d##2); \
-	}
-#define DEFINE_REMOVE3(go2) \
-	/* check that 3 faces form a loop */ \
-	itFace = componentFaces.cbegin(); \
-	DEFINE_FACE_VERTS(0); \
-	DEFINE_FACE_VERTS(1); \
-	DEFINE_FACE_VERTS(2); \
-	if (!IS_LOOP_FACE3(0,1,2) && !IS_LOOP_FACE3(0,2,1)) \
-		goto go2; \
-	/* to find the right vertex order for the new face, */ \
-	/* set first two vertices in the order appearing in any of the three existing faces, */ \
-	/* and the third as the remaining one */ \
-	faces.AddConstruct( \
-		v01, \
-		v02, \
-		(v02 == v11 ? v12 : v22) \
-	); \
-	/* remove component faces and create a new face from the three component vertices */ \
-	for (auto fIdx: componentFaces) \
-		removeFaces.insert(fIdx); \
-	++nPyramid3
-#define DEFINE_REMOVE4(go2) \
-	/* check that 3 faces form a loop */ \
-	itFace = componentFaces.cbegin(); \
-	DEFINE_FACE_VERTS(0); \
-	DEFINE_FACE_VERTS(1); \
-	DEFINE_FACE_VERTS(2); \
-	DEFINE_FACE_VERTS(3); \
-	/* to find the right vertex order for the new faces, */ \
-	/* find the link order of the face */ \
-	DEFINE_FACES4(0,1,2,3, go2) else \
-	DEFINE_FACES4(0,1,3,2, go2) else \
-	DEFINE_FACES4(0,2,1,3, go2) else \
-	DEFINE_FACES4(0,2,3,1, go2) else \
-	DEFINE_FACES4(0,3,1,2, go2) else \
-	DEFINE_FACES4(0,3,2,1, go2) else \
-		goto go2; \
-	/* remove component faces and create two new faces from the four component vertices */ \
-	for (auto fIdx: componentFaces) \
-		removeFaces.insert(fIdx); \
-	++nPyramid4
-#define DEFINE_REMOVE_FACES \
-	if (!removeFaces.empty()) { \
-		/* remove old faces; */ \
-		/* delete them in reverse order since the remove operation is simply replacing the removed item with the last item */ \
-		std::vector<FIndex> orderedRemoveFaces; \
-		orderedRemoveFaces.reserve(removeFaces.size()); \
-		nRemoveFaces += (unsigned)removeFaces.size(); \
-		for (FIndex fIdx: removeFaces) \
-			orderedRemoveFaces.push_back(fIdx); \
-		removeFaces.clear(); \
-		std::sort(orderedRemoveFaces.begin(), orderedRemoveFaces.end()); \
-		std::vector<FIndex>::const_iterator it(orderedRemoveFaces.cend()); \
-		do { \
-			faces.RemoveAt(*(--it)); \
-		} while (it != orderedRemoveFaces.cbegin()); \
-	}
-
-struct VertexInfo {
-	typedef Mesh::VIndex VIndex;
-	typedef Mesh::FIndex FIndex;
-	typedef boost::property<boost::vertex_index1_t, VIndex> VertexProperty;
-	typedef boost::property<boost::edge_index_t, FIndex> EdgeProperty;
-	typedef boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS, VertexProperty, EdgeProperty> Graph;
-	typedef boost::graph_traits<Graph>::vertex_descriptor Vertex;
-	typedef boost::graph_traits<Graph>::edge_descriptor Edge;
-	typedef boost::property_map<Graph, boost::vertex_index1_t>::type VertexIndex1Map;
-	typedef boost::property_map<Graph, boost::edge_index_t>::type EdgeIndexMap;
-	typedef boost::graph_traits<Graph>::vertex_iterator VertexIter;
-	typedef boost::graph_traits<Graph>::out_edge_iterator EdgeIter;
-	typedef std::unordered_map<Vertex, Graph::vertices_size_type> Components;
-	typedef boost::associative_property_map<Components> ComponentMap;
-	typedef std::unordered_map<VIndex, Vertex> VertexMap;
-	typedef std::unordered_set<Vertex> VertexSet;
-	struct FilterVertex {
-		FilterVertex() {}
-		FilterVertex(const VertexSet* _filterVerts) : filterVerts(_filterVerts) {}
-		template <typename Vertex>
-		bool operator()(const Vertex& v) const {
-			return (filterVerts->find(v) == filterVerts->cend());
-		}
-		const VertexSet* filterVerts;
-	};
-	struct FilterEdge {
-		FilterEdge() {}
-		FilterEdge(const Graph* _graph, const VertexSet* _filterVerts) : graph(_graph), filterVerts(_filterVerts) {}
-		template <typename Edge>
-		bool operator()(const Edge& e) const {
-			return (filterVerts->find(boost::source(e,*graph)) == filterVerts->cend() &&
-					filterVerts->find(boost::target(e,*graph)) == filterVerts->cend());
-		}
-		const Graph* graph;
-		const VertexSet* filterVerts;
-	};
-
-	VertexMap index2idx; // useful/valid only during graph creation
-	Graph graph;
-	VertexIndex1Map vertexIndex1;
-	EdgeIndexMap edgeIndex;
-	Components components;
-	VertexSet filterVerts;
-
-	inline VertexInfo() {
-		vertexIndex1 = boost::get(boost::vertex_index1, graph);
-		edgeIndex = boost::get(boost::edge_index, graph);
-	}
-	Vertex AddVertex(VIndex v) {
-		auto vert(index2idx.insert(std::make_pair(v, Vertex())));
-		if (vert.second) {
-			vert.first->second = boost::add_vertex(graph);
-			vertexIndex1[vert.first->second] = v;
-		}
-		return vert.first->second;
-	}
-	void AddEdge(VIndex v0, VIndex v1, FIndex f) {
-		boost::add_edge(AddVertex(v0), AddVertex(v1), f, graph);
-	}
-	size_t ComputeComponents() {
-		components.clear();
-		ComponentMap componentMap(components);
-		return boost::connected_components(graph, componentMap);
-	}
-	size_t ComputeFilteredComponents() {
-		ASSERT(!filterVerts.empty());
-		FilterEdge filterEdge(&graph, &filterVerts);
-		FilterVertex filterVertex(&filterVerts);
-		boost::filtered_graph<Graph, FilterEdge, FilterVertex> filterGraph(graph, filterEdge, filterVertex);
-		components.clear();
-		ComponentMap componentMap(components);
-		const size_t nComponents(boost::connected_components(filterGraph, componentMap));
-		filterVerts.clear();
-		return nComponents;
-	}
-	void Clear() {
-		graph.clear();
-		index2idx.clear();
-	}
-};
-
-// find all non-manifold edges/vertices and for each, duplicate the vertex,
-// assigning the new vertex to the smallest connected set of faces;
-// return true if problems were found
-bool Mesh::FixNonManifold()
-{
-	TD_TIMER_STARTD();
-	ASSERT(!vertices.IsEmpty() && !faces.IsEmpty());
-	if (vertexFaces.GetSize() != vertices.GetSize())
-		ListIncidenteFaces();
-	VertexInfo vertexInfo;
-	IntArr sizes;
-	unsigned nNonManifoldVertices(0), nNonManifoldEdges(0), nRemoveFaces(0), nPyramid3(0), nPyramid4(0);
-	std::unordered_set<FIndex> seenFaces;
-	std::unordered_set<FIndex> removeFaces;
-	std::unordered_set<FIndex> componentFaces;
-	std::unordered_set<FIndex>::const_iterator itFace;
-	VertexInfo::EdgeIter ei, eie;
-	// fix non-manifold edges
-	ASSERT(seenFaces.empty());
-	FOREACH(v, vertices) {
-		const FaceIdxArr& vFaces = vertexFaces[v];
-		if (vFaces.GetSize() < 3)
-			continue;
-		FOREACHPTR(pFIdx, vFaces) {
-			const Face& f(faces[*pFIdx]);
-			const uint32_t i(FindVertex(f, v));
-			vertexInfo.AddEdge(f[(i+1)%3], f[(i+2)%3], *pFIdx);
-		}
-		for (const auto& idx2id: vertexInfo.index2idx) {
-			boost::tie(ei, eie) = boost::out_edges(idx2id.second, vertexInfo.graph);
-			if (std::distance(ei, eie) >= 4) {
-				ASSERT(vertexInfo.filterVerts.empty());
-				// do not proceed, if any of the faces was removed
-				FOREACHPTR(pFIdx, vFaces) {
-					if (seenFaces.find(*pFIdx) != seenFaces.cend())
-						goto ABORT_EDGE;
-				}
-				{
-				// current vertex and this vertex form the non-manifold edge
-				if (vertexInfo.ComputeComponents() > 1) {
-					// filter-out all vertices not belonging to this component
-					const size_t mainComp(vertexInfo.components[idx2id.second]);
-					for (const auto& idx2id: vertexInfo.index2idx) {
-						if (vertexInfo.components[idx2id.second] != mainComp)
-							vertexInfo.filterVerts.insert(idx2id.second);
-					}
-				}
-				// filter-out this vertex to find the two components to be split
-				vertexInfo.filterVerts.insert(idx2id.second);
-				const size_t nComponents(vertexInfo.ComputeFilteredComponents());
-				if (nComponents < 2)
-					break; // something is wrong, the vertex configuration is not as expected
-				// find all vertices in the smallest component
-				sizes.Resize(nComponents);
-				sizes.Memset(0);
-				for (const auto& comp: vertexInfo.components)
-					++sizes[comp.second];
-				size_t nLongestCompIdx(0);
-				for (size_t s=1; s<sizes.GetSize(); ++s) {
-					if (sizes[nLongestCompIdx] < sizes[s])
-						nLongestCompIdx = s;
-				}
-				FOREACH(s, sizes) {
-					if (s == nLongestCompIdx)
-						continue;
-					ASSERT(componentFaces.empty());
-					Mesh::Vertex pos(vertices[idx2id.first]);
-					for (const auto& comp: vertexInfo.components) {
-						if (comp.second == s) {
-							for (boost::tie(ei, eie) = boost::out_edges(comp.first, vertexInfo.graph); ei != eie; ++ei)
-								componentFaces.insert(vertexInfo.edgeIndex[*ei]);
-							pos += vertices[vertexInfo.vertexIndex1[comp.first]];
-						}
-					}
-					const size_t nComponentVertices(sizes[s]+1); // including intersection vertex (this vertex)
-					if (componentFaces.size() != nComponentVertices) {
-						componentFaces.clear();
-						break; // something is wrong, the vertex configuration is not as expected
-					}
-					if (componentFaces.size() == 3/* && vertexInfo.components.size() > 6*/) {
-						// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-						// having the apex the current vertex and the base formed by 3 vertices - one being this vertex;
- 						DEFINE_REMOVE3(GENERAL_EDGE);
-					#if 1
-					} else if (componentFaces.size() == 4/* && vertexInfo.components.size() > 8*/) {
-						// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-						// having the apex the current vertex and the base formed by 4 vertices - one being this vertex;
-						DEFINE_REMOVE4(GENERAL_EDGE);
-					#endif
-					} else {
-						GENERAL_EDGE:
-						// simply duplicate the vertex and assign it to the component faces
-						const Mesh::VIndex newIndex((Mesh::VIndex)vertices.GetSize());
-						for (auto fIdx: componentFaces)
-							GetVertex(faces[fIdx], (VIndex)v) = newIndex;
-						vertices.Insert(pos / nComponentVertices);
-					}
-					for (auto fIdx: componentFaces)
-						seenFaces.insert(fIdx);
-					componentFaces.clear();
-				}
-				++nNonManifoldEdges;
-				}
-				ABORT_EDGE:
-				break;
-			}
-		}
-		vertexInfo.Clear();
-	}
-	seenFaces.clear();
-	DEFINE_REMOVE_FACES;
-	// fix non-manifold vertices
-	if (nNonManifoldEdges)
-		ListIncidenteFaces();
-	ASSERT(seenFaces.empty());
-	FOREACH(v, vertices) {
-		const FaceIdxArr& vFaces = vertexFaces[v];
-		if (vFaces.GetSize() < 2)
-						continue;
-		FOREACHPTR(pFIdx, vFaces) {
-			const Face& f(faces[*pFIdx]);
-			const uint32_t i(FindVertex(f, v));
-			vertexInfo.AddEdge(f[(i+1)%3], f[(i+2)%3], *pFIdx);
-			}
-		// find all connected sub-graphs
-		const size_t nComponents(vertexInfo.ComputeComponents());
-		if (nComponents == 1)
-			goto ABORT_VERTEX;
-		// do not proceed, if any of the faces was removed
-		FOREACHPTR(pFIdx, vFaces) {
-			if (seenFaces.find(*pFIdx) != seenFaces.cend())
-				goto ABORT_VERTEX;
-		}
-		{
-		// there are at least two connected components (usually exactly two);
-		// duplicate the vertex and assign the duplicate to the smallest component
-		ASSERT(nComponents > 1);
-		sizes.Resize(nComponents);
-		sizes.Memset(0);
-		for (const auto& comp: vertexInfo.components)
-			++sizes[comp.second];
-		size_t nLongestCompIdx(0);
-		for (size_t s=1; s<sizes.GetSize(); ++s) {
-			if (sizes[nLongestCompIdx] < sizes[s])
-				nLongestCompIdx = s;
-	}
-		FOREACH(s, sizes) {
-			if (s == nLongestCompIdx)
-				continue;
-			ASSERT(componentFaces.empty());
-			for (const auto& idx2id: vertexInfo.index2idx) {
-				if (vertexInfo.components[idx2id.second] == s) {
-					for (boost::tie(ei, eie) = boost::out_edges(idx2id.second, vertexInfo.graph); ei != eie; ++ei)
-						componentFaces.insert(vertexInfo.edgeIndex[*ei]);
-		}
-				}
-			if (componentFaces.size() == 3 && sizes[s] == 3 && nComponents == 2/* && vFaces.GetSize() > 6*/) {
-				// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-				// having the apex this vertex and the base formed by 3 vertices;
-				DEFINE_REMOVE3(GENERAL_VERTEX);
-			#if 1
-			} else if (componentFaces.size() == 4 && sizes[s] == 4 && nComponents == 2/* && vFaces.GetSize() > 8*/) {
-				// this is the case of a legitimate vertex on the surface and a pyramid rising from the neighboring surface
-				// having the apex this vertex and the base formed by 4 vertices;
-				DEFINE_REMOVE4(GENERAL_VERTEX);
-			#endif
-			} else {
-				GENERAL_VERTEX:
-				// simply duplicate the vertex and assign it to the component faces
-				const VIndex newIndex((VIndex)vertices.GetSize());
-				Vertex& pos(vertices.AddEmpty());
-				pos = vertices[v];
-				for (auto fIdx: componentFaces)
-					GetVertex(faces[fIdx], (VIndex)v) = newIndex;
-			}
-			for (auto fIdx: componentFaces)
-				seenFaces.insert(fIdx);
-			componentFaces.clear();
-		}
-		++nNonManifoldVertices;
-		}
-		ABORT_VERTEX:;
-		vertexInfo.Clear();
-	}
-	seenFaces.clear();
-	if (nNonManifoldVertices)
-		vertexFaces.Empty();
-	DEFINE_REMOVE_FACES;
-	DEBUG_ULTIMATE("Fixed %u/%u non-manifold edges/vertices and %u faces removed: %u pyramid3 and %u pyramid4 (%s)", nNonManifoldEdges, nNonManifoldVertices, nRemoveFaces, nPyramid3, nPyramid4, TD_TIMER_GET_FMT().c_str());
-	return (nNonManifoldEdges > 0 || nNonManifoldVertices > 0);
-} // FixNonManifold
-#undef DEFINE_REMOVE_FACES
-#undef DEFINE_REMOVE3
-#undef DEFINE_REMOVE4
-#undef DEFINE_FACES4
-#undef IS_LINK_FACE3
-#undef IS_LOOP_FACE3
-#undef DEFINE_FACE_VERTS
-#endif
-
+}
 #endif // 2.1 version
 /*----------------------------------------------------------------*/
 
@@ -1308,6 +757,158 @@ public:
 	inline TriEdgeCollapse(const VertexPair &p, int i, vcg::BaseParameterClass *pp) :TECQ(p, i, pp) {}
 };
 }
+
+#if 0 // JPB WIP
+#pragma once
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <new>
+#include <type_traits>
+#include <algorithm>
+
+class ScratchPad {
+public:
+	explicit ScratchPad(size_t lanes = 1, size_t initialBytes = 0) {
+		resizeLanes(lanes, initialBytes);
+	}
+
+	void resizeLanes(size_t lanes, size_t initialBytes = 0) {
+		lanes_.resize(lanes);
+		for (size_t i = 0; i < lanes_.size(); ++i) {
+			if (initialBytes > 0 && lanes_[i].buffer.capacity() < initialBytes) {
+				lanes_[i].buffer.reserve(initialBytes);
+			}
+			lanes_[i].cursor = 0;
+		}
+	}
+
+	void clearAll(bool shrink = false) {
+		for (auto& ln : lanes_) {
+			ln.buffer.clear();
+			if (shrink) {
+				ln.buffer.shrink_to_fit();
+			}
+			ln.cursor = 0;
+		}
+	}
+
+	void resetAll() {
+		for (auto& ln : lanes_) {
+			ln.cursor = 0;
+		}
+	}
+
+	void reset(size_t lane) {
+		lanes_.at(lane).cursor = 0;
+	}
+
+	void reserve(size_t lane, size_t bytes) {
+		lanes_.at(lane).buffer.reserve(bytes);
+	}
+
+	size_t size(size_t lane) const {
+		return lanes_.at(lane).cursor;
+	}
+
+	size_t capacity(size_t lane) const {
+		return lanes_.at(lane).buffer.capacity();
+	}
+
+	size_t remaining(size_t lane) const {
+		const auto& ln = lanes_.at(lane);
+		return ln.buffer.capacity() >= ln.cursor ? (ln.buffer.capacity() - ln.cursor) : 0;
+	}
+
+	void* allocateRaw(size_t lane, size_t bytes, size_t alignment = alignof(std::max_align_t)) {
+		Lane& ln = lanes_.at(lane);
+		size_t aligned = alignUp(ln.cursor, alignment);
+		ensure(lane, aligned + bytes, alignment);
+		ln.cursor = aligned;
+		void* ptr = ln.ptr() + ln.cursor;
+		ln.cursor += bytes;
+		return ptr;
+	}
+
+	template<typename T>
+	T* allocate(size_t lane, size_t count = 1) {
+		return static_cast<T*>(allocateRaw(lane, sizeof(T) * count, alignof(T)));
+	}
+
+	template<typename T>
+	T* allocateCleared(size_t lane, size_t count = 1) {
+		T* p = allocate<T>(lane, count);
+		std::byte* b = reinterpret_cast<std::byte*>(p);
+		std::fill(b, b + sizeof(T) * count, std::byte{ 0 });
+		return p;
+	}
+
+	template<typename T>
+	T* emplaceDefault(size_t lane, size_t count = 1) {
+		static_assert(std::is_default_constructible<T>::value, "T must be default constructible");
+		T* p = allocate<T>(lane, count);
+		for (size_t i = 0; i < count; ++i) {
+			new (p + i) T();
+		}
+		return p;
+	}
+
+	template<typename T>
+	T* castAt(size_t lane, size_t byteOffset) {
+		Lane& ln = lanes_.at(lane);
+		return reinterpret_cast<T*>(ln.ptr() + byteOffset);
+	}
+
+	// Access the underlying vector-of-vectors if needed.
+	const std::vector<unsigned char>& laneBuffer(size_t lane) const {
+		return lanes_.at(lane).buffer;
+	}
+
+private:
+	struct Lane {
+		std::vector<unsigned char> buffer;
+		size_t cursor = 0;
+
+		unsigned char* ptr() {
+			if (buffer.empty()) return nullptr;
+			return buffer.data();
+		}
+	};
+
+	static size_t alignUp(size_t x, size_t a) {
+		size_t mask = a - 1;
+		return (x + mask) & ~mask;
+	}
+
+	void ensure(size_t lane, size_t neededCursor, size_t alignment) {
+		Lane& ln = lanes_.at(lane);
+		size_t needBytes = neededCursor;
+		if (ln.buffer.capacity() < needBytes) {
+			size_t newCap = std::max(needBytes, std::max<size_t>(64, ln.buffer.capacity() * 2));
+			// Keep alignment-friendly capacity growth (round up to alignment).
+			newCap = alignUp(newCap, alignment);
+			std::vector<unsigned char> tmp;
+			tmp.reserve(newCap);
+			if (!ln.buffer.empty()) {
+				tmp.insert(tmp.end(), ln.buffer.begin(), ln.buffer.begin() + ln.cursor);
+			}
+			else if (ln.cursor > 0) {
+				tmp.resize(ln.cursor);
+			}
+			ln.buffer.swap(tmp);
+			if (ln.buffer.size() < ln.cursor) {
+				ln.buffer.resize(ln.cursor);
+			}
+		}
+		if (ln.buffer.size() < needBytes) {
+			ln.buffer.resize(needBytes);
+		}
+	}
+
+	std::vector<Lane> lanes_;
+};
+
+#endif
 
 // decimate, clean and smooth mesh
 // fDecimate factor is in range (0..1], if 1 no decimation takes place
@@ -1356,6 +957,22 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		}
 		faces.Release();
 	}
+
+#if 0 // JPB WIP
+	// Create a 3-lane scratch pad with some initial capacity per lane.
+	ScratchPad pad(3, 1 << 16);
+
+	// Lane 0: get raw aligned block and manually cast.
+	void* raw = pad.allocateRaw(0, 1024, 64);
+	float* asFloats = reinterpret_cast<float*>(raw);
+
+	// Lane 1: carve out N structs.
+	struct Foo {
+		int a;
+		double b;
+	};
+	Foo* foos = pad.allocate<Foo>(1, 128);
+#endif
 
 	// decimate mesh
 	if (fDecimate < 1) {
@@ -1440,11 +1057,11 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 
 	// remove spurious components
 	if (fSpurious > 0) {
-#if 1 // suggested
+#if 0 // suggested  this introduces sparkles
   	// Gather squared edge lengths once
 		std::vector<float> e2;
 		e2.reserve(mesh.EN());
-		for (auto &e : mesh.edge) {
+		for (const auto& e : mesh.edge) {
 		  if (e.IsD()) continue;
 		  const auto &p0 = e.V(0)->P();
 		  const auto &p1 = e.V(1)->P();
@@ -1470,24 +1087,24 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		size_t selCount = vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge);
 
 		// 1b) mark tiny-area faces inline (add to selection)
-		for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-			if (fi->IsD()) continue;
-			const auto &p0 = fi->V(0)->P();
-			const auto &p1 = fi->V(1)->P();
-			const auto &p2 = fi->V(2)->P();
+		for (auto& f : mesh.face) {
+			if (f.IsD()) continue;
+			const auto &p0 = f.V(0)->P();
+			const auto &p1 = f.V(1)->P();
+			const auto &p2 = f.V(2)->P();
 			const auto cross = (p1 - p0) ^ (p2 - p0); // still a CoordType
-			const float crossLenSq = cross.SquaredNorm(); // no sqrt
+			const float crossLenSq = cross.SquaredNorm();
 			if (crossLenSq < tinyAreaSq) {
-				fi->SetS();
+				f.SetS();
 				++selCount;
 			}
 		}
 
 		// Inline "DeleteFaceIf": erase selected faces
 		if (selCount) {
-			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-				if (!fi->IsD() && fi->IsS()) {
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+			for (auto& f : mesh.face) {
+				if (!f.IsD() && f.IsS()) {
+					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, f);
 				}
 			}
 			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
@@ -1498,7 +1115,7 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 
 		// 2) Remove small/skinny components by diameter
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-				auto delInfo = vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thDiameter);
+		auto delInfo = vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thDiameter);
 		
 		// Optional: also cull by face count (tiny specks)
 		// delInfo = vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponents(mesh, minFaceNum);
@@ -1540,49 +1157,94 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 			DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
 		}
 		else {
-			// Build per-vertex valence and incident-face lists (single pass).
-			const int numVerts = mesh.vert.size();
+			// Build per-vertex valence and incident-face lists (compact CSR form).
+			const int numVerts = (int)mesh.vert.size();
 			std::vector<int> valence(numVerts, 0);
-			std::vector<std::vector<CLEAN::Mesh::FacePointer>> incFaces(numVerts);
 
-			auto vpIndex = [&](CLEAN::Mesh::VertexPointer vp) -> int {
-				return vcg::tri::Index(mesh, vp);
-				};
-
-			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-				if (fi->IsD())
-					continue;
-				auto v0 = fi->V(0);
-				auto v1 = fi->V(1);
-				auto v2 = fi->V(2);
-				if (v0->IsD() || v1->IsD() || v2->IsD())
-					continue;
-
-				int i0 = vpIndex(v0);
-				int i1 = vpIndex(v1);
-				int i2 = vpIndex(v2);
-
-				++valence[i0];
-				++valence[i1];
-				++valence[i2];
-
-				incFaces[i0].push_back(&*fi);
-				incFaces[i1].push_back(&*fi);
-				incFaces[i2].push_back(&*fi);
+			// Precompute vertex alive flags once (no pointer chasing in the hot loop).
+			std::vector<uint8_t> alive(numVerts, 0);
+			for (int i = 0; i < numVerts; ++i) {
+				alive[i] = mesh.vert[i].IsD() ? 0u : 1u;
 			}
 
-			// Seed queue with all current spikes (valence == 1).
+			auto vpIndex = [&](CLEAN::Mesh::VertexPointer vp) -> int {
+				// Faster than vcg::tri::Index(mesh, vp) when vert is contiguous
+				return int(vp - &mesh.vert[0]);
+				};
+
+			// Pass 1: count valence using alive-mask (no v->IsD() per face).
+			size_t numFaceRefs = 0;
+			for (auto& f : mesh.face) {
+				if (f.IsD())
+					continue;
+
+				auto* v0 = f.V(0);
+				auto* v1 = f.V(1);
+				auto* v2 = f.V(2);
+
+				const int i0 = vpIndex(v0);
+				const int i1 = vpIndex(v1);
+				const int i2 = vpIndex(v2);
+
+				const uint8_t m = uint8_t(alive[i0] & alive[i1] & alive[i2]); // 0 or 1
+				if (!m)
+					continue;
+
+				valence[i0] += 1;
+				valence[i1] += 1;
+				valence[i2] += 1;
+				numFaceRefs += 3;
+			}
+
+			// CSR offsets
+			std::vector<uint32_t> incOffsets(numVerts + 1);
+			uint64_t run = 0;
+			for (int i = 0; i < numVerts; ++i) {
+				incOffsets[(size_t)i] = (uint32_t)run;
+				run += (uint32_t)valence[i];
+			}
+			incOffsets[(size_t)numVerts] = (uint32_t)run;
+
+			// Pass 2: fill flat incident-face array using the same alive-mask.
+			std::vector<CLEAN::Mesh::FacePointer> incFacesFlat(numFaceRefs);
+			std::vector<uint32_t> cursor = incOffsets;
+
+			for (auto& f : mesh.face) {
+				if (f.IsD())
+					continue;
+
+				auto* v0 = f.V(0);
+				auto* v1 = f.V(1);
+				auto* v2 = f.V(2);
+
+				const int i0 = vpIndex(v0);
+				const int i1 = vpIndex(v1);
+				const int i2 = vpIndex(v2);
+
+				const uint8_t m = uint8_t(alive[i0] & alive[i1] & alive[i2]);
+				if (!m)
+					continue;
+
+				incFacesFlat[(size_t)cursor[(size_t)i0]++] = &f;
+				incFacesFlat[(size_t)cursor[(size_t)i1]++] = &f;
+				incFacesFlat[(size_t)cursor[(size_t)i2]++] = &f;
+			}
+
+			// Seed queue with spikes (valence == 1), using alive[] so we don't touch vertices again.
 			std::vector<int> q;
 			q.reserve(numVerts);
-
 			for (int i = 0; i < numVerts; ++i) {
-				if (!mesh.vert[i].IsD() && valence[i] == 1)
+				if (alive[i] && valence[i] == 1)
 					q.push_back(i);
 			}
 
+			// CSR range helpers
+			auto facesBegin = [&](int vi) { return incFacesFlat.data() + incOffsets[(size_t)vi]; };
+			auto facesEnd = [&](int vi) { return incFacesFlat.data() + incOffsets[(size_t)vi + 1]; };
+
 			auto findOneFace = [&](int vi) -> CLEAN::Mesh::FacePointer {
-				const auto& lst = incFaces[vi];
-				for (auto f : lst) {
+				for (auto p = facesBegin(vi), e = facesEnd(vi); p != e; ++p) {
+					CLEAN::Mesh::FacePointer f = *p;
 					if (f && !f->IsD())
 						return f;
 				}
@@ -1590,10 +1252,10 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 				};
 
 			auto decValence = [&](CLEAN::Mesh::VertexPointer vp) {
-				if (!vp || vp->IsD())
+				if (!vp)
 					return;
-				int idx = vpIndex(vp);
-				if (idx < 0 || idx >= numVerts)
+				const int idx = vpIndex(vp);
+				if ((unsigned)idx >= (unsigned)numVerts || !alive[idx])
 					return;
 				if (valence[idx] > 0) {
 					--valence[idx];
@@ -1602,21 +1264,15 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 				}
 				};
 
-			// Prune spikes: delete the unique incident face, then the spike vertex.
+			// Prune spikes
 			size_t head = 0;
 			while (head < q.size()) {
-				int vi = q[head++];   // consume in FIFO order
-
-				if (vi < 0 || vi >= numVerts)
-					continue;
-				auto& v = mesh.vert[vi];
-				if (v.IsD())
-					continue;
-				if (valence[vi] != 1)
+				const int vi = q[head++];
+				if ((unsigned)vi >= (unsigned)numVerts || !alive[vi] || valence[vi] != 1)
 					continue;
 
 				auto f = findOneFace(vi);
-				if (f == nullptr)
+				if (!f)
 					continue;
 
 				auto a = f->V(0);
@@ -1624,42 +1280,31 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 				auto c = f->V(2);
 
 				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *f);
-
 				decValence(a);
 				decValence(b);
 				decValence(c);
 
-				vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, v);
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, mesh.vert[vi]);
+				alive[vi] = 0;
 				++nTotalSpikes;
 			}
 
-			// -------- Safe cleanup sequence (prevents CompactEveryVector crashes) --------
-
-			// 1) Remove any faces that still reference deleted vertices (defensive sweep).
+			// Cleanup sequence
 			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
 				if (fi->IsD())
 					continue;
 				if (fi->V(0)->IsD() || fi->V(1)->IsD() || fi->V(2)->IsD())
 					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
 			}
-
-			// 2) Rebuild adjacency to purge stale VF/FF pointers created by deletions.
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-
-			// 3) Drop vertices that lost all incident faces during pruning.
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
-
-			// 4) Compact once everything is consistent.
-			//    NOTE: any external raw pointers/indices into mesh.vert/mesh.face become invalid now.
 			vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
-
-			// If later code depends on adjacency, rebuild once more after compaction (cheap, optional):
-			// vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-			// vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 
 			DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
 		}
+
+
 	}
 #else
 	if (bRemoveSpikes) {

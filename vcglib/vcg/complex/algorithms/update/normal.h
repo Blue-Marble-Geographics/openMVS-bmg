@@ -124,21 +124,19 @@ Journal of Graphics Tools, 1998
 static void PerVertexAngleWeighted(ComputeMeshType &m)
 {
   PerVertexClear(m);
-  const int64_t cnt = (int64_t) m.fn;
-#pragma omp parallel for
-  for(int64_t i = 0; i < cnt; ++i) {
-    auto& face = m.face[i];
-    if( !face.IsD() && face.IsR() ) {
-      NormalType t = TriangleNormal(face).Normalize();
-      NormalType e0 = (face.V1(0)->cP()-face.V0(0)->cP()).Normalize();
-      NormalType e1 = (face.V1(1)->cP()-face.V0(1)->cP()).Normalize();
-      NormalType e2 = (face.V1(2)->cP()-face.V0(2)->cP()).Normalize();
+  FaceIterator f;
+  for(f=m.face.begin();f!=m.face.end();++f)
+   if( !(*f).IsD() && (*f).IsR() )
+   {
+        NormalType t = TriangleNormal(*f).Normalize();
+        NormalType e0 = ((*f).V1(0)->cP()-(*f).V0(0)->cP()).Normalize();
+        NormalType e1 = ((*f).V1(1)->cP()-(*f).V0(1)->cP()).Normalize();
+        NormalType e2 = ((*f).V1(2)->cP()-(*f).V0(2)->cP()).Normalize();
 
-      face.V(0)->N() += t*AngleN(e0,-e2);
-      face.V(1)->N() += t*AngleN(-e0,e1);
-      face.V(2)->N() += t*AngleN(-e1,e2);
-    }
-  }
+        (*f).V(0)->N() += t*AngleN(e0,-e2);
+        (*f).V(1)->N() += t*AngleN(-e0,e1);
+        (*f).V(2)->N() += t*AngleN(-e1,e2);
+   }
 }
 
 ///  \brief Calculates the vertex normal using the Max et al. weighting scheme. It does not need or exploit current face normals.
@@ -172,16 +170,16 @@ static void PerVertexNelsonMaxWeighted(ComputeMeshType &m)
 /// Not normalized. Use PerFaceNormalized() or call NormalizePerVertex() if you need unit length per face normals.
 static void PerFace(ComputeMeshType &m)
 {
-  RequirePerFaceNormal(m); // JPB WIP BUG What is this doing?
+    RequirePerFaceNormal(m); // JPB WIP BUG What is this doing?
 
-  int64_t numFaces = m.fn;
+    int64_t numFaces = m.fn;
 #pragma omp parallel for
-  for (int64_t i = 0; i < numFaces; ++i) {
-    auto& f = m.face[i];
-    if ( ! f.IsD() ) {
-      f.N() = TriangleNormal(f);
+    for (int64_t i = 0; i < numFaces; ++i) {
+        auto& f = m.face[i];
+        if ( !f.IsD() ) {
+            f.N() = TriangleNormal(f);
+        }
     }
-  }
 }
 
 
@@ -244,18 +242,18 @@ static void PerFaceFromCurrentVertexNormal(ComputeMeshType &m)
 }
 
 /// \brief Normalize the length of the vertex normals.
-static void NormalizePerVertex(ComputeMeshType &m)
+static void NormalizePerVertex(ComputeMeshType& m)
 {
-  tri::RequirePerVertexNormal(m); // JPB WIP BUG What is this doing?
+    tri::RequirePerVertexNormal(m); // JPB WIP BUG What is this doing?
 
-  int64_t numVertices = m.vn;
+    int64_t numVertices = m.vn;
 #pragma omp parallel for
-  for (int64_t i = 0; i < numVertices; ++i) {
-    auto& v = m.vert[i];
-    if ( ! v.IsD && v.isRW() ) {
-      v.N().Normalize();
+    for (int64_t i = 0; i < numVertices; ++i) {
+        auto& v = m.vert[i];
+        if (!v.IsD && v.isRW()) {
+            v.N().Normalize();
+        }
     }
-  }
 }
 
 /// \brief Normalize the length of the face normals.
