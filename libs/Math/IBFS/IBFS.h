@@ -194,28 +194,30 @@ public:
 
 	struct Node;
 
-  struct Arc {
+	struct Arc {
 		Node*		head;
 		Arc*		rev;
 		EdgeCap			rCap;
 		unsigned char	isRevResidual;
 	};
 
-  struct Node {
-    static constexpr int kMaxArcs = 4;
+	struct Node {
+		static constexpr int kMaxArcs = 4;
 
-		int			lastAugTimestamp:31;
-		int			isParentCurr:1;
+		// Group together arcCount + arcs for locality
+		std::atomic<int> arcCount;               // 4
+		Arc arcs[kMaxArcs];         // 32 (assuming Arc = 8 bytes)
 
-		Arc			*parent;
-		Node		*firstSon;
-		Node		*nextPtr;
+		EdgeCap excess;             // 4
+		Arc* parent;                // 8
 
-    int label;
-    EdgeCap excess;
+		Node* firstSon;             // 8
+		Node* nextPtr;              // 8
 
-    Arc arcs[kMaxArcs];
-    int arcCount;
+		int lastAugTimestamp : 31;  // 4 (bitfield with next)
+		int isParentCurr : 1;
+
+		int label;                  // 4
 	};
 
 	class ActiveList
@@ -383,37 +385,46 @@ public:
 inline void IBFSGraph::addNode(int nodeIndex, EdgeCap capFromSource, EdgeCap capToSink)
 {
 	EdgeCap f = nodes[nodeIndex].excess;
-  if (f > 0) capFromSource += f;
-  else capToSink -= f;
-  flow += (capFromSource < capToSink ? capFromSource : capToSink);
-  nodes[nodeIndex].excess = capFromSource - capToSink;
+	if (f > 0) capFromSource += f;
+	else capToSink -= f;
+	flow += (capFromSource < capToSink ? capFromSource : capToSink);
+	nodes[nodeIndex].excess = capFromSource - capToSink;
 }
 
 inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
-  Node* u = &nodes[from];
-  Node* v = &nodes[to];
+	Node* __restrict u = &nodes[from];
+	Node* __restrict v = &nodes[to];
 
-  Arc* uv = &u->arcs[u->arcCount++];
-  Arc* vu = &v->arcs[v->arcCount++];
+#if 1 // JPB WIP Faster than serial code by 25%
+	// Atomically get the next arc index for each node
+	int uArcIdx = u->arcCount.fetch_add(1, std::memory_order_relaxed);
+	int vArcIdx = v->arcCount.fetch_add(1, std::memory_order_relaxed);
 
-  uv->head = v;
-  uv->rev = vu;
-  uv->rCap = cap;
-  uv->isRevResidual = (revCap > 0);
+	Arc* __restrict uv = &u->arcs[uArcIdx];
+	Arc* __restrict vu = &v->arcs[vArcIdx];
+#else
+	Arc* uv = &u->arcs[u->arcCount++];
+	Arc* vu = &v->arcs[v->arcCount++];
+#endif
 
-  vu->head = u;
-  vu->rev = uv;
-  vu->rCap = revCap;
-  vu->isRevResidual = (cap > 0);
+	uv->head = v;
+	uv->rev = vu;
+	uv->rCap = cap;
+	uv->isRevResidual = (revCap > 0);
+
+	vu->head = u;
+	vu->rev = uv;
+	vu->rCap = revCap;
+	vu->isRevResidual = (cap > 0);
 }
 
 
 inline bool IBFSGraph::isNodeOnSrcSide(int nodeIndex) const
 {
-  const Node& x = nodes[nodeIndex];
-  if (x.label == numNodes || x.label == 0) return activeT1.len == 0;
-  return x.label > 0;
-	}
+	const Node& x = nodes[nodeIndex];
+	if (x.label == numNodes || x.label == 0) return activeT1.len == 0;
+	return x.label > 0;
+}
 
 } // namespace IBFS
 

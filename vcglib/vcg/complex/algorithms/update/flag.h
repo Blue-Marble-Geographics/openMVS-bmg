@@ -83,8 +83,8 @@ public:
         RequirePerVertexFlags(m);
         int andMask = ~FlagMask;
 
-        const auto numVertices = m.vn;
-        #pragma omp parallel for
+        const int64_t numVertices = m.vn;
+        #pragma omp parallel for schedule(static, 4096)
           for (int64_t i = 0; i < numVertices; ++i) {
             auto& vi = m.vert[i];
             if(!vi.IsD()) vi.Flags() &= andMask;

@@ -96,80 +96,84 @@ public:
   /// The process can be done or in a straightforward manner (e.g. selection values are substituted)
   /// or preserving selected or unselected elements (e.g. the restoring is combined in OR/AND) 
   /// 
-  bool pop(bool orFlag=false, bool andFlag=false)
+  bool pop(bool orFlag = false, bool andFlag = false)
   {
-    if(vsV.empty()) return false;
-    if(orFlag && andFlag) return false;
-    
-    vsHandle vsH = vsV.back();
-    esHandle esH = esV.back();
-    fsHandle fsH = fsV.back();
-    tsHandle tsH = tsV.back();
+      if (vsV.empty()) return false;
+      if (orFlag && andFlag) return false;
 
-    if(! (Allocator<ComputeMeshType>::template IsValidHandle(*_m, vsH))) return false;
+      vsHandle vsH = vsV.back();
+      esHandle esH = esV.back();
+      fsHandle fsH = fsV.back();
+      tsHandle tsH = tsV.back();
 
-		int64_t cnt = (int64_t) _m->vert.size();
+      if (!(Allocator<ComputeMeshType>::template IsValidHandle(*_m, vsH))) return false;
+
+      int64_t cnt = (int64_t)_m->vert.size();
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-      auto& vi = _m->vert[i];
-      if( !vi.IsD() )
-      {
-        if(vsH[vi]) { 
-           if(!andFlag) vi.SetS();
-        } else {
-          if(!orFlag)   vi.ClearS();
-        }
+      for (int64_t i = 0; i < cnt; ++i) {
+          auto& vi = _m->vert[i];
+          if (!vi.IsD())
+          {
+              if (vsH[vi]) {
+                  if (!andFlag) vi.SetS();
+              }
+              else {
+                  if (!orFlag)   vi.ClearS();
+              }
+          }
       }
-    }
 
-	  cnt = (int64_t) _m->edge.size();
+      cnt = (int64_t)_m->edge.size();
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-      auto& e = _m->edge[i];
-      if( !e.IsD() )
-      {
-        if(esH[e]) { 
-           if(!andFlag) e.SetS();
-        } else {
-          if(!orFlag)   e.ClearS();
-        }
+      for (int64_t i = 0; i < cnt; ++i) {
+          auto& e = _m->edge[i];
+          if (!e.IsD())
+          {
+              if (esH[e]) {
+                  if (!andFlag) e.SetS();
+              }
+              else {
+                  if (!orFlag)   e.ClearS();
+              }
+          }
       }
-    }
 
-    cnt = (int64_t) _m->face.size();
+      cnt = (int64_t)_m->face.size();
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-      auto& f = _m->face[i];
-      if( !f.IsD() )
-      {  
-        if(fsH[f]) { 
-           if(!andFlag) f.SetS();
-        } else {
-          if(!orFlag)   f.ClearS();
-        }
-      }
-    }
-
-     for (auto ti = _m->tetra.begin(); ti != _m->tetra.end(); ++ti)
-      if (!(*ti).IsD())
-      {
-        if (tsH[*ti]) {
-          if (!andFlag) (*ti).SetS();
-        } else {
-          if (!orFlag)  (*ti).ClearS();
-        }
+      for (int64_t i = 0; i < cnt; ++i) {
+          auto& f = _m->face[i];
+          if (!f.IsD())
+          {
+              if (fsH[f]) {
+                  if (!andFlag) f.SetS();
+              }
+              else {
+                  if (!orFlag)   f.ClearS();
+              }
+          }
       }
 
-    Allocator<ComputeMeshType>::template DeletePerVertexAttribute<bool>(*_m,vsH);
-    Allocator<ComputeMeshType>::template DeletePerEdgeAttribute<bool>(*_m,esH);
-    Allocator<ComputeMeshType>::template DeletePerFaceAttribute<bool>(*_m,fsH);
-    Allocator<ComputeMeshType>::template DeletePerTetraAttribute<bool>(*_m,tsH);
+      for (auto ti = _m->tetra.begin(); ti != _m->tetra.end(); ++ti)
+          if (!(*ti).IsD())
+          {
+              if (tsH[*ti]) {
+                  if (!andFlag) (*ti).SetS();
+              }
+              else {
+                  if (!orFlag)  (*ti).ClearS();
+              }
+          }
 
-    vsV.pop_back();
-    esV.pop_back();
-    fsV.pop_back();
-    tsV.pop_back();
-    return true;
+      Allocator<ComputeMeshType>::template DeletePerVertexAttribute<bool>(*_m, vsH);
+      Allocator<ComputeMeshType>::template DeletePerEdgeAttribute<bool>(*_m, esH);
+      Allocator<ComputeMeshType>::template DeletePerFaceAttribute<bool>(*_m, fsH);
+      Allocator<ComputeMeshType>::template DeletePerTetraAttribute<bool>(*_m, tsH);
+
+      vsV.pop_back();
+      esV.pop_back();
+      fsV.pop_back();
+      tsV.pop_back();
+      return true;
   }
 
 private:

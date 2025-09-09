@@ -31,7 +31,7 @@
 
 #define MANIFOLD_FIXUP
 #undef PRE_OPENMVS21
-#undef APPROXIMATE_GRAPHCUT
+#define APPROXIMATE_GRAPHCUT
 
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
@@ -348,24 +348,25 @@ struct vert_info_t {
 
 uint32_t vert_info_t::g_idx = 0;
 
-	typedef edge_cap_t Type;
-	struct view_t {
-		PointCloud::View idxView; // view index
-		//float weight;
-		inline view_t() {}
-		inline view_t(PointCloud::View _idxView) : idxView(_idxView) {}
-		inline bool operator <(const view_t& v) const { return idxView < v.idxView; }
-		inline operator PointCloud::View() const { return idxView; }
-	};
+typedef edge_cap_t Type;
+struct view_t {
+	PointCloud::View idxView; // view index
+	//float weight;
+	inline view_t() {}
+	inline view_t(PointCloud::View _idxView) : idxView(_idxView) {}
+	inline bool operator <(const view_t& v) const { return idxView < v.idxView; }
+	inline operator PointCloud::View() const { return idxView; }
+};
 
-typedef boost::container::small_vector<PointCloud::Index, 10> view_vec_t;
+// Use 2 cache lines per entry to start.
+typedef boost::container::small_vector<uint32_t, 26> view_vec_t;
 std::vector<view_vec_t> allViews; // faces' weight from the cell outwards
 
 void InsertViews(size_t vertexId, const PointCloudStreaming& pc, PointCloud::Index idxPoint)
 {
+	// Note we silently enforce indices no larger than a uint32_t
 	allViews[vertexId].push_back(idxPoint);
 }
-
 
 #ifdef VALIDATE
 struct vert_info_t2 {
@@ -582,6 +583,21 @@ void fetchCellFacets(const delaunay_t& Tr, const std::vector<facet_t>& hullFacet
 	}
 }
 
+struct IntersectHelper
+{
+	double segDiff[3];
+	double segDiffNeg[3];
+	double v1v0Diff[3]; // 1-0
+	double v2v0Diff[3]; // 2-0
+	double qv0Diff[3]; // 3-0
+	double pv0Diff[3]; // 4-0
+	double pqDiff[3]; // 4-3
+	double v1qDiff[3]; // 1-3
+	double v2qDiff[3]; // 2-3
+	double v1pDiff[3]; // 1-4
+	double v2pDiff[3]; // 2-4
+};
+
 static inline int fasterOrientation(const double* __restrict qDiff, const double* __restrict aDiff, const double* __restrict bDiff)
 {
 	// inexact_orientation
@@ -642,6 +658,116 @@ inline int checkEdges(const point_t& a, const point_t& b, const point_t& c, cons
 	return nCoplanar;
 }
 
+#if 1
+
+__forceinline int CheckEdges2FastP(
+	const IntersectHelper& ih,
+	int* __restrict coplanar
+)
+{
+	// return checkEdges2FastP(pv0Diff, b, c, p, segDiff, coplanar);
+
+	constexpr double eps = 1e-12;
+	int nCoplanar = 0;
+
+	// Load qDiff once
+	const double qx = ih.segDiff[0], qy = ih.segDiff[1], qz = ih.segDiff[2]; // correct
+
+	// Precompute diffs once
+	const double ax = -ih.pv0Diff[0], ay = -ih.pv0Diff[1], az = -ih.pv0Diff[2]; // correct
+
+	// b-p is v1-p
+	const double bx = ih.v1pDiff[0], by = ih.v1pDiff[1], bz = ih.v1pDiff[2]; // correct
+	// c-p is v2-p
+	const double cx = ih.v2pDiff[0], cy = ih.v2pDiff[1], cz = ih.v2pDiff[2];// correct
+
+	// Precompute shared 2D cross terms with q
+	const double qxa_y = qx * ay - ax * qy;
+	const double qxb_y = qx * by - bx * qy;
+	const double qxc_y = qx * cy - cx * qy;
+
+	// ---- Edge 1: pq, ab ----
+	{
+		const double t3 = ax * by - bx * ay;
+		const double det = qxa_y * bz - qxb_y * az + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 0;
+	}
+
+	// ---- Edge 2: pq, bc ----
+	{
+		const double t3 = bx * cy - cx * by;
+		const double det = qxb_y * cz - qxc_y * bz + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 1;
+	}
+
+	// ---- Edge 3: pq, ca ----
+	{
+		const double t3 = cx * ay - ax * cy;
+		const double det = qxc_y * az - qxa_y * cz + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 2;
+	}
+
+	return nCoplanar;
+}
+
+__forceinline int CheckEdges2FastQ(
+	const IntersectHelper& ih,
+	int* __restrict coplanar)
+{
+	constexpr double eps = 1e-12;
+	int nCoplanar = 0;
+
+	// return checkEdges2FastQ(qv0Diff, b, c, q, segDiffN, coplanar);
+
+
+	// Load qDiff once
+	const double qx = ih.segDiffNeg[0], qy = ih.segDiffNeg[1], qz = ih.segDiffNeg[2]; // correct
+
+	// Precompute diffs once
+	const double ax = -ih.qv0Diff[0], ay = -ih.qv0Diff[1], az = -ih.qv0Diff[2]; // correct
+
+	// b-q is v1-q
+	const double bx = ih.v1qDiff[0], by = ih.v1qDiff[1], bz = ih.v1qDiff[2]; // correct
+	// c-q is v2-q
+	const double cx = ih.v2qDiff[0], cy = ih.v2qDiff[1], cz = ih.v2qDiff[2]; // correct
+
+	// Precompute shared 2D cross terms with q
+	const double qxa_y = qx * ay - ax * qy;
+	const double qxb_y = qx * by - bx * qy;
+	const double qxc_y = qx * cy - cx * qy;
+
+	// ---- Edge 1: pq, ab ----
+	{
+		const double t3 = ax * by - bx * ay;
+		const double det = qxa_y * bz - qxb_y * az + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 0;
+	}
+
+	// ---- Edge 2: pq, bc ----
+	{
+		const double t3 = bx * cy - cx * by;
+		const double det = qxb_y * cz - qxc_y * bz + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 1;
+	}
+
+	// ---- Edge 3: pq, ca ----
+	{
+		const double t3 = cx * ay - ax * cy;
+		const double det = qxc_y * az - qxa_y * cz + t3 * qz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCoplanar++] = 2;
+	}
+
+	return nCoplanar;
+}
+
+#else
+
 __forceinline int checkEdges2_fast(
   const double* __restrict negPa,
   const point_t& b,
@@ -692,6 +818,7 @@ __forceinline int checkEdges2_fast(
 
   return nCoplanar;
 }
+#endif
 
 #if 0 // original
 static inline int orientationv(const point_t& a, const point_t& b, const point_t& c, const point_t& p)
@@ -914,11 +1041,64 @@ bool intersectv(const delaunay_t& Tr, const segment_t& seg, const std::vector<fa
 }
 #else
 
+static constexpr uint32_t facetIdx[4][3] = {
+  {2,1,3}, // i=0 v2,v1,v3
+  {2,3,0}, // i=1 v1,v2,v3
+  {0,3,1}, // i=2 v2,v1,v3
+  {0,1,2}  // i=3 v1,v2,v3
+};
+
 // Check intersection between a facet (f) and a segment (s)
 // (derived from CGAL::do_intersect in CGAL/Triangle_3_Segment_3_do_intersect.h)
 //  coplanar [out] : pointer to the 3 int array of indices of the edges coplanar with (s)
 // return -1 if there is no intersection or
 // the number of edges coplanar with the segment (0 = intersection inside the triangle)
+#if 1 // try agin
+__forceinline int intersect(
+	const IntersectHelper& ih,
+	int* __restrict coplanar
+)
+{
+	// edges: (b - a), (c - a)
+	const double bax = ih.v1v0Diff[0], bay = ih.v1v0Diff[1], baz = ih.v1v0Diff[2];
+	const double cax = ih.v2v0Diff[0], cay = ih.v2v0Diff[1], caz = ih.v2v0Diff[2];
+
+	// unnormalized normal n = (b - a) x (c - a)
+	const double nx = bay * caz - baz * cay;
+	const double ny = baz * cax - bax * caz;
+	const double nz = bax * cay - bay * cax;
+
+	// endpoint offsets from 'a' (compute once; cheap)
+	const double pax = ih.pv0Diff[0], pay = ih.pv0Diff[1], paz = ih.pv0Diff[2];
+	const double qax = ih.qv0Diff[0], qay = ih.qv0Diff[1], qaz = ih.qv0Diff[2];
+
+	// signed distances to plane (no 'd' needed): dp = n·(p-a), dq = n·(q-a)
+	const double dp = nx * pax + ny * pay + nz * paz;
+	const double dq = nx * qax + ny * qay + nz * qaz;
+
+	// classify with tight epsilon (branchless-ish)
+	constexpr double eps = 1e-12;
+	const int sp = (dp > eps) - (dp < -eps);
+	const int sq = (dq > eps) - (dq < -eps);
+
+	// both strictly same side -> no intersection with plane
+	if ((sp > 0 && sq > 0) || (sp < 0 && sq < 0))
+		return -1;
+
+	// entirely coplanar with plane
+	if (sp == 0 && sq == 0)
+		return 3;
+
+	// choose which endpoint to use for edge tests:
+	// Use P-side when (sp >= 0 && sq <= 0); otherwise use Q-side.
+	if (sp >= 0 && sq <= 0) {
+		return CheckEdges2FastP(ih, coplanar);
+	}
+	else {
+		return CheckEdges2FastQ(ih, coplanar);
+	}
+}
+#else
 int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __restrict segDiff /* target - source */, const double* __restrict segDiffN /* source - target */, int* __restrict coplanar)
 {
 	const point_t& a = vs[0]->point(); // t.vertex(0);
@@ -991,140 +1171,366 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 	ASSERT("should not happen" == NULL);
 	return -1;
 }
+#endif
 
-inline double IntersectsDist(const SEACAVE::Ray3& ray, const CGAL::Plane_3<kernel_t>& plane)
+#if 0
+__forceinline bool IntersectsPrecheck(
+	const SEACAVE::Ray3& ray,
+	const double v0x,
+	const double v0y,
+	const double v0z,
+	double prevDist,
+	bool bigger,
+	double& voOut,
+	double& vdOut)
 {
-	const auto& normal = plane.orthogonal_vector();
-	const double nx = normal.x();
-	const double ny = normal.y();
-	const double nz = normal.z();
+	const double v10x = ih.v1v0Diff[0];
+	const double v10y = ih.v1v0Diff[1];
+	const double v10z = ih.v1v0Diff[2];
 
-	const double Vd = nx * ray.m_vDir.x() + ny * ray.m_vDir.y() + nz * ray.m_vDir.z();
-	const double Vo = -(nx * ray.m_pOrig.x() + ny * ray.m_pOrig.y() + nz * ray.m_pOrig.z() + plane.d());
+	const double v20x = ih.v2v0Diff[0];
+	const double v20y = ih.v2v0Diff[1];
+	const double v20z = ih.v2v0Diff[2];
+
+	const double nx = v10y * v20z - v10z * v20y;
+	const double ny = v10z * v20x - v10x * v20z;
+	const double nz = v10x * v20y - v10y * v20x;
+
+	const double d = -(nx * v0x + ny * v0y + nz * v0z);
+
+	const double dx = ray.m_vDir.x();
+	const double dy = ray.m_vDir.y();
+	const double dz = ray.m_vDir.z();
+	const double ox = ray.m_pOrig.x();
+	const double oy = ray.m_pOrig.y();
+	const double oz = ray.m_pOrig.z();
+
+	const double vd = nx * dx + ny * dy + nz * dz;
+	constexpr double eps = 1e-12;
+	if (std::abs(vd) < eps)
+		return false; // parallel or nearly so
+
+	const double vo = -(nx * ox + ny * oy + nz * oz + d);
+
+	// Compare without divide:
+	// interDist > prevDist  iff  (vd >= 0 ? vo - prevDist*vd > 0 : vo - prevDist*vd < 0)
+	const double delta = vo - prevDist * vd;
+	const bool isGreater = (vd >= 0.0) ? (delta > 0.0) : (delta < 0.0);
+	if (isGreater != bigger)
+		return false;
+
+	voOut = vo;
+	vdOut = vd;
+	return true;
+}
+#endif
+
+// Return false if nearly parallel or compare fails; otherwise return vo, vd
+__forceinline bool IntersectsPrecheckFast(
+	const SEACAVE::Ray3& ray,
+	double v0x, double v0y, double v0z,
+	double nx, double ny, double nz,
+	double prevDist, bool bigger,
+	double& voOut, double& vdOut) {
+	const double dx = ray.m_vDir.x(), dy = ray.m_vDir.y(), dz = ray.m_vDir.z();
+	const double ox = ray.m_pOrig.x(), oy = ray.m_pOrig.y(), oz = ray.m_pOrig.z();
+
+	const double vd = nx * dx + ny * dy + nz * dz;
+	constexpr double eps = 1e-12;
+	if (std::abs(vd) < eps) return false;
+
+	const double d = -(nx * v0x + ny * v0y + nz * v0z);
+	const double vo = -(nx * ox + ny * oy + nz * oz + d);
+
+	const double delta = vo - prevDist * vd;
+	const bool isGreater = (vd >= 0.0) ? (delta > 0.0) : (delta < 0.0);
+	if (isGreater != bigger) return false;
+
+	voOut = vo; vdOut = vd;
+	return true;
+}
+
+
+// Shared core for edge checks.
+// Select endpoint set with template bool UseP: true => P-side, false => Q-side.
+template<bool UseP>
+__forceinline int CheckEdges2FastCore(
+	double sx, double sy, double sz,   // segment (q - p) if UseP, else (p - q)
+	double ax, double ay, double az,   // -(endpoint - v0)
+	double bx, double by, double bz,   // v1 - endpoint
+	double cx, double cy, double cz,   // v2 - endpoint
+	int* __restrict coplanar) {
+	constexpr double eps = 1e-12;
+	int nCop = 0;
+
+	// (-ay*sx) - (-ax*sy)
+	// a = -aysx + aysy
+	// ay*sy - ay*sx
+	const double sxa_y = ax * sy - sx * ay; // sx * ay - ax * sy;
+	const double sxb_y = sx * by - bx * sy;
+	const double sxc_y = cx * sy - sx * cy; // sx * cy - cx * sy;
+
+
+	{ // (s, ab)
+		const double t3 = bx * ay - ax * by; // ax * by - bx * ay;
+		const double det = sxa_y * bz + sxb_y * az + t3 * sz; // sxa_y * bz - sxb_y * az + t3 * sz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCop++] = 0;
+	}
+	{ // (s, bc)
+		const double t3 = bx * cy - cx * by;
+		const double det = sxb_y * cz + sxc_y * bz + t3 * sz; // sxb_y * cz - sxc_y * bz + t3 * sz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCop++] = 1;
+	}
+	{ // (s, ca)
+		const double t3 = ax * cy - cx * ay; // cx* ay - ax * cy;
+		const double det = sxc_y * az - sxa_y * cz + t3 * sz; // sxc_y * az - sxa_y * cz + t3 * sz;
+		if (det > eps) return -1;
+		if (det >= -eps && det <= eps) coplanar[nCop++] = 2;
+	}
+	return nCop;
+}
+
+// Plane-side classification; pick which endpoint (P vs Q) to use for edges.
+// Returns -1 (no hit), 3 (coplanar), or 0/1/2 count from checkEdges2FastCore.
+__forceinline int IntersectPlaneAndEdges(
+	// plane normal (v1-v0) x (v2-v0)
+	double nx, double ny, double nz,
+	// p-v0, q-v0
+	double pax, double pay, double paz,
+	double qax, double qay, double qaz,
+	double px, double py, double pz,
+	double v1x, double v1y, double v1z,
+	double v2x, double v2y, double v2z,
+	double qx, double qy, double qz,
+	// segment vectors
+	double sPx, double sPy, double sPz,  // q - p
+	double sQx, double sQy, double sQz,  // p - q
+	int* RESTRICT coplanar) {
+
+//	const point_t& a = t.vertex(0);
+//	const point_t& b = t.vertex(1);
+//	const point_t& c = t.vertex(2);
+//	const point_t& p = s.source();
+//	const point_t& q = s.target();
+
+	const double dp = nx * pax + ny * pay + nz * paz;
+	const double dq = nx * qax + ny * qay + nz * qaz;
 
 	constexpr double eps = 1e-12;
-	const double safeVd = (std::abs(Vd) < eps) ? std::copysign(eps, Vd) : Vd;
+	const int sp = (dp > eps) - (dp < -eps);
+	const int sq = (dq > eps) - (dq < -eps);
 
-	return Vo / safeVd;
-} // IntersectsDist(PLANE)
+	if ((sp > 0 && sq > 0) || (sp < 0 && sq < 0)) return -1;
+	if (sp == 0 && sq == 0) return 3;
+
+	if (sp >= 0 && sq <= 0) {
+		// P-side endpoint = p: a = -(p-v0), b = v1-p, c = v2-p
+		const double bxP = v1x - px, byP = v1y - py, bzP = v1z - pz;
+		const double cxP = v2x - px, cyP = v2y - py, czP = v2z - pz;
+		return CheckEdges2FastCore<true>(sPx, sPy, sPz, pax, pay, paz, bxP, byP, bzP, cxP, cyP, czP, coplanar);
+	} else {
+		// Q-side endpoint = q: a = -(q-v0), b = v1-q, c = v2-q
+		const double bxQ = v1x - qx, byQ = v1y - qy, bzQ = v1z - qz;
+		const double cxQ = v2x - qx, cyQ = v2y - qy, czQ = v2z - qz;
+		return CheckEdges2FastCore<false>(sQx, sQy, sQz, qaz, qay, qaz, bxQ, byQ, bzQ, cxQ, cyQ, czQ, coplanar);
+	}
+}
+
+constexpr int facet_vertex_order[] = { 2,1,3,2,2,3,0,2,0,3,1,0,0,1,2,0 };
 
 // Find which facet is intersected by the segment (seg) and return next facets to check:
 //  in_facets [in] : vector of facets to check
 //  out_facets [out] : vector of facets to check at next step (can be in_facets)
 //  out_inter [out] : kind of intersection
 // return false if no intersection found and the end of the segment was not reached
-bool intersect(const delaunay_t& Tr, const segment_t& seg, const double* __restrict segDiff, const double* __restrict segDiff2, const std::vector<facet_t>& in_facets, std::vector<facet_t>& out_facets, intersection_t& inter)
-{
+bool intersect(const delaunay_t& Tr,
+	const segment_t& seg,
+	const std::vector<facet_t>& in_facets,
+	std::vector<facet_t>& out_facets,
+	intersection_t& inter) {
 	ASSERT(!in_facets.empty());
-	static const int facet_vertex_order[] = {2,1,3,2,2,3,0,2,0,3,1,0,0,1,2,0};
+
 	int coplanar[3];
-	const REAL prevDist(inter.dist);
-	vertex_handle_t vs[3];
-	for (const facet_t& in_facet: in_facets) {
-		ASSERT(!Tr.is_infinite(in_facet));
-		Tr.triangle_vertices(vs, in_facet.first, in_facet.second);
-		const int nb_coplanar(intersect(vs, seg, segDiff, segDiff2, coplanar));
-		if (nb_coplanar >= 0) {
+	const double prevDist = inter.dist;
+
+	// segment endpoints and direction (hoisted once)
+	const point_t& p = seg.source();
+	const point_t& q = seg.target();
+	const double px = p.x(), py = p.y(), pz = p.z();
+	const double qx = q.x(), qy = q.y(), qz = q.z();
+	const double sPx = qx - px, sPy = qy - py, sPz = qz - pz; // q - p
+	const double sQx = -sPx, sQy = -sPy, sQz = -sPz;    // p - q
+
+	for (const facet_t& inFacet : in_facets) {
+		ASSERT(!Tr.is_infinite(inFacet));
+
+		// facet vertices (a=v0, b=v1, c=v2)
+		const uint32_t* __restrict m = facetIdx[inFacet.second & 3]; // {i0,i1,i2}
+
+		const point_t& v0 = inFacet.first->vertex(m[0])->point();
+		const point_t& v1 = inFacet.first->vertex(m[1])->point();
+		const point_t& v2 = inFacet.first->vertex(m[2])->point();
+
+		const double v0x = v0.x(), v0y = v0.y(), v0z = v0.z();
+		const double v1x = v1.x(), v1y = v1.y(), v1z = v1.z();
+		const double v2x = v2.x(), v2y = v2.y(), v2z = v2.z();
+
+		// edges from v0
+		const double bax = v1x - v0x, bay = v1y - v0y, baz = v1z - v0z;
+		const double cax = v2x - v0x, cay = v2y - v0y, caz = v2z - v0z;
+
+		// plane normal n = (v1 - v0) x (v2 - v0)
+		const double nx = bay * caz - baz * cay;
+		const double ny = baz * cax - bax * caz;
+		const double nz = bax * cay - bay * cax;
+
+		// p - v0, q - v0
+		const double pax = px - v0x, pay = py - v0y, paz = pz - v0z;
+		const double qax = qx - v0x, qay = qy - v0y, qaz = qz - v0z;
+
+		// plane classify + edge checks (unchanged logic through your helper)
+		const int nbCoplanar = IntersectPlaneAndEdges(
+			nx, ny, nz,
+			pax, pay, paz,
+			qax, qay, qaz,
+			px, py, pz,
+			v1x, v1y, v1z,
+			v2x, v2y, v2z,
+			qx, qy, qz,
+			sPx, sPy, sPz, sQx, sQy, sQz,
+			coplanar);
+
+		if (nbCoplanar >= 0) {
 			// skip this cell if the intersection is not in the desired direction
-			//const REAL interDist(inter.ray.IntersectsDist(getFacetPlane(in_facet)));
-			const REAL interDist(IntersectsDist(inter.ray, getFacetPlane(in_facet)));
-			if ((interDist > prevDist) != inter.bigger)
+			double vo, vd;
+			if (!IntersectsPrecheckFast(inter.ray, v0x, v0y, v0z, nx, ny, nz,
+				prevDist, inter.bigger, vo, vd)) {
 				continue;
-			// vertices of facet i: j = 4 * i, vertices = facet_vertex_order[j,j+1,j+2] negative orientation
-			inter.facet = in_facet;
+			}
+
+			// distance along ray (one divide only on pass)
+			const double interDist = vo / vd;
+
+			// record the hit facet + distance exactly like before
+			inter.facet = inFacet;
 			inter.dist = interDist;
-			switch (nb_coplanar) {
+
+			switch (nbCoplanar) {
 			case 0: {
 				// face intersection
 				inter.type = intersection_t::FACET;
-				// now find next facets to be checked as
-				// the three faces in the neighbor cell different than the origin face
+
+				// next facets: the three faces in the neighbor cell different than the origin face
 				out_facets.clear();
 				const cell_handle_t nc(inter.facet.first->neighbor(inter.facet.second));
 				ASSERT(!Tr.is_infinite(nc));
-				for (int i=0; i<4; ++i)
+				for (int i = 0; i < 4; ++i) {
 					if (nc->neighbor(i) != inter.facet.first)
 						out_facets.emplace_back(nc, i);
-				return true; }
+				}
+				return true;
+			}
+
 			case 1: {
 				// coplanar with 1 edge = intersect edge
-				const int j(4 * inter.facet.second);
-				const int i1(j + coplanar[0]);
+				const int j = 4 * inter.facet.second;
+				const int i1 = j + coplanar[0];
+
 				inter.type = intersection_t::EDGE;
-				inter.v1 = inter.facet.first->vertex(facet_vertex_order[i1+0]);
-				inter.v2 = inter.facet.first->vertex(facet_vertex_order[i1+1]);
-				// now find next facets to be checked as
-				// the two faces in this cell opposing this edge
+				inter.v1 = inter.facet.first->vertex(facet_vertex_order[i1 + 0]);
+				inter.v2 = inter.facet.first->vertex(facet_vertex_order[i1 + 1]);
+
+				// next facets: the two faces in cells opposing this edge
 				out_facets.clear();
-				const edge_t out_edge(inter.facet.first, facet_vertex_order[i1+0], facet_vertex_order[i1+1]);
-				const typename delaunay_t::Cell_circulator efc(Tr.incident_cells(out_edge));
-				typename delaunay_t::Cell_circulator ifc(efc);
+				const edge_t out_edge(inter.facet.first,
+					facet_vertex_order[i1 + 0],
+					facet_vertex_order[i1 + 1]);
+
+				typename delaunay_t::Cell_circulator efc(Tr.incident_cells(out_edge));
+				typename delaunay_t::Cell_circulator ifc = efc;
 				do {
 					const cell_handle_t c(ifc);
 					if (c == inter.facet.first) continue;
+
 					const facet_t f1(c, c->index(inter.v1));
-					if (!Tr.is_infinite(f1))
-						out_facets.push_back(f1);
+					if (!Tr.is_infinite(f1)) out_facets.push_back(f1);
+
 					const facet_t f2(c, c->index(inter.v2));
-					if (!Tr.is_infinite(f2))
-						out_facets.push_back(f2);
+					if (!Tr.is_infinite(f2)) out_facets.push_back(f2);
 				} while (++ifc != efc);
-				return true; }
+
+				return true;
+			}
+
 			case 2: {
 				// coplanar with 2 edges = hit a vertex
-				// find vertex index
-				const int j(4 * inter.facet.second);
-				const int i1(j + coplanar[0]);
-				const int i2(j + coplanar[1]);
-				int i;
-				if (facet_vertex_order[i1] == facet_vertex_order[i2] || facet_vertex_order[i1] == facet_vertex_order[i2+1]) {
-					i = facet_vertex_order[i1];
-				} else
-				if (facet_vertex_order[i1+1] == facet_vertex_order[i2] || facet_vertex_order[i1+1] == facet_vertex_order[i2+1]) {
-					i = facet_vertex_order[i1+1];
-				} else {
-					ASSERT("2 edges intersections without common vertex" == NULL);
+				const int j = 4 * inter.facet.second;
+				const int i1 = j + coplanar[0];
+				const int i2 = j + coplanar[1];
+
+				int vi;
+				if (facet_vertex_order[i1] == facet_vertex_order[i2] ||
+					facet_vertex_order[i1] == facet_vertex_order[i2 + 1]) {
+					vi = facet_vertex_order[i1];
 				}
+				else
+					if (facet_vertex_order[i1 + 1] == facet_vertex_order[i2] ||
+						facet_vertex_order[i1 + 1] == facet_vertex_order[i2 + 1]) {
+						vi = facet_vertex_order[i1 + 1];
+					}
+					else {
+						ASSERT("2 edges intersections without common vertex" == NULL);
+						break;
+					}
+
 				inter.type = intersection_t::VERTEX;
-				inter.v1 = inter.facet.first->vertex(i);
+				inter.v1 = inter.facet.first->vertex(vi);
 				ASSERT(!Tr.is_infinite(inter.v1));
+
 				if (inter.v1->point() == seg.target()) {
 					// target reached
 					out_facets.clear();
 					return false;
 				}
-				// now find next facets to be checked as
-				// the faces in the cells around opposing this common vertex
+
+				// next facets: faces in cells around opposing this common vertex
 				out_facets.clear();
 				struct cell_back_inserter_t {
 					const delaunay_t& Tr;
 					const vertex_handle_t v;
 					const cell_handle_t current_cell;
-					std::vector<facet_t>& out_facets;
-					inline cell_back_inserter_t(const delaunay_t& _Tr, const intersection_t& inter,std::vector<facet_t>& _out_facets)
-						: Tr(_Tr), v(inter.v1), current_cell(inter.facet.first), out_facets(_out_facets) {}
+					std::vector<facet_t>& out;
+					inline cell_back_inserter_t(const delaunay_t& _Tr,
+						const intersection_t& inter,
+						std::vector<facet_t>& _out)
+						: Tr(_Tr), v(inter.v1), current_cell(inter.facet.first), out(_out) {
+					}
 					inline cell_back_inserter_t& operator*() { return *this; }
 					inline cell_back_inserter_t& operator++(int) { return *this; }
 					inline void operator=(cell_handle_t c) {
-						if (c == current_cell)
-							return;
+						if (c == current_cell) return;
 						const facet_t f(c, c->index(v));
-						if (Tr.is_infinite(f))
-							return;
-						out_facets.push_back(f);
+						if (Tr.is_infinite(f)) return;
+						out.push_back(f);
 					}
 				};
 				Tr.finite_incident_cells(inter.v1, cell_back_inserter_t(Tr, inter, out_facets));
-				return true; }
+				return true;
 			}
+			}
+
 			// coplanar with 3 edges = tangent = impossible?
-			break;
+			// fall through and keep checking other facets
 		}
 	}
-	// Bad end: no intersection found and we are not at the end of the segment (very rarely, but it happens)!
+
+	// no intersection found and not at end of segment (rare)
 	out_facets.clear();
 	return false;
 }
+
 #endif
 
 #if 0 // JPB Freespace support removed.
@@ -1213,6 +1619,180 @@ inline triangle_vhandles_t getTriangle(cell_handle_t cell, int i)
 // Compute the angle between the plane containing the given facet and the cell's circumscribed sphere
 // return cosines of the angle
 #if 1 // Faster
+
+// Helper: map getTriangle(cell,k) verts back to cell indices 0..3.
+// idx[0], idx[1], idx[2] correspond to Pa, Pb, Pc (exact order from getTriangle).
+__forceinline void facetOrderIndices(const cell_handle_t& cell, int k, int idx[3]) {
+	const auto tri = getTriangle(cell, k);
+	for (int j = 0; j < 3; ++j) {
+		auto vj = tri.verts[j];
+		int found = -1;
+		// There are only 4, do a tiny linear scan (fast, branchless enough for MSVC).
+		if (vj == cell->vertex(0)) found = 0;
+		else if (vj == cell->vertex(1)) found = 1;
+		else if (vj == cell->vertex(2)) found = 2;
+		else /* vj == cell->vertex(3) */ found = 3;
+		idx[j] = found;
+	}
+}
+// Compute plane-sphere "angle cosine" for all 4 facets of a tetra at once.
+// out[0..3] correspond to facet indices 0..3 (vertex opposite the facet).
+// Uses SSE if available; otherwise falls back to scalar.
+// Assumes: facet index k triangle is "all vertices except k".
+// 4-at-once, sqrt-based, no temp arrays, minimal loads/stores.
+// Build with /O2 (and /fp:precise or /fp:fast as you prefer).
+// Strict match to scalar: uses getTriangle(cell, k) ordering,
+// computes result = dot / sqrt(|N|^2 * |C|^2), clamps to [-1,1],
+// and returns 0.5f for degenerates (same as your scalar).
+// 2-space indent, braces same line, camelCase variables.
+__forceinline void computePlaneSphereAngle4(const delaunay_t& Tr,
+	const cell_handle_t& cell,
+	float out[4]) {
+	if (Tr.is_infinite(cell)) {
+		out[0] = out[1] = out[2] = out[3] = 1.0f;
+		return;
+	}
+
+	// Load the four cell vertices once (SoA source)
+	const auto& p0 = cell->vertex(0)->point();
+	const auto& p1 = cell->vertex(1)->point();
+	const auto& p2 = cell->vertex(2)->point();
+	const auto& p3 = cell->vertex(3)->point();
+
+	const float px[4] = { (float)p0.x(), (float)p1.x(), (float)p2.x(), (float)p3.x() };
+	const float py[4] = { (float)p0.y(), (float)p1.y(), (float)p2.y(), (float)p3.y() };
+	const float pz[4] = { (float)p0.z(), (float)p1.z(), (float)p2.z(), (float)p3.z() };
+
+#if CGAL_VERSION_NR < 1041101000
+	const auto cc = cell->circumcenter(Tr.geom_traits());
+#else
+	const auto cc = Tr.geom_traits().construct_circumcenter_3_object()(
+		cell->vertex(0)->point(),
+		cell->vertex(1)->point(),
+		cell->vertex(2)->point(),
+		cell->vertex(3)->point());
+#endif
+	const float ccx = (float)cc.x();
+	const float ccy = (float)cc.y();
+	const float ccz = (float)cc.z();
+
+#if defined(__SSE2__)
+	// Gather Pa/Pb/Pc from your exact facet triangles (matches scalar order).
+	// facet k: tri = getTriangle(cell, k); Pa=tri[0], Pb=tri[1], Pc=tri[2]
+
+  // Per-facet lane index mapping that matches getTriangle(cell,k)
+	int i0[3], i1[3], i2[3], i3[3];
+	facetOrderIndices(cell, 0, i0);
+	facetOrderIndices(cell, 1, i1);
+	facetOrderIndices(cell, 2, i2);
+	facetOrderIndices(cell, 3, i3);
+
+	__m128 ax = _mm_setr_ps(px[i0[0]], px[i1[0]], px[i2[0]], px[i3[0]]);
+	__m128 ay = _mm_setr_ps(py[i0[0]], py[i1[0]], py[i2[0]], py[i3[0]]);
+	__m128 az = _mm_setr_ps(pz[i0[0]], pz[i1[0]], pz[i2[0]], pz[i3[0]]);
+
+	__m128 bx = _mm_setr_ps(px[i0[1]], px[i1[1]], px[i2[1]], px[i3[1]]);
+	__m128 by = _mm_setr_ps(py[i0[1]], py[i1[1]], py[i2[1]], py[i3[1]]);
+	__m128 bz = _mm_setr_ps(pz[i0[1]], pz[i1[1]], pz[i2[1]], pz[i3[1]]);
+
+	__m128 cx = _mm_setr_ps(px[i0[2]], px[i1[2]], px[i2[2]], px[i3[2]]);
+	__m128 cy = _mm_setr_ps(py[i0[2]], py[i1[2]], py[i2[2]], py[i3[2]]);
+	__m128 cz = _mm_setr_ps(pz[i0[2]], pz[i1[2]], pz[i2[2]], pz[i3[2]]);
+
+	// A = Pb - Pa; B = Pc - Pa
+	__m128 Ax = _mm_sub_ps(bx, ax);
+	__m128 Ay = _mm_sub_ps(by, ay);
+	__m128 Az = _mm_sub_ps(bz, az);
+
+	__m128 Bx = _mm_sub_ps(cx, ax);
+	__m128 By = _mm_sub_ps(cy, ay);
+	__m128 Bz = _mm_sub_ps(cz, az);
+
+	// N = A x B
+	__m128 Nx = _mm_sub_ps(_mm_mul_ps(Ay, Bz), _mm_mul_ps(Az, By));
+	__m128 Ny = _mm_sub_ps(_mm_mul_ps(Az, Bx), _mm_mul_ps(Ax, Bz));
+	__m128 Nz = _mm_sub_ps(_mm_mul_ps(Ax, By), _mm_mul_ps(Ay, Bx));
+
+	// |N|^2
+	__m128 Nx2 = _mm_mul_ps(Nx, Nx);
+	__m128 Ny2 = _mm_mul_ps(Ny, Ny);
+	__m128 Nz2 = _mm_mul_ps(Nz, Nz);
+	__m128 n12 = _mm_add_ps(Nx2, Ny2);
+	__m128 fnLenSq = _mm_add_ps(n12, Nz2);
+
+	// C = CC - Pa
+	__m128 CCx = _mm_set1_ps(ccx);
+	__m128 CCy = _mm_set1_ps(ccy);
+	__m128 CCz = _mm_set1_ps(ccz);
+	__m128 Cx = _mm_sub_ps(CCx, ax);
+	__m128 Cy = _mm_sub_ps(CCy, ay);
+	__m128 Cz = _mm_sub_ps(CCz, az);
+
+	// |C|^2
+	__m128 Cx2 = _mm_mul_ps(Cx, Cx);
+	__m128 Cy2 = _mm_mul_ps(Cy, Cy);
+	__m128 Cz2 = _mm_mul_ps(Cz, Cz);
+	__m128 c12 = _mm_add_ps(Cx2, Cy2);
+	__m128 ctLenSq = _mm_add_ps(c12, Cz2);
+
+	// dot(N, C)
+	__m128 d0 = _mm_mul_ps(Nx, Cx);
+	__m128 d1 = _mm_mul_ps(Ny, Cy);
+	__m128 d2 = _mm_mul_ps(Nz, Cz);
+	__m128 d01 = _mm_add_ps(d0, d1);
+	__m128 dot = _mm_add_ps(d01, d2);
+
+	// denom and real sqrt
+	__m128 denom = _mm_mul_ps(fnLenSq, ctLenSq);
+	__m128 sqrtDen = _mm_sqrt_ps(denom);
+	__m128 res = _mm_div_ps(dot, sqrtDen);
+
+	// clamp [-1,1]
+	__m128 one = _mm_set1_ps(1.0f);
+	__m128 negOne = _mm_set1_ps(-1.0f);
+	res = _mm_min_ps(_mm_max_ps(res, negOne), one);
+
+	// degenerates -> 0.5f
+	__m128 zero = _mm_set1_ps(0.0f);
+	__m128 halfVal = _mm_set1_ps(0.5f);
+	__m128 mBad = _mm_or_ps(_mm_or_ps(_mm_cmple_ps(fnLenSq, zero),
+		_mm_cmple_ps(ctLenSq, zero)),
+		_mm_cmple_ps(denom, zero));
+	__m128 outv = _mm_or_ps(_mm_and_ps(mBad, halfVal),
+		_mm_andnot_ps(mBad, res));
+
+	_mm_storeu_ps(out, outv);
+
+#else
+	// Scalar fallback identical to your math (kept for portability)
+	for (int k = 0; k < 4; ++k) {
+		const auto tri = getTriangle(cell, k);
+		const auto& pa = tri.verts[0]->point();
+		const auto& pb = tri.verts[1]->point();
+		const auto& pc = tri.verts[2]->point();
+		const float x0 = (float)pa.x(), y0 = (float)pa.y(), z0 = (float)pa.z();
+		const float x1 = (float)pb.x(), y1 = (float)pb.y(), z1 = (float)pb.z();
+		const float x2 = (float)pc.x(), y2 = (float)pc.y(), z2 = (float)pc.z();
+		const float ax = x1 - x0, ay = y1 - y0, az = z1 - z0;
+		const float bx = x2 - x0, by = y2 - y0, bz = z2 - z0;
+		const float nx = ay * bz - az * by;
+		const float ny = az * bx - ax * bz;
+		const float nz = ax * by - ay * bx;
+		const float fn = nx * nx + ny * ny + nz * nz;
+		if (fn == 0.0f) { out[k] = 0.5f; continue; }
+		const float cx = ccx - x0, cy = ccy - y0, cz = ccz - z0;
+		const float ct = cx * cx + cy * cy + cz * cz;
+		const float d = fn * ct;
+		if (d <= 0.0f) { out[k] = 0.5f; continue; }
+		float r = (nx * cx + ny * cy + nz * cz) / std::sqrt(d);
+		out[k] = r < -1.0f ? -1.0f : (r > 1.0f ? 1.0f : r);
+	}
+#endif
+}
+
+
+
+
 inline float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
 {
   if (Tr.is_infinite(facet.first))
@@ -1317,70 +1897,115 @@ float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
 } // namespace DELAUNAY
 
 #pragma intrinsic(_InterlockedCompareExchange)
-__forceinline float AtomicAddFloat(float* __restrict addr, float val) {
-  static_assert(sizeof(float) == sizeof(LONG), "Expected float and LONG to be same size");
+__forceinline float AtomicAddFloat(float* __restrict addr, float val)
+{
+	static_assert(sizeof(float) == sizeof(LONG), "Expected float and LONG to be same size");
 
-  volatile LONG* __restrict intAddr = reinterpret_cast<volatile LONG*>(addr);
-  union {
-    float f;
-    LONG i;
-  } oldVal, newVal;
+	volatile LONG* __restrict intAddr = reinterpret_cast<volatile LONG*>(addr);
+	union {
+		float f;
+		LONG i;
+	} oldVal, newVal;
 
-  do {
-    oldVal.i = *intAddr;
-    newVal.f = oldVal.f + val;
-    newVal.i = *reinterpret_cast<LONG*>(&newVal.f); // or just reuse newVal.i = *(LONG*)&newVal.f;
-  } while (_InterlockedCompareExchange(intAddr, newVal.i, oldVal.i) != oldVal.i);
+	do {
+		oldVal.i = *intAddr;
+		newVal.f = oldVal.f + val;
+		newVal.i = *reinterpret_cast<LONG*>(&newVal.f); // or just reuse newVal.i = *(LONG*)&newVal.f;
+	} while (_InterlockedCompareExchange(intAddr, newVal.i, oldVal.i) != oldVal.i);
 
-  return newVal.f;
+	return newVal.f;
 }
 
 static inline float
-fasterpow2( float p )
-    {
-	float clipp = ( p < -126 ) ? -126.0f : p;
-	union { uint32_t i; float f; } v = { static_cast<uint32_t>( ( 1 << 23 ) * ( clipp + 126.94269504f ) ) };
-	return v.f;
-        }
-
-static inline float JPBEXP( float p )
+fasterpow2(float p)
 {
-	return fasterpow2( 1.442695040f * p );
-    }
+	float clipp = (p < -126) ? -126.0f : p;
+	union { uint32_t i; float f; } v = { static_cast<uint32_t>((1 << 23) * (clipp + 126.94269504f)) };
+	return v.f;
+}
+
+static inline float JPBEXP(float p)
+{
+	return fasterpow2(1.442695040f * p);
+}
 
 template <bool UseROI>
 size_t ProcessPoints(
 	const float* __restrict pPointStream,
 	size_t numVertices,
 	DELAUNAY::point_t* __restrict origVertices,
-	ptrdiff_t* __restrict indices,
-  const SEACAVE::OBB3f& obb
+	std::ptrdiff_t* __restrict indices,
+	const SEACAVE::OBB3f& obb
 )
-    {
-  size_t validCount = 0;
+{
+	if constexpr (UseROI) {
+		size_t validCount = 0;
 
-  for (size_t i = 0, j = 0; i < numVertices; ++i, j += 3) {
-    const float x = pPointStream[j];
-    const float y = pPointStream[j+1];
-    const float z = pPointStream[j+2];
+		for (size_t i = 0, j = 0; i < numVertices; ++i, j += 3) {
+			const float x = pPointStream[j];
+			const float y = pPointStream[j + 1];
+			const float z = pPointStream[j + 2];
 
-    if constexpr (UseROI) {
-	    const PointCloud::Point X(x, y, z);
-      if (!obb.Intersects(X)) continue;
-        }
+			if constexpr (UseROI) {
+				const PointCloud::Point X(x, y, z);
+				if (!obb.Intersects(X)) continue;
+			}
 
-    origVertices[validCount] = DELAUNAY::point_t(x, y, z);
+			origVertices[validCount] = DELAUNAY::point_t(x, y, z);
 #ifndef VALIDATE
-    indices[validCount] = validCount;
+			indices[validCount] = validCount;
 #endif
-		++validCount;
-	}
+			++validCount;
+		}
 
-  return validCount;
+		return validCount;
+	}
+	else {
+		const int64_t cnt = (int64_t)numVertices;
+		// NOTE: More than twice as fast natively parallelized.
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+			const int64_t j = i * 3;
+			const float x = pPointStream[j];
+			const float y = pPointStream[j + 1];
+			const float z = pPointStream[j + 2];
+
+			origVertices[i] = DELAUNAY::point_t(x, y, z);
+#ifndef VALIDATE
+			indices[i] = i;
+#endif
+		}
+
+		return numVertices;
+	}
 }
 
 float Quantize(float cap, float maxCap)
 {
+#if 1
+#if 1
+	// Branchless clamp to [0, maxCap]
+	float clamped = FastClampS(cap, 0.0f, maxCap);
+
+	// Exact "round half up" for non-negative values:
+	// MSVC lowers this to add + cvttss2si (truncate) -> very fast.
+	int scaled = static_cast<int>(clamped * 2.0f + 0.5f);
+	return 0.5f * static_cast<float>(scaled);
+#else
+	if (!std::isfinite(cap)) return maxCap;
+	if (cap <= 0.0f)
+	{
+		return 0.f;
+	}
+	else if (cap >= maxCap)
+	{
+		return maxCap;
+	}
+
+	int scaled = static_cast<int>(cap * 2.0f + 0.5f);
+	return 0.5f * scaled;
+#endif
+#else
 #ifdef APPROXIMATE_GRAPHCUT
 #if 1
   int scaled = static_cast<int>(cap * 2.0f + 0.5f);
@@ -1394,6 +2019,38 @@ float Quantize(float cap, float maxCap)
   if (!std::isfinite(cap)) return maxCap;
   return cap <= 0.0f ? 0.0f : (cap >= maxCap ? maxCap : cap);
 #endif
+#endif
+}
+
+#include <algorithm>
+#include <cstdint>
+#include <vector>
+#include <limits>
+#include <cmath>
+
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+
+template<class T0, class T1, class T2>
+void permuteScatter2(
+	const std::vector<ptrdiff_t>& orderNewToOld,
+	const std::vector<T0>& src0, T0* __restrict dst0,
+	const std::vector<T1>& src1, std::vector<T1>& dst1,
+	const std::vector<T2>& src2, std::vector<T2>& dst2
+)
+{
+	const size_t n = orderNewToOld.size();
+	dst1.resize(n);
+	dst2.resize(n);
+
+	tbb::parallel_for(tbb::blocked_range<size_t>(0, n, 1 << 16), [&](auto const& r) {
+		for (size_t i = r.begin(); i != r.end(); ++i) {
+			const size_t oldId = static_cast<size_t>(orderNewToOld[i]); // indices[new]=old
+			dst0[i] = src0[oldId];
+			dst1[i] = src1[oldId];
+			dst2[i] = src2[oldId];
+		}
+	});
 }
 
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
@@ -1413,7 +2070,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	using namespace DELAUNAY;
 	ASSERT(!pointcloud.IsEmpty());
 	mesh.Release();
+
 	std::vector<std::ptrdiff_t> indices(pointcloud.GetSize());
+	std::vector<uint32_t> offsets(pointcloud.GetSize());
+	std::vector<uint32_t> sizes(pointcloud.GetSize());
 #ifdef VALIDATE
 	delaunay_t2 delaunay2;
 	{
@@ -1526,21 +2186,21 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 	std::vector<TMatrix<float,3,4>> viewCameras(images.size());
 
-	FOREACH(i, images)
-{
+	FOREACH(i, images) {
 		Image& imageData = images[i];
 		if (!imageData.IsValid())
-					continue;
+			continue;
 		for (int j = 0; j < imageData.camera.P.elems; ++j) {
-			viewCameras[i][j] = (float) imageData.camera.P[j];
-}
-}
-	using namespace DELAUNAY;
-	ASSERT(!pointcloud.IsEmpty());
-	mesh.Release();
+			viewCameras[i][j] = (float)imageData.camera.P[j];
+		}
+	}
 
 	// create the Delaunay triangulation
 	const size_t numPointCloudVertices = pointcloud.NumPoints();
+	if (numPointCloudVertices >= std::numeric_limits<uint32_t>::max()) {
+		throw std::runtime_error("Unsupported");
+	}
+
 	delaunay_t delaunay;
 
 	std::vector<cell_info_t> infoCells;
@@ -1568,16 +2228,12 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 		std::vector<point_t> origVertices;
 		origVertices.resize(numPointCloudVertices);
-		//std::vector<std::ptrdiff_t> indices(numPointCloudVertices);
-		//indices.resize(numPointCloudVertices);
-		double eps2 = 1e-10;
-
 		{
 			TD_TIMER_STARTD();
 
-		// fetch points
-		if (bUseOnlyROI && !IsBounded())
-			bUseOnlyROI = false;
+			// fetch points
+			if (bUseOnlyROI && !IsBounded())
+				bUseOnlyROI = false;
 
 			numVertices =
 				bUseOnlyROI ?
@@ -1596,32 +2252,47 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					obb
 				);
 
-
+			indices.resize(numVertices);
+			origVertices.resize(numVertices);
+			offsets.resize(numVertices);
+			sizes.resize(numVertices);
 #ifndef VALIDATE
-		// sort vertices
-		typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
-		// JPB The runtime here is not consistent.
-			CGAL::spatial_sort<CGAL::Parallel_tag>(indices.begin(), indices.begin() + numVertices, Search_traits(&origVertices[0], delaunay.geom_traits()));
+			// sort vertices
+			typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
+			// JPB The runtime here is not consistent.
+			// Defaults on this work really well.
+			CGAL::spatial_sort<CGAL::Parallel_tag>(
+				indices.begin(), indices.end(),
+				Search_traits(&origVertices[0], delaunay.geom_traits())
+			);
 #endif
 
 			// origVertices[i] refers to the original data.
 			// indices[i] maps the sorted data to the original data.
 			// Rewrite the vertex data in index sorted form:
 			vertices.reset(new point_t[numVertices]);
-			for (size_t i = 0; i < numVertices; ++i) {
-				vertices[i] = origVertices[indices[i]];
-			}
+			permuteScatter2(
+				indices,
+				origVertices, vertices.get(),
+				pointcloud.pointViewsOffsets, offsets,
+				pointcloud.pointViewsSizes, sizes
+			);
+			decltype(origVertices)().swap(origVertices);
+			decltype(indices)().swap(indices);
 
-		// insert vertices
-			// JPB WIP BUG delaunay.tds().cells().reserve(numVertices*6); // May reserve dynamically
-			// JPB WIP BUG delaunay.tds().vertices().reserve(numVertices);
+			// insert vertices
+			// 6x vertices is a generous worst case, but uses too much memory.
+			// Potentally allow some dynamic allocation to better keep
+			// memory within reasonable limits.
+			delaunay.tds().cells().reserve(numVertices*4); // May reserve dynamically
+			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.s
 			allViews.resize(numVertices);
 
 			// jpb wip bug this is very interesting it was reserve before. but allowed the filteredPt[i] write.
-		
+
 			DEBUG_EXTRA("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
 		}
-		Util::Progress progress(_T("Points inserted"), indices.size());
+		Util::Progress progress(_T("Points inserted"), numVertices);
 
 		// Here we keep track of versioning for testing.
 		// Both delaunay.info() and vcg::tri::Info() only compile
@@ -1632,11 +2303,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.5");
+		DEBUG("ReconstructMesh optimization version 1.1.6");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
-		const int vcgVersion = vcg::tri::Info();
+		constexpr int vcgVersion = vcg::tri::Info();
 		DEBUG("VCG version: = %d", vcgVersion);
 		DEBUG("------------------------------------------");
 #endif
@@ -1645,19 +2316,17 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		std::vector<cell_handle_t> cellQueue;
 		cellQueue.reserve(kMaxCells);
 
-		auto itIndices = std::cbegin(indices);
 		vertex_handle_t hint;
 
 		// InsertViews first parameter must be the dt's index --verified by validation code.
 		if (distInsert <= 0) {
-			for (size_t i = 0; i < numVertices; ++i, ++itIndices) {
-				const auto idx = *itIndices; // This sorted vertex' original position.
+			for (size_t i = 0; i < numVertices; ++i) {
 				const point_t& p = vertices[i]; // These are the sorted vertices.
 				// insert all points
 				hint = delaunay.insert(p, hint);
 				ASSERT(anchor != vertex_handle_t());
 				// update point visibility info
-				InsertViews(hint->info().idx, pointcloud, idx);
+				InsertViews(hint->info().idx, pointcloud, i);
 				if (!(i & 255)) {
 					progress += 256;
 				}
@@ -1665,23 +2334,19 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		} else {
 			std::vector<uint32_t> vertexMarks(numVertices);
 			uint32_t marker = 0;
+			const vertex_handle_t infV = delaunay.infinite_vertex();  // cheap pointer compare
 
-			ptrdiff_t idx = *itIndices++;
 			hint = delaunay.insert(vertices[0]);
-			InsertViews(hint->info().idx, pointcloud, idx);
+			InsertViews(hint->info().idx, pointcloud, 0);
 
-			for (int i = 1; i < numVertices; ++i, ++itIndices) {
+			for (int i = 1; i < numVertices; ++i) {
 				const point_t& p = vertices[i];
 				const double px = p.x();
 				const double py = p.y();
 				const double pz = p.z();
-				const ptrdiff_t idx = *itIndices;
 
-				const uint32_t* __restrict pointViewsOffset = pointcloud.pointViewsOffsets.data() + idx;
-				_mm_prefetch((const char*)pointViewsOffset, _MM_HINT_T1);
-
-				const uint32_t* __restrict pointViewSizes = pointcloud.pointViewsSizes.data() + idx;
-				_mm_prefetch((const char*)pointViewSizes, _MM_HINT_T1);
+				const uint32_t* __restrict pointViewsOffset = &offsets[i];
+				const uint32_t* __restrict pointViewSizes = &sizes[i];
 
 				size_t offset;
 				size_t numViews;
@@ -1735,6 +2400,98 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						start->tds_data().marker = marker;
 
 						size_t queueIndex = 0;
+#if 1
+						// inside your loop:
+						while (queueIndex < cellQueue.size()) {
+							const cell_handle_t c = cellQueue[queueIndex++];
+
+							// fetch vertices once; reuse in both phases
+							const vertex_handle_t v0 = c->vertex(0);
+							const vertex_handle_t v1 = c->vertex(1);
+							const vertex_handle_t v2 = c->vertex(2);
+							const vertex_handle_t v3 = c->vertex(3);
+
+							{
+								// v0
+								if (v0 != nearest && v0 != infV) {
+									uint32_t* m = &vertexMarks[v0->info().idx];
+									if (*m != marker) {
+										*m = marker;
+										const point_t& pt = v0->point();
+										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
+										const double d2 = dx * dx + dy * dy + dz * dz;
+										if (d2 < bestSq) { bestSq = d2; best = v0; goto refine_restart; }
+									}
+								}
+
+								// v1
+								if (v1 != nearest && v1 != infV) {
+									uint32_t* m = &vertexMarks[v1->info().idx];
+									if (*m != marker) {
+										*m = marker;
+										const point_t& pt = v1->point();
+										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
+										const double d2 = dx * dx + dy * dy + dz * dz;
+										if (d2 < bestSq) { bestSq = d2; best = v1; goto refine_restart; }
+									}
+								}
+
+								// v2
+								if (v2 != nearest && v2 != infV) {
+									uint32_t* m = &vertexMarks[v2->info().idx];
+									if (*m != marker) {
+										*m = marker;
+										const point_t& pt = v2->point();
+										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
+										const double d2 = dx * dx + dy * dy + dz * dz;
+										if (d2 < bestSq) { bestSq = d2; best = v2; goto refine_restart; }
+									}
+								}
+
+								// v3
+								if (v3 != nearest && v3 != infV) {
+									uint32_t* m = &vertexMarks[v3->info().idx];
+									if (*m != marker) {
+										*m = marker;
+										const point_t& pt = v3->point();
+										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
+										const double d2 = dx * dx + dy * dy + dz * dz;
+										if (d2 < bestSq) { bestSq = d2; best = v3; goto refine_restart; }
+									}
+								}
+							}
+
+							// === Only expand neighbors if no refinement happened ===
+							if (best == nearest) {
+								// reuse v0..v3 we already loaded to avoid re-calling vertex(i)
+								// enqueue exactly like your code: same cells, same order
+								if (v0 != nearest) {
+									cell_handle_t next = c->neighbor(0);
+									auto& nm = next->tds_data().marker;
+									if (nm != marker) { nm = marker; cellQueue.push_back(next); }
+								}
+								if (v1 != nearest) {
+									cell_handle_t next = c->neighbor(1);
+									auto& nm = next->tds_data().marker;
+									if (nm != marker) { nm = marker; cellQueue.push_back(next); }
+								}
+								if (v2 != nearest) {
+									cell_handle_t next = c->neighbor(2);
+									auto& nm = next->tds_data().marker;
+									if (nm != marker) { nm = marker; cellQueue.push_back(next); }
+								}
+								if (v3 != nearest) {
+									cell_handle_t next = c->neighbor(3);
+									auto& nm = next->tds_data().marker;
+									if (nm != marker) { nm = marker; cellQueue.push_back(next); }
+								}
+							}
+							else {
+								// refinement occurred, stop immediately
+								break;
+							}
+						}
+#else
 						while (queueIndex < cellQueue.size()) {
 							const cell_handle_t c = cellQueue[queueIndex++];
 
@@ -1774,22 +2531,19 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 									if (c->vertex(i) == nearest) continue;
 
 									cell_handle_t next = c->neighbor(i);
-									auto& nextMarker = next->tds_data().marker;
-									if (nextMarker == marker) continue;
+									auto& nm = next->tds_data().marker;
+									if (nm == marker) continue;
 
-									for (int j = 0; j < 4; ++j) {
-										if (next->vertex(j) == nearest) {
-											nextMarker = marker;
-											cellQueue.push_back(next);
-											break;
-										}
-									}
+									nm = marker;
+
+									cellQueue.push_back(next);  // no pop; head advances
 								}
 							} else {
 								// refinement occurred, stop immediately
 								break;
 							}
 						}
+#endif
 
 refine_restart:
 						if (best == nearest)
@@ -1852,7 +2606,7 @@ refine_restart:
 
 				// Visibility information not needed for the dt, but used in the next step.
 				// idx is the index of the spatially sorted point.
-				InsertViews(hint->info().idx, pointcloud, idx);
+				InsertViews(hint->info().idx, pointcloud, i);
 advance:
 				if (!(i & 255)) progress += 256;
 			}
@@ -1860,6 +2614,9 @@ advance:
 
 		progress.process();
 		progress.close();
+
+		decltype(cellQueue)().swap(cellQueue);
+		decltype(viewCameras)().swap(viewCameras);
 
 		numDelaunayVertices = delaunay.number_of_vertices(); // Number of finite vertices, has one more.
 		std::cerr << "verts : " << numDelaunayVertices << "\n";
@@ -1899,82 +2656,83 @@ advance:
 		totalCells = ciID;
 
 #if 1 // New idea for median calculation
-	// 25510599386 4,47s:
-	const auto maxIndex = vert_info_t::g_idx;
-	idToVertex.resize(maxIndex + 1); // or allocate based on vertex count
-	for (auto vit = delaunay.finite_vertices_begin(), end = delaunay.finite_vertices_end(); vit != end; ++vit) {
-		idToVertex[vit->info().idx] = vit;
-	}
+		// 25510599386 4.47s:
+		const auto maxIndex = vert_info_t::g_idx;
+		idToVertex.resize(maxIndex + 1); // or allocate based on vertex count
+		for (auto vit = delaunay.finite_vertices_begin(), end = delaunay.finite_vertices_end(); vit != end; ++vit) {
+			idToVertex[vit->info().idx] = vit;
+		}
 
-	const size_t totalEstimate = 6ull * finiteCells.size();
-	std::vector<uint64_t> edges(totalEstimate);
+		const size_t totalEstimate = 6ull * finiteCells.size();
+		std::vector<uint64_t> edges(totalEstimate);
 
 #pragma omp parallel
-{
-  int tid = omp_get_thread_num();
-  int numThreads = omp_get_num_threads();
+	{
+		int tid = omp_get_thread_num();
+		int numThreads = omp_get_num_threads();
 
-  // Assign cell range to this thread
-  size_t cellStart = finiteCells.size() * tid / numThreads;
-  size_t cellEnd   = finiteCells.size() * (tid + 1) / numThreads;
+		// Assign cell range to this thread
+		size_t cellStart = finiteCells.size() * tid / numThreads;
+		size_t cellEnd = finiteCells.size() * (tid + 1) / numThreads;
 
-  // Each cell produces 6 edges and compute edge range
-  size_t edgeStart = 6 * cellStart;
-  uint64_t* p = edges.data() + edgeStart;
+		// Each cell produces 6 edges and compute edge range
+		size_t edgeStart = 6 * cellStart;
+		uint64_t* __restrict p = edges.data() + edgeStart;
 
-  for (size_t i = cellStart; i < cellEnd; ++i) {
-    const cell_handle_t ci = finiteCells[i];
+		for (size_t i = cellStart; i < cellEnd; ++i) {
+			const cell_handle_t ci = finiteCells[i];
 
-    uint32_t ids[4] = {
-      ci->vertex(0)->info().idx,
-      ci->vertex(1)->info().idx,
-      ci->vertex(2)->info().idx,
-      ci->vertex(3)->info().idx
-    };
+			uint32_t ids[4] = {
+			  ci->vertex(0)->info().idx,
+			  ci->vertex(1)->info().idx,
+			  ci->vertex(2)->info().idx,
+			  ci->vertex(3)->info().idx
+			};
 
-    #define STORE(u, v) do { \
-      if ((u) > (v)) std::swap((u), (v)); \
-      *p++ = ((uint64_t)(u) << 32) | (v); \
-    } while (0)
+#define STORE(u, v) do { \
+			if ((u) > (v)) std::swap((u), (v)); \
+				*p++ = ((uint64_t)(u) << 32) | (v); \
+			} while (0)
 
-    STORE(ids[0], ids[1]);
-    STORE(ids[0], ids[2]);
-    STORE(ids[0], ids[3]);
-    STORE(ids[1], ids[2]);
-    STORE(ids[1], ids[3]);
-    STORE(ids[2], ids[3]);
-  }
-}
-
-	// Sort and deduplicate
-	tbb::parallel_sort(edges.begin(), edges.end());
-	edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-
-	std::vector<float> dists(edges.size());
-
-#pragma omp parallel for schedule(static)
-	for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(edges.size()); ++i) {
-		uint64_t code = edges[i];
-		uint32_t id0 = code >> 32;
-		uint32_t id1 = code & 0xFFFFFFFF;
-
-		const point_t& p0 = idToVertex[id0]->point();
-		const point_t& p1 = idToVertex[id1]->point();
-
-		const double x0 = p0.x(), y0 = p0.y(), z0 = p0.z();
-		const double x1 = p1.x(), y1 = p1.y(), z1 = p1.z();
-
-    const float dx = (float)(x0 - x1);
-    const float dy = (float)(y0 - y1);
-    const float dz = (float)(z0 - z1);
-    dists[i] = dx*dx + dy*dy + dz*dz;
+			STORE(ids[0], ids[1]);
+			STORE(ids[0], ids[2]);
+			STORE(ids[0], ids[3]);
+			STORE(ids[1], ids[2]);
+			STORE(ids[1], ids[3]);
+			STORE(ids[2], ids[3]);
+		}
 	}
 
-	const size_t numDistances = dists.size();
-  std::nth_element(dists.begin(), dists.begin() + numDistances/2, dists.end());
-	approxMedian = dists[numDistances/2];
-#else
+		decltype(finiteCells)().swap(finiteCells);
 
+		// Sort and deduplicate
+		tbb::parallel_sort(edges.begin(), edges.end());
+		edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+		std::vector<float> dists(edges.size());
+
+#pragma omp parallel for schedule(static)
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(edges.size()); ++i) {
+			uint64_t code = edges[i];
+			uint32_t id0 = code >> 32;
+			uint32_t id1 = code & 0xFFFFFFFF;
+
+			const point_t& p0 = idToVertex[id0]->point();
+			const point_t& p1 = idToVertex[id1]->point();
+
+			const double x0 = p0.x(), y0 = p0.y(), z0 = p0.z();
+			const double x1 = p1.x(), y1 = p1.y(), z1 = p1.z();
+
+			const float dx = (float)(x0 - x1);
+			const float dy = (float)(y0 - y1);
+			const float dz = (float)(z0 - z1);
+			dists[i] = dx * dx + dy * dy + dz * dz;
+		}
+
+		const size_t numDistances = dists.size();
+		std::nth_element(dists.begin(), dists.begin() + numDistances/2, dists.end());
+		approxMedian = dists[numDistances/2];
+#else
 		const int numThreads = omp_get_max_threads();
 		std::vector<std::vector<float>> threadDists(numThreads);
 
@@ -2037,6 +2795,8 @@ advance:
 		approxMedian = distsSq[totalSize/2];
 #endif
 
+		decltype(dists)().swap(dists);
+
 		auto t1 = rdtscEnd();
 
 		DEBUG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
@@ -2076,14 +2836,14 @@ advance:
 
 #ifdef FACET_DIAGNOSTICS
 		DEBUG_EXTRA("Delaunay tetrahedralization completed: %u points -> %u vertices, %u (+%u) cells, %u (+%u) faces (%s)",
-			indices.size(), delaunay.number_of_vertices(), numFiniteCells, infiniteCells, numFiniteFacets,  numFacets-numFiniteFacets, TD_TIMER_GET_FMT().c_str());
+			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, numFiniteFacets,  numFacets-numFiniteFacets, TD_TIMER_GET_FMT().c_str());
 #else
 		DEBUG_EXTRA("Delaunay tetrahedralization completed: %u points -> %u vertices, %u (+%u) cells, faces not calculated (%s)",
-			indices.size(), delaunay.number_of_vertices(), numFiniteCells, infiniteCells, TD_TIMER_GET_FMT().c_str());
+			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, TD_TIMER_GET_FMT().c_str());
 #endif
 	}
 
-	const float sigma = (SQRT(approxMedian)*kSigma);
+	const float sigma = SQRT(approxMedian)*kSigma;
 
 	// for every camera-point ray intersect it with the tetrahedrons and
 	// add alpha_vis(point) to cell's directed edge in the graph
@@ -2114,7 +2874,6 @@ advance:
 		distsSq.Release();
 
 #else
-		const float sigma(SQRT(approxMedian)* kSigma);
 		DEBUG_EXTRA("Sigma is %f", sigma);
 		// Notice we negate inv2SigmaSq here to aid the vector calculations below.
 		float inv2SigmaSq(-0.5f/(sigma*sigma));
@@ -2191,7 +2950,7 @@ advance:
 						const edge_cap_t w(alpha_vis * (1.f - EXP(-SQUARE((float)inter.dist) * inv2SigmaSq)));
 						edge_cap_t& f(infoCells[inter.facet.first->info()].f[inter.facet.second]);
 						#pragma omp atomic
-							f += w;
+						f += w;
 					} while (intersectv(delaunay, segCamPoint, facets, facets, inter));
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
 
@@ -2221,8 +2980,7 @@ advance:
 			}
 			progress.close();
 			DEBUG_ULTIMATE("\tweighting completed in %s", TD_TIMER_GET_FMT().c_str());
-			}
-
+		}
 #else
 		struct ThreadData
 		{
@@ -2314,8 +3072,8 @@ advance:
 				// and assign a (constant) weight to the point which equals
 				// the number of views.
 				for (auto& i : viewInstance) {
-					auto* __restrict src = pointcloud.ViewsStream(i);
-					auto cnt = pointcloud.ViewsStreamSize(i);
+					auto* __restrict src = &pointcloud.pointViewsMemory[offsets[i]];
+					auto cnt = sizes[i];
 					std::copy(src, src + cnt, std::back_inserter(viewIdxs));
 				}
 
@@ -2380,19 +3138,13 @@ advance:
 					const Camera& camera = imageData.camera;
 					const camera_cell_t& camCell = camCells[imageID];
 					// compute the ray used to find point intersection
-					const Point3 vecCamPoint(pt-camera.C);
-					const REAL invLenCamPoint(REAL(1)/norm(vecCamPoint));
+					const Point3 vecCamPoint(pt - camera.C);
+					const REAL invLenCamPoint(REAL(1) / norm(vecCamPoint));
 					// find faces intersected by the camera-point segment
 					const segment_t segCamPoint(MVS2CGAL(camera.C), p);
-					{
-						intersection_t inter(pt, Point3(vecCamPoint*invLenCamPoint));
+					intersection_t inter(pt, Point3(vecCamPoint * invLenCamPoint));
 
-					const point_t& source = segCamPoint.source();
-					const point_t& target = segCamPoint.target();
-						const double segDiff[] = { target.x() - source.x(), target.y() - source.y(), target.z() - source.z() };
-						const double segDiffN[] = { -segDiff[0], -segDiff[1], -segDiff[2] };
-
-					if (!intersect(delaunay, segCamPoint, segDiff, segDiffN, camCell.facets, facets, inter))
+					if (!intersect(delaunay, segCamPoint, camCell.facets, facets, inter))
 						continue;
 					do {
 						// assign score, weighted by the distance from the point to the intersection
@@ -2400,37 +3152,32 @@ advance:
 						pts.push_back(&f);
 						vis.push_back(alpha_vis);
 						dist.push_back((edge_cap_t)inter.dist);
-					}
-					while (intersect(delaunay, segCamPoint, segDiff, segDiffN, facets, facets, inter));
+					} while (intersect(delaunay, segCamPoint, facets, facets, inter));
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
 					// find faces intersected by the endpoint-point segment
 					inter.dist = FLT_MAX; inter.bigger = false;
-					const Point3 endPoint(pt+vecCamPoint*(invLenCamPoint*sigma));
+					const Point3 endPoint(pt + vecCamPoint * (invLenCamPoint * sigma));
 					const segment_t segEndPoint(MVS2CGAL(endPoint), p);
 					const cell_handle_t endCell(delaunay.locate(segEndPoint.source(), vi->cell()));
 					ASSERT(endCell != cell_handle_t());
 					fetchCellFacets<CGAL::NEGATIVE>(delaunay, hullFacets, endCell, imageData, facets);
 					edge_cap_t& t(infoCells[endCell->info()].t);
-#ifdef DELAUNAY_USE_OPENMP
-#pragma omp atomic
-#endif
-					t += alpha_vis;
-
-					const point_t& source2 = segEndPoint.source();
-					const point_t& target2 = segEndPoint.target();
-						const double segDiff2[] = { target2.x() - source2.x(), target2.y() - source2.y(), target2.z() - source2.z() };
-						const double segDiff2N[] = { -segDiff2[0], -segDiff2[1], -segDiff2[2] };
-
-					while (intersect(delaunay, segEndPoint, segDiff2, segDiff2N, facets, facets, inter)) {
+					AtomicAddFloat(&t, alpha_vis);
+					while (intersect(delaunay, segEndPoint, facets, facets, inter)) {
 						// assign score, weighted by the distance from the point to the intersection
-						const facet_t& mf(delaunay.mirror_facet(inter.facet));
-						edge_cap_t& f(infoCells[mf.first->info()].f[mf.second]);
-						pts.push_back(&f);
+						// inline mirror_facet
+						cell_handle_t  c = inter.facet.first;
+						const int      i = inter.facet.second;
+						cell_handle_t  nc = c->neighbor(i);
+						const int      mi = delaunay.mirror_index(c, i);
+
+						edge_cap_t* fp = &infoCells[nc->info()].f[mi];
+
+						pts.push_back(fp);
 						vis.push_back(alpha_vis);
 						dist.push_back((edge_cap_t)inter.dist);
 					}
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
-				}
 				}
 
 #ifdef VALIDATE
@@ -2577,13 +3324,15 @@ advance:
 				if (!(i&255)) { progress += 256; }
 			}
 		} // parallel
-
 #endif
 
 		progress.process();
 		progress.close();
 
-		camCells.clear();
+		decltype(allViews)().swap(allViews);
+		decltype(offsets)().swap(offsets);
+		decltype(sizes)().swap(sizes);
+		decltype(camCells)().swap(camCells);
 
 #ifdef FACET_DIAGNOSTICS
 		DEBUG_EXTRA("Delaunay tetrahedras weighting completed: %u cells, %u faces (%s)", delaunay.number_of_cells(), numFacets, TD_TIMER_GET_FMT().c_str());
@@ -2614,8 +3363,8 @@ advance:
 		};
 
 		FacetAngleIndex facetData;
-		facetData.angle.resize(totalCells * 4);
-		facetData.cellIDToIdx.resize(totalCells);
+		facetData.angle.resize(totalCells * 4); // 1.6 Gb
+		facetData.cellIDToIdx.resize(totalCells); // 400Mb
 
 		// --- Compute facet angles in parallel ---
 		#pragma omp parallel for schedule(static)
@@ -2625,16 +3374,25 @@ advance:
 
 			// Safe single-thread write if cellIDs are unique
 			facetData.cellIDToIdx[cellID] = (int32_t)i;
-
+#if 1
+			float a4[4];
+			computePlaneSphereAngle4(delaunay, ci, a4);
+			facetData.angle[i * 4 + 0] = a4[0];
+			facetData.angle[i * 4 + 1] = a4[1];
+			facetData.angle[i * 4 + 2] = a4[2];
+			facetData.angle[i * 4 + 3] = a4[3];
+#else
 			facetData.angle[i * 4 + 0] = computePlaneSphereAngle(delaunay, facet_t(ci, 0));
 			facetData.angle[i * 4 + 1] = computePlaneSphereAngle(delaunay, facet_t(ci, 1));
 			facetData.angle[i * 4 + 2] = computePlaneSphereAngle(delaunay, facet_t(ci, 2));
 			facetData.angle[i * 4 + 3] = computePlaneSphereAngle(delaunay, facet_t(ci, 3));
+#endif
 		}
 
 		// --- Graph construction pass ---
 		struct EdgeDesc
 		{
+			EdgeDesc() {}
 			EdgeDesc(int f, int t, edge_cap_t c, edge_cap_t r):
 				from(f),
 				to(t),
@@ -2648,6 +3406,7 @@ advance:
 
 		struct NodeDesc
 		{
+			NodeDesc() {}
 			NodeDesc(int id_, edge_cap_t source_, edge_cap_t sink_) :
 				id(id_),
 				source(source_),
@@ -2666,6 +3425,39 @@ advance:
 			char pad[64 - sizeof(flow)]; // force `flow` onto its own cache line
 		};
 
+#if 0
+
+		node is big 144 bytes memset takes a long time 8 seconds or so
+
+			need this par:
+
+		template < class T, class Allocator, class Increment_policy, class TimeStamper >
+		void Compact_container<T, Allocator, Increment_policy, TimeStamper>::clear()
+		{
+			for (typename All_items::iterator it = all_items.begin(), itend = all_items.end();
+				it != itend; ++it) {
+				pointer p = it->first;
+				size_type s = it->second;
+				for (pointer pp = p + 1; pp != p + s - 1; ++pp) {
+					if (type(pp) == USED)
+					{
+						std::allocator_traits<allocator_type>::destroy(alloc, pp);
+						set_type(pp, nullptr, FREE);
+					}
+				}
+				alloc.deallocate(p, s);
+			}
+			init();
+		}
+
+
+
+		eneed flow parallel(atomic)
+
+			save scene as binary
+			--archive - type  1 add to GM
+#endif
+
 		int threadCount = omp_get_max_threads();
 		std::vector<ThreadLocalBuffer> threadBuffers(threadCount);
 
@@ -2674,11 +3466,14 @@ advance:
 			int tid = omp_get_thread_num();
 			ThreadLocalBuffer& buf = threadBuffers[tid];
 
-			size_t est = (totalCells + threadCount - 1) / threadCount;
-			buf.nodes.reserve(est);
-			buf.edges.reserve(est * 4); // Worst case.
+			const size_t est = (totalCells + threadCount - 1) / threadCount;
+			constexpr size_t pad = 2048; // schedule
+			buf.nodes.resize(est + pad); // 1.2Gb total
+			buf.edges.resize((est + pad) * 4); // Worst case. 6.4Gb total
+			auto* __restrict dstNodes = buf.nodes.data();
+			auto* __restrict dstEdges = buf.edges.data();
 
-#pragma omp for schedule(static)
+#pragma omp for schedule(static, 2048)
 			for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
 				const auto ci = cellIterators[idx];
 				const int ciID = ci->info();
@@ -2686,16 +3481,19 @@ advance:
 
 				// Compute terminal capacities
 				edge_cap_t s = ciInfo.s;
-				edge_cap_t t = MINF(ciInfo.t, maxCap);
+				edge_cap_t t = FastMinS(ciInfo.t, maxCap);
 
 				edge_cap_t f = graph.graph.nodes[ciID].excess;
 				if (f > 0) s += f;
 				else t -= f;
 
-				edge_cap_t push = MINF(s, t);
+				edge_cap_t push = FastMinS(s, t);
 				buf.flow += push;
 
-				buf.nodes.emplace_back(ciID, s, t);
+				dstNodes->id = ciID;
+				dstNodes->source = s;
+				dstNodes->sink = t;
+				++dstNodes;
 
 				for (int i = 0; i < 4; ++i) {
 					const auto cj = ci->neighbor(i);
@@ -2710,13 +3508,28 @@ advance:
 					const int cjIdx = facetData.cellIDToIdx[cjID];
 					const float angleCj = facetData.angle[cjIdx * 4 + j];
 
-					edge_cap_t q = (1.f - MINF(angleCi, angleCj)) * kQual;
+					float minAngle = FastMinS(angleCi, angleCj);
+					dstEdges->from = ciID;
+					dstEdges->to = cjID;
+					uint32_t bits;
+					memcpy(&bits, &minAngle, sizeof(float));
 
-					edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
-					edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
-					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
+					// Fast finite check for float (avoids std::isfinite overhead)
+					if ((bits & 0x7f800000u) == 0x7f800000u) {
+						dstEdges->cap = dstEdges->revCap = maxCap; // NaN or Inf -> clamp to max
+					}
+					else {
+						const edge_cap_t q = (1.f - minAngle) * kQual;
+						const edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
+						const edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
+						dstEdges->cap = iCap;
+						dstEdges->revCap = jCap;
+					}
+					++dstEdges;
 				}
 			}
+
+			buf.edges.resize(dstEdges - buf.edges.data());
 		}
 
 		for (const auto& buf : threadBuffers)
@@ -2726,9 +3539,20 @@ advance:
 			for (const auto& n : buf.nodes)
 				graph.AddNode(n.id, n.source, n.sink);
 
+#if 1
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < (int)threadBuffers.size(); ++i) {
+			const auto& buf = threadBuffers[i];
+			for (const auto& e : buf.edges) {
+				graph.AddEdge(e.from, e.to, e.cap, e.revCap); // now thread-safe
+			}
+		}
+#else
 		for (const auto& buf : threadBuffers)
 			for (const auto& e : buf.edges)
 				graph.AddEdge(e.from, e.to, e.cap, e.revCap);
+#endif
+
 #else
 		MaxFlow<cell_size_t,edge_cap_t> graph(delaunay.number_of_cells());
 		// set weights
@@ -2748,7 +3572,7 @@ advance:
 		}
 		#endif
 
-		infoCells.clear();
+		std::vector<cell_info_t>().swap(infoCells); // release memory
 		auto t1 = rdtscEnd();
 	  //RestoreAffinity(originalMask); // Restore original affinity
 
@@ -2806,6 +3630,8 @@ advance:
 				local.localFaces.push_back(std::move(face));
 			}
 	}
+
+		std::vector<delaunay_t::All_cells_iterator>().swap(cellIterators); // free memory
 
 		constexpr Mesh::VIndex kInvalid = ~0;
 		const size_t numVertices = delaunay.number_of_vertices();
@@ -2867,7 +3693,7 @@ advance:
 			}
 		}
 #endif
-		delaunay.clear();
+		// JPB WIP BUG Not needed memory released on exit. delaunay.clear();
 
 		auto t3 = rdtscEnd();
 	  //RestoreAffinity(originalMask); // Restore original affinity

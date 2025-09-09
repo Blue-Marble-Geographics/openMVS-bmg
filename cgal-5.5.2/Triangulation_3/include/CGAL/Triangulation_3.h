@@ -84,7 +84,7 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 2;
+  constexpr int version = 3;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else
@@ -2589,7 +2589,7 @@ template < class GT, class Tds, class Lds >
 void
 Triangulation_3<GT, Tds, Lds>::triangle_vertices(Vertex_handle V[3], const Cell_handle c, int i) const
 {
-  const Vertex_handle* v = c->raw_vertices();
+  const Vertex_handle* __restrict v = c->raw_vertices();
 
   // Precompute indices
   const int i1 = (i + 1) & 3;

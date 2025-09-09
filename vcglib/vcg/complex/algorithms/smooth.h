@@ -373,12 +373,12 @@ class Smooth
     //
     // This function simply accumulate over a TempData all the positions of the ajacent vertices
     //
-    static void AccumulateLaplacianInfo(MeshType &m, SimpleTempData<typename MeshType::VertContainer, LaplacianInfo> &TD, bool cotangentFlag = false)
+    static void AccumulateLaplacianInfo(MeshType& m, SimpleTempData<typename MeshType::VertContainer, LaplacianInfo>& TD, bool cotangentFlag = false)
     {
         float weight = 1.0f;
 
         //if we are applying to a tetrahedral mesh:
-        ForEachTetra(m, [&](TetraType &t) {
+        ForEachTetra(m, [&](TetraType& t) {
             for (int i = 0; i < 6; ++i)
             {
                 VertexPointer v0, v1, vo0, vo1;
@@ -401,9 +401,9 @@ class Smooth
                 TD[v0].cnt += weight;
                 TD[v1].cnt += weight;
             }
-        });
+            });
 
-        ForEachTetra(m, [&](TetraType &t) {
+        ForEachTetra(m, [&](TetraType& t) {
             for (int i = 0; i < 4; ++i)
                 if (t.IsB(i))
                 {
@@ -420,30 +420,131 @@ class Smooth
                     TD[v1].cnt = 1;
                     TD[v2].cnt = 1;
                 }
-        });
+            });
 
-//        ForEachTetra(m, [&](TetraType &t) {
-//            for (int i = 0; i < 4; ++i)
-//                if (t.IsB(i))
-//                {
-//                    VertexPointer v0, v1, v2;
-//                    v0 = t.V(Tetra::VofF(i, 0));
-//                    v1 = t.V(Tetra::VofF(i, 1));
-//                    v2 = t.V(Tetra::VofF(i, 2));
+        //        ForEachTetra(m, [&](TetraType &t) {
+        //            for (int i = 0; i < 4; ++i)
+        //                if (t.IsB(i))
+        //                {
+        //                    VertexPointer v0, v1, v2;
+        //                    v0 = t.V(Tetra::VofF(i, 0));
+        //                    v1 = t.V(Tetra::VofF(i, 1));
+        //                    v2 = t.V(Tetra::VofF(i, 2));
 
-//                    TD[v0].sum += v1->P();
-//                    TD[v0].sum += v2->P();
-//                    TD[v0].cnt += 2;
+        //                    TD[v0].sum += v1->P();
+        //                    TD[v0].sum += v2->P();
+        //                    TD[v0].cnt += 2;
 
-//                    TD[v1].sum += v0->P();
-//                    TD[v1].sum += v2->P();
-//                    TD[v1].cnt += 2;
+        //                    TD[v1].sum += v0->P();
+        //                    TD[v1].sum += v2->P();
+        //                    TD[v1].cnt += 2;
 
-//                    TD[v2].sum += v0->P();
-//                    TD[v2].sum += v1->P();
-//                    TD[v2].cnt += 2;
-//                }
-//        });
+        //                    TD[v2].sum += v0->P();
+        //                    TD[v2].sum += v1->P();
+        //                    TD[v2].cnt += 2;
+        //                }
+        //        });
+
+#if 0 // JPB WIP Revised (much slower)
+        const int nV = (int)m.vert.size();
+        const int nF = (int)m.face.size();
+        if (nV == 0 || nF == 0) return;
+
+        auto vbase = &m.vert[0];
+        auto vpIndex = [&](typename MeshType::VertexType* vp) -> int {
+            return int(vp - vbase);
+        };
+
+        int nThreads = 1;
+#ifdef _OPENMP
+        nThreads = omp_get_max_threads();
+#endif
+
+        struct Accum {
+            Point3f sumInt;
+            double cntInt;
+            Point3f sumB;
+            double cntB;
+        };
+
+        std::vector<std::vector<Accum>> tls(nThreads);
+        std::vector<std::vector<unsigned char>> tlsBorder(nThreads);
+        for (int t = 0; t < nThreads; ++t) {
+            tls[t].assign(nV, Accum{ Point3f(0,0,0), 0.0, Point3f(0,0,0), 0.0 });
+            tlsBorder[t].assign(nV, 0);
+        }
+
+        // Single parallel pass over faces
+#pragma omp parallel for schedule(static, 256)
+        for (int f = 0; f < nF; ++f) {
+            auto& face = m.face[f];
+            if (face.IsD()) continue;
+
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            auto& acc = tls[tid];
+            auto& isB = tlsBorder[tid];
+
+            for (int j = 0; j < 3; ++j) {
+                const int i0 = vpIndex(face.V0(j));
+                const int i1 = vpIndex(face.V1(j));
+
+                if (!face.IsB(j)) {
+                    double w = 1.0;
+                    if (cotangentFlag) {
+                        // cot(theta) at P2(j) = dot(u,v) / |u x v|
+                        const Point3f u = face.P1(j) - face.P2(j);
+                        const Point3f v = face.P0(j) - face.P2(j);
+                        const double dot = (double)u.X() * v.X() + (double)u.Y() * v.Y() + (double)u.Z() * v.Z();
+                        const double cx = (double)u.Y() * v.Z() - (double)u.Z() * v.Y();
+                        const double cy = (double)u.Z() * v.X() - (double)u.X() * v.Z();
+                        const double cz = (double)u.X() * v.Y() - (double)u.Y() * v.X();
+                        const double sinLen = std::sqrt(cx * cx + cy * cy + cz * cz) + 1e-30;
+                        w = dot / sinLen;
+                    }
+                    acc[i0].sumInt += face.P1(j) * (float)w;
+                    acc[i1].sumInt += face.P0(j) * (float)w;
+                    acc[i0].cntInt += w;
+                    acc[i1].cntInt += w;
+                }
+                else {
+                    isB[i0] = 1;
+                    isB[i1] = 1;
+                    acc[i0].sumB += face.P1(j);
+                    acc[i1].sumB += face.P0(j);
+                    acc[i0].cntB += 1.0;
+                    acc[i1].cntB += 1.0;
+                }
+            }
+        }
+
+        // Parallel reduce into TD (one write per vertex; low false sharing)
+#pragma omp parallel for schedule(static, 2048)
+        for (int i = 0; i < nV; ++i) {
+            Point3f sumInt(0, 0, 0), sumB(0, 0, 0);
+            double cntInt = 0.0, cntB = 0.0;
+            unsigned char border = 0;
+
+            for (int t = 0; t < nThreads; ++t) {
+                sumInt += tls[t][i].sumInt;
+                cntInt += tls[t][i].cntInt;
+                sumB += tls[t][i].sumB;
+                cntB += tls[t][i].cntB;
+                border |= tlsBorder[t][i];
+            }
+
+            if (border) {
+                TD[i].sum = m.vert[i].cP() + sumB;
+                TD[i].cnt = 1.0 + cntB;
+            }
+            else {
+                TD[i].sum = sumInt;
+                TD[i].cnt = cntInt;
+            }
+        }
+#else
 
         FaceIterator fi;
         for (fi = m.face.begin(); fi != m.face.end(); ++fi)
@@ -491,6 +592,7 @@ class Smooth
                         ++TD[(*fi).V1(j)].cnt;
                     }
         }
+#endif
     }
 
     static void VertexCoordLaplacian(MeshType &m, int step, bool SmoothSelected = false, bool cotangentWeight = false, vcg::CallBackPos *cb = 0)

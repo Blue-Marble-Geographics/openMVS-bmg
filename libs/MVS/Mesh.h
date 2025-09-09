@@ -168,7 +168,7 @@ public:
 	void GetEdgeFaces(VIndex, VIndex, FaceIdxArr&) const;
 	void GetFaceFaces(FIndex, FaceIdxArr&) const;
 	void GetEdgeVertices(FIndex, FIndex, uint32_t vs0[2], uint32_t vs1[2]) const;
-	void GetAdjVertices(VIndex, VertexIdxArr&) const;
+	void GetAdjVertices(VIndex, VertexIdxArr&, std::unordered_set<VIndex>& setIndices) const;
 	void GetAdjVertexFaces(VIndex, VIndex, FaceIdxArr&) const;
 
 #ifdef OPENMVS_21

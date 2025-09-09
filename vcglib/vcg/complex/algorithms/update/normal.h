@@ -121,6 +121,101 @@ G. Thurmer, C. A. Wuthrich
 "Computing vertex normals from polygonal facets"
 Journal of Graphics Tools, 1998
  */
+#if 0// JPB WIP BUG Revised just bad
+static __forceinline int vpIndex(const ComputeMeshType& m, typename ComputeMeshType::VertexPointer vp)
+{
+    // Works only if vertices are stored contiguously (true for vcglib typical meshes).
+    return int(vp - &m.vert[0]);
+}
+
+static void PerVertexAngleWeighted(ComputeMeshType& m)
+{
+    using Scalar = typename ComputeMeshType::ScalarType;
+    using Coord = typename ComputeMeshType::CoordType;
+    using NormalType = typename ComputeMeshType::VertexType::NormalType;
+
+    const int nV = int(m.vert.size());
+    const int nF = int(m.face.size());
+    if (nV == 0 || nF == 0) {
+        return;
+    }
+
+    // Clear destination
+    vcg::tri::UpdateNormal<ComputeMeshType>::PerVertexClear(m);
+
+    // Thread-local accumulators
+    int nThreads = 1;
+#ifdef _OPENMP
+    nThreads = omp_get_max_threads();
+#endif
+    struct alignas(64) PaddedNormal { NormalType n; };
+    std::vector<std::vector<PaddedNormal>> tls(nThreads);
+    for (int t = 0; t < nThreads; ++t) {
+        tls[t].assign(nV, PaddedNormal{ NormalType(0,0,0) });
+    }
+
+    // Parallel pass over faces: accumulate into thread-local arrays
+#pragma omp parallel for schedule(static)
+    for (int f = 0; f < nF; ++f) {
+        auto& face = m.face[f];
+        if (face.IsD() || !face.IsR()) continue;
+
+        int tid = 0;
+#ifdef _OPENMP
+        tid = omp_get_thread_num();
+#endif
+        auto& acc = tls[tid];
+
+        // Triangle normal (unit)
+        NormalType t = vcg::TriangleNormal(face);
+        t.Normalize();
+
+        // Edge directions for angle at each corner
+        NormalType e0 = (face.V1(0)->cP() - face.V0(0)->cP());
+        NormalType e1 = (face.V1(1)->cP() - face.V0(1)->cP());
+        NormalType e2 = (face.V1(2)->cP() - face.V0(2)->cP());
+        e0.Normalize(); e1.Normalize(); e2.Normalize();
+
+        // Corner angle weights (use the same AngleN as your scalar product-based angle)
+        const Scalar a0 = AngleN(e0, -e2);
+        const Scalar a1 = AngleN(-e0, e1);
+        const Scalar a2 = AngleN(-e1, e2);
+
+        // Indices
+        const int i0 = vpIndex(m, face.V(0));
+        const int i1 = vpIndex(m, face.V(1));
+        const int i2 = vpIndex(m, face.V(2));
+
+        acc[i0].n += t * a0;
+        acc[i1].n += t * a1;
+        acc[i2].n += t * a2;
+    }
+
+    // Reduce thread-local sums into vertex normals
+    // Tree-style reduction to improve cache locality
+    int stride = 1;
+    while (stride < nThreads) {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < nV; ++i) {
+            for (int t = 0; t + stride < nThreads; t += 2 * stride) {
+                tls[t][i].n += tls[t + stride][i].n;
+            }
+        }
+        stride <<= 1;
+    }
+
+    // Write back and normalize once
+    {
+        auto& sum = tls[0];
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < nV; ++i) {
+            if (m.vert[i].IsD()) continue;
+            m.vert[i].N() = sum[i].n;
+            m.vert[i].N().Normalize();
+        }
+    }
+}
+#else
 static void PerVertexAngleWeighted(ComputeMeshType &m)
 {
   PerVertexClear(m);
@@ -138,6 +233,7 @@ static void PerVertexAngleWeighted(ComputeMeshType &m)
         (*f).V(2)->N() += t*AngleN(-e1,e2);
    }
 }
+#endif
 
 ///  \brief Calculates the vertex normal using the Max et al. weighting scheme. It does not need or exploit current face normals.
 /**

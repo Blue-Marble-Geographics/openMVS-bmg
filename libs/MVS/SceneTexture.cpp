@@ -1480,9 +1480,10 @@ void MeshTexture::GlobalSeamLeveling()
 	MatIdx rowsGamma(0);
 	Mesh::VertexIdxArr adjVerts;
 	CLISTDEF0(MatEntry) rows(0, vertices.GetSize()*4);
+	std::unordered_set<VIndex> setIndices;
 	FOREACH(v, vertices) {
 		adjVerts.Empty();
-		scene.mesh.GetAdjVertices(v, adjVerts);
+		scene.mesh.GetAdjVertices(v, adjVerts, setIndices);
 		VertexPatchIterator itV(patchIndices[v], seamVertices);
 		while (itV.Next()) {
 			const uint32_t idxPatch(itV);

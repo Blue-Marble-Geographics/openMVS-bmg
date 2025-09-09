@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 4;
+	constexpr int version = 5;
 
 	return version;
 }
@@ -205,7 +205,7 @@ public:
 	/* classe di confronto per l'algoritmo di eliminazione vertici duplicati*/
 	class RemoveDuplicateVert_Compare{
 	public:
-		inline bool operator()(VertexPointer const &a, VertexPointer const &b)
+		inline bool operator()(VertexPointer const &a, VertexPointer const &b) const
 		{
 			return ((*a).cP() == (*b).cP()) ? (a<b): ((*a).cP() < (*b).cP());
 		}
@@ -232,7 +232,7 @@ public:
 
 		RemoveDuplicateVert_Compare c_obj;
 
-		std::sort(std::execution::par_unseq, perm.begin(),perm.end(),c_obj);
+		std::sort(perm.begin(), perm.end(), c_obj);
 
 		j = 0;
 		i = j;
@@ -375,7 +375,7 @@ public:
 			fvec.end()
 		);
 
-		std::sort(std::execution::par_unseq, fvec.begin(), fvec.end());
+		tbb::parallel_sort(fvec.begin(), fvec.end());
 
 		// Step 4: Detect duplicates and delete faces (serialized deletion)
 		int total = 0;
@@ -420,23 +420,24 @@ public:
 			Note that it does not update any topology relation that could be affected by this like the VT or TT relation.
 			the reason this function is usually performed BEFORE building any topology information.
 			*/
-	static int RemoveDuplicateEdge( MeshType & m)    // V1.0
+	static int RemoveDuplicateEdge(MeshType& m)    // V1.0
 	{
-		if (m.en==0) return 0;
+		if (m.en == 0) return 0;
 		std::vector<SortedPair> eVec;
-		for(EdgeIterator ei=m.edge.begin();ei!=m.edge.end();++ei)
-			if(!(*ei).IsD())
+		eVec.reserve(m.edge.size());
+		for (EdgeIterator ei = m.edge.begin(); ei != m.edge.end(); ++ei)
+			if (!(*ei).IsD())
 			{
-				eVec.emplace_back(tri::Index(m,(*ei).V(0)), tri::Index(m,(*ei).V(1)), &*ei);
+				eVec.emplace_back(tri::Index(m, (*ei).V(0)), tri::Index(m, (*ei).V(1)), &*ei);
 			}
-		std::sort(std::execution::par_unseq,eVec.begin(),eVec.end());
-		int total=0;
-		for(int i=0;i<int(eVec.size())-1;++i)
+		std::sort(eVec.begin(), eVec.end());
+		int total = 0;
+		for (int i = 0; i<int(eVec.size()) - 1; ++i)
 		{
-			if(eVec[i]==eVec[i+1])
+			if (eVec[i] == eVec[i + 1])
 			{
 				total++;
-				tri::Allocator<MeshType>::DeleteEdge(m, *(eVec[i].fp) );
+				tri::Allocator<MeshType>::DeleteEdge(m, *(eVec[i].fp));
 			}
 		}
 		return total;
@@ -785,29 +786,29 @@ public:
 		std::set<FaceInt> faceSet;
 		for (FaceIterator fi = m.face.begin(),fe=m.face.end(); fi != fe; ++fi)
 			if (!fi->IsD())
-		{
-				for (int i=0,cnt=fi->VN(); i<cnt; i++)
-				if ((*fi).V(i)->IsS() && !(*fi).V(i)->IsV())
-				{
-					(*fi).V(i)->SetV();
-					face::Pos<FaceType> startPos(&*fi,i);
-					face::Pos<FaceType> curPos = startPos;
-						faceSet.clear();
-					do
+			{
+				for (int i = 0, cnt = fi->VN(); i < cnt; i++)
+					if ((*fi).V(i)->IsS() && !(*fi).V(i)->IsV())
 					{
-							faceSet.emplace(curPos.F(),curPos.VInd());
-						curPos.FlipE();
-						curPos.NextF();
-					} while (curPos != startPos);
+						(*fi).V(i)->SetV();
+						face::Pos<FaceType> startPos(&*fi, i);
+						face::Pos<FaceType> curPos = startPos;
+						faceSet.clear();
+						do
+						{
+							faceSet.emplace(curPos.F(), curPos.VInd());
+							curPos.FlipE();
+							curPos.NextF();
+						} while (curPos != startPos);
 
-						ToSplitVec.emplace_back((*fi).V(i),std::vector<FaceInt>());
+						ToSplitVec.emplace_back((*fi).V(i), std::vector<FaceInt>());
 
-					typename std::set<FaceInt>::const_iterator iii;
+						typename std::set<FaceInt>::const_iterator iii;
 
-					for(iii=faceSet.begin();iii!=faceSet.end();++iii)
-						ToSplitVec.back().second.push_back(*iii);
-				}
-		}
+						for (iii = faceSet.begin(); iii != faceSet.end(); ++iii)
+							ToSplitVec.back().second.push_back(*iii);
+					}
+			}
 		ss.pop();
 		// Second step actually add new vertices and split them.
 		typename tri::Allocator<MeshType>::template PointerUpdater<VertexPointer> pu;
@@ -935,7 +936,7 @@ public:
 
 		std::atomic<int64_t> awcnt = 0;
 
-#pragma omp parallel
+#pragma omp parallel for
 		for (int64_t i = 0; i < cnt; ++i) {
 			FaceType& fi = m.face[i];
 			if (!fi.IsD()) {
@@ -1419,6 +1420,45 @@ public:
 		return ConnectedComponents(m,CCV);
 	}
 
+#if 1 // JPB WIP OPT
+	static int ConnectedComponents(MeshType& m, std::vector<std::pair<int, FacePointer>>& CCV)
+	{
+		tri::RequireFFAdjacency(m);
+		CCV.clear();
+		tri::UpdateFlags<MeshType>::FaceClearV(m);
+
+		// Reserve enough space for worst case (all faces in one component).
+		std::vector<FacePointer> stack;
+		stack.reserve(m.face.size());
+		CCV.reserve(m.face.size());
+
+		for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi) {
+			if (!fi->IsD() && !fi->IsV()) {
+				fi->SetV();
+				CCV.emplace_back(0, &*fi);
+				stack.push_back(&*fi);
+
+				while (!stack.empty()) {
+					FacePointer fpt = stack.back();
+					stack.pop_back();
+					++CCV.back().first;
+
+					const int vn = fpt->VN();
+					for (int j = 0; j < vn; ++j) {
+						if (!face::IsBorder(*fpt, j)) {
+							FacePointer l = fpt->FFp(j);
+							if (!l->IsV()) {
+								l->SetV();
+								stack.push_back(l);
+							}
+						}
+					}
+				}
+			}
+		}
+		return int(CCV.size());
+	}
+#else
 	static int ConnectedComponents(MeshType &m, std::vector< std::pair<int,FacePointer> > &CCV)
 	{
 		tri::RequireFFAdjacency(m);
@@ -1455,6 +1495,7 @@ public:
 		}
 		return int(CCV.size());
 	}
+#endif
 
 	static int edgeMeshConnectedComponents(MeshType & poly,  std::vector<std::pair<int, typename MeshType::EdgePointer> > &eCC)
 	{
@@ -2132,7 +2173,8 @@ public:
 		for(unsigned int i=0;i<CCV.size();++i)
 		{
 			Box3<ScalarType> bb;
-			std::vector<typename MeshType::FacePointer> FPV;
+			//std::vector<typename MeshType::FacePointer> FPV;
+			boost::container::small_vector<MeshType::FacePointer, 128> FPV; // JPB WIP OPT
 			for(ci.start(m,CCV[i].second);!ci.completed();++ci)
 			{
 				FPV.push_back(*ci);
@@ -2143,8 +2185,8 @@ public:
 			if(bb.Diag()<maxDiameter)
 			{
 				DeletedCC++;
-				typename std::vector<typename MeshType::FacePointer>::iterator fpvi;
-				for(fpvi=FPV.begin(); fpvi!=FPV.end(); ++fpvi)
+				// JPB WIP OPT typename std::vector<typename MeshType::FacePointer>::iterator fpvi;
+				for(auto fpvi=FPV.begin(); fpvi!=FPV.end(); ++fpvi)
 					tri::Allocator<MeshType>::DeleteFace(m,(**fpvi));
 			}
 		}

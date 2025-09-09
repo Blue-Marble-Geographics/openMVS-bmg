@@ -266,6 +266,96 @@ void Mesh::ListIncidenteFaces() {
 #else
 void Mesh::ListIncidenteFaces()
 {
+#if 1 // Try parallel
+	const uint32_t nVerts = (uint32_t)vertices.size();
+	const uint32_t nFaces = (uint32_t)faces.size();
+
+	// Pass 1: counts via per-thread vectors, reduce.
+	const int nThreads =
+#ifdef _OPENMP
+		omp_get_max_threads();
+#else
+		1;
+#endif
+
+	std::vector<std::vector<uint32_t>> countsLocal(nThreads, std::vector<uint32_t>(nVerts, 0));
+
+#pragma omp parallel for if(nFaces > 1024) schedule(static)
+	for (int64_t iF = 0; iF < (int64_t)nFaces; ++iF) {
+		const Face& f = faces[(FIndex)iF];
+		VIndex u[3];
+		int m = 0;
+		{ VIndex v = f[0]; if (!(m > 0 && u[0] == v)) u[m++] = v; }
+		{ VIndex v = f[1]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
+		{ VIndex v = f[2]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
+
+		const int tid =
+#ifdef _OPENMP
+			omp_get_thread_num();
+#else
+			0;
+#endif
+		auto& cnt = countsLocal[tid];
+		for (int i = 0; i < m; ++i) {
+			++cnt[u[i]];
+		}
+	}
+
+	std::vector<uint32_t> counts(nVerts, 0);
+	for (int t = 0; t < nThreads; ++t) {
+		const auto& loc = countsLocal[t];
+		for (uint32_t v = 0; v < nVerts; ++v) {
+			counts[v] += loc[v];
+		}
+	}
+
+	// Build CSR offsets and flat storage.
+	std::vector<uint32_t> offsets(nVerts + 1, 0);
+	uint64_t total = 0;
+	for (uint32_t v = 0; v < nVerts; ++v) {
+		offsets[v] = (uint32_t)total;
+		total += counts[v];
+	}
+	offsets[nVerts] = (uint32_t)total;
+
+	std::vector<FIndex> flat((size_t)total);
+	std::vector<std::atomic<uint32_t>> writePos(nVerts);
+	for (uint32_t v = 0; v < nVerts; ++v) {
+		writePos[v].store(offsets[v], std::memory_order_relaxed);
+	}
+
+	// Pass 2: fill flat with atomics (lock-free).
+#pragma omp parallel for if(nFaces > 1024) schedule(static)
+	for (int64_t iF = 0; iF < (int64_t)nFaces; ++iF) {
+		const Face& f = faces[(FIndex)iF];
+		VIndex u[3];
+		int m = 0;
+		{ VIndex v = f[0]; if (!(m > 0 && u[0] == v)) u[m++] = v; }
+		{ VIndex v = f[1]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
+		{ VIndex v = f[2]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
+
+		for (int i = 0; i < m; ++i) {
+			uint32_t pos = writePos[u[i]].fetch_add(1, std::memory_order_relaxed);
+			flat[pos] = (FIndex)iF;
+		}
+	}
+
+	// Finalize vertexFaces[v] from flat slices (parallel, no contention).
+	vertexFaces.clear();
+	vertexFaces.resize(nVerts);
+#pragma omp parallel for if(nVerts > 1024) schedule(static)
+	for (int64_t v = 0; v < (int64_t)nVerts; ++v) {
+		const uint32_t b = offsets[(size_t)v];
+		const uint32_t e = offsets[(size_t)v + 1];
+		FaceIdxArr& dst = vertexFaces[(size_t)v];
+		const size_t len = (size_t)(e - b);
+		dst.clear();
+		dst.resize(len);
+		for (size_t i = 0; i < len; ++i) {
+			dst[i] = flat[b + i];
+		}
+	}
+#else
 	vertexFaces.clear();
 	vertexFaces.resize(vertices.size());
 	FOREACH(iF, faces) {
@@ -277,6 +367,7 @@ void Mesh::ListIncidenteFaces()
 				vfs.emplace_back(iF);
 		}
 	}
+#endif
 }
 #endif
 #else
@@ -527,11 +618,11 @@ void Mesh::GetEdgeVertices(FIndex f0, FIndex f1, uint32_t* vs0, uint32_t* vs1) c
 	}
 }
 
-void Mesh::GetAdjVertices(VIndex v, VertexIdxArr& indices) const
+void Mesh::GetAdjVertices(VIndex v, VertexIdxArr& indices, std::unordered_set<VIndex>& setIndices) const
 {
 	ASSERT(vertexFaces.GetSize() == vertices.GetSize());
 	const FaceIdxArr& idxFaces = vertexFaces[v];
-	std::unordered_set<VIndex> setIndices;
+	setIndices.clear();
 	FOREACHPTR(pIdxFace, idxFaces) {
 		const Face& face = faces[*pIdxFace];
 		for (int i=0; i<3; ++i) {
@@ -576,7 +667,7 @@ Mesh::FIndex Mesh::GetEdgeAdjacentFace(FIndex idxFace, VIndex iV0, VIndex iV1) c
 	ASSERT(vertexFaces.size() == vertices.size());
 	const bool edgeOrientation = GetEdgeOrientation(idxFace, iV0, iV1);
 	FIndex idxFaceAdj = NO_ID;
-	for (FIndex iF: vertexFaces[iV0]) { // JPB WIP BUG Parallel?
+	for (FIndex iF: vertexFaces[iV0]) {
 		// if this adjacent face is not the analyzed face
 		if (iF != idxFace) {
 			// iterate over all face vertices
@@ -600,6 +691,7 @@ Mesh::FIndex Mesh::GetEdgeAdjacentFace(FIndex idxFace, VIndex iV0, VIndex iV1) c
 
 unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxArr* duplicatedVertices)
 {
+	vertices.reserve(vertices.size() * 2); // JPB WIP OPT
 	ASSERT(!vertices.empty() && !faces.empty());
 	if (vertexFaces.size() != vertices.size())
 		ListIncidenteFaces();
@@ -608,6 +700,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 	unsigned numNonManifoldIssues(0);
 	CLISTDEF0IDX(int, FIndex) components(faces.size());
 	FaceIdxArr queueFaces;
+	std::unordered_set<VIndex> setIndices;
 	FOREACH(idxVert, vertices) {
 		// reset component indices to which each face connected to this vertex
 		const FaceIdxArr& vertFaces = vertexFaces[idxVert];
@@ -658,6 +751,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 		if (component <= 1)
 			continue;
 		// separate the vertex components
+		vertexFaces.reserve(vertexFaces.size() + std::max(component-1, 0)); // JPB WIP OPT can be -1
 		for (int c = 1; c < component; ++c) {
 			// duplicate the point to achieve the separation
 			const VIndex idxVertNew = vertices.size();
@@ -697,7 +791,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 			FOREACH(i, verts) {
 				const VIndex idxVert(verts[i]);
 				VertexIdxArr adjVerts;
-				GetAdjVertices(idxVert, adjVerts);
+				GetAdjVertices(idxVert, adjVerts, setIndices);
 				TAccumulator<Vertex> accum;
 				for (VIndex iV: adjVerts)
 					accum.Add(vertices[iV], 1.f);
@@ -910,6 +1004,39 @@ private:
 
 #endif
 
+void RemoveSlivers(CLEAN::Mesh& mesh, float spuriousFactor) {
+	vcg::tri::UpdateSelection<CLEAN::Mesh>::Clear(mesh);
+
+	for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+		if ((*fi).IsD()) continue;
+
+		// Calculate aspect ratio and thinness metrics
+		float edges[3];
+		for (int i = 0; i < 3; ++i) {
+			edges[i] = ((*fi).V((i + 1) % 3)->cP() - (*fi).V(i)->cP()).Norm();
+		}
+		std::sort(edges, edges + 3);
+
+		float aspectRatio = edges[2] / edges[0]; // longest/shortest edge
+		float area = vcg::DoubleArea(*fi) * 0.5f;
+		float perimeter = edges[0] + edges[1] + edges[2];
+		float compactness = (4.0f * M_PI * area) / (perimeter * perimeter);
+
+		// Mark as sliver if it's very thin or has extreme aspect ratio
+		if (aspectRatio > 10.0f || compactness < 0.1f) {
+			(*fi).SetS();
+		}
+	}
+
+	// Remove selected faces
+	for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+		if (!(*fi).IsD() && (*fi).IsS()) {
+			vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+		}
+	}
+}
+
+
 // decimate, clean and smooth mesh
 // fDecimate factor is in range (0..1], if 1 no decimation takes place
 void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean)
@@ -1057,77 +1184,164 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 
 	// remove spurious components
 	if (fSpurious > 0) {
-#if 0 // suggested  this introduces sparkles
-  	// Gather squared edge lengths once
-		std::vector<float> e2;
-		e2.reserve(mesh.EN());
-		for (const auto& e : mesh.edge) {
-		  if (e.IsD()) continue;
-		  const auto &p0 = e.V(0)->P();
-		  const auto &p1 = e.V(1)->P();
-		  const auto d = p1 - p0;
-		  e2.push_back(d.SquaredNorm());
-		}
-		
-		// Robust scale: median and 95th percentile (works better than 55%)
-		auto nth = [&](size_t k) -> float {
-		  k = std::min(k, e2.size() - 1);
-		  std::nth_element(e2.begin(), e2.begin() + k, e2.end());
-		  return e2[k];
-		};
-		const float medE = std::sqrt(nth(e2.size() >> 1));
-		const float p95E = std::sqrt(nth((e2.size() * 95) / 100));
-		
-		// Thresholds
-		const float thLongEdge = std::max(p95E * fSpurious, 1e-12f);
-		const float tinyAreaSq = (medE * medE * 1e-4f) * 4.0f; // compare to cross^2
-		const float thDiameter = std::max(p95E * 32.0f, 1e-6f);
-
-		// 1) mark long-edge faces via VCGLib selector
-		size_t selCount = vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge);
-
-		// 1b) mark tiny-area faces inline (add to selection)
-		for (auto& f : mesh.face) {
-			if (f.IsD()) continue;
-			const auto &p0 = f.V(0)->P();
-			const auto &p1 = f.V(1)->P();
-			const auto &p2 = f.V(2)->P();
-			const auto cross = (p1 - p0) ^ (p2 - p0); // still a CoordType
-			const float crossLenSq = cross.SquaredNorm();
-			if (crossLenSq < tinyAreaSq) {
-				f.SetS();
-				++selCount;
+#if 1 // Claude
+		if (fSpurious > 0) {
+#if 0 // Has potential, but introduces some dropouts in the mesh
+			// First pass: Remove obvious spurious components (your existing code)
+			FloatArr edgeLens(0, mesh.EN());
+			for (CLEAN::Mesh::EdgeType& edge : mesh.edge) {
+				const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
+				const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
+				edgeLens.Insert((P1 - P0).SquaredNorm());
 			}
-		}
 
-		// Inline "DeleteFaceIf": erase selected faces
-		if (selCount) {
-			for (auto& f : mesh.face) {
-				if (!f.IsD() && f.IsS()) {
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, f);
+			const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious);
+			const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
+			for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi)
+				if (!(*fi).IsD() && (*fi).IsS())
+					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+
+			// Second pass: Target slivers specifically
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			RemoveSlivers(mesh, fSpurious);
+
+			// Final pass: Remove remaining small components
+			const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size() * 55 / 100)) * fSpurious);
+			const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
+#else
+			{
+				// Original code first.
+				FloatArr edgeLens(0, mesh.EN());
+				for (CLEAN::Mesh::EdgeType& edge : mesh.edge) {
+					const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
+					const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
+					edgeLens.Insert((P1 - P0).SquaredNorm());
+				}
+				// remove faces with too long edges
+				const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious);
+				const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
+				for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi)
+					if (!(*fi).IsD() && (*fi).IsS())
+						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+				DEBUG_ULTIMATE("Removed %d faces with edges longer than %f", numLongFaces, thLongEdge);
+				// remove isolated components
+				const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size() * 55 / 100)) * fSpurious);
+				vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+				const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
+				DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
+
+			}
+
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+
+			const int nFaces = (int)mesh.face.size();
+			if (nFaces == 0) return;
+
+			// Local per-face label; -1 means unassigned
+			std::vector<int> faceLabel(nFaces, -1);
+
+			auto faceIndex = [&](CLEAN::Mesh::FacePointer fp) -> int {
+				return vcg::tri::Index(mesh, fp);
+				};
+
+			// Grow a component starting at startIdx, assign label lbl
+			auto growFrom = [&](int startIdx, std::vector<int>& stack, int lbl) {
+				stack.clear();
+				stack.push_back(startIdx);
+				faceLabel[startIdx] = lbl;
+
+				while (!stack.empty()) {
+					int fi = stack.back();
+					stack.pop_back();
+					CLEAN::Mesh::FaceType* f = &mesh.face[fi];
+
+					for (int e = 0; e < 3; ++e) {
+						CLEAN::Mesh::FacePointer nf = f->FFp(e);
+						if (!nf || nf->IsD()) continue;
+						int ni = faceIndex(nf);
+						if (ni >= 0 && faceLabel[ni] < 0 && !mesh.face[ni].IsD()) {
+							faceLabel[ni] = lbl;
+							stack.push_back(ni);
+						}
+					}
+				}
+				};
+
+			// Label all components (no VCGLib VISITED/SELECTED bits used)
+			std::vector<int> stack;
+			stack.reserve(nFaces);
+			int compCount = 0;
+			for (int i = 0; i < nFaces; ++i) {
+				if (mesh.face[i].IsD()) continue;
+				if (faceLabel[i] < 0) {
+					growFrom(i, stack, compCount++);
 				}
 			}
-			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
-			for (auto &f : mesh.face) {
-				if (!f.IsD()) f.ClearS();
-			}
-		}
 
-		// 2) Remove small/skinny components by diameter
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-		auto delInfo = vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thDiameter);
-		
-		// Optional: also cull by face count (tiny specks)
-		// delInfo = vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponents(mesh, minFaceNum);
-		
-		// Final housekeeping
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			// Bucket faces per component
+			std::vector<std::vector<CLEAN::Mesh::FacePointer>> componentFaces(compCount);
+			for (int i = 0; i < nFaces; ++i) {
+				if (mesh.face[i].IsD()) continue;
+				int c = faceLabel[i];
+				if (c >= 0) componentFaces[c].push_back(&mesh.face[i]);
+			}
+
+			// Analyze & remove slivers
+			for (int c = 0; c < compCount; ++c) {
+				auto& faces = componentFaces[c];
+				if (faces.empty()) continue;
+				DEBUG("Component %d has %d faces", c, faces.size());
+
+				float minEdge = FLT_MAX, maxEdge = 0.0f;
+				double totalArea = 0.0; // use double to sum areas robustly
+				vcg::Box3f bbox;
+				bbox.SetNull();
+
+				for (auto f : faces) {
+					for (int j = 0; j < 3; ++j) {
+						const auto& p0 = f->V(j)->cP();
+						const auto& p1 = f->V((j + 1) % 3)->cP();
+						float edgeLen = (p1 - p0).Norm();
+						if (edgeLen < minEdge) minEdge = edgeLen;
+						if (edgeLen > maxEdge) maxEdge = edgeLen;
+						bbox.Add(p0);
+					}
+					totalArea += 0.5 * vcg::DoubleArea(*f);
+				}
+
+				float bboxDiag = bbox.Diag();
+				float avgFaceArea = (float)(totalArea / (double)faces.size());
+
+				// Guard against degenerate cases
+				if (minEdge <= 0.0f) minEdge = 1e-12f;
+				if (bboxDiag <= 0.0f) bboxDiag = 1e-12f;
+
+				// Your sliver heuristic (tweak as needed)
+				bool smallCount = faces.size() < 500;
+				bool extremeEdgeRatio = (maxEdge / minEdge) > 20.0f;
+				bool tinyAreaVsBBox = (float)(totalArea) / (bboxDiag * bboxDiag) < 0.02f;
+				DEBUG("Component %d has %g er and %g ta", c, (maxEdge/minEdge), (float)(totalArea) / (bboxDiag * bboxDiag) );
+
+				if (faces.size() < 500) {//smallCount && extremeEdgeRatio && tinyAreaVsBBox) {
+					DEBUG("Culling component %d", c);
+					for (auto f : faces) {
+						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *f);
+					}
+				}
+			}
+
+			// 8) Recompact and rebuild topology after deletions
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+#endif
+		}
 #else
 		FloatArr edgeLens(0, mesh.EN());
 		for (CLEAN::Mesh::EdgeType& edge: mesh.edge) {
-			const CLEAN::Vertex::CoordType& P1(edge.V(1)->P());
-			const CLEAN::Vertex::CoordType& P0(edge.V(0)->P());
+			const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
+			const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
 			edgeLens.Insert((P1-P0).SquaredNorm());
 		}
 		// remove faces with too long edges
@@ -1141,8 +1355,8 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size()*55/100))*fSpurious);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
-#endif
 		DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
+#endif
 	}
 
 	// remove spikes
@@ -1351,7 +1565,7 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 
 	// close holes
 	if (nCloseHoles > 0) {
-		if (fSpurious <= 0 && !bRemoveSpikes)
+		if (fSpurious > 0 || /* JPB WIP BUG ECI will hang unless we update this with new spurious changes fSpurious <= 0 &&*/ !bRemoveSpikes)
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);

@@ -112,27 +112,49 @@ void IBFSGraph::initGraph() {
 
 void IBFSGraph::initSize(int n, int)
 {
-  numNodes = n;
-  nodes = new Node[n];
-  memset(nodes, 0, sizeof(Node) * n);
-  nodeEnd = nodes + n;
-  active0.init(n);
-  activeS1.init(n);
-  activeT1.init(n);
-  orphanBuckets.init(nodes, n);
-  flow = 0;
+	numNodes = n;
+	nodes = new Node[n];
+
+#pragma omp parallel
+	{
+		const int tid = omp_get_thread_num();
+		const int tcount = omp_get_num_threads();
+
+		const int chunkSize = (n + tcount - 1) / tcount;
+		const int begin = tid * chunkSize;
+		const int end = std::min(begin + chunkSize, n);
+
+		for (int i = begin; i < end; ++i) {
+			Node& node = nodes[i];
+			node.arcCount = 0;
+			node.excess = 0;
+			node.parent = nullptr;
+			node.firstSon = nullptr;
+			node.nextPtr = nullptr;
+			node.lastAugTimestamp = 0;
+			node.isParentCurr = 0;
+			node.label = 0;
+		}
 	}
+
+	nodeEnd = nodes + n;
+	active0.init(n);
+	activeS1.init(n);
+	activeT1.init(n);
+	orphanBuckets.init(nodes, n);
+	flow = 0;
+}
 
 template <bool sTree>
 void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
-  Node* y;
-  Arc* a;
-  int hopCount = 0;
+	Node* y;
+	Arc* a;
+	int hopCount = 0;
 
-  while (true) {
-    if (x->excess) break;
+	while (true) {
+		if (x->excess) break;
 
-    a = x->parent;
+		a = x->parent;
 
 		if (sTree) {
 			a->rCap += bottleneck;
@@ -144,31 +166,32 @@ void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
 			a->rCap -= bottleneck;
 		}
 
-    if ((sTree ? a->rev->rCap : a->rCap) == 0) {
+		if ((sTree ? a->rev->rCap : a->rCap) == 0) {
 			if (sTree) a->isRevResidual = 0;
 			else a->rev->isRevResidual = 0;
 
-      y = a->head->firstSon;
+			y = a->head->firstSon;
 			if (y == x) {
-        a->head->firstSon = x->nextPtr;
-			} else {
-        for (; y && y->nextPtr != x; y = y->nextPtr);
-        if (y) y->nextPtr = x->nextPtr;
+				a->head->firstSon = x->nextPtr;
+			}
+			else {
+				for (; y && y->nextPtr != x; y = y->nextPtr);
+				if (y) y->nextPtr = x->nextPtr;
 			}
 
-      x->nextPtr = IB_ORPHANS_END;
-      if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
-      else orphanFirst = orphanLast = x;
+			x->nextPtr = IB_ORPHANS_END;
+			if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
+			else orphanFirst = orphanLast = x;
 		}
 
-    x = a->head;
+		x = a->head;
 	}
 
 	x->excess += (sTree ? -bottleneck : bottleneck);
 	if (x->excess == 0) {
-    x->nextPtr = IB_ORPHANS_END;
-    if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
-    else orphanFirst = orphanLast = x;
+		x->nextPtr = IB_ORPHANS_END;
+		if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
+		else orphanFirst = orphanLast = x;
 	}
 }
 
