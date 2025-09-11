@@ -83,7 +83,7 @@ public:
         RequirePerVertexFlags(m);
         int andMask = ~FlagMask;
 
-        const int64_t numVertices = m.vn;
+        const int64_t numVertices = m.vert.size();
         #pragma omp parallel for schedule(static, 4096)
           for (int64_t i = 0; i < numVertices; ++i) {
             auto& vi = m.vert[i];

@@ -239,151 +239,18 @@ void Mesh::ListIncidenteVertices()
 }
 
 // extract the (ordered) array of triangles incident to each vertex
-#ifdef OPENMVS_21
-#ifdef FIX_OPENMVS
-// Put in Mesh or an anon namespace.
-inline bool Mesh::IsFaceSane(const Face& f) const {
-	const int a = f[0], b = f[1], c = f[2];
-	if (a == b || b == c || c == a) return false;
-	const auto n = (vertices[b] - vertices[a]).cross(vertices[c] - vertices[a]);
-	return n.dot(n) > 1e-30; // tune threshold to your scale
-}
-void Mesh::ListIncidenteFaces() {
-	vertexFaces.clear();
-	vertexFaces.resize(vertices.size());
-	FOREACH(iF, faces) {
-		const Face& face = faces[iF];
-		if (!IsFaceSane(face)) continue; // skip degenerates
-		for (int v = 0; v < 3; ++v) {
-			FaceIdxArr& vfs = vertexFaces[face[v]];
-			if (vfs.empty() || vfs.back() != iF)
-				vfs.emplace_back(iF);
-		}
-	}
-}
-
-
-#else
-void Mesh::ListIncidenteFaces()
-{
-#if 1 // Try parallel
-	const uint32_t nVerts = (uint32_t)vertices.size();
-	const uint32_t nFaces = (uint32_t)faces.size();
-
-	// Pass 1: counts via per-thread vectors, reduce.
-	const int nThreads =
-#ifdef _OPENMP
-		omp_get_max_threads();
-#else
-		1;
-#endif
-
-	std::vector<std::vector<uint32_t>> countsLocal(nThreads, std::vector<uint32_t>(nVerts, 0));
-
-#pragma omp parallel for if(nFaces > 1024) schedule(static)
-	for (int64_t iF = 0; iF < (int64_t)nFaces; ++iF) {
-		const Face& f = faces[(FIndex)iF];
-		VIndex u[3];
-		int m = 0;
-		{ VIndex v = f[0]; if (!(m > 0 && u[0] == v)) u[m++] = v; }
-		{ VIndex v = f[1]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
-		{ VIndex v = f[2]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
-
-		const int tid =
-#ifdef _OPENMP
-			omp_get_thread_num();
-#else
-			0;
-#endif
-		auto& cnt = countsLocal[tid];
-		for (int i = 0; i < m; ++i) {
-			++cnt[u[i]];
-		}
-	}
-
-	std::vector<uint32_t> counts(nVerts, 0);
-	for (int t = 0; t < nThreads; ++t) {
-		const auto& loc = countsLocal[t];
-		for (uint32_t v = 0; v < nVerts; ++v) {
-			counts[v] += loc[v];
-		}
-	}
-
-	// Build CSR offsets and flat storage.
-	std::vector<uint32_t> offsets(nVerts + 1, 0);
-	uint64_t total = 0;
-	for (uint32_t v = 0; v < nVerts; ++v) {
-		offsets[v] = (uint32_t)total;
-		total += counts[v];
-	}
-	offsets[nVerts] = (uint32_t)total;
-
-	std::vector<FIndex> flat((size_t)total);
-	std::vector<std::atomic<uint32_t>> writePos(nVerts);
-	for (uint32_t v = 0; v < nVerts; ++v) {
-		writePos[v].store(offsets[v], std::memory_order_relaxed);
-	}
-
-	// Pass 2: fill flat with atomics (lock-free).
-#pragma omp parallel for if(nFaces > 1024) schedule(static)
-	for (int64_t iF = 0; iF < (int64_t)nFaces; ++iF) {
-		const Face& f = faces[(FIndex)iF];
-		VIndex u[3];
-		int m = 0;
-		{ VIndex v = f[0]; if (!(m > 0 && u[0] == v)) u[m++] = v; }
-		{ VIndex v = f[1]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
-		{ VIndex v = f[2]; if (!((m > 0 && u[0] == v) || (m > 1 && u[1] == v))) u[m++] = v; }
-
-		for (int i = 0; i < m; ++i) {
-			uint32_t pos = writePos[u[i]].fetch_add(1, std::memory_order_relaxed);
-			flat[pos] = (FIndex)iF;
-		}
-	}
-
-	// Finalize vertexFaces[v] from flat slices (parallel, no contention).
-	vertexFaces.clear();
-	vertexFaces.resize(nVerts);
-#pragma omp parallel for if(nVerts > 1024) schedule(static)
-	for (int64_t v = 0; v < (int64_t)nVerts; ++v) {
-		const uint32_t b = offsets[(size_t)v];
-		const uint32_t e = offsets[(size_t)v + 1];
-		FaceIdxArr& dst = vertexFaces[(size_t)v];
-		const size_t len = (size_t)(e - b);
-		dst.clear();
-		dst.resize(len);
-		for (size_t i = 0; i < len; ++i) {
-			dst[i] = flat[b + i];
-		}
-	}
-#else
-	vertexFaces.clear();
-	vertexFaces.resize(vertices.size());
-	FOREACH(iF, faces) {
-		const Face& face = faces[iF];
-		for (int v=0; v<3; ++v) {
-			FaceIdxArr& vfs = vertexFaces[face[v]];
-			ASSERT(vfs.Find(iF) == FaceIdxArr::NO_INDEX || vfs.Find(iF) == vfs.size()-1/*for degenerate faces*/);
-			if (vfs.empty() || vfs.back() != iF)
-				vfs.emplace_back(iF);
-		}
-	}
-#endif
-}
-#endif
-#else
 void Mesh::ListIncidenteFaces()
 {
 	vertexFaces.Empty();
 	vertexFaces.resize(vertices.size());
 	FOREACH(i, faces) {
 		const Face& face = faces[i];
-		for (int v=0; v<3; ++v) {
+		for (int v = 0; v < 3; ++v) {
 			ASSERT(vertexFaces[face[v]].Find(i) == FaceIdxArr::NO_INDEX);
 			vertexFaces[face[v]].Insert(i);
 		}
 	}
 }
-#endif
 
 // extract array face adjacencies for each face in the mesh (3 * number of faces);
 // each triple describes the adjacent face triangles for a given face
@@ -1004,39 +871,6 @@ private:
 
 #endif
 
-void RemoveSlivers(CLEAN::Mesh& mesh, float spuriousFactor) {
-	vcg::tri::UpdateSelection<CLEAN::Mesh>::Clear(mesh);
-
-	for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-		if ((*fi).IsD()) continue;
-
-		// Calculate aspect ratio and thinness metrics
-		float edges[3];
-		for (int i = 0; i < 3; ++i) {
-			edges[i] = ((*fi).V((i + 1) % 3)->cP() - (*fi).V(i)->cP()).Norm();
-		}
-		std::sort(edges, edges + 3);
-
-		float aspectRatio = edges[2] / edges[0]; // longest/shortest edge
-		float area = vcg::DoubleArea(*fi) * 0.5f;
-		float perimeter = edges[0] + edges[1] + edges[2];
-		float compactness = (4.0f * M_PI * area) / (perimeter * perimeter);
-
-		// Mark as sliver if it's very thin or has extreme aspect ratio
-		if (aspectRatio > 10.0f || compactness < 0.1f) {
-			(*fi).SetS();
-		}
-	}
-
-	// Remove selected faces
-	for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-		if (!(*fi).IsD() && (*fi).IsS()) {
-			vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-		}
-	}
-}
-
-
 // decimate, clean and smooth mesh
 // fDecimate factor is in range (0..1], if 1 no decimation takes place
 void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean)
@@ -1320,7 +1154,7 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 				bool smallCount = faces.size() < 500;
 				bool extremeEdgeRatio = (maxEdge / minEdge) > 20.0f;
 				bool tinyAreaVsBBox = (float)(totalArea) / (bboxDiag * bboxDiag) < 0.02f;
-				DEBUG("Component %d has %g er and %g ta", c, (maxEdge/minEdge), (float)(totalArea) / (bboxDiag * bboxDiag) );
+				DEBUG("Component %d has %g er and %g ta", c, (maxEdge / minEdge), (float)(totalArea) / (bboxDiag * bboxDiag));
 
 				if (faces.size() < 500) {//smallCount && extremeEdgeRatio && tinyAreaVsBBox) {
 					DEBUG("Culling component %d", c);
@@ -1339,20 +1173,20 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		}
 #else
 		FloatArr edgeLens(0, mesh.EN());
-		for (CLEAN::Mesh::EdgeType& edge: mesh.edge) {
+		for (CLEAN::Mesh::EdgeType& edge : mesh.edge) {
 			const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
 			const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
-			edgeLens.Insert((P1-P0).SquaredNorm());
+			edgeLens.Insert((P1 - P0).SquaredNorm());
 		}
 		// remove faces with too long edges
-		const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size()*95/100))*fSpurious);
+		const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious);
 		const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
-		for (CLEAN::Mesh::FaceIterator fi=mesh.face.begin(); fi!=mesh.face.end(); ++fi)
+		for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi)
 			if (!(*fi).IsD() && (*fi).IsS())
 				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
 		DEBUG_ULTIMATE("Removed %d faces with edges longer than %f", numLongFaces, thLongEdge);
 		// remove isolated components
-		const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size()*55/100))*fSpurious);
+		const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size() * 55 / 100)) * fSpurious);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
 		DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
