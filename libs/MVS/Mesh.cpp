@@ -1298,6 +1298,30 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 	}
 #endif
 
+#if 1 // Restoring spurious for testing.
+	// remove spurious components
+	if (fSpurious > 0) {
+		FloatArr edgeLens(0, mesh.EN());
+		for (CLEAN::Mesh::EdgeType& edge : mesh.edge) {
+			const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
+			const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
+			edgeLens.Insert((P1 - P0).SquaredNorm());
+		}
+		// remove faces with too long edges
+		const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious);
+		const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
+		for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi)
+			if (!(*fi).IsD() && (*fi).IsS())
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+		DEBUG_ULTIMATE("Removed %d faces with edges longer than %f", numLongFaces, thLongEdge);
+		// remove isolated components
+		const float thLongSize(SQRT(edgeLens.GetNth(edgeLens.size() * 55 / 100)) * fSpurious);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
+		DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
+	}
+#endif
+
 #if 0 // JPB WIP BUG Not helping
 	// remove spurious components
 	if (fSpurious > 0) {
