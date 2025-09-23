@@ -71,6 +71,7 @@
 // https://developercommunity.visualstudio.com/t/1923282002-_mm_set_ss-does-not-zero/949051?space=8&q=refactor+top-level
 // This should be retested
 #define _SetFirstUnsafe _mm_set_ss
+#define _SetFirstUnsafeD _mm_set_sd
 #define _SetN(a,b,c,d) _mm_set_ps((d),(c),(b),(a))
 #define _SetND(a,b) _mm_set_pd((b),(a))
 #define _SetNI(a,b,c,d) _mm_set_epi32((d),(c),(b),(a))
@@ -528,6 +529,12 @@ static __forceinline float FastSqrtS(float x)
 {
   /* Bare sqrt, avoid setting global state. */
   return _vFirst(_mm_sqrt_ss(_SetFirstUnsafe(x)));
+}
+
+static __forceinline double FastSqrtD(double x)
+{
+  /* Bare sqrt, avoid setting global state. */
+  return _vFirstD(_mm_sqrt_pd(_SetFirstUnsafeD(x)));
 }
 
 static __forceinline float FastRSqrtS(float x) {

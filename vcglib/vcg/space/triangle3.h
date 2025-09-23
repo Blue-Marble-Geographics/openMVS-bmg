@@ -160,35 +160,518 @@ bool InterpolationParameters(const TriangleType t, const Point3<ScalarType> & P,
 
 /********************** Quality **********************/
 
+#define ORIG_RANKING // 43.399
+#undef RANKING1 // Isn't good as well.... 40.5?
+#undef RANKING2 // Worse than 1 and 3, but faster
+#undef RANKING3 // about the same as 1, but isn't good enough
+#undef RANKING4 // Good enough I think, but about the same performance as without.
+#undef RANKING4b // Better, but still not fast 43.1
+#undef RANKING4c // Good enough, but not fast 44.5
+#undef RANKING5
+#undef RANKING6
+#undef RANKING7  // Best choice for us for release
+#undef RANKING8
+#undef RANKING9  // more accurate, best for release
+#undef RANKING10  // 7 more accurate, best for release, better than 10
+#undef RANKING11  // 7 more accurate, best for release, better than 10
+
+// Calculates sqrt(area2) / maxedge2 using approximate inverse square root
+__forceinline float calculateFastApprox(float area2, float maxedge2) {
+  // Load area2 into an SSE register
+  __m128 area2_vec = _mm_set_ss(area2);
+
+  // Compute approximate 1/sqrt(area2)
+  __m128 inv_sqrt_area2_vec = _mm_rsqrt_ss(area2_vec);
+
+  // To get sqrt(area2) from 1/sqrt(area2), you can do area2 * (1/sqrt(area2))
+  // Or, more accurately, refine with one Newton-Raphson iteration
+  // The RSQRTSS instruction has about 12 bits of precision. One Newton-Raphson
+  // iteration typically gets it to nearly full single-precision accuracy (around 23 bits).
+  // The formula for one Newton-Raphson iteration for 1/sqrt(x) is:
+  // y = y * (1.5 - 0.5 * x * y * y)
+
+  // For your expression sqrt(area2) / maxedge2, it can be rewritten as
+  // sqrt(area2) * (1 / maxedge2)
+  // or equivalently (area2 * (1/sqrt(area2))) / maxedge2
+
+  // If you need the sqrt(area2) value specifically, and then divide:
+  // __m128 sqrt_area2_vec = _mm_mul_ss(area2_vec, inv_sqrt_area2_vec); // This is approximate sqrt(area2)
+
+  // A common pattern for `X / sqrt(Y)` is `X * (1/sqrt(Y))`
+  // Here, you have `sqrt(area2) / maxedge2`.
+  // So, we can think of it as `area2 * (1/sqrt(area2)) * (1/maxedge2)`
+  // OR: `sqrt(area2) * (1/maxedge2)`
+
+  // Option 1: Directly calculate sqrt(area2) * (1/maxedge2)
+  // This is often the most direct if RSQRTSS is sufficient precision for 1/sqrt(area2)
+
+  // First, convert 1/sqrt(area2) to sqrt(area2) (still approximate)
+  __m128 approx_sqrt_area2_vec = _mm_mul_ss(area2_vec, inv_sqrt_area2_vec);
+
+  // Load maxedge2 into an SSE register
+  __m128 maxedge2_vec = _mm_set_ss(maxedge2);
+
+  // Perform the division using _mm_div_ss (hardware division)
+  __m128 result_vec = _mm_div_ss(approx_sqrt_area2_vec, maxedge2_vec);
+
+  return _mm_cvtss_f32(result_vec); // Extract the float result
+}
+
 /// Compute a shape quality measure of the triangle composed by points p0,p1,p2
 /// It Returns 2*AreaTri/(MaxEdge^2),
 /// the range is range [0.0, 0.866]
 /// e.g. Equilateral triangle sqrt(3)/2, halfsquare: 1/2, ... up to a line that has zero quality.
 template<class P3ScalarType>
-P3ScalarType Quality( Point3<P3ScalarType> const &p0, Point3<P3ScalarType> const & p1,  Point3<P3ScalarType> const & p2)
+__forceinline float Quality(
+  Point3<P3ScalarType> const &p0, Point3<P3ScalarType> const & p1,  Point3<P3ScalarType> const & p2)
 {
-    Point3<P3ScalarType> d10=p1-p0;
-    Point3<P3ScalarType> d20=p2-p0;
-    Point3<P3ScalarType> d12=p1-p2;
-    Point3<P3ScalarType> x = d10^d20;
+#ifdef RANKING1
 
-    P3ScalarType a = Norm( x );
-    if(a==0) return 0; // Area zero triangles have surely quality==0;
-    P3ScalarType b = SquaredNorm( d10 );
-  if(b==0) return 0; // Again: area zero triangles have surely quality==0;
-    P3ScalarType t = b;
-    t = SquaredNorm( d20 ); if ( b<t ) b = t;
-    t = SquaredNorm( d12 ); if ( b<t ) b = t;
-    return a/b;
+  const P3ScalarType dx1 = p1[0] - p0[0];
+  const P3ScalarType dy1 = p1[1] - p0[1];
+  const P3ScalarType dz1 = p1[2] - p0[2];
+
+  const P3ScalarType dx2 = p2[0] - p0[0];
+  const P3ScalarType dy2 = p2[1] - p0[1];
+  const P3ScalarType dz2 = p2[2] - p0[2];
+
+  // Quick squared edge lengths
+  const float l1 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  const float l2 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+
+  // Use dot product (area projection)
+  const float dp = dx1 * dx2 + dy1 * dy2 + dz1 * dz2;
+
+  // Cheap area approximation (orthogonality)
+  const float quality = 1.0f - (dp * dp) / (l1 * l2 + 1e-8f); // 1-cos(theta)
+
+  return std::max(0.0f, quality); // Clamp to valid range
+#endif
+
+#ifdef RANKING2
+  // Edge vectors from p0
+  const float dx1 = p1[0] - p0[0];
+  const float dy1 = p1[1] - p0[1];
+  const float dz1 = p1[2] - p0[2];
+
+  const float dx2 = p2[0] - p0[0];
+  const float dy2 = p2[1] - p0[1];
+  const float dz2 = p2[2] - p0[2];
+
+  // Cross product (not normalized)
+  const float nx = dy1 * dz2 - dz1 * dy2;
+  const float ny = dz1 * dx2 - dx1 * dz2;
+  const float nz = dx1 * dy2 - dy1 * dx2;
+
+  // Max edge^2 (approximate or skip entirely)
+  const float l1 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  const float l2 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+
+  float area2 = nx * nx + ny * ny + nz * nz;
+  float maxEdge2 = std::max(l1, l2);
+
+  // Skip sqrt and divide
+  return area2 / (maxEdge2 + 1e-8f);
+#endif
+
+#ifdef RANKING3
+  const float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+  const float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+  const float dx3 = p1[0] - p2[0], dy3 = p1[1] - p2[1], dz3 = p1[2] - p2[2];
+
+  // Cross product (d10 ^ d20)
+  const float cx = dy1 * dz2 - dz1 * dy2;
+  const float cy = dz1 * dx2 - dx1 * dz2;
+  const float cz = dx1 * dy2 - dy1 * dx2;
+
+  const float area2 = cx * cx + cy * cy + cz * cz; // = (2 * area)^2
+
+  const float e0 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  const float e1 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  const float e2 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+  const float maxEdge2 = std::max({ e0, e1, e2 });
+
+  if (maxEdge2 == 0) return 0.f; // degenerate triangle
+
+  constexpr float scale = 0.4330127f; // ~sqrt(3)/4, consistent with 2*area/maxEdge^2
+  return scale * area2 / (maxEdge2 * maxEdge2);
+
+#if 0
+  // Clamp and quantize into 0..255 for <= 0.3 range
+  constexpr ScalarType maxQual = ScalarType(0.3);
+  ScalarType clamped = (quality > maxQual) ? maxQual : quality;
+
+  // Map [0.0, 0.3] -> [0, 255]
+  return static_cast<uint8_t>(clamped * ScalarType(255.0 / 0.3));
+#endif
+#endif
+
+#ifdef RANKING4
+  float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+  float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+
+  float cx = dy1 * dz2 - dz1 * dy2;
+  float cy = dz1 * dx2 - dx1 * dz2;
+  float cz = dx1 * dy2 - dy1 * dx2;
+
+  float area2 = cx * cx + cy * cy + cz * cz;
+
+  float ex = p1[0] - p2[0], ey = p1[1] - p2[1], ez = p1[2] - p2[2];
+  float e0 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  float e1 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  float e2 = ex * ex + ey * ey + ez * ez;
+  float maxEdge2 = std::max(e0, std::max(e1, e2));
+
+  if (maxEdge2 <= 0.0f) return 0.0f;
+
+  float q = FastSqrtS(area2) / maxEdge2;
+  return (q > 0.3f) ? 0.3f : q;
+#endif
+
+#ifdef RANKING4b
+  const float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+  const float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+
+  const float cx = dy1 * dz2 - dz1 * dy2;
+  const float cy = dz1 * dx2 - dx1 * dz2;
+  const float cz = dx1 * dy2 - dy1 * dx2;
+
+  const float area2 = cx * cx + cy * cy + cz * cz;
+
+  const float ex = p1[0] - p2[0], ey = p1[1] - p2[1], ez = p1[2] - p2[2];
+  const float e0 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  const float e1 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  const float e2 = ex * ex + ey * ey + ez * ez;
+  const float maxEdge2 = FastMaxS(e0, FastMaxS(e1, e2));
+
+  if (maxEdge2 <= 0.0f) return 0.0f;
+
+  return FastSqrtS(area2) / maxEdge2;
+#endif
+
+
+#ifdef RANKING4c
+  const float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+  const float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+
+  const float cx = dy1 * dz2 - dz1 * dy2;
+  const float cy = dz1 * dx2 - dx1 * dz2;
+  const float cz = dx1 * dy2 - dy1 * dx2;
+
+  const float area2 = cx * cx + cy * cy + cz * cz;
+
+  const float ex = p1[0] - p2[0], ey = p1[1] - p2[1], ez = p1[2] - p2[2];
+  const float e0 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  const float e1 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  const float e2 = ex * ex + ey * ey + ez * ez;
+  const float maxEdge2 = FastMaxS(e0, FastMaxS(e1, e2));
+
+  if (maxEdge2 <= 0.0f) return 0.0f;
+
+  return LookupSqrt(area2 / (maxEdge2 * maxEdge2));
+#endif
+
+#ifdef RANKING5
+  float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+  float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+
+  float cx = dy1 * dz2 - dz1 * dy2;
+  float cy = dz1 * dx2 - dx1 * dz2;
+  float cz = dx1 * dy2 - dy1 * dx2;
+  float area2 = cx * cx + cy * cy + cz * cz;
+
+  float dx3 = p1[0] - p2[0], dy3 = p1[1] - p2[1], dz3 = p1[2] - p2[2];
+  float e0 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+  float e1 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+  float e2 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+  float maxEdge2 = std::max(e0, std::max(e1, e2));
+
+  if (maxEdge2 <= 0.0f || area2 <= 0.0f)
+    return 0.0f;
+
+  float q = SqrtAccurateNear03(area2 / maxEdge2);
+  return (q > 0.3f) ? 0.3f : q;
+#endif
+
+#ifdef ORIG_RANKING
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    const P3ScalarType dx3 = p1[0] - p2[0];
+    const P3ScalarType dy3 = p1[1] - p2[1];
+    const P3ScalarType dz3 = p1[2] - p2[2];
+
+    // Squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    P3ScalarType maxEdge2 = l2_10;
+    if (l2_20 > maxEdge2) maxEdge2 = l2_20;
+    if (l2_12 > maxEdge2) maxEdge2 = l2_12;
+    if (maxEdge2 == 0) return P3ScalarType(0);
+
+    // Cross product
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
+    if (area2 == 0) return P3ScalarType(0);
+
+    return FastSqrtS(area2) / maxEdge2;
+#endif
+
+#ifdef RANKING6
+    // d10 = p1 - p0
+    const float dx1 = p1[0] - p0[0], dy1 = p1[1] - p0[1], dz1 = p1[2] - p0[2];
+
+    // d20 = p2 - p0
+    const float dx2 = p2[0] - p0[0], dy2 = p2[1] - p0[1], dz2 = p2[2] - p0[2];
+
+    // d12 = p1 - p2
+    const float dx3 = dx1 - dx2, dy3 = dy1 - dy2, dz3 = dz1 - dz2;
+
+    // Squared edge lengths
+    const float l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const float l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const float l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    // Branchless max
+    float maxEdge2 = l2_10;
+    maxEdge2 = (l2_20 > maxEdge2) ? l2_20 : maxEdge2;
+    maxEdge2 = (l2_12 > maxEdge2) ? l2_12 : maxEdge2;
+
+    // Early out on degenerate
+    if (maxEdge2 <= 0.0f) return 0.0f;
+
+    // Cross product of d10 ^ d20
+    const float nx = dy1 * dz2 - dz1 * dy2;
+    const float ny = dz1 * dx2 - dx1 * dz2;
+    const float nz = dx1 * dy2 - dy1 * dx2;
+    const float area2 = nx * nx + ny * ny + nz * nz;
+
+    if (area2 <= 0.0f) return 0.0f;
+
+    const float q = FastSqrt_NR2(area2) / maxEdge2;
+
+    // Clamp to 0.3
+    return (q > 0.3f) ? 0.3f : q;
+#endif
+#ifdef RANKING7
+    // Best so far
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    const P3ScalarType dx3 = p1[0] - p2[0];
+    const P3ScalarType dy3 = p1[1] - p2[1];
+    const P3ScalarType dz3 = p1[2] - p2[2];
+
+    // Squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    P3ScalarType maxEdge2 = l2_10;
+    if (l2_20 > maxEdge2) maxEdge2 = l2_20;
+    if (l2_12 > maxEdge2) maxEdge2 = l2_12;
+
+   // const float invMaxEdge2 = 1.f / maxEdge2;
+
+    // Cross product
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
+
+    // Slightly better to remove the compare (43.029)
+    //if (area2 > 0.09f * maxEdge2 * maxEdge2) {
+   //   return 0.3f;
+   // } else {
+    return FastSqrtS(area2) / maxEdge2;
+  //  }
+#endif
+
+#ifdef RANKING8
+    // SIMD not faster
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    const P3ScalarType dx3 = p1[0] - p2[0];
+    const P3ScalarType dy3 = p1[1] - p2[1];
+    const P3ScalarType dz3 = p1[2] - p2[2];
+
+    // Squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    P3ScalarType maxEdge2 = l2_10;
+    if (l2_20 > maxEdge2) maxEdge2 = l2_20;
+    if (l2_12 > maxEdge2) maxEdge2 = l2_12;
+    *maxEdges = maxEdge2;
+
+    // Cross product
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    *areas = nx * nx + ny * ny + nz * nz;
+#endif
+
+
+#ifdef RANKING9 // Gives up some speed, but is more accurate
+    // Suggestions to improve RANKING7's accuracy
+  // Vector diffs
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    // Cross product: (p1 - p0) x (p2 - p0)
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
+
+    // Reuse existing diffs to compute all 3 squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+
+    const P3ScalarType dx3 = dx1 - dx2;
+    const P3ScalarType dy3 = dy1 - dy2;
+    const P3ScalarType dz3 = dz1 - dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    // Branchless max of three
+    P3ScalarType maxEdge2 = l2_10;
+    maxEdge2 = (l2_20 > maxEdge2) ? l2_20 : maxEdge2;
+    maxEdge2 = (l2_12 > maxEdge2) ? l2_12 : maxEdge2;
+
+    // Use epsilon to avoid divide-by-zero, and clamp area2
+    constexpr P3ScalarType eps = P3ScalarType(1e-20f);
+    const P3ScalarType safeArea2 = area2 + eps;      // No branch
+    const P3ScalarType safeMaxEdge2 = maxEdge2 + eps;
+
+    return FastSqrtS(safeArea2) / safeMaxEdge2;
+#endif
+
+#ifdef RANKING10
+    // more accurate
+    // Edge vectors from p0
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    // Edge p1 - p2 from reused diffs
+    const P3ScalarType dx3 = dx1 - dx2;
+    const P3ScalarType dy3 = dy1 - dy2;
+    const P3ScalarType dz3 = dz1 - dz2;
+
+    // Squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    P3ScalarType maxEdge2 = l2_10;
+    maxEdge2 = (l2_20 > maxEdge2) ? l2_20 : maxEdge2;
+    maxEdge2 = (l2_12 > maxEdge2) ? l2_12 : maxEdge2;
+
+    // Cross product (area² of triangle)
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
+
+    // Safe clamp to avoid divide-by-zero
+    constexpr P3ScalarType epsilon = P3ScalarType(1e-20f);
+
+    // Return exact 0.0 if degenerate
+    if (!(area2 > epsilon) || !(maxEdge2 > epsilon))
+      return P3ScalarType(0);
+
+    return FastSqrtS(area2) / maxEdge2;
+
+#endif
+
+#ifdef RANKING11
+    // more accurate
+    // Edge vectors from p0
+    const P3ScalarType dx1 = p1[0] - p0[0];
+    const P3ScalarType dy1 = p1[1] - p0[1];
+    const P3ScalarType dz1 = p1[2] - p0[2];
+
+    const P3ScalarType dx2 = p2[0] - p0[0];
+    const P3ScalarType dy2 = p2[1] - p0[1];
+    const P3ScalarType dz2 = p2[2] - p0[2];
+
+    // Edge p1 - p2 from reused diffs
+    const P3ScalarType dx3 = dx1 - dx2;
+    const P3ScalarType dy3 = dy1 - dy2;
+    const P3ScalarType dz3 = dz1 - dz2;
+
+    // Squared edge lengths
+    const P3ScalarType l2_10 = dx1 * dx1 + dy1 * dy1 + dz1 * dz1;
+    const P3ScalarType l2_20 = dx2 * dx2 + dy2 * dy2 + dz2 * dz2;
+    const P3ScalarType l2_12 = dx3 * dx3 + dy3 * dy3 + dz3 * dz3;
+
+    P3ScalarType maxEdge2 = l2_10;
+    maxEdge2 = (l2_20 > maxEdge2) ? l2_20 : maxEdge2;
+    maxEdge2 = (l2_12 > maxEdge2) ? l2_12 : maxEdge2;
+
+    // Cross product (area² of triangle)
+    const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
+    const P3ScalarType ny = dz1 * dx2 - dx1 * dz2;
+    const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
+
+    const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
+
+    // Safe clamp to avoid divide-by-zero
+    constexpr P3ScalarType epsilon = P3ScalarType(1e-20f);
+
+    // Return exact 0.0 if degenerate
+    if (!(area2 > epsilon) || !(maxEdge2 > epsilon))
+      return P3ScalarType(0);
+
+    return area2 / ( maxEdge2 * maxEdge2 );
+
+
+#endif
 }
-
 
 /// Return the _q of the face, the return value is in [0,sqrt(3)/2] = [0 - 0.866.. ]
 template<class TriangleType>
-typename TriangleType::ScalarType QualityFace(const TriangleType &t)
+__forceinline float QualityFace(const TriangleType &t)
 {
   return Quality(t.cP(0), t.cP(1), t.cP(2));
 }
+
 /// Compute a shape quality measure of the triangle composed by points p0,p1,p2
 /// It Returns inradius/circumradius
 /// the range is range [0, 1]

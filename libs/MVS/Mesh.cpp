@@ -98,6 +98,10 @@ using namespace MVS;
 #include <unsupported/Eigen/BVH>
 #endif
 
+static constexpr size_t BLOCK_SIZE = 8 * 1024 * 1024;  // objects per block
+std::vector<void*> g_qBlocks;
+size_t g_qOffset = BLOCK_SIZE;
+
 // S T R U C T S ///////////////////////////////////////////////////
 
 // free all memory
@@ -874,47 +878,65 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 /*----------------------------------------------------------------*/
 
 namespace CLEAN {
-// define mesh type
-class Vertex; class Edge; class Face;
-struct UsedTypes : public vcg::UsedTypes<
-	vcg::Use<Vertex>::AsVertexType,
-	vcg::Use<Edge>  ::AsEdgeType,
-	vcg::Use<Face>  ::AsFaceType   > {};
+	// define mesh type
+	class Vertex; class Edge; class Face;
+	struct UsedTypes : public vcg::UsedTypes<
+		vcg::Use<Vertex>::AsVertexType,
+		vcg::Use<Edge>  ::AsEdgeType,
+		vcg::Use<Face>  ::AsFaceType   > {
+	};
 
-class Vertex : public vcg::Vertex<UsedTypes, vcg::vertex::Coord3f, vcg::vertex::Normal3f, vcg::vertex::VFAdj, vcg::vertex::Mark, vcg::vertex::BitFlags> {};
-class Face   : public vcg::Face<  UsedTypes, vcg::face::VertexRef, vcg::face::Normal3f, vcg::face::FFAdj, vcg::face::VFAdj, vcg::face::Mark, vcg::face::BitFlags> {};
-class Edge   : public vcg::Edge<  UsedTypes, vcg::edge::VertexRef, vcg::edge::Mark, vcg::edge::BitFlags> {};
+	class Vertex : public vcg::Vertex<UsedTypes, vcg::vertex::Coord3f, vcg::vertex::Normal3f, vcg::vertex::VFAdj, vcg::vertex::Mark, vcg::vertex::BitFlags> {};
+	class Face : public vcg::Face<  UsedTypes, vcg::face::VertexRef, vcg::face::Normal3f, vcg::face::FFAdj, vcg::face::VFAdj, vcg::face::Mark, vcg::face::BitFlags> {};
+	class Edge : public vcg::Edge<  UsedTypes, vcg::edge::VertexRef, vcg::edge::Mark, vcg::edge::BitFlags> {};
 
-class Mesh : public vcg::tri::TriMesh< std::vector<Vertex>, std::vector<Face>, std::vector<Edge> > {
-public:
-	bool hasDeletedFaces = false;
+	class Mesh : public vcg::tri::TriMesh< std::vector<Vertex>, std::vector<Face>, std::vector<Edge> > {
+	public:
+		bool hasDeletedFaces = false;
+	};
+
+	// decimation helper classes
+	typedef	vcg::SimpleTempData< Mesh::VertContainer, vcg::math::Quadric<double> > QuadricTemp;
+
+	class QHelper
+	{
+	public:
+		QHelper() {}
+		static void Init() {}
+		static vcg::math::Quadric<double>& Qd(const Vertex& v) { return TD()[v]; }
+		static vcg::math::Quadric<double>& Qd(const Vertex* v) { return TD()[*v]; }
+		static Vertex::ScalarType W(Vertex* /*v*/) { return 1.0; }
+		static Vertex::ScalarType W(Vertex& /*v*/) { return 1.0; }
+		static void Merge(Vertex& /*v_dest*/, Vertex const& /*v_del*/) {}
+		static QuadricTemp*& TDp() { static QuadricTemp* td; return td; }
+		static QuadricTemp& TD() { return *TDp(); }
+	};
+
+	typedef vcg::tri::BasicVertexPair<Vertex> VertexPair;
+
+	class TriEdgeCollapse : public vcg::tri::TriEdgeCollapseQuadric<Mesh, VertexPair, TriEdgeCollapse, QHelper>
+	{
+	public:
+		typedef vcg::tri::TriEdgeCollapseQuadric<Mesh, VertexPair, TriEdgeCollapse, QHelper> TECQ;
+		inline TriEdgeCollapse(const VertexPair& p, int i) :TECQ(p, i) {}
+
+		// Custom allocator
+		static __forceinline void* operator new(std::size_t size)
+		{
+			// Operator new always needs to give you a real pointer to the memory where the object is stored.
+			if (g_qOffset == BLOCK_SIZE) {
+				g_qBlocks.push_back(::operator new(BLOCK_SIZE * size));
+				// The very first block is marker for "nullptr" and is unused.
+				g_qOffset = (1 == g_qBlocks.size()) ? 1 : 0;
+			}
+
+
+			//const uint64_t value = ((g_qBlocks.size() - 1) << (8 + 8 + 7)) + (g_qOffset++);
+			//return reinterpret_cast<void*>(static_cast<uintptr_t>(value));
+			return (uint8_t*)g_qBlocks.back() + size * g_qOffset++;
+		}
+	};
 };
-
-// decimation helper classes
-typedef	vcg::SimpleTempData< Mesh::VertContainer, vcg::math::Quadric<double> > QuadricTemp;
-
-class QHelper
-{
-public:
-	QHelper() {}
-	static void Init() {}
-	static vcg::math::Quadric<double> &Qd(Vertex &v) { return TD()[v]; }
-	static vcg::math::Quadric<double> &Qd(Vertex *v) { return TD()[*v]; }
-	static Vertex::ScalarType W(Vertex * /*v*/) { return 1.0; }
-	static Vertex::ScalarType W(Vertex & /*v*/) { return 1.0; }
-	static void Merge(Vertex & /*v_dest*/, Vertex const & /*v_del*/) {}
-	static QuadricTemp* &TDp() { static QuadricTemp *td; return td; }
-	static QuadricTemp &TD() { return *TDp(); }
-};
-
-typedef vcg::tri::BasicVertexPair<Vertex> VertexPair;
-
-class TriEdgeCollapse : public vcg::tri::TriEdgeCollapseQuadric<Mesh, VertexPair, TriEdgeCollapse, QHelper> {
-public:
-	typedef vcg::tri::TriEdgeCollapseQuadric<Mesh, VertexPair, TriEdgeCollapse, QHelper> TECQ;
-	inline TriEdgeCollapse(const VertexPair &p, int i, vcg::BaseParameterClass *pp) :TECQ(p, i, pp) {}
-};
-}
 
 #if 0 // JPB WIP
 #pragma once
@@ -1166,6 +1188,7 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		const int OriginalFaceNum(mesh.fn);
 		Util::Progress progress(_T("Decimated faces"), OriginalFaceNum-TargetFaceNum);
 		vcg::LocalOptimization<CLEAN::Mesh> DeciSession(mesh, &pp);
+		g_qBlocks.reserve((mesh.vn + BLOCK_SIZE - 1) / BLOCK_SIZE);
 		DeciSession.Init<CLEAN::TriEdgeCollapse>();
 		DeciSession.SetTargetSimplices(TargetFaceNum);
 		DeciSession.SetTimeBudget(0.1f); // this allow to update the progress bar 10 time for sec...
@@ -3831,8 +3854,8 @@ void Mesh::Decimate(VertexIdxArr& verticesRemove)
 				// add vertices of the first face
 				const Face& f = faces[vf.First()];
 				const uint32_t i(FindVertex(f, idxV));
-				verts.Insert(f[(i+1)%3]);
-				verts.Insert(f[(i+2)%3]);
+				verts.Insert(f[SmallMod3(i+1)]);
+				verts.Insert(f[SmallMod3(i+2)]);
 				vf.RemoveAt(0);
 			}
 			while (verts.GetSize() < n) {
@@ -3846,7 +3869,7 @@ void Mesh::Decimate(VertexIdxArr& verticesRemove)
 						continue;
 					// add the missing vertex at the end
 					ASSERT(f[(i+2)%3] == idxV);
-					const FIndex idxVN(f[(i+1)%3]);
+					const FIndex idxVN(f[SmallMod3(i+1)]);
 					ASSERT(verts.First() != idxVN);
 					verts.Insert(idxVN);
 					vf.RemoveAt(idxF);
@@ -3873,7 +3896,7 @@ void Mesh::Decimate(VertexIdxArr& verticesRemove)
 						continue;
 					// add the missing vertex at the beginning
 					ASSERT(f[(i+1)%3] == idxV);
-					const FIndex idxVP(f[(i+2)%3]);
+					const FIndex idxVP(f[SmallMod3(i+2)]);
 					ASSERT(verts.Last() != idxVP || vf.GetSize() == 1);
 					if (verts.Last() != idxVP)
 						verts.InsertAt(0, idxVP);

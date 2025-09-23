@@ -198,6 +198,7 @@ public:
   typedef typename T::VertexType::CoordType CoordType;
   typedef typename T::VertexType::ScalarType ScalarType;
 
+  __forceinline typename T::VertexType* const* VRaw() const { return v; }
   inline typename T::VertexType * &V( const int j )       { assert(j>=0 && j<3); return v[j]; } /// \brief The pointer to the i-th vertex
   inline const typename T::VertexType * V (const int j) const { assert(j>=0 && j<3); return v[j]; }
   inline const typename T::VertexType * cV( const int j ) const { assert(j>=0 && j<3);	return v[j]; }
@@ -614,7 +615,7 @@ public:
   static bool HasVFAdjacency()      {   return true; }
   static void Name(std::vector<std::string> & name){name.push_back(std::string("VFAdj"));T::Name(name);}
 
-private:
+//private:
   typename T::FacePointer _vfp[3] ;
   char _vfi[3] ;
 };

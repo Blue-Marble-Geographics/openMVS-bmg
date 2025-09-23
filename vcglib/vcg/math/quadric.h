@@ -28,6 +28,9 @@
 #include <vcg/math/matrix33.h>
 #include <Eigen/Core>
 
+// This is not breaking clean.
+#define MINIMUM_IMPROVEMENT // JPB WIP
+
 namespace vcg {
 namespace math {
 
@@ -41,11 +44,31 @@ class Quadric
 {
 public:
   typedef _ScalarType ScalarType;
-  ScalarType a[6];		// Symmetric Matrix 3x3 : a11 a12 a13 a22 a23 a33
-  ScalarType b[3];		// Vector r3
-  ScalarType c;			  // Scalar (-1 means null/un-initialized quadric)
-  
+  union {
+    struct {
+      ScalarType a[6];		// Symmetric Matrix 3x3 : a11 a12 a13 a22 a23 a33
+      ScalarType b[3];		// Vector r3
+      ScalarType c;			  // Scalar (-1 means null/un-initialized quadric)
+    };
+    ScalarType array[10];
+  };
+
   inline Quadric() { c = -1; }
+
+  void Print() const
+  {
+    std::cout << "A: ";
+    for (int i = 0; i < 6; ++i) {
+      std::cout << a[i] << " ";
+    }
+
+    std::cout << "B: ";
+    for (int i = 0; i < 3; ++i) {
+      std::cout << b[i] << " ";
+    }
+
+    std::cout << "C: " << c << "\n";
+  }
   
   bool IsValid() const { return c>=0; }
   void SetInvalid() { c = -1.0; }
@@ -135,7 +158,7 @@ public:
     b[2] = q.b[2];
     c    = q.c;
   }
-  
+
   void operator += ( const Quadric & q )
   {
     assert( IsValid() );
@@ -152,7 +175,7 @@ public:
     b[2] += q.b[2];
     c    += q.c;
   }
-  
+ 
   void operator *= ( const ScalarType & w )			// Amplifica una quadirca
   {
     assert( IsValid() );
@@ -169,8 +192,6 @@ public:
     c    *= w;
   }
   
-  
-  
   /* Evaluate a quadric over a point p.
    */
   template <class ResultScalarType>
@@ -183,7 +204,6 @@ public:
         +   p[2]*p[2]*a[5] + p[2]*b[2]	+ c);
   }
   
-  
   static double &RelativeErrorThr()
   {
     static double _err = 0.000001;
@@ -195,8 +215,80 @@ public:
   // return true if the found solution fits the system. 
   
   template <class ReturnScalarType>
-  bool Minimum(Point3<ReturnScalarType> &x)
+  bool Minimum(Point3<ReturnScalarType> &x) const
   {
+#ifdef MINIMUM_IMPROVEMENT
+#if 1
+    // Matrix A (symmetric)
+    bool success = false;
+
+    const ReturnScalarType A00 = a[0], A01 = a[1], A02 = a[2];
+    const ReturnScalarType      A11 = a[3], A12 = a[4];
+    const ReturnScalarType           A22 = a[5];
+
+    // Vector b (divided by 2)
+    const ReturnScalarType b0 = -b[0] * ReturnScalarType(0.5);
+    const ReturnScalarType b1 = -b[1] * ReturnScalarType(0.5);
+    const ReturnScalarType b2 = -b[2] * ReturnScalarType(0.5);
+
+    // Cholesky decomposition (A = L * Lt)
+    ReturnScalarType L00 = FastSqrtS(A00);
+    auto invL00 = 1.0 / L00;
+
+    ReturnScalarType L10 = A01 * invL00;
+    ReturnScalarType L20 = A02 * invL00;
+
+    ReturnScalarType d11 = A11 - L10 * L10;
+
+    const ReturnScalarType L11 = FastSqrtS(d11);
+    const auto invL11 = ReturnScalarType(1.0) / L11;
+
+    ReturnScalarType L21 = (A12 - L10 * L20) * invL11;
+
+    ReturnScalarType d22 = A22 - L20 * L20 - L21 * L21;
+    ReturnScalarType L22 = FastSqrtS(d22);
+    auto invL22 = ReturnScalarType(1.0) / L22;
+
+    // Forward substitution: solve L * y = b
+    ReturnScalarType y0 = b0 * invL00;
+    ReturnScalarType y1 = (b1 - L10 * y0) * invL11;
+    ReturnScalarType y2 = (b2 - L20 * y0 - L21 * y1) * invL22;
+
+    // Backward substitution: solve Lt * x = y
+    ReturnScalarType x2 = y2 * invL22;
+    ReturnScalarType x1 = (y1 - L21 * x2) * invL11;
+    ReturnScalarType x0 = (y0 - L10 * x1 - L20 * x2) * invL00;
+
+    x[0] = x0;
+    x[1] = x1;
+    x[2] = x2;
+
+    return (L00 >= 1e-12) && (d11 > 0.) && (d22 > 0.);
+#else
+    using Scalar = ReturnScalarType;
+    using Mat3 = Eigen::Matrix<Scalar, 3, 3>;
+    using Vec3 = Eigen::Matrix<Scalar, 3, 1>;
+
+    Mat3 A;
+    A << a[0], a[1], a[2],
+         a[1], a[3], a[4],
+         a[2], a[4], a[5];
+
+    Vec3  be(-b[0] / Scalar(2), -b[1] / Scalar(2), -b[2] / Scalar(2));
+
+    Eigen::LLT<Mat3> solver(A);
+
+    if (solver.info() != Eigen::Success) {
+      return false;
+      ++failures;
+    }
+
+    Vec3 xe = solver.solve(be);
+
+    x.FromEigenVector(xe);
+    return true;
+#endif
+#else
     Eigen::Matrix3d A;
     Eigen::Vector3d be;
     A << a[0], a[1], a[2],
@@ -213,6 +305,7 @@ public:
     
     x.FromEigenVector(xe);
     return true;
+#endif
   }
   
   
@@ -243,6 +336,14 @@ public:
   }
   
 };
+
+template<typename T>
+__forceinline Quadric<T> operator + (const Quadric<T>& lhs, const Quadric<T>& rhs)
+{
+  auto result = lhs;   // make a copy of lhs
+  result += rhs;          // reuse operator+=
+  return result;
+}
 
 typedef Quadric<short>  Quadrics;
 typedef Quadric<int>	  Quadrici;

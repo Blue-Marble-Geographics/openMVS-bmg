@@ -24,8 +24,11 @@
 #define _VCG_EDGE_COLLAPSE_
 
 
-#include<vcg/simplex/face/pos.h>
-#include<vcg/simplex/face/topology.h>
+#include <vcg/simplex/face/pos.h>
+#include <vcg/simplex/face/topology.h>
+#include <boost/container/small_vector.hpp>
+#include <unordered_map>
+#include <array>
 
 namespace vcg{
 namespace tri{
@@ -61,9 +64,14 @@ public:
   typedef	typename FaceType::VertexType::CoordType CoordType;
   typedef	typename TriMeshType::VertexType::ScalarType ScalarType;
   typedef typename vcg::face::VFIterator<FaceType>  VFIterator;
-  typedef typename std::vector<vcg::face::VFIterator<FaceType> > VFIVec;
 
 private:
+
+
+
+#if 0 // original
+  typedef typename std::vector<vcg::face::VFIterator<FaceType> > VFIVec;
+
   struct EdgeSet
   {
      VFIVec av0, av1, av01;
@@ -104,7 +112,54 @@ private:
 //      if(!foundV0)	es.AV1().push_back( x ); // v0 not found -> so the face is incident only on v0
 //    }
   }
-  
+#else
+  enum { kMaxSize = 32 };
+  struct EdgeSet
+  {
+    FaceType* av01Faces[kMaxSize];
+    int av01Vertices[kMaxSize*2];
+    FaceType* av0Faces[kMaxSize];
+    int av0Vertices[kMaxSize];
+    int av01Cnt;
+    int av0Cnt;
+  };
+
+  static void FindSets(VertexPair& p, EdgeSet& es)
+  {
+    VertexType* __restrict v0 = p.V(0);
+    VertexType* __restrict v1 = p.V(1);
+
+    int av01Cnt = 0;
+    int av0Cnt = 0;
+    // Local stack (optional): avoids calling push_back if counts are known
+    for (VFIterator x = VFIterator(v0); !x.End(); ++x) {
+      FaceType* __restrict f = x.F();
+      const int z = x.I();
+      VertexType* const * __restrict verts = f->VRaw(); // assume VRaw returns VertexType*[3]
+
+      // Manual unrolled check for v1 (much faster than loop)
+      bool match =
+        (uintptr_t(verts[0]) == uintptr_t(v1)) |
+        (uintptr_t(verts[1]) == uintptr_t(v1)) |
+        (uintptr_t(verts[2]) == uintptr_t(v1));
+      if (match) {
+        const int next = z + 1 - 3 * (z == 2);     // (z + 1) % 3
+        const int nextNext = z + 2 - 3 * (z >= 1);     // (z + 2) % 3
+        es.av01Vertices[av01Cnt * 2] = next;
+        es.av01Vertices[av01Cnt * 2 + 1] = nextNext;
+        es.av01Faces[av01Cnt] = f;
+        ++av01Cnt;
+      } else {
+        es.av0Faces[av0Cnt] = f;
+        es.av0Vertices[av0Cnt] = z;
+        ++av0Cnt;
+      }
+    }
+    es.av01Cnt = av01Cnt;
+    es.av0Cnt = av0Cnt;
+  }
+#endif
+
   /*
     Link Conditions test, as described in
 
@@ -130,15 +185,112 @@ private:
 */
 
 public:
+
+  // Fast hash for VertexPointer assuming it is pointer-like or index-like
+  struct PtrHash {
+    size_t operator()(VertexPointer v) const {
+      return std::hash<uintptr_t>()(reinterpret_cast<uintptr_t>(v));
+    }
+  };
+
+  struct EdgeKey {
+    VertexPointer v0;
+    VertexPointer v1;
+
+    EdgeKey(VertexPointer a, VertexPointer b) {
+      if (a < b) { v0 = a; v1 = b; }
+      else { v0 = b; v1 = a; }
+    }
+
+    bool operator==(const EdgeKey& other) const {
+      return v0 == other.v0 && v1 == other.v1;
+    }
+  };
+
+  struct EdgeHash {
+    size_t operator()(const EdgeKey& e) const {
+      return PtrHash{}(e.v0) ^ (PtrHash{}(e.v1) << 1);
+    }
+  };
+  
   static bool LinkConditions(VertexPair &pos)
   {
+#if 1
+    static std::unordered_map<VertexPointer, int, PtrHash> vertCnt;
+    static std::unordered_map<EdgeKey, int, EdgeHash> edgeCnt;
+
+    vertCnt.clear();
+    edgeCnt.clear();
+
+    vertCnt.reserve(64);
+    edgeCnt.reserve(64);
+
+    std::array<VertexPointer, 2> boundaryVerts[2];
+    int boundaryCounts[2] = { 0, 0 };
+
+    // Pass over both vertices of the edge
+    for (int i = 0; i < 2; ++i) {
+      for (VFIterator vfi(pos.V(i)); !vfi.End(); ++vfi) {
+        VertexPointer v1 = vfi.V1();
+        VertexPointer v2 = vfi.V2();
+
+        ++vertCnt[v1];
+        ++vertCnt[v2];
+        ++edgeCnt[EdgeKey(v1, v2)];
+      }
+
+      // Fast pass to find boundary vertices
+      for (const auto& kv : vertCnt) {
+        if (kv.second == 1 && boundaryCounts[i] < 2)
+          boundaryVerts[i][boundaryCounts[i]++] = kv.first;
+      }
+
+      if (boundaryCounts[i] == 2) {
+        VertexPointer dummy = VertexPointer(0);
+        vertCnt[dummy] += 2;
+
+        ++edgeCnt[EdgeKey(dummy, boundaryVerts[i][0])];
+        ++edgeCnt[EdgeKey(dummy, boundaryVerts[i][1])];
+
+        ++vertCnt[boundaryVerts[i][0]];
+        ++vertCnt[boundaryVerts[i][1]];
+      }
+    }
+
+    // Build link of edge
+    std::array<VertexPointer, 2> lkEdge;
+    int lkSize = 0;
+    for (VFIterator vfi(pos.V(0)); !vfi.End(); ++vfi) {
+      if (vfi.V1() == pos.V(1)) lkEdge[lkSize++] = vfi.V2();
+      else if (vfi.V2() == pos.V(1)) lkEdge[lkSize++] = vfi.V1();
+      if (lkSize == 2) break;
+    }
+
+    // If boundary edge, insert dummy vertex
+    if (lkSize == 1) lkEdge[lkSize++] = VertexPointer(0);
+
+    // Count shared edges and vertices
+    size_t sharedEdgeCount = 0;
+    for (const auto& kv : edgeCnt)
+      if (kv.second == 2) ++sharedEdgeCount;
+
+    if (sharedEdgeCount > 0)
+      return false;
+
+    size_t sharedVertCount = 0;
+    for (const auto& kv : vertCnt)
+      if (kv.second == 4) ++sharedVertCount;
+
+    return sharedVertCount == static_cast<size_t>(lkSize);
+#else
+//original
     // at the end of the loop each vertex must be counted twice
     // except for boundary vertex.
     std::map<VertexPointer,int> VertCnt;
     std::map<std::pair<VertexPointer,VertexPointer>,int> EdgeCnt;
 
     // the list of the boundary vertexes for the two endpoints
-    std::vector<VertexPointer> BoundaryVertexVec[2];
+    boost::container::small_vector<VertexPointer, 32> BoundaryVertexVec[2];
 
     // Collect vertexes and edges of V0 and V1
     VFIterator vfi;
@@ -204,12 +356,14 @@ public:
     if(SharedVertCnt != LkEdge.size() ) return false;
 
     return true;
+#endif
   }
 
   // Main Collapsing Function: the one that actually performs the collapse of the edge denoted by the VertexPair c
   // Remember that v[0] will be deleted and v[1] will survive with the position indicated by p
   // To do a collapse onto a vertex simply pass p as the position of the surviving vertex
-  static int Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const bool preserveFaceEdgeS = false)
+#if 0 // original
+static int Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const bool preserveFaceEdgeS = false)
   {
       EdgeSet es, es1;
       FindSets(c,es);
@@ -323,7 +477,43 @@ public:
       c.V(1)->P()=p;
       return n_face_del;
   }
-  
+
+#else
+  static void Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const bool preserveFaceEdgeS = false)
+  {
+     EdgeSet es;
+
+    FindSets(c,es);
+
+    for (int i = 0, cnt = es.av01Cnt; i < cnt; ++i) {
+      FaceType& f = *es.av01Faces[i];
+      const int current = es.av01Vertices[i*2];
+      const int next = es.av01Vertices[i*2 + 1];
+      vcg::face::VFDetach(f,current);
+      vcg::face::VFDetach(f,next);
+      Allocator<TriMeshType>::DeleteFace(m,f);
+    }
+
+    // Very LOW LEVEL update of VF Adjacency;
+    // for all the faces incident in v[0]
+    // - v[0] will be deleted so we substitute v[0] with v[1]
+    // - we prepend that face to the list of the faces incident on v[1]
+    auto& cv1 = c.V(1);
+    for (int i = 0, cnt = es.av0Cnt; i < cnt; ++i) {
+      FaceType& f = *es.av0Faces[i];
+      int z = es.av0Vertices[i];
+
+      f.V(z) = cv1;	// For each face in v0 we substitute v0 with v1
+      f.VFp(z) = cv1->VFp();
+      f.VFi(z) = cv1->VFi();
+      cv1->VFp() = &f;
+      cv1->VFi() = z;
+    }
+
+    Allocator<TriMeshType>::DeleteVertex(m,*(c.V(0)));
+    cv1->P()=p;
+  }
+#endif
 };
 
 } // end namespace tri

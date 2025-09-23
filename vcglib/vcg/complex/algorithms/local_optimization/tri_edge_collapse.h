@@ -42,7 +42,7 @@ namespace tri{
 /// This is the base class of all the specialized collapse classes like for example Quadric Edge Collapse.
 /// Each derived class
 
-template<class TriMeshType, class VertexPair, class MYTYPE>
+template<class TriMeshType, class VertexPair, class MYTYPE, class HelperType >
 class TriEdgeCollapse: public LocalOptimization<TriMeshType>::LocModType
 {
 public:
@@ -65,16 +65,16 @@ public:
    Border()           =0;
   }
 };
-protected:
   typedef	typename TriMeshType::FaceType FaceType;
   typedef	typename TriMeshType::FaceType::VertexType VertexType;
 //	typedef	typename VertexType::EdgeType EdgeType;
   typedef	typename FaceType::VertexType::CoordType CoordType;
   typedef	typename TriMeshType::VertexType::ScalarType ScalarType;
-  typedef typename LocalOptimization<TriMeshType>::HeapElem HeapElem;
+  typedef typename LocalOptimization<TriMeshType>::PackedHeapElem HeapElem;
   typedef typename LocalOptimization<TriMeshType>::HeapType HeapType;
+  typedef HelperType QH;
 
-  TriMeshType *mt;
+  // TriMeshType *mt;
   ///the pair to collapse
   VertexPair pos;
 
@@ -85,13 +85,13 @@ protected:
   int localMark;
 
   /// priority in the heap
-  ScalarType _priority;
+  //ScalarType _priority;
 
-  public:
   /// Default Constructor
   inline	TriEdgeCollapse()
       {}
   ///Constructor with postype
+#if 0
    inline TriEdgeCollapse(const VertexPair &p, int mark, BaseParameterClass *pp)
       {
         localMark = mark;
@@ -101,18 +101,18 @@ protected:
 
     ~TriEdgeCollapse()
       {}
-
+#endif
 private:
 
 
 public:
-
-  inline ScalarType ComputePriority(BaseParameterClass *)
+  inline ScalarType ComputePriority()
   {
-    _priority = Distance(pos.V(0)->cP(),pos.V(1)->cP());
-    return _priority;
+    //_priority = Distance(pos.V(0)->cP(),pos.V(1)->cP());
+    return 0.f; // _priority;
   }
 
+#if 0
   virtual const char *Info(TriMeshType &m) {
     mt = &m;
     static std::string msg;
@@ -122,8 +122,9 @@ public:
         " " + std::to_string(-_priority) + "\n";
     return msg.c_str();
   }
+#endif
 
-  inline void Execute(TriMeshType &m, BaseParameterClass *)
+  inline void Execute(TriMeshType &m)
   {
     CoordType MidPoint=(pos.V(0)->P()+pos.V(1)->P())/2.0;
     EdgeCollapser<TriMeshType,VertexPair>::Do(m, pos, MidPoint);
@@ -135,8 +136,10 @@ public:
   // in the plain case we just put again in the heap all the edges around the vertex resulting from the previous collapse: v[1].
   // if the collapse is not symmetric you should add also backward edges (because v0->v1 collapse could be different from v1->v0)
 
-  inline  void UpdateHeap(HeapType & h_ret, BaseParameterClass *pp)
+#if 0
+  inline  void UpdateHeap(HeapType & h_ret)
   {
+#if 0
     GlobalMark()++;
     VertexType *v[2];
     v[0]= pos.V(0);v[1]=pos.V(1);
@@ -187,31 +190,66 @@ public:
       //        }
       ++vfi;
     } // end while
+#endif
   }
+#endif
 
   ModifierType IsOfType(){ return TriEdgeCollapseOp;}
 
-  inline bool IsFeasible(BaseParameterClass *){
+  __forceinline bool IsFeasible(BaseParameterClass *) {
     return EdgeCollapser<TriMeshType,VertexPair>::LinkConditions(pos);
   }
 
-  inline bool IsUpToDate() const
+  __forceinline bool IsUpToDate() const
   {
-      VertexType *v0=pos.cV(0);
-      VertexType *v1=pos.cV(1);
-      if( v0->IsD() || v1->IsD() ||
-         localMark < v0->IMark()  ||
-         localMark < v1->IMark()   )
+#if 1
+#if 0
+    const VertexType* __restrict v0 = pos.cV(0);
+    const VertexType* __restrict v1 = pos.cV(1);
+
+    int mask = ((v0->cFlags() | v1->cFlags()) & 1) |
+      (localMark < v0->IMark()) |
+      (localMark < v1->IMark());
+
+    return !mask;
+
+#else
+    const VertexType* __restrict v0 = pos.cV(0);
+    if ((v0->cFlags() & 1) || localMark < v0->IMark())
+      return false;
+
+    const VertexType* __restrict v1 = pos.cV(1);
+    if ((v1->cFlags() & 1) || localMark < v1->IMark())
+      return false;
+
+    return true;
+#endif
+#else
+    const VertexType* __restrict v0 = pos.cV(0);
+    const VertexType* __restrict v1 = pos.cV(1);
+
+
+      if( (v0->IsD()) || (v1->IsD()) ||
+         (localMark < v0->IMark())  ||
+         (localMark < v1->IMark())   )
       {
-        ++FailStat::OutOfDate();
+        // JPB WIP BUG ++FailStat::OutOfDate();
         return false;
       }
         return true;
+#endif 
   }
 
-  virtual ScalarType Priority() const {
-  return _priority;
+  inline void AddCollapseToHeap(void* phBuffer, VertexType* v0, VertexType* v1)
+  {
+    // Keep compiler happy
   }
+
+#if 0
+  ScalarType Priority() const {
+    return _priority;
+  }
+#endif
 
   static void Init(TriMeshType &m, HeapType &h_ret, BaseParameterClass *pp)
   {

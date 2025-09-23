@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 7;
+	constexpr int version = 8;
 
 	return version;
 }
@@ -366,7 +366,7 @@ public:
 	{
 #ifdef FAST_REMOVEDUPFACE
 		std::vector<SortedTriple> fvec;
-		fvec.resize(m.fn);
+		fvec.resize(m.face.size());
 
 		const int64_t numFaces = m.face.size();
 		const auto start = m.vert.begin();

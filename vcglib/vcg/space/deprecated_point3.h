@@ -347,7 +347,7 @@ public:
 	// Norms
     inline P3ScalarType Norm() const
     {
-    return math::Sqrt( _v[0]*_v[0] + _v[1]*_v[1] + _v[2]*_v[2] );
+      return FastSqrtS( _v[0]*_v[0] + _v[1]*_v[1] + _v[2]*_v[2] );
     }
     inline P3ScalarType SquaredNorm() const
     {
@@ -372,7 +372,7 @@ public:
 	// Normalization
 	inline Point3 & Normalize()
 	{
-		P3ScalarType n = P3ScalarType(math::Sqrt(_v[0]*_v[0] + _v[1]*_v[1] + _v[2]*_v[2]));
+		P3ScalarType n = P3ScalarType(FastSqrtS(_v[0]*_v[0] + _v[1]*_v[1] + _v[2]*_v[2]));
 		if (n > P3ScalarType(0)) { _v[0] /= n; _v[1] /= n; _v[2] /= n; }
 		return *this;
 	}
