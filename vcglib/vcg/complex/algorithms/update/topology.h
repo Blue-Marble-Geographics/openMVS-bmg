@@ -48,253 +48,230 @@ class UpdateTopology
 {
 
 public:
-typedef UpdateMeshType MeshType;
-typedef typename MeshType::ScalarType     ScalarType;
-typedef typename MeshType::VertexType     VertexType;
-typedef typename MeshType::VertexPointer  VertexPointer;
-typedef typename MeshType::VertexIterator VertexIterator;
-typedef typename MeshType::EdgeType       EdgeType;
-typedef typename MeshType::EdgePointer    EdgePointer;
-typedef typename MeshType::EdgeIterator   EdgeIterator;
-typedef typename MeshType::FaceType       FaceType;
-typedef typename MeshType::FacePointer    FacePointer;
-typedef typename MeshType::FaceIterator   FaceIterator;
-typedef typename MeshType::TetraType      TetraType;
-typedef typename MeshType::TetraPointer   TetraPointer;
-typedef typename MeshType::TetraIterator  TetraIterator;
+  typedef UpdateMeshType MeshType;
+  typedef typename MeshType::ScalarType     ScalarType;
+  typedef typename MeshType::VertexType     VertexType;
+  typedef typename MeshType::VertexPointer  VertexPointer;
+  typedef typename MeshType::VertexIterator VertexIterator;
+  typedef typename MeshType::EdgeType       EdgeType;
+  typedef typename MeshType::EdgePointer    EdgePointer;
+  typedef typename MeshType::EdgeIterator   EdgeIterator;
+  typedef typename MeshType::FaceType       FaceType;
+  typedef typename MeshType::FacePointer    FacePointer;
+  typedef typename MeshType::FaceIterator   FaceIterator;
+  typedef typename MeshType::TetraType      TetraType;
+  typedef typename MeshType::TetraPointer   TetraPointer;
+  typedef typename MeshType::TetraIterator  TetraIterator;
 
 
-/// \headerfile topology.h vcg/complex/algorithms/update/topology.h
+  /// \headerfile topology.h vcg/complex/algorithms/update/topology.h
 
-/// \brief Auxiliary data structure for computing tetra tetra adjacency information.
-/**
- * It identifies a face, storing three vertex pointers and a tetra pointer where it belongs.
- */
+  /// \brief Auxiliary data structure for computing tetra tetra adjacency information.
+  /**
+   * It identifies a face, storing three vertex pointers and a tetra pointer where it belongs.
+   */
 
-class PFace
-{
-public:
-  VertexPointer v[3];  //three ordered vertex pointers, identify a face
-  TetraPointer  t;     //the pointer to the tetra where this face belongs
-  int           z;     //index in [0..3] of the face in the tetra
-  bool   isBorder;
-
-  PFace () {}
-  PFace (TetraPointer tp, const int nz) { this->Set(tp, nz); }
-
-  void Set (TetraPointer tp /*the tetra pointer*/, const int nz /*the face index*/) 
+  class PFace
   {
-    assert (tp != 0);
-    assert (nz >= 0 && nz < 4);
-    
-    v[0] = tp->V(Tetra::VofF(nz, 0));
-    v[1] = tp->V(Tetra::VofF(nz, 1));
-    v[2] = tp->V(Tetra::VofF(nz, 2));
-    
-    assert(v[0] != v[1] && v[1] != v[2]); //no degenerate faces
+  public:
+    VertexPointer v[3];  //three ordered vertex pointers, identify a face
+    TetraPointer  t;     //the pointer to the tetra where this face belongs
+    int           z;     //index in [0..3] of the face in the tetra
+    bool   isBorder;
 
-    if (v[0] > v[1])
-      std::swap(v[0], v[1]);
-    if (v[1] > v[2])
-      std::swap(v[1], v[2]);
-    if (v[0] > v[1])
-      std::swap(v[0], v[1]);
+    PFace() {}
+    PFace(TetraPointer tp, const int nz) { this->Set(tp, nz); }
 
-    t = tp;
-    z = nz;
-    
+    void Set(TetraPointer tp /*the tetra pointer*/, const int nz /*the face index*/)
+    {
+      assert(tp != 0);
+      assert(nz >= 0 && nz < 4);
 
-  }
+      v[0] = tp->V(Tetra::VofF(nz, 0));
+      v[1] = tp->V(Tetra::VofF(nz, 1));
+      v[2] = tp->V(Tetra::VofF(nz, 2));
 
-  inline bool operator < (const PFace & pf) const 
-  {
-    if (v[0] < pf.v[0]) 
-      return true;
-    else
-    { 
-      if (v[0] > pf.v[0]) return false;
+      assert(v[0] != v[1] && v[1] != v[2]); //no degenerate faces
 
-      if (v[1] < pf.v[1])
+      if (v[0] > v[1])
+        std::swap(v[0], v[1]);
+      if (v[1] > v[2])
+        std::swap(v[1], v[2]);
+      if (v[0] > v[1])
+        std::swap(v[0], v[1]);
+
+      t = tp;
+      z = nz;
+
+
+    }
+
+    inline bool operator < (const PFace& pf) const
+    {
+      if (v[0] < pf.v[0])
         return true;
       else
       {
-        if (v[1] > pf.v[1]) return false;
+        if (v[0] > pf.v[0]) return false;
 
-        return (v[2] < pf.v[2]);
+        if (v[1] < pf.v[1])
+          return true;
+        else
+        {
+          if (v[1] > pf.v[1]) return false;
+
+          return (v[2] < pf.v[2]);
+        }
       }
     }
-  }
 
-  inline bool operator == (const PFace & pf) const
+    inline bool operator == (const PFace& pf) const
+    {
+      return v[0] == pf.v[0] && v[1] == pf.v[1] && v[2] == pf.v[2];
+    }
+  };
+
+  static void FillFaceVector(MeshType& m, std::vector<PFace>& fvec)
   {
-    return v[0] == pf.v[0] && v[1] == pf.v[1] && v[2] == pf.v[2];
+    ForEachTetra(m, [&fvec](TetraType& t) {
+      for (int i = 0; i < 4; ++i)
+        fvec.push_back(PFace(&t, i));
+      });
   }
-};
 
-static void FillFaceVector (MeshType & m, std::vector<PFace> & fvec)
-{
-  ForEachTetra(m, [&fvec] (TetraType & t) {
-    for (int i = 0; i < 4; ++i)
-      fvec.push_back(PFace(&t, i));
-  });
-}
-
-static void FillUniqueFaceVector (MeshType & m, std::vector<PFace> & fvec)
-{
-  FillFaceVector(m, fvec);
-  std::sort(fvec.begin(), fvec.end());
-  typename std::vector<PFace>::iterator newEnd = std::unique(fvec.begin(), fvec.end());
-}
-
-/// \brief Auxiliairy data structure for computing face face adjacency information.
-/**
-It identifies and edge storing two vertex pointer and a face pointer where it belong.
-*/
-class PEdge
-{
-public:
-
-  VertexPointer  v[2];  // the two Vertex pointer are ordered!
-  FacePointer    f;     // the face where this edge belong
-  int            z;     // index in [0..2] of the edge of the face
-  bool isBorder;
-
-  PEdge() {}
-  PEdge(FacePointer  pf, const int nz) { this->Set(pf,nz); }
-  void Set( FacePointer  pf, const int nz )
+  static void FillUniqueFaceVector(MeshType& m, std::vector<PFace>& fvec)
   {
-    assert(pf!=0);
-    assert(nz>=0);
-    assert(nz<pf->VN());
-
-    v[0] = pf->V(nz);
-    v[1] = pf->V(pf->Next(nz));
-    assert(v[0] != v[1]); // The face pointed by 'f' is Degenerate (two coincident vertexes)
-
-    if( v[0] > v[1] ) std::swap(v[0],v[1]);
-    f    = pf;
-    z    = nz;
+    FillFaceVector(m, fvec);
+    std::sort(fvec.begin(), fvec.end());
+    typename std::vector<PFace>::iterator newEnd = std::unique(fvec.begin(), fvec.end());
   }
 
-  inline bool operator <  ( const PEdge & pe ) const
+  /// \brief Auxiliairy data structure for computing face face adjacency information.
+  /**
+  It identifies and edge storing two vertex pointer and a face pointer where it belong.
+  */
+  class PEdge
   {
-    if( v[0]<pe.v[0] ) return true;
-    else if( v[0]>pe.v[0] ) return false;
-    else return v[1] < pe.v[1];
-  }
+  public:
 
-  inline bool operator == ( const PEdge & pe ) const
+    VertexPointer  v[2];  // the two Vertex pointer are ordered!
+    FacePointer    f;     // the face where this edge belong
+    int            z;     // index in [0..2] of the edge of the face
+    bool isBorder;
+
+    PEdge() {}
+    PEdge(FacePointer  pf, const int nz) { this->Set(pf, nz); }
+    void Set(FacePointer  pf, const int nz)
+    {
+      assert(pf != 0);
+      assert(nz >= 0);
+      assert(nz < pf->VN());
+
+      v[0] = pf->V(nz);
+      v[1] = pf->V(pf->Next(nz));
+      assert(v[0] != v[1]); // The face pointed by 'f' is Degenerate (two coincident vertexes)
+
+      if (v[0] > v[1]) std::swap(v[0], v[1]);
+      f = pf;
+      z = nz;
+    }
+
+    inline bool operator <  (const PEdge& pe) const noexcept
+    {
+      if (v[0] < pe.v[0]) return true;
+      else if (v[0] > pe.v[0]) return false;
+      else return v[1] < pe.v[1];
+    }
+
+    inline bool operator == (const PEdge& pe) const noexcept
+    {
+      return v[0] == pe.v[0] && v[1] == pe.v[1];
+    }
+    /// Convert from edge barycentric coord to the face baricentric coord a point on the current edge.
+    /// Face barycentric coordinates are relative to the edge face.
+    inline Point3<ScalarType> EdgeBarycentricToFaceBarycentric(ScalarType u) const
+    {
+      Point3<ScalarType> interp(0, 0, 0);
+      interp[this->z] = u;
+      interp[(this->z + 1) % 3] = 1.0f - u;
+      return interp;
+    }
+  };
+
+  class PEdge2
   {
-    return v[0]==pe.v[0] && v[1]==pe.v[1];
-  }
-  /// Convert from edge barycentric coord to the face baricentric coord a point on the current edge.
-  /// Face barycentric coordinates are relative to the edge face.
-  inline Point3<ScalarType> EdgeBarycentricToFaceBarycentric(ScalarType u) const
-  {
-    Point3<ScalarType> interp(0,0,0);
-    interp[ this->z     ] = u;
-    interp[(this->z+1)%3] = 1.0f-u;
-    return interp;
-  }
-};
+  public:
+
+    uint64_t key;     // (uint64_t(v0) << 32) | v1
+    FacePointer    f;     // the face where this edge belong
+    int            z;     // index in [0..2] of the edge of the face
+    bool isBorder;
+
+    __forceinline bool operator <  (const PEdge2& pe) const noexcept
+    {
+      return key < pe.key;
+    }
+
+    __forceinline bool operator == (const PEdge2& pe) const noexcept
+    {
+      return key == pe.key;
+    }
+    /// Convert from edge barycentric coord to the face baricentric coord a point on the current edge.
+    /// Face barycentric coordinates are relative to the edge face.
+    inline Point3<ScalarType> EdgeBarycentricToFaceBarycentric(ScalarType u) const
+    {
+      Point3<ScalarType> interp(0, 0, 0);
+      interp[this->z] = u;
+      interp[(this->z + 1) % 3] = 1.0f - u;
+      return interp;
+    }
+  };
 
 #ifdef FAST_FILLEDGEVECTOR
-/// Fill a vector with all the edges of the mesh.
-/// each edge is stored in the vector the number of times that it appears in the mesh, with the referring face.
-/// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
-template<bool IncludeFaux>
-static __forceinline void FillEdgeVectorImpl(MeshType& m, std::vector<PEdge>& edgeVec)
-{
-  struct alignas(64) CountSlot { size_t n; };
-
-  edgeVec.clear();
-  const int64_t faceCount = (int64_t)m.face.size();
-
-  std::vector<CountSlot> counts;   // sized inside the parallel region
-  std::vector<size_t> offsets;     // sized inside the parallel region
-
-#pragma omp parallel
+  /// Fill a vector with all the edges of the mesh.
+  /// each edge is stored in the vector the number of times that it appears in the mesh, with the referring face.
+  /// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
+  static constexpr int edgeNext[] = { 1, 2, 0 };
+  static void FillEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec)
   {
-    const int tid = omp_get_thread_num();
+    const int64_t faceCount = (int64_t)m.face.size();
+    const int T = omp_get_max_threads();
 
-#pragma omp single
+    size_t aliveCount;
+    if (m.hasDeletedFaces)
     {
-      const int T = omp_get_num_threads();
-      counts.resize(T);
-      offsets.assign(T + 1, 0);
+      // Step 1: compact
+      auto firstDeleted = std::partition(m.face.begin(), m.face.begin() + faceCount,
+        [](auto& f) { return !f.IsD(); });
+      aliveCount = std::distance(m.face.begin(), firstDeleted);
     }
-
-    // pass 1: count (no contention; each thread writes its own slot)
-    size_t local = 0;
-
-#pragma omp for schedule(static) nowait
-    for (int64_t i = 0; i < faceCount; ++i) {
-      auto& f = m.face[i];
-      if (f.IsD()) continue;
-
-      const int vn = f.VN();
-      if constexpr (IncludeFaux) {
-        local += (size_t)vn;
-      } else {
-        for (int j = 0; j < vn; ++j) {
-          if (!f.IsF(j)) ++local;
-        }
-      }
-    }
-
-    counts[tid].n = local;
-
-#pragma omp barrier
-
-    // one thread computes offsets and resizes output once
-#pragma omp single
+    else
     {
-      for (size_t t = 0; t + 1 < offsets.size(); ++t) {
-        offsets[t + 1] = offsets[t] + counts[t].n;
-      }
-      edgeVec.resize(offsets.back()); // fill will write every slot
+      aliveCount = faceCount;
     }
 
-    // pass 2: fill directly into your slice
-    PEdge* out = edgeVec.data() + offsets[tid];
-    size_t pos = 0;
+    // Step 2: reserve edges (upper bound is 3 per face)
+    edgeVec.resize(aliveCount * 3);
 
-#pragma omp for schedule(static)
-    for (int64_t i = 0; i < faceCount; ++i) {
+    // Step 3: parallel fill
+    auto* start = &m.vert[0];
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < (int64_t)aliveCount; ++i) {
       auto& f = m.face[i];
-      if (f.IsD()) continue;
-
-      const int vn = f.VN();
-
-      if (vn == 3) {
-        if constexpr (IncludeFaux) {
-          out[pos++] = PEdge(&f, 0);
-          out[pos++] = PEdge(&f, 1);
-          out[pos++] = PEdge(&f, 2);
-        } else {
-          if (!f.IsF(0)) out[pos++] = PEdge(&f, 0);
-          if (!f.IsF(1)) out[pos++] = PEdge(&f, 1);
-          if (!f.IsF(2)) out[pos++] = PEdge(&f, 2);
-        }
-      } else {
-        if constexpr (IncludeFaux) {
-          for (int j = 0; j < vn; ++j) out[pos++] = PEdge(&f, j);
-        } else {
-          for (int j = 0; j < vn; ++j) if (!f.IsF(j)) out[pos++] = PEdge(&f, j);
-        }
+      int vn = f.VN();
+      size_t base = i * 3; // each face reserves exactly 3 slots
+      size_t pos = 0;
+      for (int j = 0; j < vn; ++j) {
+        const int jNext = edgeNext[j];
+        PEdge2& e = edgeVec[base + pos++];
+        e.f = &f; e.z = (uint8_t)j;
+        size_t i0 = f.V(j) - start;
+        size_t i1 = f.V(jNext) - start;
+        if (i0 > i1) std::swap(i0, i1);
+        e.key = (uint64_t(i0) << 32) | uint32_t(i1);
       }
     }
   }
-}
-
-static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includeFauxEdge = true)
-{
-  if (includeFauxEdge) {
-    FillEdgeVectorImpl<true>(m, edgeVec);
-  } else {
-    FillEdgeVectorImpl<false>(m, edgeVec);
-  }
-}
 #else
 static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includeFauxEdge=true)
 {
@@ -307,23 +284,28 @@ static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includ
 }
 #endif
 
-static void FillUniqueEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec, bool includeFauxEdge=true, bool computeBorderFlag=false)
+static void FillUniqueEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec, bool includeFauxEdge = true, bool computeBorderFlag = false)
 {
-    FillEdgeVector(m,edgeVec,includeFauxEdge);
-    sort(std::execution::par_unseq,edgeVec.begin(),edgeVec.end()); // oredering by vertex
+  if (!includeFauxEdge)
+  {
+    throw std::runtime_error("Unsupported");
+  }
 
-    if (computeBorderFlag) {
-        for (size_t i=0; i<edgeVec.size(); i++)
-            edgeVec[ i ].isBorder = true;
-        for (size_t i=1; i<edgeVec.size(); i++) {
-            if (edgeVec[i]==edgeVec[i-1])
-                edgeVec[i].isBorder = edgeVec[i-1].isBorder = false;
-        }
+  FillEdgeVector(m, edgeVec);
+  tbb::parallel_sort(edgeVec.begin(), edgeVec.end()); // oredering by vertex
+
+  if (computeBorderFlag) {
+    for (size_t i = 0; i < edgeVec.size(); i++)
+      edgeVec[i].isBorder = true;
+    for (size_t i = 1; i < edgeVec.size(); i++) {
+      if (edgeVec[i] == edgeVec[i - 1])
+        edgeVec[i].isBorder = edgeVec[i - 1].isBorder = false;
     }
+  }
 
-    typename std::vector< PEdge>::iterator newEnd = std::unique(std::execution::par_unseq,edgeVec.begin(),edgeVec.end());
+  typename std::vector< PEdge2>::iterator newEnd = std::unique(std::execution::par_unseq, edgeVec.begin(), edgeVec.end());
 
-    edgeVec.resize(newEnd-edgeVec.begin()); // redundant! remove?
+  edgeVec.resize(newEnd - edgeVec.begin()); // redundant! remove?
 }
 
 static void FillSelectedFaceEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec)
@@ -354,7 +336,7 @@ static void AllocateEdge(MeshType &m)
   tri::Allocator<MeshType>::CompactEdgeVector(m);
 
   // Compute and add edges
-  std::vector<PEdge> Edges;
+  std::vector<PEdge2> Edges;
   FillUniqueEdgeVector(m,Edges,true,tri::HasPerEdgeFlags(m) );
   assert(m.edge.empty());
   tri::Allocator<MeshType>::AddEdges(m,Edges.size());
@@ -368,9 +350,11 @@ static void AllocateEdge(MeshType &m)
 #pragma omp parallel for // No conditional
     for (int64_t i = 0; i < cnt; ++i) {
       const auto& srcEdge = Edges[i];
+      auto srcV0 = srcEdge.key >> 32;
+      auto srcV1 = srcEdge.key & 0xFFFFFFFF;
 			auto& dstEdge = m.edge[i];
-      const auto v1 = srcEdge.v[0];
-      const auto v2 = srcEdge.v[1];
+      const auto v1 = &m.vert[srcV0];
+      const auto v2 = &m.vert[srcV1];
       dstEdge.V(0) = v1;
       dstEdge.V(1) = v2;
       if (hasPerEdgeFlags) {
@@ -503,46 +487,42 @@ static void ClearFaceFace(MeshType &m)
 }
 
 /// \brief Update the Face-Face topological relation by allowing to retrieve for each face what other faces shares their edges.
-static void FaceFace(MeshType &m)
+static void FaceFace(MeshType& m)
 {
   RequireFFAdjacency(m);
-  if( m.fn == 0 ) return;
+  if (m.fn == 0) return;
 
-  std::vector<PEdge> e;
-  FillEdgeVector(m,e);
-  tbb::parallel_sort(e.begin(), e.end());							// Lo ordino per vertici
+  std::vector<PEdge2> edges;
+  FillEdgeVector(m, edges);   // or <false>, depending on need
 
-  int ne = 0;											// Numero di edge reali
+  // Sort by canonical vertex pair
+  tbb::parallel_sort(edges.begin(), edges.end());
 
-  typename std::vector<PEdge>::iterator pe,ps;
-  ps = e.begin();pe=e.begin();
-  //for(ps = e.begin(),pe=e.begin();pe<=e.end();++pe)	// Scansione vettore ausiliario
-  do
+  // Find run boundaries
+  std::vector<size_t> runStarts;
+  runStarts.reserve(edges.size());
+  runStarts.push_back(0);
+  for (size_t i = 1; i < edges.size(); ++i)
   {
-    if( pe==e.end() || !(*pe == *ps) )					// Trovo blocco di edge uguali
+    if (!(edges[i] == edges[i - 1]))
+      runStarts.push_back(i);
+  }
+  runStarts.push_back(edges.size());
+
+  // Parallel wiring
+#pragma omp parallel for schedule(static, 10000)
+  for (ptrdiff_t r = 0; r < (ptrdiff_t)runStarts.size() - 1; ++r)
+  {
+    size_t i = runStarts[r];
+    size_t j = runStarts[r + 1];
+    for (size_t k = i; k < j; ++k)
     {
-      typename std::vector<PEdge>::iterator q,q_next;
-      for (q=ps;q<pe-1;++q)						// Scansione facce associate
-      {
-        assert((*q).z>=0);
-        //assert((*q).z< 3);
-        q_next = q;
-        ++q_next;
-        assert((*q_next).z>=0);
-        assert((*q_next).z< (*q_next).f->VN());
-        (*q).f->FFp(q->z) = (*q_next).f;				// Collegamento in lista delle facce
-        (*q).f->FFi(q->z) = (*q_next).z;
-      }
-      assert((*q).z>=0);
-      assert((*q).z< (*q).f->VN());
-      (*q).f->FFp((*q).z) = ps->f;
-      (*q).f->FFi((*q).z) = ps->z;
-      ps = pe;
-      ++ne;										// Aggiorno il numero di edge
+      auto& a = edges[k];
+      auto& b = edges[(k + 1 == j) ? i : k + 1]; // wrap
+      a.f->FFp(a.z) = b.f;
+      a.f->FFi(a.z) = b.z;
     }
-    if(pe==e.end()) break;
-    ++pe;
-  } while(true);
+  }
 }
 
 /// \brief Update the vertex-tetra topological relation.
@@ -581,7 +561,7 @@ static void VertexFace(MeshType &m)
   RequireVFAdjacency(m);
 
 #ifdef FAST_VERTEXFACE
-  const int64_t numVertices = (int64_t) std::distance(std::begin(m.vert), std::end(m.vert)); // Not m.vn
+  const int64_t numVertices = (int64_t)m.vert.size();
 #pragma omp parallel for
    for (int64_t i = 0; i < numVertices; ++i) {
       auto& vi = m.vert[i];
@@ -596,17 +576,38 @@ static void VertexFace(MeshType &m)
   }
 #endif
 
-  for(FaceIterator fi=m.face.begin(), fe = m.face.end();fi!=fe;++fi)
-    if( ! (*fi).IsD() )
-    {
-      for(int j=0, cnt = (*fi).VN();j<cnt;++j)
-      {
-        (*fi).VFp(j) = (*fi).V(j)->VFp();
-        (*fi).VFi(j) = (*fi).V(j)->VFi();
-        (*fi).V(j)->VFp() = &(*fi);
-        (*fi).V(j)->VFi() = j;
+  if (m.hasDeletedFaces)
+  {
+    for (auto fi = m.face.begin(), fe = m.face.end(); fi != fe; ++fi) {
+      auto& f = *fi;
+      if (f.IsD()) continue;
+
+      const int cnt = f.VN();
+      for (int j = 0; j < cnt; ++j) {
+        auto v = f.V(j);   // pointer to vertex
+
+        f.VFp(j) = v->VFp();
+        f.VFi(j) = v->VFi();
+        v->VFp() = &f;
+        v->VFi() = j;
       }
     }
+  }
+  else
+  {
+    for (auto fi = m.face.begin(), fe = m.face.end(); fi != fe; ++fi) {
+      auto& f = *fi;
+      const int cnt = f.VN();
+      for (int j = 0; j < cnt; ++j) {
+        auto v = f.V(j);   // pointer to vertex
+
+        f.VFp(j) = v->VFp();
+        f.VFi(j) = v->VFi();
+        v->VFp() = &f;
+        v->VFi() = j;
+      }
+    }
+  }
 }
 
 

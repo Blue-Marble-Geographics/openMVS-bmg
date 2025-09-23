@@ -237,29 +237,57 @@ public:
 
         const int BORDERFLAG[3]={FaceType::BORDER0, FaceType::BORDER1, FaceType::BORDER2};
 
-        for(VertexIterator vi=m.vert.begin();vi!=m.vert.end();++vi)
-            if(!(*vi).IsD())
+        if (m.hasDeletedFaces)
+        {
+          for (VertexIterator vi = m.vert.begin(); vi != m.vert.end(); ++vi)
+            if (!(*vi).IsD())
             {
-                for(face::VFIterator<FaceType> vfi(&*vi) ; !vfi.End(); ++vfi )
-                {
-                    vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
-                    vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
-                }
-                for(face::VFIterator<FaceType> vfi(&*vi) ; !vfi.End(); ++vfi )
-                {
-                    if(vfi.f->V1(vfi.z)->IsUserBit(visitedBit))  vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
-                    else vfi.f->V1(vfi.z)->SetUserBit(visitedBit);
-                    if(vfi.f->V2(vfi.z)->IsUserBit(visitedBit))  vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
-                    else vfi.f->V2(vfi.z)->SetUserBit(visitedBit);
-                }
-                for(face::VFIterator<FaceType> vfi(&*vi) ; !vfi.End(); ++vfi )
-                {
-                    if(vfi.f->V(vfi.z)< vfi.f->V1(vfi.z)  &&  vfi.f->V1(vfi.z)->IsUserBit(visitedBit))
-                        vfi.f->Flags() |= BORDERFLAG[vfi.z];
-                    if(vfi.f->V(vfi.z)< vfi.f->V2(vfi.z)  &&  vfi.f->V2(vfi.z)->IsUserBit(visitedBit))
-                        vfi.f->Flags() |= BORDERFLAG[(vfi.z+2)%3];
-                }
+              for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+              {
+                vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
+                vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
+              }
+              for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+              {
+                if (vfi.f->V1(vfi.z)->IsUserBit(visitedBit))  vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
+                else vfi.f->V1(vfi.z)->SetUserBit(visitedBit);
+                if (vfi.f->V2(vfi.z)->IsUserBit(visitedBit))  vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
+                else vfi.f->V2(vfi.z)->SetUserBit(visitedBit);
+              }
+              for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+              {
+                if (vfi.f->V(vfi.z) < vfi.f->V1(vfi.z) && vfi.f->V1(vfi.z)->IsUserBit(visitedBit))
+                  vfi.f->Flags() |= BORDERFLAG[vfi.z];
+                if (vfi.f->V(vfi.z) < vfi.f->V2(vfi.z) && vfi.f->V2(vfi.z)->IsUserBit(visitedBit))
+                  vfi.f->Flags() |= BORDERFLAG[(vfi.z + 2) % 3];
+              }
             }
+        }
+        else
+        {
+          for (VertexIterator vi = m.vert.begin(); vi != m.vert.end(); ++vi)
+          {
+            for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+            {
+              vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
+              vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
+            }
+            for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+            {
+              if (vfi.f->V1(vfi.z)->IsUserBit(visitedBit))  vfi.f->V1(vfi.z)->ClearUserBit(visitedBit);
+              else vfi.f->V1(vfi.z)->SetUserBit(visitedBit);
+              if (vfi.f->V2(vfi.z)->IsUserBit(visitedBit))  vfi.f->V2(vfi.z)->ClearUserBit(visitedBit);
+              else vfi.f->V2(vfi.z)->SetUserBit(visitedBit);
+            }
+            for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
+            {
+              if (vfi.f->V(vfi.z) < vfi.f->V1(vfi.z) && vfi.f->V1(vfi.z)->IsUserBit(visitedBit))
+                vfi.f->Flags() |= BORDERFLAG[vfi.z];
+              if (vfi.f->V(vfi.z) < vfi.f->V2(vfi.z) && vfi.f->V2(vfi.z)->IsUserBit(visitedBit))
+                vfi.f->Flags() |= BORDERFLAG[(vfi.z + 2) % 3];
+            }
+          }
+        }
         VertexType::DeleteBitFlag(visitedBit);
     }
 

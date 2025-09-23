@@ -610,52 +610,98 @@ template<class EAR>
       return holeCnt;
     }
 
-    static void GetInfo(MESH &m, bool Selected ,std::vector<Info >& VHI)
+    static void GetInfo(MESH& m, bool Selected, std::vector<Info >& VHI)
+    {
+      UnMarkAll(m);
+      const int mark = m.imark;
+      if (m.hasDeletedFaces)
+      {
+        for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
         {
-      tri::UpdateFlags<MESH>::FaceClearV(m);
-            for(FaceIterator fi = m.face.begin(); fi!=m.face.end(); ++fi)
+          if (!(*fi).IsD())
+          {
+            if (Selected && !(*fi).IsS())
             {
-                if(!(*fi).IsD())
-                {
-                    if(Selected && !(*fi).IsS())
-                    {
-                        //se devo considerare solo i triangoli selezionati e
-                        //quello che sto considerando non lo e' lo marchio e vado avanti
-                      (*fi).SetV();
-                    }
-                    else
-                    {
-                            for(int j =0; j<3 ; ++j)
-                            {
-                              if( face::IsBorder(*fi,j) && !(*fi).IsV() )
-                                {//Trovato una faccia di bordo non ancora visitata.
-                                    (*fi).SetV();
-                                PosType sp(&*fi, j, (*fi).V(j));
-                                    PosType fp=sp;
-                                    int holesize=0;
+              //se devo considerare solo i triangoli selezionati e
+              //quello che sto considerando non lo e' lo marchio e vado avanti
+              fi->IMark() = mark;
+            }
+            else
+            {
+              for (int j = 0; j < 3; ++j)
+              {
+                if (face::IsBorder(*fi, j) && (fi->IMark() != mark))
+                {//Trovato una faccia di bordo non ancora visitata.
+                  fi->IMark() = mark;
+                  PosType sp(&*fi, j, (*fi).V(j));
+                  PosType fp = sp;
+                  int holesize = 0;
 
-                                    Box3Type hbox;
-                                    hbox.Add(sp.v->cP());
+                  Box3Type hbox;
+                  hbox.Add(sp.v->cP());
                   //printf("Looping %i : (face %i edge %i) \n", VHI.size(),sp.f-&*m.face.begin(),sp.z);
-                                    sp.f->SetV();
-                                    do
-                                    {
-                                        sp.f->SetV();
-                                        hbox.Add(sp.v->cP());
-                                        ++holesize;
-                                        sp.NextB();
-                                        sp.f->SetV();
-                                        assert(sp.IsBorder());
-                                    }while(sp != fp);
+                  sp.f->IMark() = mark;
+                  do
+                  {
+                    sp.f->IMark() = mark;
+                    hbox.Add(sp.v->cP());
+                    ++holesize;
+                    sp.NextB();
+                    sp.f->IMark() = mark;
+                    assert(sp.IsBorder());
+                  } while (sp != fp);
 
-                                    //ho recuperato l'inofrmazione su tutto il buco
-                                    VHI.push_back( Info(sp,holesize,hbox) );
-                                }
-                            }//for sugli edge del triangolo
-                    }//S & !S
-                }//!IsD()
-            }//for principale!!!
-        }
+                  //ho recuperato l'inofrmazione su tutto il buco
+                  VHI.push_back(Info(sp, holesize, hbox));
+                }
+              }//for sugli edge del triangolo
+            }//S & !S
+          }//!IsD()
+        }//for principale!!!
+      }
+      else
+      {
+        for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+        {
+          if (Selected && !(*fi).IsS())
+          {
+            //se devo considerare solo i triangoli selezionati e
+            //quello che sto considerando non lo e' lo marchio e vado avanti
+            fi->IMark() = mark;
+          }
+          else
+          {
+            for (int j = 0; j < 3; ++j)
+            {
+              if (face::IsBorder(*fi, j) && (fi->IMark() != mark))
+              {//Trovato una faccia di bordo non ancora visitata.
+                fi->IMark() = mark;
+                PosType sp(&*fi, j, (*fi).V(j));
+                PosType fp = sp;
+                int holesize = 0;
+
+                Box3Type hbox;
+                hbox.Add(sp.v->cP());
+                //printf("Looping %i : (face %i edge %i) \n", VHI.size(),sp.f-&*m.face.begin(),sp.z);
+                sp.f->IMark() = mark;
+                do
+                {
+                  sp.f->IMark() = mark;
+                  hbox.Add(sp.v->cP());
+                  ++holesize;
+                  sp.NextB();
+                  sp.f->IMark() = mark;
+                  assert(sp.IsBorder());
+                } while (sp != fp);
+
+                //ho recuperato l'inofrmazione su tutto il buco
+                VHI.push_back(Info(sp, holesize, hbox));
+              }
+            }//for sugli edge del triangolo
+          }//S & !S
+        }//for principale!!!
+      }
+    }
 
         //Minimum Weight Algorithm
         class Weight

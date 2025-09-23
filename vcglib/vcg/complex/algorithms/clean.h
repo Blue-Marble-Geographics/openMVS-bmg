@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 6;
+	constexpr int version = 7;
 
 	return version;
 }
@@ -203,11 +203,15 @@ public:
 	typedef GridStaticPtr<FaceType, ScalarType > TriMeshGrid;
 
 	/* classe di confronto per l'algoritmo di eliminazione vertici duplicati*/
-	class RemoveDuplicateVert_Compare{
-	public:
-		inline bool operator()(VertexPointer const &a, VertexPointer const &b) const
-		{
-			return ((*a).cP() == (*b).cP()) ? (a<b): ((*a).cP() < (*b).cP());
+	struct RemoveDuplicateVert_Compare {
+		bool operator()(VertexPointer const& a, VertexPointer const& b) const noexcept {
+			const auto& pa = a->cP();
+			const auto& pb = b->cP();
+
+			if (pa[0] != pb[0]) return pa[0] < pb[0];
+			if (pa[1] != pb[1]) return pa[1] < pb[1];
+			if (pa[2] != pb[2]) return pa[2] < pb[2];
+			return a < b;
 		}
 	};
 
@@ -232,7 +236,7 @@ public:
 
 		RemoveDuplicateVert_Compare c_obj;
 
-		std::sort(perm.begin(), perm.end(), c_obj);
+		tbb::parallel_sort(perm.begin(), perm.end(), c_obj);
 
 		j = 0;
 		i = j;
@@ -257,13 +261,25 @@ public:
 			}
 		}
 
-		for(FaceIterator fi = m.face.begin(); fi!=m.face.end(); ++fi)
-			if( !(*fi).IsD() )
-				for(k = 0; k < (*fi).VN(); ++k)
-					if( mp.find( (typename MeshType::VertexPointer)(*fi).V(k) ) != mp.end() )
+		if (m.hasDeletedFaces)
+		{
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+				if (!(*fi).IsD())
+					for (k = 0; k < (*fi).VN(); ++k)
+						if (mp.find((typename MeshType::VertexPointer)(*fi).V(k)) != mp.end())
+						{
+							(*fi).V(k) = &*mp[(*fi).V(k)];
+						}
+		}
+		else
+		{
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+				for (k = 0; k < (*fi).VN(); ++k)
+					if (mp.find((typename MeshType::VertexPointer)(*fi).V(k)) != mp.end())
 					{
-						(*fi).V(k) = &*mp[ (*fi).V(k) ];
+						(*fi).V(k) = &*mp[(*fi).V(k)];
 					}
+		}
 
 
 		for(EdgeIterator ei = m.edge.begin(); ei!=m.edge.end(); ++ei)
@@ -318,9 +334,12 @@ public:
 		SortedTriple() {}
 		SortedTriple(unsigned int v0, unsigned int v1, unsigned int v2,FacePointer _fp)
 		{
+			if (v0 > v1) std::swap(v0, v1);
+			if (v1 > v2) std::swap(v1, v2);
+			if (v0 > v1) std::swap(v0, v1);
+
 			v[0]=v0;v[1]=v1;v[2]=v2;
 			fp=_fp;
-			std::sort(v,v+3);
 		}
 		bool operator < (const SortedTriple &p) const
 		{
@@ -343,47 +362,68 @@ public:
 	  Note that it does not update any topology relation that could be affected by this like the VT or TT relation.
 	  the reason this function is usually performed BEFORE building any topology information.
 	 */
-	static int RemoveDuplicateFace( MeshType & m)    // V1.0
+	static int RemoveDuplicateFace(MeshType& m)    // V1.0
 	{
 #ifdef FAST_REMOVEDUPFACE
 		std::vector<SortedTriple> fvec;
-
 		fvec.resize(m.fn);
 
-		const int64_t numFaces = m.fn;
-#pragma omp parallel for schedule(static)
-		for (int i = 0; i < numFaces; ++i) {
-			FaceType &f = m.face[i];
-			if (f.IsD()) {
-				fvec[i].fp = nullptr;  // mark invalid
-			} else {
+		const int64_t numFaces = m.face.size();
+		const auto start = m.vert.begin();
+		if (m.hasDeletedFaces)
+		{
+#pragma omp parallel for
+			for (int i = 0; i < numFaces; ++i)
+			{
+				FaceType& f = m.face[i];
+				if (f.IsD())
+				{
+					fvec[i].fp = nullptr;  // mark invalid
+				}
+				else
+				{
+					fvec[i] = SortedTriple(
+						f.V(0) - &*start,
+						f.V(1) - &*start,
+						f.V(2) - &*start,
+						&f
+					);
+				}
+			}
+
+			fvec.erase(
+				std::remove_if(
+					fvec.begin(),
+					fvec.end(),
+					[](const SortedTriple& s) { return s.fp == nullptr; }
+				),
+				fvec.end()
+			);
+		}
+		else
+		{
+#pragma omp parallel for
+			for (int i = 0; i < numFaces; ++i)
+			{
+				FaceType& f = m.face[i];
 				fvec[i] = SortedTriple(
-					tri::Index(m, f.V(0)),
-					tri::Index(m, f.V(1)),
-					tri::Index(m, f.V(2)),
+					f.V(0) - &*start,
+					f.V(1) - &*start,
+					f.V(2) - &*start,
 					&f
 				);
 			}
 		}
 
-		fvec.erase(
-			std::remove_if(
-				fvec.begin(),
-				fvec.end(),
-				[](const SortedTriple& s) { return s.fp == nullptr; }
-			),
-			fvec.end()
-		);
-
+		// sort and dedup
 		tbb::parallel_sort(fvec.begin(), fvec.end());
 
-		// Step 4: Detect duplicates and delete faces (serialized deletion)
-		int total = 0;
 		const int64_t cnt = (int64_t)fvec.size();
-#pragma omp parallel for reduction(+:total)
-		for (int64_t i = 0; i < cnt - 1; ++i) {
-			if (fvec[i] == fvec[i + 1]) {
-#pragma omp critical
+		int total = 0;
+		for (int64_t i = 1; i < cnt; ++i)
+		{
+			if (fvec[i] == fvec[i - 1])
+			{
 				tri::Allocator<MeshType>::DeleteFace(m, *(fvec[i].fp));
 				++total;
 			}
@@ -460,42 +500,55 @@ public:
 		tri::RequirePerVertexFlags(m);
 
 		const int64_t nVerts = m.vert.size(); // Not m.vn
-		std::vector<std::atomic_bool> referredVec(nVerts);  // atomic for thread-safe writes
+		std::vector<uint8_t> referredVec(nVerts, 0);
 
-		const int64_t numFaces = (int64_t) std::distance(std::begin(m.face), std::end(m.face)); // Not m.fn
-		// memory_order_relaxed lets us write safely to the flags, but only because none of the
-		// other threads read this data.
+		const int64_t numFaces = (int64_t) m.face.size(); // Not m.fn
+		const auto start = m.vert.begin();
+
+		if (m.hasDeletedFaces)
+		{
+			// the stores are technically UB, but for our purposes it isn't a race.
 #pragma omp parallel for schedule(static)
-		for (int i = 0; i < numFaces; ++i) {
-			const FaceType &f = m.face[i];
-			if (f.IsD()) continue;
-			for (int j = 0; j < f.VN(); ++j)
-				referredVec[tri::Index(m, f.V(j))].store(true, std::memory_order_relaxed);
+			for (int i = 0; i < numFaces; ++i) {
+				const FaceType& f = m.face[i];
+				if (f.IsD()) continue;
+				for (int j = 0; j < f.VN(); ++j)
+					referredVec[f.V(j) - &*start] = 1;
+			}
+		}
+		else
+		{
+#pragma omp parallel for schedule(static)
+			for (int i = 0; i < numFaces; ++i) {
+				const FaceType& f = m.face[i];
+				for (int j = 0; j < f.VN(); ++j)
+					referredVec[f.V(j) - &*start] = 1;
+			}
 		}
 
-		const int64_t numEdges = std::distance(std::begin(m.edge), std::end(m.edge)); // Not m.en
+		const int64_t numEdges = m.edge.size(); // Not m.en
 #pragma omp parallel for schedule(static)
 		for (int i = 0; i < numEdges; ++i) {
 			const auto &e = m.edge[i];
 			if (e.IsD()) continue;
-			referredVec[tri::Index(m, e.V(0))].store(true, std::memory_order_relaxed);
-			referredVec[tri::Index(m, e.V(1))].store(true, std::memory_order_relaxed);
+			referredVec[tri::Index(m, e.V(0))] = 1;
+			referredVec[tri::Index(m, e.V(1))] = 1;
 		}
 
 		// Unused
 		for(auto ti=m.tetra.begin(); ti!=m.tetra.end();++ti)
 			if( !(*ti).IsD() ){
-				referredVec[tri::Index(m, (*ti).V(0))]=true;
-				referredVec[tri::Index(m, (*ti).V(1))]=true;
-				referredVec[tri::Index(m, (*ti).V(2))]=true;
-				referredVec[tri::Index(m, (*ti).V(3))]=true;
+				referredVec[tri::Index(m, (*ti).V(0))] = 1;
+				referredVec[tri::Index(m, (*ti).V(1))] = 1;
+				referredVec[tri::Index(m, (*ti).V(2))] = 1;
+				referredVec[tri::Index(m, (*ti).V(3))] = 1;
 			}
 
 		if (!DeleteVertexFlag) {
 			size_t count = 0;
 #pragma omp parallel for reduction(+:count)
 			for (int i = 0; i < nVerts; ++i) {
-				if (!referredVec[i].load(std::memory_order_relaxed)) ++count;
+				if (!referredVec[i]) ++count;
 			}
 			return static_cast<int>(count);
 		}
@@ -504,8 +557,8 @@ public:
 #pragma omp parallel for reduction(+:deleted)
 		for (int64_t i = 0; i < nVerts; ++i) {
 			VertexType &v = m.vert[i];
-			if (!v.IsD() && !referredVec[tri::Index(m, v)].load(std::memory_order_relaxed)) {
-				#pragma omp critical
+			if (!v.IsD() && !referredVec[tri::Index(m, v)]) {
+#pragma omp critical
 				{
 					Allocator<MeshType>::DeleteVertex(m, v); // Decrements m.vn
 				}
@@ -561,39 +614,82 @@ public:
 	{
 #ifdef FAST_REMOVEDEGVERTEX
 		int64_t count_vd = 0;
-		const int64_t numVerts = m.vn;
-#pragma omp parallel for reduction(+:count_vd)
-		for (int64_t i = 0; i < numVerts; ++i) {
-			VertexType &v = m.vert[i];
-			if (v.IsD()) continue;
-
-			const auto &p = v.P();
-			if (math::IsNAN(p[0]) || math::IsNAN(p[1]) || math::IsNAN(p[2])) {
-				#pragma omp critical
-				{
-					Allocator<MeshType>::DeleteVertex(m, v);
-				}
-				++count_vd;
-			}
-		}
-
 		int64_t count_fd = 0;
-		const int64_t numFaces = m.fn;
-#pragma omp parallel for reduction(+:count_fd)
-		for (int64_t i = 0; i < numFaces; ++i) {
-			FaceType &f = m.face[i];
-			if (f.IsD()) continue;
+		const int64_t numVerts = (int64_t) m.vert.size();
+		const int64_t numFaces = (int64_t) m.face.size();
 
-			if (f.V(0)->IsD() || f.V(1)->IsD() || f.V(2)->IsD()) {
-				#pragma omp critical
+		if (m.hasDeletedFaces)
+		{
+#pragma omp parallel for reduction(+:count_vd)
+			for (int64_t i = 0; i < numVerts; ++i)
+			{
+				VertexType& v = m.vert[i];
+				if (v.IsD()) continue;
+
+				const auto& p = v.P();
+				if (math::IsNAN(p[0]) || math::IsNAN(p[1]) || math::IsNAN(p[2]))
 				{
-					Allocator<MeshType>::DeleteFace(m, f);
+#pragma omp critical
+					{
+						Allocator<MeshType>::DeleteVertex(m, v);
+					}
+					++count_vd;
 				}
-				++count_fd;
+			}
+
+#pragma omp parallel for reduction(+:count_fd)
+			for (int64_t i = 0; i < numFaces; ++i)
+			{
+				FaceType& f = m.face[i];
+				if (f.IsD()) continue;
+
+				if (f.V(0)->IsD() || f.V(1)->IsD() || f.V(2)->IsD())
+				{
+#pragma omp critical
+					{
+						Allocator<MeshType>::DeleteFace(m, f);
+					}
+					++count_fd;
+				}
+			}
+		}
+		else
+		{
+#pragma omp parallel for reduction(+:count_vd)
+			for (int64_t i = 0; i < numVerts; ++i)
+			{
+				VertexType& v = m.vert[i];
+				const auto& p = v.cP();
+				const __m128 vNaNTest = _mm_set_ps(0.0f, p[2], p[1], p[0]);
+				const __m128 vCmp = _mm_cmpunord_ps(vNaNTest, vNaNTest);   // NaN -> all bits 1
+				if (_mm_movemask_ps(vCmp) != 0)
+				//if (math::IsNAN(p[0]) || math::IsNAN(p[1]) || math::IsNAN(p[2]))
+				{
+#pragma omp critical
+					{
+						Allocator<MeshType>::DeleteVertex(m, v);
+					}
+					++count_vd;
+				}
+			}
+
+			const int64_t numFaces = m.fn;
+#pragma omp parallel for reduction(+:count_fd)
+			for (int64_t i = 0; i < numFaces; ++i)
+			{
+				FaceType& f = m.face[i];
+				if (f.V(0)->IsD() || f.V(1)->IsD() || f.V(2)->IsD())
+				{
+#pragma omp critical
+					{
+						Allocator<MeshType>::DeleteFace(m, f);
+					}
+					++count_fd;
+				}
 			}
 		}
 
-		return (int) count_vd;
+		return (int)count_vd;
 #else
 		VertexIterator vi;
 		int count_vd = 0;
@@ -635,17 +731,32 @@ public:
 	{
 		int count_fd = 0;
 
-		for(FaceIterator fi=m.face.begin(); fi!=m.face.end();++fi)
-			if(!(*fi).IsD())
-			{
-				if((*fi).V(0) == (*fi).V(1) ||
-				   (*fi).V(0) == (*fi).V(2) ||
-				   (*fi).V(1) == (*fi).V(2) )
+		if (m.hasDeletedFaces)
+		{
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+				if (!(*fi).IsD())
+				{
+					if ((*fi).V(0) == (*fi).V(1) ||
+						(*fi).V(0) == (*fi).V(2) ||
+						(*fi).V(1) == (*fi).V(2))
+					{
+						count_fd++;
+						Allocator<MeshType>::DeleteFace(m, *fi);
+					}
+				}
+		}
+		else
+		{
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+				if ((*fi).V(0) == (*fi).V(1) ||
+					(*fi).V(0) == (*fi).V(2) ||
+					(*fi).V(1) == (*fi).V(2))
 				{
 					count_fd++;
-					Allocator<MeshType>::DeleteFace(m,*fi);
+					Allocator<MeshType>::DeleteFace(m, *fi);
 				}
-			}
+		}
+
 		return count_fd;
 	}
 
@@ -670,9 +781,13 @@ public:
 		CountNonManifoldVertexFF(m,true);
 		tri::UpdateSelection<MeshType>::FaceFromVertexLoose(m);
 		int count_removed = 0;
-		for(FaceIterator fi=m.face.begin(); fi!=m.face.end();++fi)
-			if(!(*fi).IsD() && (*fi).IsS())
-				Allocator<MeshType>::DeleteFace(m,*fi);
+		for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+		{
+			if (!(*fi).IsD() && (*fi).IsS())
+			{
+				Allocator<MeshType>::DeleteFace(m, *fi);
+			}
+		}
 		for(VertexIterator vi=m.vert.begin(); vi!=m.vert.end();++vi)
 			if(!(*vi).IsD() && (*vi).IsS()) {
 				++count_removed;
@@ -782,15 +897,16 @@ public:
 		SelectionStack<MeshType> ss(m);
 		ss.push();
 		CountNonManifoldVertexFF(m,true);
-		UpdateFlags<MeshType>::VertexClearV(m);
+		UnMarkAll(m);
+		const int mark = m.imark;
 		std::set<FaceInt> faceSet;
 		for (FaceIterator fi = m.face.begin(),fe=m.face.end(); fi != fe; ++fi)
 			if (!fi->IsD())
 			{
 				for (int i = 0, cnt = fi->VN(); i < cnt; i++)
-					if ((*fi).V(i)->IsS() && !(*fi).V(i)->IsV())
+					if ((*fi).V(i)->IsS() && ((*fi).V(i)->IMark() != mark))
 					{
-						(*fi).V(i)->SetV();
+						(*fi).V(i)->IMark() = mark;
 						face::Pos<FaceType> startPos(&*fi, i);
 						face::Pos<FaceType> curPos = startPos;
 						faceSet.clear();
@@ -931,18 +1047,38 @@ public:
 		int count_fd = 0;
 		std::vector<FacePointer> ToDelVec;
 
-		int64_t cnt = (int64_t)std::distance(std::begin(m.face), std::end(m.face));
+		int64_t cnt = (int64_t)m.face.size();
 		ToDelVec.resize(cnt);
 
 		std::atomic<int64_t> awcnt = 0;
 
+		if (m.hasDeletedFaces)
+		{
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-			FaceType& fi = m.face[i];
-			if (!fi.IsD()) {
-				if ((!IsManifold(fi, 0))||
-					(!IsManifold(fi, 1))||
-					(!IsManifold(fi, 2))) {
+			for (int64_t i = 0; i < cnt; ++i)
+			{
+				FaceType& fi = m.face[i];
+				if (!fi.IsD())
+				{
+					if ((!IsManifold(fi, 0)) ||
+						(!IsManifold(fi, 1)) ||
+						(!IsManifold(fi, 2)))
+					{
+						ToDelVec[awcnt++] = &fi;
+					}
+				}
+			}
+		}
+		else
+		{
+#pragma omp parallel for
+			for (int64_t i = 0; i < cnt; ++i)
+			{
+				FaceType& fi = m.face[i];
+				if ((!IsManifold(fi, 0)) ||
+					(!IsManifold(fi, 1)) ||
+					(!IsManifold(fi, 2)))
+				{
 					ToDelVec[awcnt++] = &fi;
 				}
 			}
@@ -971,31 +1107,84 @@ public:
 				}
 			}
 		}
+
 		return count_fd;
 	}
 
 	/* Remove the faces that are out of a given range of area  */
 	static int RemoveFaceOutOfRangeArea(MeshType& m, ScalarType MinAreaThr=0, ScalarType MaxAreaThr=(std::numeric_limits<ScalarType>::max)(), bool OnlyOnSelected=false)
 	{
-		int count_fd = 0;
-		MinAreaThr*=2;
-		MaxAreaThr*=2;
-		for(FaceIterator fi=m.face.begin(); fi!=m.face.end();++fi){
-			if(!(*fi).IsD())
-				if(!OnlyOnSelected || (*fi).IsS())
-				{
-					const ScalarType doubleArea=DoubleArea<FaceType>(*fi);
-					if((doubleArea<=MinAreaThr) || (doubleArea>=MaxAreaThr) )
-					{
-						Allocator<MeshType>::DeleteFace(m,*fi); // JPB WIP BUG Check dealloc
-						count_fd++;
+		ScalarType MinAreaThrSq = MinAreaThr * MinAreaThr;
+		ScalarType MaxAreaThrSq = ( MaxAreaThr == (std::numeric_limits<ScalarType>::max)() ) ? (std::numeric_limits<ScalarType>::max)() : ( MaxAreaThr * MaxAreaThr );
+
+		const int64_t cnt = (int64_t)m.face.size();
+		std::vector<int64_t> facesToDelete; // Final list
+		//const ScalarType doubleArea = DoubleArea<FaceType>(*fi);
+
+		// This block creates a private list for each thread
+#pragma omp parallel
+		{
+			std::vector<int64_t> threadLocalDeletes; // Each thread gets its own list
+
+			// This is the main parallel workhorse loop
+			if (!m.hasDeletedFaces && (!OnlyOnSelected))
+			{
+#pragma omp for nowait // nowait is a small optimization
+				for (int64_t i = 0; i < cnt; ++i) {
+					auto& f = m.face[i];
+					auto v0 = f.cP(0);
+					auto v1 = f.cP(1);
+					auto v2 = f.cP(2);
+					const ScalarType doubleAreaSq = SquaredNorm((v1 - v0) ^ (v2 - v0));
+					if ((doubleAreaSq <= MinAreaThrSq) || (doubleAreaSq >= MaxAreaThrSq)) {
+						// No lock needed! Adding to a private list.
+						threadLocalDeletes.push_back(i);
 					}
 				}
+			}
+			else
+			{
+#pragma omp for nowait // nowait is a small optimization
+				for (int64_t i = 0; i < cnt; ++i) {
+					auto& f = m.face[i];
+					if (!f.IsD()) {
+						if (!OnlyOnSelected || f.IsS()) {
+							const ScalarType doubleAreaSq = SquaredNorm((f.cP(1) - f.cP(0)) ^ (f.cP(2) - f.cP(0)));
+							if ((doubleAreaSq <= MinAreaThrSq) || (doubleAreaSq >= MaxAreaThrSq)) {
+								// No lock needed! Adding to a private list.
+								threadLocalDeletes.push_back(i);
+							}
+						}
+					}
+				}
+			}
+
+			// Safely merge the private lists into the main list
+#pragma omp critical
+			{
+				facesToDelete.insert(facesToDelete.end(), threadLocalDeletes.begin(), threadLocalDeletes.end());
+			}
 		}
-		return count_fd;
+
+		// Now perform the deletion serially, which is safe
+		int count_fd = facesToDelete.size();
+		// Optional: Sort and remove duplicates if an index could be added multiple times
+		// std::sort(facesToDelete.begin(), facesToDelete.end());
+		// facesToDelete.erase(std::unique(facesToDelete.begin(), facesToDelete.end()), facesToDelete.end());
+
+		// Iterate backwards to safely delete from a vector
+		for (int64_t i = facesToDelete.size() - 1; i >= 0; --i)
+		{
+			const int64_t faceIdx = facesToDelete[i];
+			auto& f = m.face[faceIdx];
+			Allocator<MeshType>::DeleteFace(m, f);
+		}
 	}
 
-	static int RemoveZeroAreaFace(MeshType& m) { return RemoveFaceOutOfRangeArea(m,0);}
+	static int RemoveZeroAreaFace(MeshType& m)
+	{
+		return RemoveFaceOutOfRangeArea(m,0);
+	}
 
 	/**
 			 * Is the mesh only composed by quadrilaterals?
@@ -1240,35 +1429,66 @@ public:
 			UpdateSelection<MeshType>::FaceClear(m);
 		}
 
-		int edgeCnt = 0;
-		for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+		if (m.hasDeletedFaces)
 		{
-			if (!fi->IsD())
+			int edgeCnt = 0;
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
 			{
-				for(int i=0;i<3;++i)
-					if(!IsManifold(*fi,i))
+				if (!fi->IsD())
+				{
+					for (int i = 0; i < 3; ++i)
+						if (!IsManifold(*fi, i))
+						{
+							if (!(*fi).IsUserBit(nmfBit[i]))
+							{
+								++edgeCnt;
+								if (SelectFlag)
+								{
+									(*fi).V0(i)->SetS();
+									(*fi).V1(i)->SetS();
+								}
+								// follow the ring of faces incident on edge i;
+								face::Pos<FaceType> nmf(&*fi, i);
+								do
+								{
+									if (SelectFlag) nmf.F()->SetS();
+									nmf.F()->SetUserBit(nmfBit[nmf.E()]);
+									nmf.NextF();
+								} while (nmf.f != &*fi);
+							}
+						}
+				}
+			}
+		}
+		else
+		{
+			int edgeCnt = 0;
+			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
+			{
+				for (int i = 0; i < 3; ++i)
+					if (!IsManifold(*fi, i))
 					{
-						if(!(*fi).IsUserBit(nmfBit[i]))
+						if (!(*fi).IsUserBit(nmfBit[i]))
 						{
 							++edgeCnt;
-							if(SelectFlag)
+							if (SelectFlag)
 							{
 								(*fi).V0(i)->SetS();
 								(*fi).V1(i)->SetS();
 							}
 							// follow the ring of faces incident on edge i;
-							face::Pos<FaceType> nmf(&*fi,i);
+							face::Pos<FaceType> nmf(&*fi, i);
 							do
 							{
-								if(SelectFlag) nmf.F()->SetS();
+								if (SelectFlag) nmf.F()->SetS();
 								nmf.F()->SetUserBit(nmfBit[nmf.E()]);
 								nmf.NextF();
-							}
-							while(nmf.f != &*fi);
+							} while (nmf.f != &*fi);
 						}
 					}
 			}
 		}
+
 		return edgeCnt;
 	}
 
@@ -1279,64 +1499,95 @@ public:
 	static void /* int unused */ CountNonManifoldVertexFF(MeshType& m, bool selectVert = true, bool clearSelection = true)
 	{
 		RequireFFAdjacency(m);
-		if(selectVert && clearSelection) UpdateSelection<MeshType>::VertexClear(m);
 
 		// Unused std::atomic<int> nonManifoldCnt=0;
 		SimpleTempData<typename MeshType::VertContainer, int > TD(m.vert,0);
 
-		// First Loop, just count how many faces are incident on a vertex and store it in the TemporaryData Counter.
+		UnMarkAll(m);
+		// Just count how many faces are incident on a vertex and store it in the TemporaryData Counter.
+		//Mmark out of the game the vertexes that are incident on non manifold edges.
 		const int64_t cnt = (int64_t) m.face.size();
+		const int mark = m.imark;
+
+		if (m.hasDeletedFaces)
+		{
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-			const auto& f = m.face[i];
-			if (!f.IsD())
-			{
-				for (int k=0,cnt=f.VN(); k<cnt; k++)
+			for (int64_t i = 0; i < cnt; ++i) {
+				auto& f = m.face[i];
+				if (!f.IsD())
 				{
-					InterlockedIncrement((long*) &TD[f.V(k)]);
-					//TD[f.V(k)]++;
+					for (int k = 0, cnt = f.VN(); k < cnt; k++)
+					{
+						InterlockedIncrement((long*)&TD[f.V(k)]);
+						if (!IsManifold(f, k))
+						{
+							f.V0(k)->IMark() = mark;
+							f.V1(k)->IMark() = mark;
+						}
+					}
+				}
+			}
+
+			// Lastly, for safe vertexes, check that the number of faces that you can reach starting
+			// from it and using FF is the same of the previously counted.
+#pragma omp parallel for
+			for (int64_t i = 0; i < cnt; ++i) {
+				auto& f = m.face[i];
+				if (!f.IsD())
+				{
+					for (int i = 0, cnt = f.VN(); i < cnt; i++)
+						if (f.V(i)->IMark() != mark)
+						{
+							f.V(i)->IMark() = mark;
+							face::Pos<FaceType> pos(&f, i);
+
+							int starSizeFF = pos.NumberOfIncidentFaces();
+
+							if (starSizeFF != TD[f.V(i)])
+							{
+								if (selectVert)
+									f.V(i)->SetS();
+								// Unused nonManifoldCnt++;
+							}
+						}
 				}
 			}
 		}
-
-		tri::UpdateFlags<MeshType>::VertexClearV(m);
-		// Second Loop.
-		// mark out of the game the vertexes that are incident on non manifold edges.
+		else
+		{
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-			auto& f = m.face[i];
-			if (!f.IsD())
-			{
-				for (int i=0,cnt=f.VN(); i<cnt; ++i)
-					if (!IsManifold(f,i))
+			for (int64_t i = 0; i < cnt; ++i) {
+				auto& f = m.face[i];
+				for (int k = 0, cnt = f.VN(); k < cnt; k++)
+				{
+					InterlockedIncrement((long*)&TD[f.V(k)]);
+					if (!IsManifold(f, k))
 					{
-						f.V0(i)->SetV();
-						f.V1(i)->SetV();
+						f.V0(k)->IMark() = mark;
+						f.V1(k)->IMark() = mark;
 					}
+				}
 			}
-		}
-		// Third Loop, for safe vertexes, check that the number of faces that you can reach starting
-		// from it and using FF is the same of the previously counted.
+
+			// Lastly, for safe vertexes, check that the number of faces that you can reach starting
+			// from it and using FF is the same of the previously counted.
 #pragma omp parallel for
-		for (int64_t i = 0; i < cnt; ++i) {
-			auto& f = m.face[i];
-			if (!f.IsD())
-			{
-				for (int i=0,cnt=f.VN(); i<cnt; i++)
-					if (!f.V(i)->IsV())
-					{
-						f.V(i)->SetV();
-						face::Pos<FaceType> pos(&f,i);
+			for (int64_t vi = 0; vi < (int64_t)m.vert.size(); ++vi) {
+				auto* __restrict v = &m.vert[vi];
+				if (v->IsD()) continue;
 
-						int starSizeFF = pos.NumberOfIncidentFaces();
+				// skip already marked
+				if (v->IMark() == mark) continue;
+				v->IMark() = mark;
 
-						if (starSizeFF != TD[f.V(i)])
-						{
-								if (selectVert)
-										f.V(i)->SetS();
-								// Unused nonManifoldCnt++;
-						}
-					}
+				// Traverse star once
+				face::VFIterator<FaceType> it(v);
+				int starSizeFF = 0;
+				for (; !it.End(); ++it) ++starSizeFF;
+
+				if (starSizeFF != TD[v]) {
+					if (selectVert) v->SetS();
+				}
 			}
 		}
 		// Unused return nonManifoldCnt;
@@ -1357,7 +1608,7 @@ public:
 
 	static void CountEdgeNum( MeshType & m, int &total_e, int &boundary_e, int &non_manif_e )
 	{
-		std::vector< typename tri::UpdateTopology<MeshType>::PEdge > edgeVec;
+		std::vector< typename tri::UpdateTopology<MeshType>::PEdge2 > edgeVec;
 		tri::UpdateTopology<MeshType>::FillEdgeVector(m,edgeVec,true);
 		sort(edgeVec.begin(), edgeVec.end());		// Lo ordino per vertici
 		total_e=0;
@@ -1425,37 +1676,117 @@ public:
 	{
 		tri::RequireFFAdjacency(m);
 		CCV.clear();
-		tri::UpdateFlags<MeshType>::FaceClearV(m);
+		const size_t nFaces = m.face.size();
 
-		// Reserve enough space for worst case (all faces in one component).
-		std::vector<FacePointer> stack;
-		stack.reserve(m.face.size());
-		CCV.reserve(m.face.size());
+		std::vector<uint8_t> mark(nFaces, 0);
 
-		for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi) {
-			if (!fi->IsD() && !fi->IsV()) {
-				fi->SetV();
-				CCV.emplace_back(0, &*fi);
-				stack.push_back(&*fi);
+		std::vector<int> edgeTable(nFaces * 3); //  -1 if border
+		if (m.hasDeletedFaces)
+		{
+#pragma omp parallel for schedule(static)
+			for (int64_t i = 0; i < (int64_t)nFaces; ++i)
+			{
+				FaceType& f = m.face[i];
+				if (f.IsD()) continue;
+				for (int j = 0, cnt = (int)f.VN(); j < cnt; ++j)
+				{
+					FacePointer l = f.FFp(j);
+					const bool border = (!l || l->IsD());
+					edgeTable[i * 3 + j] = border ? -1 : int(l - &m.face[0]);
+				}
+			}
 
-				while (!stack.empty()) {
-					FacePointer fpt = stack.back();
-					stack.pop_back();
-					++CCV.back().first;
+			// Reserve enough space for worst case (all faces in one component).
+			std::vector<FacePointer> stack;
+			stack.reserve(nFaces);
+			CCV.reserve(nFaces);
 
-					const int vn = fpt->VN();
-					for (int j = 0; j < vn; ++j) {
-						if (!face::IsBorder(*fpt, j)) {
-							FacePointer l = fpt->FFp(j);
-							if (!l->IsV()) {
-								l->SetV();
-								stack.push_back(l);
+			for (int64_t i = 0; i < (int64_t)nFaces; ++i)
+			{
+				auto& f = m.face[i];
+				if (!mark[i] && !f.IsD())
+				{
+					mark[i] = 1;
+					CCV.emplace_back(0, &f);
+					stack.clear();
+					stack.push_back(&f);
+
+					int componentSize = 0;
+					while (!stack.empty())
+					{
+						FacePointer fpt = stack.back();
+						stack.pop_back();
+						++componentSize;
+
+						size_t fi = fpt - &m.face[0];     // face index
+						const int vn = fpt->VN();
+						for (int j = 0; j < vn; ++j) {
+							const auto rec = edgeTable[fi * 3 + j];
+							if (rec == -1) continue; // border?
+							if (!mark[rec]) {
+								mark[rec] = 1;
+								stack.push_back(&m.face[rec]);
 							}
 						}
 					}
+
+					CCV.back().first = componentSize;
 				}
 			}
 		}
+		else
+		{
+#pragma omp parallel for schedule(static)
+			for (int64_t i = 0; i < (int64_t)nFaces; ++i)
+			{
+				FaceType& f = m.face[i];
+				for (int j = 0, cnt = (int)f.VN(); j < cnt; ++j)
+				{
+					FacePointer l = f.FFp(j);
+					const bool border = (!l || l->IsD());
+					edgeTable[i * 3 + j] = border ? -1 : int(l - &m.face[0]);
+				}
+			}
+
+			// Reserve enough space for worst case (all faces in one component).
+			std::vector<FacePointer> stack;
+			stack.reserve(nFaces);
+			CCV.reserve(nFaces);
+
+			for (int64_t i = 0; i < (int64_t)nFaces; ++i)
+			{
+				if (!mark[i])
+				{
+					mark[i] = 1;
+					auto& f = m.face[i];
+					CCV.emplace_back(0, &f);
+					stack.clear();
+					stack.push_back(&f);
+
+					int componentSize = 0;
+					while (!stack.empty())
+					{
+						FacePointer fpt = stack.back();
+						stack.pop_back();
+						++componentSize;
+
+						size_t fi = fpt - &m.face[0];     // face index
+						const int vn = fpt->VN();
+						for (int j = 0; j < vn; ++j) {
+							const auto rec = edgeTable[fi * 3 + j];
+							if (rec == -1) continue; // border?
+							if (!mark[rec]) {
+								mark[rec] = 1;
+								stack.push_back(&m.face[rec]);
+							}
+						}
+					}
+
+					CCV.back().first = componentSize;
+				}
+			}
+		}
+
 		return int(CCV.size());
 	}
 #else
@@ -2164,33 +2495,33 @@ public:
 
 	/// Remove the connected components smaller than a given diameter
 	// it returns a pair with the number of connected components and the number of deleted ones.
-	static std::pair<int,int> RemoveSmallConnectedComponentsDiameter(MeshType &m, ScalarType maxDiameter)
+	static std::pair<int, int> RemoveSmallConnectedComponentsDiameter(MeshType& m, ScalarType maxDiameter)
 	{
 		std::vector< std::pair<int, typename MeshType::FacePointer> > CCV;
-		int TotalCC=ConnectedComponents(m, CCV);
-		int DeletedCC=0;
+		int TotalCC = ConnectedComponents(m, CCV);
+		int DeletedCC = 0;
 		tri::ConnectedComponentIterator<MeshType> ci;
-		for(unsigned int i=0;i<CCV.size();++i)
+		for (unsigned int i = 0; i < CCV.size(); ++i)
 		{
 			Box3<ScalarType> bb;
 			//std::vector<typename MeshType::FacePointer> FPV;
 			boost::container::small_vector<MeshType::FacePointer, 128> FPV; // JPB WIP OPT
-			for(ci.start(m,CCV[i].second);!ci.completed();++ci)
+			for (ci.start(m, CCV[i].second); !ci.completed(); ++ci)
 			{
 				FPV.push_back(*ci);
 				bb.Add((*ci)->P(0));
 				bb.Add((*ci)->P(1));
 				bb.Add((*ci)->P(2));
 			}
-			if(bb.Diag()<maxDiameter)
+			if (bb.Diag() < maxDiameter)
 			{
 				DeletedCC++;
 				// JPB WIP OPT typename std::vector<typename MeshType::FacePointer>::iterator fpvi;
-				for(auto fpvi=FPV.begin(); fpvi!=FPV.end(); ++fpvi)
-					tri::Allocator<MeshType>::DeleteFace(m,(**fpvi));
+				for (auto fpvi = FPV.begin(); fpvi != FPV.end(); ++fpvi)
+					tri::Allocator<MeshType>::DeleteFace(m, (**fpvi));
 			}
 		}
-		return std::make_pair(TotalCC,DeletedCC);
+		return std::make_pair(TotalCC, DeletedCC);
 	}
 
 	/// Remove the connected components greater than a given diameter

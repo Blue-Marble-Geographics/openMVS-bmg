@@ -1899,7 +1899,7 @@ float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
 #pragma intrinsic(_InterlockedCompareExchange)
 __forceinline float AtomicAddFloat(float* __restrict addr, float val)
 {
-	static_assert(sizeof(float) == sizeof(LONG), "Expected float and LONG to be same size");
+  static_assert(sizeof(float) == sizeof(LONG), "Expected float and LONG to be same size");
 
 	volatile LONG* __restrict intAddr = reinterpret_cast<volatile LONG*>(addr);
 	union {
@@ -1989,8 +1989,8 @@ float Quantize(float cap, float maxCap)
 
 	// Exact "round half up" for non-negative values:
 	// MSVC lowers this to add + cvttss2si (truncate) -> very fast.
-	int scaled = static_cast<int>(clamped * 2.0f + 0.5f);
-	return 0.5f * static_cast<float>(scaled);
+	int scaled = static_cast<int>(clamped * 4.0f + 0.5f);
+	return 0.25f * static_cast<float>(scaled);
 #else
 	if (!std::isfinite(cap)) return maxCap;
 	if (cap <= 0.0f)
@@ -2051,6 +2051,90 @@ void permuteScatter2(
 			dst2[i] = src2[oldId];
 		}
 	});
+}
+
+// Euclidean squared distance
+inline double dist2(const DELAUNAY::point_t& a, const DELAUNAY::point_t& b)
+{
+	double dx = a.x() - b.x();
+	double dy = a.y() - b.y();
+	double dz = a.z() - b.z();
+	return dx * dx + dy * dy + dz * dz;
+}
+
+typedef CGAL::Simple_cartesian<double>              Kernel;
+typedef Kernel::Point_3                             CGALPoint;
+typedef CGAL::Search_traits_3<Kernel>               Traits;
+typedef CGAL::Kd_tree<Traits>                       Tree;
+typedef CGAL::Orthogonal_k_neighbor_search<Traits>  KSearch;
+typedef KSearch::Tree                              KdTree;
+
+static void knnMeanDist(const DELAUNAY::point_t* pts, size_t n, int k,
+	std::vector<double>& out)
+{
+	out.resize(n);
+	std::vector<CGALPoint> cloud;
+	cloud.reserve(n);
+	for (size_t i = 0; i < n; ++i)
+		cloud.emplace_back(pts[i].x(), pts[i].y(), pts[i].z());
+
+	Tree tree(cloud.begin(), cloud.end());
+
+#pragma omp parallel for schedule(static)
+	for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
+		KSearch search(tree, cloud[i], k + 1); // include self
+		double sum = 0.0;
+		int count = 0;
+		for (auto it = search.begin(); it != search.end(); ++it) {
+			if (count == 0) { count++; continue; } // skip self
+			sum += std::sqrt(it->second);
+			count++;
+		}
+		out[(size_t)i] = (count > 1 ? sum / (count - 1) : 0.0);
+	}
+}
+
+// Main routine: fills mask[0..n-1] with 1 = keep, 0 = drop
+void StatisticalOutlierRemoval(const DELAUNAY::point_t* pts, size_t n,
+	unsigned char* mask,
+	int k = 16, double stddevMul = 1.5)
+{
+	TD_TIMER_STARTD();
+
+	int removed = 0;
+	if (n != 0) {
+		std::vector<double> meanDist;
+		knnMeanDist(pts, n, k, meanDist);
+
+		// Compute global mean and stdev
+		double mean = 0.0;
+		for (double v : meanDist) mean += v;
+		mean /= n;
+
+		double var = 0.0;
+		for (double v : meanDist) {
+			double d = v - mean;
+			var += d * d;
+		}
+		var /= n;
+		double stdev = std::sqrt(var);
+
+		double threshold = mean + stddevMul * stdev;
+
+		// Write mask
+		for (size_t i = 0; i < n; ++i) {
+			mask[i] = (meanDist[i] <= threshold ? 1 : 0);
+			if (!mask[i]) {
+				++removed;
+			}
+		}
+	}
+
+	DEBUG_EXTRA(
+		"%d point outliers removed in %s",
+		removed,
+		TD_TIMER_GET_FMT().c_str()
+	);
 }
 
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
@@ -2222,6 +2306,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	delaunay_t::Locate_type lt;
 	int li, lj;
 	size_t totalCells;
+	std::vector<unsigned char> mask;
 
 	{
 		TD_TIMER_STARTD();
@@ -2280,6 +2365,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			decltype(origVertices)().swap(origVertices);
 			decltype(indices)().swap(indices);
 
+			// The points of the cloud are now kept in vertices.  Ancillary data, for view information,
+			// is also maintained.
+			// Go through the cloud and eliminate outliers, but do so in-place (without disturbing
+			// the ancillary data.
+			mask.resize(numVertices);
+			StatisticalOutlierRemoval(vertices.get(), numVertices, mask.data(), 32, 2);
+
 			// insert vertices
 			// 6x vertices is a generous worst case, but uses too much memory.
 			// Potentally allow some dynamic allocation to better keep
@@ -2287,8 +2379,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			delaunay.tds().cells().reserve(numVertices*4); // May reserve dynamically
 			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.s
 			allViews.resize(numVertices);
-
-			// jpb wip bug this is very interesting it was reserve before. but allowed the filteredPt[i] write.
 
 			DEBUG_EXTRA("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
 		}
@@ -2303,7 +2393,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.7");
+		DEBUG("ReconstructMesh optimization version 1.1.8");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2322,6 +2412,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		if (distInsert <= 0) {
 			for (size_t i = 0; i < numVertices; ++i) {
 				const point_t& p = vertices[i]; // These are the sorted vertices.
+				if (!mask[i]) {
+					continue;
+				}
 				// insert all points
 				hint = delaunay.insert(p, hint);
 				ASSERT(anchor != vertex_handle_t());
@@ -2336,10 +2429,20 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			uint32_t marker = 0;
 			const vertex_handle_t infV = delaunay.infinite_vertex();  // cheap pointer compare
 
-			hint = delaunay.insert(vertices[0]);
-			InsertViews(hint->info().idx, pointcloud, 0);
+			int i = 0;
+			for (bool done = false; !done; ++i) {
+				if (mask[i]) {
+					hint = delaunay.insert(vertices[i]);
+					InsertViews(hint->info().idx, pointcloud, 0);
+					done = true;
+				}
+			}
 
-			for (int i = 1; i < numVertices; ++i) {
+			for (; i < numVertices; ++i) {
+				if (!mask[i]) {
+					continue;
+				}
+
 				const point_t& p = vertices[i];
 				const double px = p.x();
 				const double py = p.y();
@@ -3072,7 +3175,7 @@ advance:
 				// and assign a (constant) weight to the point which equals
 				// the number of views.
 				for (auto& i : viewInstance) {
-					auto* __restrict src = &pointcloud.pointViewsMemory[offsets[i]];
+					auto* src = &pointcloud.pointViewsMemory[offsets[i]];
 					auto cnt = sizes[i];
 					std::copy(src, src + cnt, std::back_inserter(viewIdxs));
 				}
@@ -3119,7 +3222,6 @@ advance:
 				std::cerr << "\n";
 
 				std::cerr << "\n";
-
 #endif
 
 				auto it = std::begin(viewIdxs);
@@ -3592,44 +3694,57 @@ advance:
 		  std::vector<uint32_t> localVertexIDs; // vertex idxs
 			tsl::robin_map<uint32_t, Mesh::VIndex> localIndexMap;
 		};
+		const int nThreads = omp_get_max_threads();
 
-		std::vector<LocalMeshData> localData(omp_get_max_threads());
+		std::vector<LocalMeshData> localData(nThreads);
 
-		#pragma omp parallel for schedule(static)
-		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
-			auto ci = cellIterators[idx];
-			const cell_size_t ciID = ci->info();
-			auto& local = localData[omp_get_thread_num()];
+		const size_t cellsPerThread = (totalCells + nThreads - 1) / nThreads;
+		for (int t = 0; t < nThreads; ++t) {
+			localData[t].localFaces.reserve(cellsPerThread * 4);
+			localData[t].localVertexIDs.reserve(cellsPerThread * 12);
+			// Reserve on the map is much more expensive than vector reserve.
+		}
 
-			for (int f = 0; f < 4; ++f) {
-				if (delaunay.is_infinite(ci, f)) continue;
-				const cell_handle_t cj = ci->neighbor(f);
-				const cell_size_t cjID = cj->info();
-				if (ciID < cjID) continue;
+		#pragma omp parallel
+		{
+			const int tid = omp_get_thread_num();
+			auto& local = localData[tid];
 
-				const bool ciType = graph.IsNodeOnSrcSide(ciID);
-				if (ciType == graph.IsNodeOnSrcSide(cjID)) continue;
+			#pragma omp for schedule(static)
+			for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+				auto ci = cellIterators[idx];
+				const cell_size_t ciID = ci->info();
 
-				const triangle_vhandles_t tri = getTriangle(ci, f);
 				Mesh::Face face;
+				for (int f = 0; f < 4; ++f) {
+					if (delaunay.is_infinite(ci, f)) continue;
+					const cell_handle_t cj = ci->neighbor(f);
+					const cell_size_t cjID = cj->info();
+					if (ciID < cjID) continue;
 
-				for (int v = 0; v < 3; ++v) {
-					const vertex_handle_t vh = tri.verts[v];
-					const uint32_t vertexID = vh->info().idx;
+					const bool ciType = graph.IsNodeOnSrcSide(ciID);
+					if (ciType == graph.IsNodeOnSrcSide(cjID)) continue;
 
-					auto [it, inserted] = local.localIndexMap.try_emplace(vertexID, (Mesh::VIndex)local.localVertexIDs.size());
-					if (inserted)
-						local.localVertexIDs.push_back(vertexID);
+					const triangle_vhandles_t tri = getTriangle(ci, f);
 
-					face[v] = it->second; // local index
+					for (int v = 0; v < 3; ++v) {
+						const vertex_handle_t vh = tri.verts[v];
+						const uint32_t vertexID = vh->info().idx;
+
+						auto [it, inserted] = local.localIndexMap.try_emplace(vertexID, (Mesh::VIndex)local.localVertexIDs.size());
+						if (inserted)
+							local.localVertexIDs.push_back(vertexID);
+
+						face[v] = it->second; // local index
+					}
+
+					if (!ciType)
+						std::swap(face[0], face[2]);
+
+					local.localFaces.push_back(face);
 				}
-
-				if (!ciType)
-					std::swap(face[0], face[2]);
-
-				local.localFaces.push_back(std::move(face));
 			}
-	}
+		}
 
 		std::vector<delaunay_t::All_cells_iterator>().swap(cellIterators); // free memory
 

@@ -888,6 +888,7 @@ public:
   {
     assert(&f >= &m.face.front() && &f <= &m.face.back());
     assert(!f.IsD());
+    m.hasDeletedFaces = true;
     f.Dealloc();
     f.SetD();
     --m.fn;
@@ -1201,23 +1202,61 @@ public:
     pu.remap.resize( m.face.size(),std::numeric_limits<size_t>::max() );
 
     size_t pos=0;
-    for(size_t i=0;i<m.face.size();++i)
+    if (m.hasDeletedFaces)
     {
-      if(!m.face[i].IsD())
+      for (size_t i = 0; i < m.face.size(); ++i)
       {
-        if(pos!=i)
+        if (!m.face[i].IsD())
+        {
+          if (pos != i)
+          {
+            m.face[pos].ImportData(m.face[i]);
+            if (FaceType::HasPolyInfo())
+            {
+              m.face[pos].Dealloc();
+              m.face[pos].Alloc(m.face[i].VN());
+            }
+            for (int j = 0; j < m.face[i].VN(); ++j)
+              m.face[pos].V(j) = m.face[i].V(j);
+
+            if (HasVFAdjacency(m))
+              for (int j = 0; j < m.face[i].VN(); ++j)
+              {
+                if (m.face[i].IsVFInitialized(j)) {
+                  m.face[pos].VFp(j) = m.face[i].cVFp(j);
+                  m.face[pos].VFi(j) = m.face[i].cVFi(j);
+                }
+                else m.face[pos].VFClear(j);
+              }
+            if (HasFFAdjacency(m))
+              for (int j = 0; j < m.face[i].VN(); ++j)
+              {
+                m.face[pos].FFp(j) = m.face[i].cFFp(j);
+                m.face[pos].FFi(j) = m.face[i].cFFi(j);
+              }
+          }
+          pu.remap[i] = pos;
+          ++pos;
+        }
+      }
+    }
+    else
+    {
+      for (size_t i = 0; i < m.face.size(); ++i)
+      {
+        if (pos != i)
         {
           m.face[pos].ImportData(m.face[i]);
-          if(FaceType::HasPolyInfo())
+          if (FaceType::HasPolyInfo())
           {
             m.face[pos].Dealloc();
             m.face[pos].Alloc(m.face[i].VN());
           }
-          for(int j=0;j<m.face[i].VN();++j)
+          for (int j = 0; j < m.face[i].VN(); ++j)
             m.face[pos].V(j) = m.face[i].V(j);
 
-          if(HasVFAdjacency(m))
-            for(int j=0;j<m.face[i].VN();++j)
+          if (HasVFAdjacency(m))
+            for (int j = 0; j < m.face[i].VN(); ++j)
             {
               if (m.face[i].IsVFInitialized(j)) {
                 m.face[pos].VFp(j) = m.face[i].cVFp(j);
@@ -1225,14 +1264,14 @@ public:
               }
               else m.face[pos].VFClear(j);
             }
-          if(HasFFAdjacency(m))
-            for(int j=0;j<m.face[i].VN();++j)
-              {
-                m.face[pos].FFp(j) = m.face[i].cFFp(j);
-                m.face[pos].FFi(j) = m.face[i].cFFi(j);
-              }
+          if (HasFFAdjacency(m))
+            for (int j = 0; j < m.face[i].VN(); ++j)
+            {
+              m.face[pos].FFp(j) = m.face[i].cFFp(j);
+              m.face[pos].FFi(j) = m.face[i].cFFi(j);
+            }
         }
-        pu.remap[i]=pos;
+        pu.remap[i] = pos;
         ++pos;
       }
     }
@@ -1292,15 +1331,14 @@ public:
               (*fi).FFp(i) = fbase+pu.remap[oldIndex];
             }
       }
-
-
-
   }
 
   /*! \brief Wrapper without the PointerUpdater. */
   static void CompactFaceVector( MeshType &m  ) {
     PointerUpdater<FacePointer>  pu;
     CompactFaceVector(m,pu);
+
+    m.hasDeletedFaces = false;
   }
 
 /*!

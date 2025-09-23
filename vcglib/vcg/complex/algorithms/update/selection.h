@@ -96,84 +96,80 @@ public:
   /// The process can be done or in a straightforward manner (e.g. selection values are substituted)
   /// or preserving selected or unselected elements (e.g. the restoring is combined in OR/AND) 
   /// 
-  bool pop(bool orFlag = false, bool andFlag = false)
+  bool pop(bool orFlag=false, bool andFlag=false)
   {
-      if (vsV.empty()) return false;
-      if (orFlag && andFlag) return false;
+    if(vsV.empty()) return false;
+    if(orFlag && andFlag) return false;
+    
+    vsHandle vsH = vsV.back();
+    esHandle esH = esV.back();
+    fsHandle fsH = fsV.back();
+    tsHandle tsH = tsV.back();
 
-      vsHandle vsH = vsV.back();
-      esHandle esH = esV.back();
-      fsHandle fsH = fsV.back();
-      tsHandle tsH = tsV.back();
+    if(! (Allocator<ComputeMeshType>::template IsValidHandle(*_m, vsH))) return false;
 
-      if (!(Allocator<ComputeMeshType>::template IsValidHandle(*_m, vsH))) return false;
-
-      int64_t cnt = (int64_t)_m->vert.size();
+		int64_t cnt = (int64_t) _m->vert.size();
 #pragma omp parallel for
-      for (int64_t i = 0; i < cnt; ++i) {
-          auto& vi = _m->vert[i];
-          if (!vi.IsD())
-          {
-              if (vsH[vi]) {
-                  if (!andFlag) vi.SetS();
-              }
-              else {
-                  if (!orFlag)   vi.ClearS();
-              }
-          }
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& vi = _m->vert[i];
+      if( !vi.IsD() )
+      {
+        if(vsH[vi]) { 
+           if(!andFlag) vi.SetS();
+        } else {
+          if(!orFlag)   vi.ClearS();
+        }
+      }
+    }
+
+	  cnt = (int64_t) _m->edge.size();
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& e = _m->edge[i];
+      if( !e.IsD() )
+      {
+        if(esH[e]) { 
+           if(!andFlag) e.SetS();
+        } else {
+          if(!orFlag)   e.ClearS();
+        }
+      }
+    }
+
+    cnt = (int64_t) _m->face.size();
+#pragma omp parallel for
+		for (int64_t i = 0; i < cnt; ++i) {
+      auto& f = _m->face[i];
+      if( !f.IsD() )
+      {  
+        if(fsH[f]) { 
+           if(!andFlag) f.SetS();
+        } else {
+          if(!orFlag)   f.ClearS();
+        }
+      }
+    }
+
+     for (auto ti = _m->tetra.begin(); ti != _m->tetra.end(); ++ti)
+      if (!(*ti).IsD())
+      {
+        if (tsH[*ti]) {
+          if (!andFlag) (*ti).SetS();
+        } else {
+          if (!orFlag)  (*ti).ClearS();
+        }
       }
 
-      cnt = (int64_t)_m->edge.size();
-#pragma omp parallel for
-      for (int64_t i = 0; i < cnt; ++i) {
-          auto& e = _m->edge[i];
-          if (!e.IsD())
-          {
-              if (esH[e]) {
-                  if (!andFlag) e.SetS();
-              }
-              else {
-                  if (!orFlag)   e.ClearS();
-              }
-          }
-      }
+    Allocator<ComputeMeshType>::template DeletePerVertexAttribute<bool>(*_m,vsH);
+    Allocator<ComputeMeshType>::template DeletePerEdgeAttribute<bool>(*_m,esH);
+    Allocator<ComputeMeshType>::template DeletePerFaceAttribute<bool>(*_m,fsH);
+    Allocator<ComputeMeshType>::template DeletePerTetraAttribute<bool>(*_m,tsH);
 
-      cnt = (int64_t)_m->face.size();
-#pragma omp parallel for
-      for (int64_t i = 0; i < cnt; ++i) {
-          auto& f = _m->face[i];
-          if (!f.IsD())
-          {
-              if (fsH[f]) {
-                  if (!andFlag) f.SetS();
-              }
-              else {
-                  if (!orFlag)   f.ClearS();
-              }
-          }
-      }
-
-      for (auto ti = _m->tetra.begin(); ti != _m->tetra.end(); ++ti)
-          if (!(*ti).IsD())
-          {
-              if (tsH[*ti]) {
-                  if (!andFlag) (*ti).SetS();
-              }
-              else {
-                  if (!orFlag)  (*ti).ClearS();
-              }
-          }
-
-      Allocator<ComputeMeshType>::template DeletePerVertexAttribute<bool>(*_m, vsH);
-      Allocator<ComputeMeshType>::template DeletePerEdgeAttribute<bool>(*_m, esH);
-      Allocator<ComputeMeshType>::template DeletePerFaceAttribute<bool>(*_m, fsH);
-      Allocator<ComputeMeshType>::template DeletePerTetraAttribute<bool>(*_m, tsH);
-
-      vsV.pop_back();
-      esV.pop_back();
-      fsV.pop_back();
-      tsV.pop_back();
-      return true;
+    vsV.pop_back();
+    esV.pop_back();
+    fsV.pop_back();
+    tsV.pop_back();
+    return true;
   }
 
 private:
@@ -546,25 +542,62 @@ static size_t FaceFromBorderFlag(MeshType &m, bool preserveSelection=false)
 /// You can skip the second parameter to choose all the edges smaller than a given lenght
 static size_t FaceOutOfRangeEdge(MeshType &m, ScalarType MinEdgeThr, ScalarType MaxEdgeThr=(std::numeric_limits<ScalarType>::max)(), bool preserveSelection=false)
 {
-  if(!preserveSelection) FaceClear(m);
+  if (!preserveSelection) FaceClear(m);
   size_t selCnt = 0;
-  MinEdgeThr=MinEdgeThr*MinEdgeThr;
-  MaxEdgeThr=MaxEdgeThr*MaxEdgeThr;
-  for(FaceIterator fi=m.face.begin(); fi!=m.face.end();++fi)
-    if(!(*fi).IsD())
+  ScalarType minThr2 = MinEdgeThr * MinEdgeThr;
+  ScalarType maxThr2 = MaxEdgeThr * MaxEdgeThr;
+
+  if (m.hasDeletedFaces)
+  {
+#pragma omp parallel for reduction(+:selCnt)
+    for (int64_t i = 0; i < (int64_t)m.face.size(); ++i) {
+      FaceType& f = m.face[i];
+      if (!f.IsD())
       {
-        for(int i=0;i<(*fi).VN();++i)
+        const auto& v0 = f.V(0)->cP();
+        const auto& v1 = f.V(1)->cP();
+        const auto& v2 = f.V(2)->cP();
+
+        ScalarType d01 = SquaredDistance(v0, v1);
+        ScalarType d12 = SquaredDistance(v1, v2);
+        ScalarType d20 = SquaredDistance(v2, v0);
+
+        if ((d01 <= minThr2 || d01 >= maxThr2) ||
+          (d12 <= minThr2 || d12 >= maxThr2) ||
+          (d20 <= minThr2 || d20 >= maxThr2))
         {
-          const ScalarType squaredEdge=SquaredDistance((*fi).V0(i)->cP(),(*fi).V1(i)->cP());
-          if((squaredEdge<=MinEdgeThr) || (squaredEdge>=MaxEdgeThr) )
-          {
-            selCnt++;
-            (*fi).SetS();
-            break; // skip the rest of the edges of the tri
-          }
+          f.SetS();
+          selCnt++;
         }
       }
-      return selCnt;
+    }
+  }
+  else
+  {
+#pragma omp parallel for reduction(+:selCnt)
+    for (int64_t i = 0; i < (int64_t)m.face.size(); ++i) {
+      FaceType& f = m.face[i];
+
+      const auto& v0 = f.V(0)->cP();
+      const auto& v1 = f.V(1)->cP();
+      const auto& v2 = f.V(2)->cP();
+
+      ScalarType d01 = SquaredDistance(v0, v1);
+      ScalarType d12 = SquaredDistance(v1, v2);
+      ScalarType d20 = SquaredDistance(v2, v0);
+
+      if ((d01 <= minThr2 || d01 >= maxThr2) ||
+        (d12 <= minThr2 || d12 >= maxThr2) ||
+        (d20 <= minThr2 || d20 >= maxThr2))
+      {
+        f.SetS();
+        selCnt++;
+      }
+    }
+  }
+
+  return selCnt;
+
 }
 
 /// \brief This function expand current selection to cover the whole connected component.

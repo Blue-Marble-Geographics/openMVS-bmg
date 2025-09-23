@@ -37,6 +37,7 @@
 
 #include "Platform.h"
 #include "PointCloud.h"
+#include <boost/container/small_vector.hpp>
 
 
 // D E F I N E S ///////////////////////////////////////////////////
@@ -61,10 +62,10 @@ public:
 	typedef SEACAVE::cList<Vertex,const Vertex&,0,8192,VIndex> VertexArr;
 	typedef SEACAVE::cList<Face,const Face&,0,8192,FIndex> FaceArr;
 
-	typedef SEACAVE::cList<VIndex,VIndex,0,8,VIndex> VertexIdxArr;
-	typedef SEACAVE::cList<FIndex,FIndex,0,8,FIndex> FaceIdxArr;
-	typedef SEACAVE::cList<VertexIdxArr,const VertexIdxArr&,2,8192,VIndex> VertexVerticesArr;
-	typedef SEACAVE::cList<FaceIdxArr,const FaceIdxArr&,2,8192,VIndex> VertexFacesArr;
+	typedef SEACAVE::cList<VIndex,VIndex,0,16,VIndex> VertexIdxArr;
+	typedef SEACAVE::cList<FIndex,FIndex,0,16,FIndex> FaceIdxArr;
+	typedef SEACAVE::cList<VertexIdxArr,const VertexIdxArr&,4,8192,VIndex> VertexVerticesArr;
+	typedef SEACAVE::cList<FaceIdxArr,const FaceIdxArr&,4,8192,VIndex> VertexFacesArr;
 
 	typedef TPoint3<Type> Normal;
 	typedef SEACAVE::cList<Normal,const Normal&,0,8192,FIndex> NormalArr;
@@ -168,12 +169,26 @@ public:
 	void GetEdgeFaces(VIndex, VIndex, FaceIdxArr&) const;
 	void GetFaceFaces(FIndex, FaceIdxArr&) const;
 	void GetEdgeVertices(FIndex, FIndex, uint32_t vs0[2], uint32_t vs1[2]) const;
-	void GetAdjVertices(VIndex, VertexIdxArr&, std::unordered_set<VIndex>& setIndices) const;
+	void GetAdjVertices(VIndex, boost::container::small_vector<VIndex, 32>&) const;
 	void GetAdjVertexFaces(VIndex, VIndex, FaceIdxArr&) const;
 
 #ifdef OPENMVS_21
 	__forceinline int SmallMod3(int n) const noexcept { return (0x0924 >> (n << 1)) & 3; }
-	bool Mesh::GetEdgeOrientation(FIndex idxFace, VIndex iV0, VIndex iV1) const;
+#if 1
+	// get the edge orientation in the given face:
+	// return false for backward, true for forward
+	__forceinline bool GetEdgeOrientation(const Face& face, VIndex iV0, VIndex iV1) const
+	{
+		for (int i = 0; i < 3; ++i) {
+			if (face[i] == iV0) {
+				return face[SmallMod3(i + 1)] == iV1;
+			}
+		}
+		return false; // invalid edge
+	}
+#else
+	bool GetEdgeOrientation(FIndex idxFace, VIndex iV0, VIndex iV1) const;
+#endif
 	FIndex GetEdgeAdjacentFace(FIndex idxFace, VIndex iV0, VIndex iV1) const;
 	unsigned FixNonManifold(float magDisplacementDuplicateVertices=0.01f, VertexIdxArr* duplicatedVertices=NULL);
 #else

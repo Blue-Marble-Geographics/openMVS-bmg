@@ -1478,12 +1478,11 @@ void MeshTexture::GlobalSeamLeveling()
 	// fill Tikhonov's Gamma matrix (regularization constraints)
 	const float lambda(0.1f);
 	MatIdx rowsGamma(0);
-	Mesh::VertexIdxArr adjVerts;
+	boost::container::small_vector<VIndex, 32> adjVerts;
 	CLISTDEF0(MatEntry) rows(0, vertices.GetSize()*4);
-	std::unordered_set<VIndex> setIndices;
 	FOREACH(v, vertices) {
-		adjVerts.Empty();
-		scene.mesh.GetAdjVertices(v, adjVerts, setIndices);
+		adjVerts.clear();
+		scene.mesh.GetAdjVertices(v, adjVerts);
 		VertexPatchIterator itV(patchIndices[v], seamVertices);
 		while (itV.Next()) {
 			const uint32_t idxPatch(itV);

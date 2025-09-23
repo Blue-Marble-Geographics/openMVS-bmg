@@ -31,6 +31,8 @@
 
 #include "flag.h"
 
+#include "P2PUtils.h"
+
 namespace vcg {
 namespace tri {
 
@@ -121,119 +123,323 @@ G. Thurmer, C. A. Wuthrich
 "Computing vertex normals from polygonal facets"
 Journal of Graphics Tools, 1998
  */
-#if 0// JPB WIP BUG Revised just bad
-static __forceinline int vpIndex(const ComputeMeshType& m, typename ComputeMeshType::VertexPointer vp)
+
+#pragma intrinsic(_InterlockedCompareExchange)
+static __forceinline float AtomicAddFloat(float* __restrict addr, float val)
 {
-    // Works only if vertices are stored contiguously (true for vcglib typical meshes).
-    return int(vp - &m.vert[0]);
+  static_assert(sizeof(float) == sizeof(LONG), "Expected float and LONG to be same size");
+
+  volatile LONG* __restrict intAddr = reinterpret_cast<volatile LONG*>(addr);
+  union {
+    float f;
+    LONG i;
+  } oldVal, newVal;
+
+  do {
+    oldVal.i = *intAddr;
+    newVal.f = oldVal.f + val;
+    newVal.i = *reinterpret_cast<LONG*>(&newVal.f); // or just reuse newVal.i = *(LONG*)&newVal.f;
+  } while (_InterlockedCompareExchange(intAddr, newVal.i, oldVal.i) != oldVal.i);
+
+  return newVal.f;
 }
 
 static void PerVertexAngleWeighted(ComputeMeshType& m)
 {
-    using Scalar = typename ComputeMeshType::ScalarType;
-    using Coord = typename ComputeMeshType::CoordType;
-    using NormalType = typename ComputeMeshType::VertexType::NormalType;
+#if 1 // Try again
+  using Scalar = float;
+  using Point = vcg::Point3<Scalar>;
 
-    const int nV = int(m.vert.size());
-    const int nF = int(m.face.size());
-    if (nV == 0 || nF == 0) {
-        return;
-    }
+  const auto* start = &m.vert[0];
+#pragma omp parallel for
+  for (ptrdiff_t fi = 0; fi < (ptrdiff_t)m.face.size(); ++fi) {
+    auto& f = m.face[fi];
+    if (f.IsD()) continue;
 
-    // Clear destination
-    vcg::tri::UpdateNormal<ComputeMeshType>::PerVertexClear(m);
+    const auto& p0 = f.cP(0);
+    const auto& p1 = f.cP(1);
+    const auto& p2 = f.cP(2);
 
-    // Thread-local accumulators
-    int nThreads = 1;
-#ifdef _OPENMP
-    nThreads = omp_get_max_threads();
-#endif
-    struct alignas(64) PaddedNormal { NormalType n; };
-    std::vector<std::vector<PaddedNormal>> tls(nThreads);
-    for (int t = 0; t < nThreads; ++t) {
-        tls[t].assign(nV, PaddedNormal{ NormalType(0,0,0) });
-    }
+    // Edge vectors
+    const Point e0 = p1 - p0;
+    const Point e1 = p2 - p1;
+    const Point e2 = p0 - p2;
 
-    // Parallel pass over faces: accumulate into thread-local arrays
-#pragma omp parallel for schedule(static)
-    for (int f = 0; f < nF; ++f) {
-        auto& face = m.face[f];
-        if (face.IsD() || !face.IsR()) continue;
+    // Face normal
+    const Point fn = e0 ^ -e2;
 
-        int tid = 0;
-#ifdef _OPENMP
-        tid = omp_get_thread_num();
-#endif
-        auto& acc = tls[tid];
+    // Squared lengths
+    const float e0len2 = e0.X() * e0.X() + e0.Y() * e0.Y() + e0.Z() * e0.Z();
+    const float e1len2 = e1.X() * e1.X() + e1.Y() * e1.Y() + e1.Z() * e1.Z();
+    const float e2len2 = e2.X() * e2.X() + e2.Y() * e2.Y() + e2.Z() * e2.Z();
+    const float fnLen2 = fn.X() * fn.X() + fn.Y() * fn.Y() + fn.Z() * fn.Z();
 
-        // Triangle normal (unit)
-        NormalType t = vcg::TriangleNormal(face);
-        t.Normalize();
+    // SIMD sqrt of [e0, e1, e2, fn]
+    const _Data len2 = _SetN(fnLen2, e2len2, e1len2, e0len2);
+    const _Data len = _mm_sqrt_ps(len2);
+    const _Data inv = _Div(_Set(1.0f), len);
 
-        // Edge directions for angle at each corner
-        NormalType e0 = (face.V1(0)->cP() - face.V0(0)->cP());
-        NormalType e1 = (face.V1(1)->cP() - face.V0(1)->cP());
-        NormalType e2 = (face.V1(2)->cP() - face.V0(2)->cP());
-        e0.Normalize(); e1.Normalize(); e2.Normalize();
+    float invs[4];
+    _Store(invs, inv);
 
-        // Corner angle weights (use the same AngleN as your scalar product-based angle)
-        const Scalar a0 = AngleN(e0, -e2);
-        const Scalar a1 = AngleN(-e0, e1);
-        const Scalar a2 = AngleN(-e1, e2);
+    Point n(0, 0, 0);
+    if (fnLen2 > 1e-20f)
+      n = fn * invs[3];
 
-        // Indices
-        const int i0 = vpIndex(m, face.V(0));
-        const int i1 = vpIndex(m, face.V(1));
-        const int i2 = vpIndex(m, face.V(2));
+    // Edge normals
+    const Point e0n = e0 * invs[0];
+    const Point e1n = e1 * invs[1];
+    const Point e2n = e2 * invs[2];
 
-        acc[i0].n += t * a0;
-        acc[i1].n += t * a1;
-        acc[i2].n += t * a2;
-    }
+    // Wedge angles
+    const float d0 = e0n * (-e2n);
+    const float d1 = (-e0n) * e1n;
+    const float d2 = (-e1n) * e2n;
 
-    // Reduce thread-local sums into vertex normals
-    // Tree-style reduction to improve cache locality
-    int stride = 1;
-    while (stride < nThreads) {
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < nV; ++i) {
-            for (int t = 0; t + stride < nThreads; t += 2 * stride) {
-                tls[t][i].n += tls[t + stride][i].n;
-            }
-        }
-        stride <<= 1;
-    }
+    const _Data vDots = _SetN(d0, d1, d2, 0.0f);
+    const _Data vAngles = FastACos(vDots);
 
-    // Write back and normalize once
-    {
-        auto& sum = tls[0];
-#pragma omp parallel for schedule(static)
-        for (int i = 0; i < nV; ++i) {
-            if (m.vert[i].IsD()) continue;
-            m.vert[i].N() = sum[i].n;
-            m.vert[i].N().Normalize();
-        }
-    }
-}
+    float angles[4];
+    _Store(angles, vAngles);
+
+    const Point c0 = angles[0] * n;
+    const Point c1 = angles[1] * n;
+    const Point c2 = angles[2] * n;
+
+    const int i0 = int(f.V(0) - start);
+    const int i1 = int(f.V(1) - start);
+    const int i2 = int(f.V(2) - start);
+
+    // ============================
+    // Atomic accumulation per vertex
+    // ============================
+    float* __restrict f0 = &m.vert[i0].N()[0];
+    float* __restrict f1 = &m.vert[i1].N()[0];
+    float* __restrict f2 = &m.vert[i2].N()[0];
+
+    const float c0x = c0.X();
+    const float c0y = c0.Y();
+    const float c0z = c0.Z();
+
+    const float c1x = c1.X();
+    const float c1y = c1.Y();
+    const float c1z = c1.Z();
+
+    const float c2x = c2.X();
+    const float c2y = c2.Y();
+    const float c2z = c2.Z();
+
+    AtomicAddFloat(f0, c0x);
+    AtomicAddFloat(f0 + 1, c0y);
+    AtomicAddFloat(f0 + 2, c0z);
+
+    AtomicAddFloat(f1, c1x);
+    AtomicAddFloat(f1 + 1, c1y);
+    AtomicAddFloat(f1 + 2, c1z);
+
+    AtomicAddFloat(f2, c2x);
+    AtomicAddFloat(f2 + 1, c2y);
+    AtomicAddFloat(f2 + 2, c2z);
+  }
+
+  // Normalize final vertex normals
+#pragma omp parallel for
+  for (int i = 0; i < (int)m.vert.size(); ++i) {
+    if (m.vert[i].IsD()) continue;
+    Point n = m.vert[i].N();
+    if (Norm(n) > 0) n.Normalize();
+    m.vert[i].N() = n;
+  }
+
 #else
-static void PerVertexAngleWeighted(ComputeMeshType &m)
-{
-  PerVertexClear(m);
-  FaceIterator f;
-  for(f=m.face.begin();f!=m.face.end();++f)
-   if( !(*f).IsD() && (*f).IsR() )
-   {
-        NormalType t = TriangleNormal(*f).Normalize();
-        NormalType e0 = ((*f).V1(0)->cP()-(*f).V0(0)->cP()).Normalize();
-        NormalType e1 = ((*f).V1(1)->cP()-(*f).V0(1)->cP()).Normalize();
-        NormalType e2 = ((*f).V1(2)->cP()-(*f).V0(2)->cP()).Normalize();
+  using Scalar = float;
+  using Point = vcg::Point3<Scalar>;
 
-        (*f).V(0)->N() += t*AngleN(e0,-e2);
-        (*f).V(1)->N() += t*AngleN(-e0,e1);
-        (*f).V(2)->N() += t*AngleN(-e1,e2);
-   }
-}
+  const int nVerts = (int)m.vert.size();
+  const int nThreads = omp_get_max_threads();
+
+  std::vector<Scalar> soaAccum((size_t)nVerts * nThreads * 3, Scalar(0));
+
+  const auto* start = &m.vert[0];
+
+  if (m.hasDeletedFaces)
+  {
+#pragma omp parallel
+    {
+      int tid = omp_get_thread_num();
+      Scalar* __restrict soa = soaAccum.data();
+
+#pragma omp for
+      for (ptrdiff_t fi = 0; fi < (ptrdiff_t)m.face.size(); ++fi) {
+        auto& f = m.face[fi];
+        if (f.IsD()) continue;
+
+        const auto& p0 = f.cP(0);
+        const auto& p1 = f.cP(1);
+        const auto& p2 = f.cP(2);
+
+        const Point e0 = p1 - p0;
+        const Point e1 = p2 - p1;
+        const Point e2 = p0 - p2;
+
+        const Point fn = e0 ^ -e2;
+        const Scalar fnLen = Norm(fn);
+        if (fnLen <= Scalar(0)) continue;
+        const Point n = fn / fnLen;
+
+        // -----------------------------------------
+        // Normalize 3 edges in SIMD
+        // -----------------------------------------
+        const _Data len2 = _mm_set_ps(
+          e2.X() * e2.X() + e2.Y() * e2.Y() + e2.Z() * e2.Z(),
+          e1.X() * e1.X() + e1.Y() * e1.Y() + e1.Z() * e1.Z(),
+          e0.X() * e0.X() + e0.Y() * e0.Y() + e0.Z() * e0.Z(),
+          0.0f);
+
+        const _Data len = _mm_sqrt_ps(len2);
+        const _Data inv = _Div(_Set(1.0f), len);
+
+        float invs[4];
+        _Store(invs, inv);
+
+        const Point e0n = Point(e0.X() * invs[0], e0.Y() * invs[0], e0.Z() * invs[0]);
+        const Point e1n = Point(e1.X() * invs[1], e1.Y() * invs[1], e1.Z() * invs[1]);
+        const Point e2n = Point(e2.X() * invs[2], e2.Y() * invs[2], e2.Z() * invs[2]);
+
+        const float d0 = e0n * (-e2n);
+        const float d1 = (-e0n) * e1n;
+        const float d2 = (-e1n) * e2n;
+
+        const _Data vDots = _SetN(d0, d1, d2, 0.0f);
+        const _Data vAngles = FastACos(vDots);
+
+        float angles[4];
+        _Store(angles, vAngles);
+
+        const Point c0 = angles[0] * n;
+        const Point c1 = angles[1] * n;
+        const Point c2 = angles[2] * n;
+
+        const size_t i0 = f.V(0) - start;
+        const size_t i1 = f.V(1) - start;
+        const size_t i2 = f.V(2) - start;
+
+        Scalar* __restrict a0ptr = &soa[i0 * nThreads * 3 + tid * 3];
+        Scalar* __restrict a1ptr = &soa[i1 * nThreads * 3 + tid * 3];
+        Scalar* __restrict a2ptr = &soa[i2 * nThreads * 3 + tid * 3];
+
+        a0ptr[0] += c0[0]; a0ptr[1] += c0[1]; a0ptr[2] += c0[2];
+        a1ptr[0] += c1[0]; a1ptr[1] += c1[1]; a1ptr[2] += c1[2];
+        a2ptr[0] += c2[0]; a2ptr[1] += c2[1]; a2ptr[2] += c2[2];
+      }
+    }
+  }
+  else
+  {
+#pragma omp parallel
+    {
+      int tid = omp_get_thread_num();
+      Scalar* __restrict soa = soaAccum.data();
+
+#pragma omp for
+      for (ptrdiff_t fi = 0; fi < (ptrdiff_t)m.face.size(); ++fi) {
+        auto& f = m.face[fi];
+
+        const auto& p0 = f.cP(0);
+        const auto& p1 = f.cP(1);
+        const auto& p2 = f.cP(2);
+
+        const Point e0 = p1 - p0;
+        const Point e1 = p2 - p1;
+        const Point e2 = p0 - p2;
+
+        const Point fn = e0 ^ -e2;
+
+        // Compute squared lengths: e0, e1, e2, fn
+        const float e0len2 = e0.X() * e0.X() + e0.Y() * e0.Y() + e0.Z() * e0.Z();
+        const float e1len2 = e1.X() * e1.X() + e1.Y() * e1.Y() + e1.Z() * e1.Z();
+        const float e2len2 = e2.X() * e2.X() + e2.Y() * e2.Y() + e2.Z() * e2.Z();
+        const float fnLen2 = fn.X() * fn.X() + fn.Y() * fn.Y() + fn.Z() * fn.Z();
+
+        // Pack into SIMD lanes [e0, e1, e2, fn]
+        const _Data len2 = _SetN(fnLen2, e2len2, e1len2, e0len2);
+
+        // sqrt all 4 at once
+        const _Data len = _mm_sqrt_ps(len2);
+
+        // invLen = 1.0 / len
+        const _Data inv = _Div(_Set(1.0f), len);
+
+        // Extract results
+        float invs[4];
+        _Store(invs, inv);
+
+        // invs[0] -> 1/|e0|
+        // invs[1] -> 1/|e1|
+        // invs[2] -> 1/|e2|
+        // invs[3] -> 1/|fn|
+
+        // Face normal
+        Point n(0, 0, 0);
+        if (fnLen2 > 1e-20f) {
+          n = fn * invs[3];
+        }
+
+        // Edge normals
+        const Point e0n = e0 * invs[0];
+        const Point e1n = e1 * invs[1];
+        const Point e2n = e2 * invs[2];
+
+        const float d0 = e0n * (-e2n);
+        const float d1 = (-e0n) * e1n;
+        const float d2 = (-e1n) * e2n;
+
+        const _Data vDots = _SetN(d0, d1, d2, 0.0f);
+        const _Data vAngles = FastACos(vDots);
+
+        float angles[4];
+        _Store(angles, vAngles);
+
+        const Point c0 = angles[0] * n;
+        const Point c1 = angles[1] * n;
+        const Point c2 = angles[2] * n;
+
+        const size_t i0 = f.V(0) - start;
+        const size_t i1 = f.V(1) - start;
+        const size_t i2 = f.V(2) - start;
+
+        Scalar* __restrict a0ptr = &soa[i0 * nThreads * 3 + tid * 3];
+        Scalar* __restrict a1ptr = &soa[i1 * nThreads * 3 + tid * 3];
+        Scalar* __restrict a2ptr = &soa[i2 * nThreads * 3 + tid * 3];
+
+        a0ptr[0] += c0[0]; a0ptr[1] += c0[1]; a0ptr[2] += c0[2];
+        a1ptr[0] += c1[0]; a1ptr[1] += c1[1]; a1ptr[2] += c1[2];
+        a2ptr[0] += c2[0]; a2ptr[1] += c2[1]; a2ptr[2] += c2[2];
+      }
+    }
+  }
+
+  // =====================================================
+  // Reduction + normalize
+  // =====================================================
+#pragma omp parallel for
+  for (int i = 0; i < nVerts; ++i) {
+    if (m.vert[i].IsD()) continue;
+
+    Scalar nx = 0, ny = 0, nz = 0;
+    for (int t = 0; t < nThreads; ++t) {
+      const Scalar* __restrict acc = &soaAccum[i * nThreads * 3 + t * 3];
+      nx += acc[0];
+      ny += acc[1];
+      nz += acc[2];
+    }
+
+    Point n(nx, ny, nz);
+    if (Norm(n) > 0) n.Normalize();
+    m.vert[i].N() = n;
+  }
 #endif
+}
 
 ///  \brief Calculates the vertex normal using the Max et al. weighting scheme. It does not need or exploit current face normals.
 /**
@@ -264,18 +470,42 @@ static void PerVertexNelsonMaxWeighted(ComputeMeshType &m)
 /// \brief Calculates the face normal
 ///
 /// Not normalized. Use PerFaceNormalized() or call NormalizePerVertex() if you need unit length per face normals.
-static void PerFace(ComputeMeshType &m)
+static void PerFace(ComputeMeshType& m)
 {
-    RequirePerFaceNormal(m); // JPB WIP BUG What is this doing?
+  RequirePerFaceNormal(m); // JPB WIP BUG What is this doing?
 
-    int64_t numFaces = m.fn;
+  int64_t numFaces = m.fn;
+
+  if (m.hasDeletedFaces)
+  {
 #pragma omp parallel for
     for (int64_t i = 0; i < numFaces; ++i) {
-        auto& f = m.face[i];
-        if ( !f.IsD() ) {
-            f.N() = TriangleNormal(f);
-        }
+      auto& f = m.face[i];
+      if (!f.IsD()) {
+        f.N() = TriangleNormal(f);
+      }
     }
+  }
+  else
+  {
+#pragma omp parallel for
+    for (int64_t i = 0; i < numFaces; ++i) {
+      auto& f = m.face[i];
+
+      auto v0 = f.cP(0);
+      auto v1 = f.cP(1);
+      auto v2 = f.cP(2);
+
+      auto e0 = v1 - v0;
+      auto e1 = v2 - v0;
+
+      auto n = e0 ^ e1;  // cross product
+
+      f.N()[0] = n[0];
+      f.N()[1] = n[1];
+      f.N()[2] = n[2];
+    }
+  }
 }
 
 
