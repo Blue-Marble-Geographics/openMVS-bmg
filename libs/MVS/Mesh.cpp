@@ -245,17 +245,30 @@ void Mesh::ListIncidenteVertices()
 // extract the (ordered) array of triangles incident to each vertex
 void Mesh::ListIncidenteFaces()
 {
-	vertexFaces.Empty();
+	vertexFaces.clear();
 	vertexFaces.resize(vertices.size());
-	FOREACH(i, faces) {
-		const Face& face = faces[i];
-		for (int v = 0; v < 3; ++v) {
-			const auto fi = face[v];
-			auto& vf = vertexFaces[fi];
-			vf.reserve(8); // 32 slower
-			ASSERT(vf.Find(i) == FaceIdxArr::NO_INDEX);
-			vf.Insert(i);
+
+	size_t i = 0;
+	while (i < faces.size()) {
+		Face& face = faces[i];
+
+		// Check for degeneracy
+		if (face[0] == face[1] || face[1] == face[2] || face[2] == face[0]) {
+			// Overwrite this slot with the last face and shrink
+			faces[i] = faces.back();
+			faces.pop_back();
+			continue; // re-check the new face at index i
 		}
+
+		// Build adjacency
+		for (int v = 0; v < 3; ++v) {
+			VIndex vi = face[v];
+			auto& vf = vertexFaces[vi];
+			vf.reserve(8);
+			vf.Insert((FIndex)i);
+		}
+
+		++i;
 	}
 }
 
@@ -528,15 +541,15 @@ void Mesh::GetAdjVertices(VIndex v, boost::container::small_vector<VIndex, 32>& 
 		}
 	}
 #else
-	ASSERT(vertexFaces.GetSize() == vertices.GetSize());
+	ASSERT(vertexFaces.size() == vertices.size());
 	const FaceIdxArr& idxFaces = vertexFaces[v];
-	setIndices.clear();
-	FOREACHPTR(pIdxFace, idxFaces) {
-		const Face& face = faces[*pIdxFace];
-		for (int i=0; i<3; ++i) {
+	std::unordered_set<VIndex> setIndices;
+	for (FIndex idxFace : idxFaces) {
+		const Face& face = faces[idxFace];
+		for (int i = 0; i < 3; ++i) {
 			const VIndex vAdj(face[i]);
 			if (vAdj != v && setIndices.insert(vAdj).second)
-				indices.Insert(vAdj);
+				indices.emplace_back(vAdj);
 		}
 	}
 #endif
@@ -627,7 +640,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 		queue.reserve(64);
 		VertexWork local;
 
-#pragma omp for schedule(dynamic)
+#pragma omp for schedule(static)
 		for (ptrdiff_t idxVert = 0; idxVert < (ptrdiff_t)nVerts; ++idxVert) {
 			local.componentFaces.clear();
 			local.numComponents = 0;
@@ -1090,6 +1103,150 @@ private:
 
 #endif
 
+// Helper: restore consistency after deletions
+inline void RestoreConsistency(CLEAN::Mesh& mesh)
+{
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+}
+
+// Count faces with area smaller than epsilon
+static int CountZeroAreaFaces(const CLEAN::Mesh& mesh, CLEAN::Mesh::ScalarType eps = 1e-12)
+{
+	int n = 0;
+	const auto* vBegin = mesh.vert.empty() ? nullptr : &*mesh.vert.begin();
+	const auto* vEnd = vBegin ? vBegin + mesh.vert.size() : nullptr;
+
+	for (size_t i = 0; i < mesh.face.size(); ++i) {
+		const auto& f = mesh.face[i];
+		if (f.IsD()) continue;
+
+		auto* v0 = f.V(0);
+		auto* v1 = f.V(1);
+		auto* v2 = f.V(2);
+		if (!v0 || !v1 || !v2) continue;
+		if (v0 < vBegin || v0 >= vEnd) continue;
+		if (v1 < vBegin || v1 >= vEnd) continue;
+		if (v2 < vBegin || v2 >= vEnd) continue;
+		if (v0->IsD() || v1->IsD() || v2->IsD()) continue;
+
+		const auto& p0 = v0->cP();
+		const auto& p1 = v1->cP();
+		const auto& p2 = v2->cP();
+		CLEAN::Mesh::ScalarType area2 = ((p1 - p0) ^ (p2 - p0)).Norm();
+
+		if (area2 <= eps) ++n;
+	}
+	return n;
+}
+
+
+template<class MeshType>
+bool ValidateMesh(const MeshType& m, const char* stage, bool checkEdges = false)
+{
+	bool ok = true;
+
+	const auto* vBegin = m.vert.empty() ? nullptr : &*m.vert.begin();
+	const auto* vEnd = vBegin ? vBegin + m.vert.size() : nullptr;
+
+	// Faces
+	for (size_t i = 0; i < m.face.size(); ++i) {
+		const auto& f = m.face[i];
+		if (f.IsD()) continue;
+		for (int j = 0; j < f.VN(); ++j) {
+			auto* v = f.V(j);
+			if (!v) {
+				DEBUG("[%s] Face %zu has null vertex pointer\n", stage, i);
+				ok = false; continue;
+			}
+			if (v < vBegin || v >= vEnd) {
+				DEBUG("[%s] Face %zu points outside vertex array (%p)\n",
+					stage, i, (void*)v);
+				ok = false;
+			}
+			else if (v->IsD()) {
+				DEBUG("[%s] Face %zu points to deleted vertex at idx %zd\n",
+					stage, i, v - vBegin);
+				ok = false;
+			}
+		}
+	}
+
+	if (checkEdges) {
+		// Edges
+		const auto* eBegin = m.edge.empty() ? nullptr : &*m.edge.begin();
+		const auto* eEnd = eBegin ? eBegin + m.edge.size() : nullptr;
+
+		for (size_t i = 0; i < m.edge.size(); ++i) {
+			const auto& e = m.edge[i];
+			if (e.IsD()) continue;
+			for (int j = 0; j < 2; ++j) {
+				auto* v = e.V(j);
+				if (!v) {
+					DEBUG("[%s] Edge %zu has null vertex pointer\n", stage, i);
+					ok = false; continue;
+				}
+				if (v < vBegin || v >= vEnd) {
+					DEBUG("[%s] Edge %zu points outside vertex array (%p)\n",
+						stage, i, (void*)v);
+					ok = false;
+				}
+				else if (v->IsD()) {
+					DEBUG("[%s] Edge %zu points to deleted vertex at idx %zd\n",
+						stage, i, v - vBegin);
+					ok = false;
+				}
+			}
+		}
+	}
+
+	return ok;
+}
+
+inline void LightCleanup(CLEAN::Mesh& mesh)
+{
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+}
+
+inline void FinalCleanup(CLEAN::Mesh& mesh,
+	CLEAN::Mesh::ScalarType eps,
+	bool enforceManifold)
+{
+	// 1. Remove bad/duplicate faces & verts
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateVertex(mesh);
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveDegenerateVertex(mesh);
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+
+	// 2. Compact and refresh topology so invariants hold
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+
+	// 3. Optional: enforce manifoldness
+	if (enforceManifold) {
+		int nRemoved = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
+		if (nRemoved > 0)
+			DEBUG("Removed %d non-manifold faces", nRemoved);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
+
+		// 4. Compact + refresh again
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+	}
+}
+
+
 // decimate, clean and smooth mesh
 // fDecimate factor is in range (0..1], if 1 no decimation takes place
 void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean)
@@ -1154,10 +1311,11 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 	Foo* foos = pad.allocate<Foo>(1, 128);
 #endif
 
+	constexpr CLEAN::Mesh::ScalarType eps = 1e-12;
 	// decimate mesh
 	if (fDecimate < 1) {
 		ASSERT(fDecimate > 0);
-		const int nZeroAreaFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveZeroAreaFace(mesh);
+		const int nZeroAreaFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
 		DEBUG_ULTIMATE("Removed %d zero-area faces", nZeroAreaFaces);
 		const int nDuplicateFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
 		DEBUG_ULTIMATE("Removed %d duplicate faces", nDuplicateFaces);
@@ -1197,116 +1355,32 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		DeciSession.Finalize<CLEAN::TriEdgeCollapse>();
 		progress.close();
 		DEBUG_ULTIMATE("Mesh decimated: %d -> %d faces", OriginalFaceNum, TargetFaceNum);
-	}
 
-	// clean mesh
-	{
-		const int nZeroAreaFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveZeroAreaFace(mesh);
-		DEBUG_ULTIMATE("Removed %d zero-area faces", nZeroAreaFaces);
-		const int nDuplicateFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
-		DEBUG_ULTIMATE("Removed %d duplicate faces", nDuplicateFaces);
-		const int nUnreferencedVertices = vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
-		DEBUG_ULTIMATE("Removed %d unreferenced vertices", nUnreferencedVertices);
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-		const int nNonManifoldFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
-		DEBUG_ULTIMATE("Removed %d non-manifold faces", nNonManifoldFaces);
-		const int nDegenerateVertices = vcg::tri::Clean<CLEAN::Mesh>::RemoveDegenerateVertex(mesh);
-		DEBUG_ULTIMATE("Removed %d degenerate vertices", nDegenerateVertices);
-		#if 1
-		const int nDuplicateVertices = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateVertex(mesh);
-		DEBUG_ULTIMATE("Removed %d duplicate vertices", nDuplicateVertices);
-		#endif
-		#if 1
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
-		for (int i=0; i<10; ++i) {
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-			const int nSplitNonManifoldVertices = vcg::tri::Clean<CLEAN::Mesh>::SplitNonManifoldVertex(mesh, 0.1f);
-			DEBUG_ULTIMATE("Split %d non-manifold vertices", nSplitNonManifoldVertices);
-			if (nSplitNonManifoldVertices == 0)
-				break;
-		}
-		#else
-		const int nNonManifoldVertices = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
-		DEBUG_ULTIMATE("Removed %d non-manifold vertices", nNonManifoldVertices);
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
-		#endif
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
-	}
-
-#if 0 // Remove big faces
-	if ( fSpurious > 0) 
-	{
-		// Step 0: compute global median edge length once
-		std::vector<float> allLens;
-		allLens.reserve(mesh.EN());
-		for (auto& e : mesh.edge) {
-			if (e.IsD()) continue;
-			float len = (e.V(0)->cP() - e.V(1)->cP()).Norm();
-			allLens.push_back(len);
-		}
-		if (allLens.empty()) return;
-
-		size_t midAll = allLens.size() / 2;
-		std::nth_element(allLens.begin(), allLens.begin() + midAll, allLens.end());
-		float globalMedEdge = allLens[midAll];
-
-		// Step 1: iterative passes
-		int totalRemoved = 0;
-		const int maxPasses = 5; // allow plenty of passes, break early if stable
-
-		for (int pass = 0; pass < maxPasses; ++pass) {
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
-
-			int removed = 0;
-			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-				if (fi->IsD()) continue;
-
-				int borderCount = 0;
-				float maxLen = 0.0f;
-				for (int j = 0; j < fi->VN(); ++j) {
-					float len = (fi->cP((j + 1) % fi->VN()) - fi->cP(j)).Norm();
-					if (fi->IsB(j)) borderCount++;
-					if (len > maxLen) maxLen = len;
-				}
-
-				// Heuristic: require at least 2 border edges to reduce false positives
-				if (borderCount >= 1 && maxLen > globalMedEdge * fSpurious) {
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-					++removed;
-				}
-			}
-
-			if (removed == 0) break; // stable border, stop passes
-			totalRemoved += removed;
-
-			// cleanup
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		int nZero = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
+		int nDup = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
+		if (nZero || nDup) {
+			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 			vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-
-			DEBUG_EXTRA("Pass %d: removed %d faces (total %d)", pass, removed, totalRemoved);
 		}
-
-		DEBUG_EXTRA("Finished removing %d spurious border faces (fSpurious=%.2f, global median %.3f)",
-			totalRemoved, fSpurious, globalMedEdge);
 	}
-#endif
 
-#if 1 // Restoring spurious for testing.
-	// remove spurious components
+	// Remove spurious components
+	// Mesh should be clean at this stage.
 	if (fSpurious > 0) {
+		// Rebuild edges from current valid faces/verts
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
+		//ValidateMesh(mesh, "before spurious removal", true); // <--- check edges here
+
 		FloatArr edgeLens(0, mesh.EN());
 		for (CLEAN::Mesh::EdgeType& edge : mesh.edge) {
 			const CLEAN::Vertex::CoordType& P1(edge.V(1)->cP());
 			const CLEAN::Vertex::CoordType& P0(edge.V(0)->cP());
 			edgeLens.Insert((P1 - P0).SquaredNorm());
 		}
+
 		// remove faces with too long edges
 		const float thLongEdge(SQRT(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious);
 		const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
@@ -1319,123 +1393,19 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		const std::pair<int, int> delInfo(vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, thLongSize));
 		DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
-	}
-#endif
 
-#if 0 // JPB WIP BUG Not helping
-	// remove spurious components
-	if (fSpurious > 0) {
-		std::vector<float> lens;
-		lens.reserve(mesh.EN());
-		for (auto& edge : mesh.edge) {
-			const auto& p0 = edge.V(0)->cP();
-			const auto& p1 = edge.V(1)->cP();
-			lens.push_back(-(p1 - p0).SquaredNorm()); // negate if you want to use 5%/45%
-		}
-
-		size_t idx5 = lens.size() * 5 / 100;
-		size_t idx45 = lens.size() * 45 / 100;
-
-		// 1. Partition at 45%
-		std::nth_element(lens.begin(), lens.begin() + idx45, lens.end());
-		float q45 = lens[idx45];
-
-		// 2. Partition inside the lower half at 5%
-		std::nth_element(lens.begin(), lens.begin() + idx5, lens.begin() + idx45);
-		float q5 = lens[idx5];
-
-		// thresholds
-		const float thLongEdge = std::sqrt(-q5) * fSpurious;
-		const float thLongSize = std::sqrt(-q45) * fSpurious;
-
-#if 1 // JPB WIP BUG
-		// remove faces with too long edges
-		const size_t numLongFaces(vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, thLongEdge));
-		for (CLEAN::Mesh::FaceIterator fi = mesh.face.begin(); fi != mesh.face.end(); ++fi)
-			if (!(*fi).IsD() && (*fi).IsS())
-				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-
-		DEBUG_ULTIMATE("Removed %d faces with edges longer than %f", numLongFaces, thLongEdge);
-		// remove isolated components
-
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-#endif
-		int minComponentSize = 500;
-		// Note we ignore components less than minComponentSize faces.
-
-		std::vector< std::pair<int, CLEAN::Mesh::FacePointer> > CCV;
-		int TotalCC = vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
-		int DeletedCC = 0;
-		vcg::tri::ConnectedComponentIterator<CLEAN::Mesh> ci;
-		boost::container::small_vector<CLEAN::Mesh::FacePointer, 128> FPV; // JPB WIP OPT
-		for (unsigned int i = 0; i < CCV.size(); ++i)
-		{
-			FPV.clear();
-
-			// If the connected component has less than minComponentSize faces, we always remove it.
-			bool removeComponent = CCV[i].first < minComponentSize;
-			if (!removeComponent)
-			{
-				bool tooBig = false;
-				int counter = 0;
-
-				CLEAN::Mesh::BoxType bb;
-				for (ci.start(mesh, CCV[i].second); !ci.completed(); ++ci)
-				{
-					FPV.push_back(*ci);
-					bb.Add((*ci)->cP(0));
-					bb.Add((*ci)->cP(1));
-					bb.Add((*ci)->cP(2));
-
-					// check every N adds (e.g. every 256 triangles to amortize cost)
-					if ((++counter & 255) == 0) {
-						if (bb.Diag() >= thLongSize) {
-							tooBig = true;
-							break;  // stop growing box; component is safe
-						}
-					}
-				}
-				if (!tooBig && bb.Diag() < thLongSize)
-				{
-					removeComponent = true;
-				}
-			}
-
-			if (removeComponent)
-			{
-				++DeletedCC;
-				if (FPV.empty()) {
-					for (ci.start(mesh, CCV[i].second); !ci.completed(); ++ci)
-					{
-						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, (**ci));
-					}
-				}
-				else
-				{
-					for (auto fpvi = FPV.begin(); fpvi != FPV.end(); ++fpvi)
-					{
-						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, (**fpvi));
-					}
-				}
-			}
-		}
-
-		const std::pair<int, int> delInfo = { TotalCC, DeletedCC };
-		DEBUG_ULTIMATE("Removed %d connected components out of %d", delInfo.second, delInfo.first);
-
-		// Recompact and rebuild topology after deletions
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		mesh.edge.clear(); // Edges no longer needed.
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
 	}
-#endif
 
 	// remove spikes
-#if 1 // JPB WIP BUG
-// Fast, single-pass spike removal with safe cleanup to avoid CompactEveryVector crashes.
-// Style: 2-space indent, spaces not tabs, braces on same line. CamelCase variables, PascalCase types.
-
+	// Fast, single-pass spike removal with safe cleanup to avoid CompactEveryVector crashes.
+	// Style: 2-space indent, spaces not tabs, braces on same line. CamelCase variables, PascalCase types.
+	// Mesh should be clean at this stage.
 	if (bRemoveSpikes) {
 		int nTotalSpikes = 0;
 
@@ -1443,42 +1413,31 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 			DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
 		}
 		else {
-			// Build per-vertex valence and incident-face lists (compact CSR form).
 			const int numVerts = (int)mesh.vert.size();
 			std::vector<int> valence(numVerts, 0);
-
-			// Precompute vertex alive flags once (no pointer chasing in the hot loop).
 			std::vector<uint8_t> alive(numVerts, 0);
-			for (int i = 0; i < numVerts; ++i) {
+
+			for (int i = 0; i < numVerts; ++i)
 				alive[i] = mesh.vert[i].IsD() ? 0u : 1u;
-			}
 
 			auto vpIndex = [&](CLEAN::Mesh::VertexPointer vp) -> int {
-				// Faster than vcg::tri::Index(mesh, vp) when vert is contiguous
 				return int(vp - &mesh.vert[0]);
 				};
 
-			// Pass 1: count valence using alive-mask (no v->IsD() per face).
+			// Pass 1: count valence
 			size_t numFaceRefs = 0;
 			for (auto& f : mesh.face) {
-				if (f.IsD())
-					continue;
-
+				if (f.IsD()) continue;
 				auto* v0 = f.V(0);
 				auto* v1 = f.V(1);
 				auto* v2 = f.V(2);
-
 				const int i0 = vpIndex(v0);
 				const int i1 = vpIndex(v1);
 				const int i2 = vpIndex(v2);
 
-				const uint8_t m = uint8_t(alive[i0] & alive[i1] & alive[i2]); // 0 or 1
-				if (!m)
-					continue;
+				if (!(alive[i0] & alive[i1] & alive[i2])) continue;
 
-				valence[i0] += 1;
-				valence[i1] += 1;
-				valence[i2] += 1;
+				valence[i0]++; valence[i1]++; valence[i2]++;
 				numFaceRefs += 3;
 			}
 
@@ -1489,160 +1448,74 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 				incOffsets[(size_t)i] = (uint32_t)run;
 				run += (uint32_t)valence[i];
 			}
-			incOffsets[(size_t)numVerts] = (uint32_t)run;
+			incOffsets[numVerts] = (uint32_t)run;
 
-			// Pass 2: fill flat incident-face array using the same alive-mask.
+			// Pass 2: fill flat incident-face array
 			std::vector<CLEAN::Mesh::FacePointer> incFacesFlat(numFaceRefs);
 			std::vector<uint32_t> cursor = incOffsets;
 
 			for (auto& f : mesh.face) {
-				if (f.IsD())
-					continue;
-
+				if (f.IsD()) continue;
 				auto* v0 = f.V(0);
 				auto* v1 = f.V(1);
 				auto* v2 = f.V(2);
-
 				const int i0 = vpIndex(v0);
 				const int i1 = vpIndex(v1);
 				const int i2 = vpIndex(v2);
 
-				const uint8_t m = uint8_t(alive[i0] & alive[i1] & alive[i2]);
-				if (!m)
-					continue;
+				if (!(alive[i0] & alive[i1] & alive[i2])) continue;
 
-				incFacesFlat[(size_t)cursor[(size_t)i0]++] = &f;
-				incFacesFlat[(size_t)cursor[(size_t)i1]++] = &f;
-				incFacesFlat[(size_t)cursor[(size_t)i2]++] = &f;
+				incFacesFlat[cursor[i0]++] = &f;
+				incFacesFlat[cursor[i1]++] = &f;
+				incFacesFlat[cursor[i2]++] = &f;
 			}
 
-			// Seed queue with spikes (valence == 1), using alive[] so we don't touch vertices again.
+			// Helpers
+			auto facesBegin = [&](int vi) { return incFacesFlat.data() + incOffsets[vi]; };
+			auto facesEnd = [&](int vi) { return incFacesFlat.data() + incOffsets[vi + 1]; };
+
+			// Seed queue with spikes
 			std::vector<int> q;
 			q.reserve(numVerts);
-			for (int i = 0; i < numVerts; ++i) {
-				if (alive[i] && valence[i] == 1)
-					q.push_back(i);
-			}
+			for (int i = 0; i < numVerts; ++i)
+				if (alive[i] && valence[i] == 1) q.push_back(i);
 
-			// CSR range helpers
-			auto facesBegin = [&](int vi) { return incFacesFlat.data() + incOffsets[(size_t)vi]; };
-			auto facesEnd = [&](int vi) { return incFacesFlat.data() + incOffsets[(size_t)vi + 1]; };
-
-			auto findOneFace = [&](int vi) -> CLEAN::Mesh::FacePointer {
-				for (auto p = facesBegin(vi), e = facesEnd(vi); p != e; ++p) {
-					CLEAN::Mesh::FacePointer f = *p;
-					if (f && !f->IsD())
-						return f;
-				}
-				return nullptr;
-				};
-
-			auto decValence = [&](CLEAN::Mesh::VertexPointer vp) {
-				if (!vp)
-					return;
-				const int idx = vpIndex(vp);
-				if ((unsigned)idx >= (unsigned)numVerts || !alive[idx])
-					return;
-				if (valence[idx] > 0) {
-					--valence[idx];
-					if (valence[idx] == 1)
-						q.push_back(idx);
-				}
-				};
-
-			// Prune spikes
+			// Spike pruning
 			size_t head = 0;
 			while (head < q.size()) {
 				const int vi = q[head++];
 				if ((unsigned)vi >= (unsigned)numVerts || !alive[vi] || valence[vi] != 1)
 					continue;
 
-				auto f = findOneFace(vi);
-				if (!f)
-					continue;
+				// Delete all incident faces first
+				for (auto p = facesBegin(vi), e = facesEnd(vi); p != e; ++p) {
+					CLEAN::Mesh::FacePointer f = *p;
+					if (f && !f->IsD())
+						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *f);
+				}
 
-				auto a = f->V(0);
-				auto b = f->V(1);
-				auto c = f->V(2);
-
-				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *f);
-
-				decValence(a);
-				decValence(b);
-				decValence(c);
-
+				// Now safe to delete vertex
 				vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, mesh.vert[vi]);
 				alive[vi] = 0;
 				++nTotalSpikes;
 			}
 
-			// Cleanup sequence
-			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-				if (fi->IsD())
-					continue;
-				if (fi->V(0)->IsD() || fi->V(1)->IsD() || fi->V(2)->IsD())
-				{
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-				}
-			}
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
-			vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
-
-			DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
-		}
-	}
-#else
-	if (bRemoveSpikes) {
-		int nTotalSpikes(0);
-		vcg::tri::RequireVFAdjacency(mesh);
-		while (true) {
-			if (fSpurious <= 0 || nTotalSpikes != 0)
-				vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-			int nSpikes(0);
-			for (CLEAN::Mesh::VertexIterator vi=mesh.vert.begin(); vi!=mesh.vert.end(); ++vi) {
-				if (vi->IsD())
-					continue;
-				CLEAN::Face* const start(vi->cVFp());
-				if (start == NULL) {
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, *vi);
-					continue;
-				}
-				vcg::face::JumpingPos<CLEAN::Face> p(start, vi->cVFi(), &*vi);
-				int count(0);
-				do {
-					++count;
-					p.NextFE();
-				} while (p.f!=start);
-				if (count == 1) {
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, *vi);
-					++nSpikes;
-				}
-			}
-			if (nSpikes == 0)
-				break;
-			for (CLEAN::Mesh::FaceIterator fi=mesh.face.begin(); fi!=mesh.face.end(); ++fi) {
-				if (!fi->IsD() &&
-					(fi->V(0)->IsD() ||
-					 fi->V(1)->IsD() ||
-					 fi->V(2)->IsD()))
-					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-			}
-			nTotalSpikes += nSpikes;
 		}
-		DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
 	}
-#endif
 
 	// close holes
+	// Mesh should be clean at this stage.
 	if (nCloseHoles > 0) {
-		if (fSpurious > 0 || /* JPB WIP BUG ECI will hang unless we update this with new spurious changes fSpurious <= 0 &&*/ !bRemoveSpikes)
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		// Ensure normals are fresh (required for SelfIntersectionEar)
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);
 		ASSERT(vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh) == 0);
+
 		const int OriginalSize(mesh.fn);
 		#if 1
 		// When closing holes it tries to prevent the creation of faces that intersect faces adjacent to
@@ -1652,27 +1525,40 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		const int holeCnt = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingFill< vcg::tri::MinimumWeightEar<CLEAN::Mesh> >(mesh, (int)nCloseHoles, false);
 		#endif
 		DEBUG_ULTIMATE("Closed %d holes and added %d new faces", holeCnt, mesh.fn-OriginalSize);
+
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
 	}
 
 	// smooth mesh
+	// Mesh should be clean at this stage.
 	if (nSmooth > 0) {
-		if (fSpurious <= 0 && !bRemoveSpikes && nCloseHoles <= 0)
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
-		#if 1
+#if 1
 		DEBUG("Smoothing %d", nSmooth);
 		vcg::tri::Smooth<CLEAN::Mesh>::VertexCoordLaplacian(mesh, (int)nSmooth, false, false);
-		#else
+#else
 		vcg::tri::Smooth<CLEAN::Mesh>::VertexCoordLaplacianHC(mesh, (int)nSmooth, false);
-		#endif
+#endif
 		DEBUG_ULTIMATE("Smoothed %d vertices", mesh.vn);
+
+		// Topology doesn't change, but may introduce slivers.
+		int nEps = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
+		if (nEps > 0) {
+			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		}
 	}
 
 	// remesh
+	// Mesh should be clean at this stage.
 	if (fEdgeLength > 0) {
-		vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateVertex(mesh);
-		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
 		CLEAN::Mesh original;
 		vcg::tri::Append<CLEAN::Mesh,CLEAN::Mesh>::MeshCopy(original, mesh);
 		vcg::tri::IsotropicRemeshing<CLEAN::Mesh>::Params params;
@@ -1688,23 +1574,75 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 		catch(vcg::MissingPreconditionException& e) {
 			VERBOSE("error: %s", e.what());
 		}
+
+		// Post-clean only if needed
+		int nDupF = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
+		int nZero = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps); // optional sliver removal
+		int nUF = vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+
+		if (nDupF || nZero || nUF) {
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		}
 	}
 
-	// clean mesh
-	if (bLastClean && (fSpurious > 0 || bRemoveSpikes || nCloseHoles > 0 || nSmooth > 0)) {
-		const int nNonManifoldFaces = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
-		DEBUG_ULTIMATE("Removed %d non-manifold faces", nNonManifoldFaces);
-		#if 0 // not working
-		vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
+	// ---- Final manifold cleanup ----
+	// 1. Sweep faces pointing to invalid verts
+	mesh.edge.clear();
+
+	// 2. Sweep faces that point to deleted/null verts
+	for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+		if (fi->IsD()) continue;
+		for (int k = 0; k < fi->VN(); ++k) {
+			auto* v = fi->V(k);
+			if (!v || v->IsD()) {
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+				break;
+			}
+		}
+	}
+
+	// 2. Drop unreferenced verts (important before compaction!)
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+
+	// 3. Compact + rebuild adjacency
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+
+	// 3. Enforce manifoldness
+	int nmE = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh);
+	int nmV = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldVertexFF(mesh);
+	while (nmE > 0 || nmV > 0) {
+		int nRemovedE = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
+		int nRemovedV = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
+		if (nRemovedE == 0 && nRemovedV == 0) break;
+
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-		const int nSplitNonManifoldVertices = vcg::tri::Clean<CLEAN::Mesh>::SplitNonManifoldVertex(mesh, 0.1f);
-		DEBUG_ULTIMATE("Split %d non-manifold vertices", nSplitNonManifoldVertices);
-		#else
-		const int nNonManifoldVertices = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
-		DEBUG_ULTIMATE("Removed %d non-manifold vertices", nNonManifoldVertices);
-		#endif
+
+		nmE = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh);
+		nmV = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldVertexFF(mesh);
 	}
+
+	// 4. Final orphan removal
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+
+	// 5. Final validation
+	int nUF = vcg::tri::Clean<CLEAN::Mesh>::CountUnreferencedVertex(mesh);
+	int nZero = CountZeroAreaFaces(mesh, eps);
+	nmE = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh);
+	nmV = vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldVertexFF(mesh);
+
+	DEBUG("Mesh integrity check: E=%d V=%d U=%d Z=%d", nmE, nmV, nUF, nZero);
 
 	// import VCG mesh
 	{

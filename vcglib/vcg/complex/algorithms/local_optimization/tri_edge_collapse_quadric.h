@@ -40,8 +40,7 @@
 #undef REJECT_BAD_CANDIDATES // Not as helpful as it seems.
 
 float g_ScaleFactor;
-
-static volatile DWORD64 g_colstart;
+constexpr uint8_t nextPacked[3] = { 0x12, 0x20, 0x01 };
 
 namespace vcg{
 namespace tri{
@@ -497,7 +496,7 @@ public:
 
     // Now Simulate the collapse 
     v[0]->P() = v[1]->P() = this->optimalPos;
-     
+    
     ScalarType newQual = 0.3f;
     static int cntr = 1;
     for (int vi = 0; vi < 2; ++vi) {
@@ -514,13 +513,13 @@ public:
           _mm_prefetch((char*)nextFace + 64, _MM_HINT_T0);
         }
 #endif
-
         // Fast early-out: skip already seen faces
         if (f->IMark() != cntr) {
           f->IMark() = cntr;
 
-          const int aIndex = z + 1 - 3 * (z == 2);     // (z + 1) % 3
-          const int bIndex = z + 2 - 3 * (z >= 1);     // (z + 2) % 3
+          const uint8_t packed = nextPacked[z];
+          const int aIndex = packed >> 4;
+          const int bIndex = packed & 0xF;
           const VertexType* __restrict a = f->V(aIndex);
           const VertexType* __restrict b = f->V(bIndex);
           if (a != other && b != other) {
@@ -949,7 +948,6 @@ inline  void UpdateHeap(HeapType& h_ret)
       //Make all quadric independent from mesh size
       g_ScaleFactor = 1e8*pow(1.0/m.bbox.Diag(),6); // scaling factor
     }
-
     if(pp->QualityWeight) // we map quality range into a squared 01 and than this into the 1..QualityWeightFactor range
     {
       ScalarType minQ, maxQ;

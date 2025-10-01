@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 8;
+	constexpr int version = 9;
 
 	return version;
 }
@@ -514,8 +514,8 @@ public:
 				if (f.IsD()) continue;
 				for (int j = 0; j < f.VN(); ++j)
 					referredVec[f.V(j) - &*start] = 1;
-			}
-		}
+					}
+				}
 		else
 		{
 #pragma omp parallel for schedule(static)
@@ -523,8 +523,8 @@ public:
 				const FaceType& f = m.face[i];
 				for (int j = 0; j < f.VN(); ++j)
 					referredVec[f.V(j) - &*start] = 1;
-			}
-		}
+					}
+				}
 
 		const int64_t numEdges = m.edge.size(); // Not m.en
 #pragma omp parallel for schedule(static)
@@ -1179,6 +1179,8 @@ public:
 			auto& f = m.face[faceIdx];
 			Allocator<MeshType>::DeleteFace(m, f);
 		}
+
+		return count_fd;
 	}
 
 	static int RemoveZeroAreaFace(MeshType& m)
@@ -1429,9 +1431,9 @@ public:
 			UpdateSelection<MeshType>::FaceClear(m);
 		}
 
+		int edgeCnt = 0;
 		if (m.hasDeletedFaces)
 		{
-			int edgeCnt = 0;
 			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
 			{
 				if (!fi->IsD())
@@ -1462,7 +1464,6 @@ public:
 		}
 		else
 		{
-			int edgeCnt = 0;
 			for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
 			{
 				for (int i = 0; i < 3; ++i)
@@ -1496,11 +1497,11 @@ public:
 	   * e.g. the vertices with a non 2-manif. neighbourhood but that do not belong to not 2-manif edges.
 	   * typical situation two cones connected by one vertex.
 	   */
-	static void /* int unused */ CountNonManifoldVertexFF(MeshType& m, bool selectVert = true, bool clearSelection = true)
+	static int CountNonManifoldVertexFF(MeshType& m, bool selectVert = true, bool clearSelection = true)
 	{
 		RequireFFAdjacency(m);
 
-		// Unused std::atomic<int> nonManifoldCnt=0;
+		std::atomic<int> nonManifoldCnt=0;
 		SimpleTempData<typename MeshType::VertContainer, int > TD(m.vert,0);
 
 		UnMarkAll(m);
@@ -1547,7 +1548,7 @@ public:
 							{
 								if (selectVert)
 									f.V(i)->SetS();
-								// Unused nonManifoldCnt++;
+								++nonManifoldCnt;
 							}
 						}
 				}
@@ -1590,7 +1591,8 @@ public:
 				}
 			}
 		}
-		// Unused return nonManifoldCnt;
+		
+		return nonManifoldCnt;
 	}
 	/// Very simple test of water tightness. No boundary and no non manifold edges.
 	/// Assume that it is orientable.

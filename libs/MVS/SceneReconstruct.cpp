@@ -1237,7 +1237,7 @@ __forceinline bool IntersectsPrecheckFast(
 
 	const double vd = nx * dx + ny * dy + nz * dz;
 	constexpr double eps = 1e-12;
-	if (std::abs(vd) < eps) return false;
+	if (FastAbsS(vd) < eps) return false;
 
 	const double d = -(nx * v0x + ny * v0y + nz * v0z);
 	const double vo = -(nx * ox + ny * oy + nz * oz + d);
@@ -2087,7 +2087,7 @@ static void knnMeanDist(const DELAUNAY::point_t* pts, size_t n, int k,
 		int count = 0;
 		for (auto it = search.begin(); it != search.end(); ++it) {
 			if (count == 0) { count++; continue; } // skip self
-			sum += std::sqrt(it->second);
+			sum += FastSqrtD(it->second);
 			count++;
 		}
 		out[(size_t)i] = (count > 1 ? sum / (count - 1) : 0.0);
@@ -2393,7 +2393,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.9");
+		DEBUG("ReconstructMesh optimization version 1.1.10");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -3560,7 +3560,7 @@ advance:
 			--archive - type  1 add to GM
 #endif
 
-		int threadCount = omp_get_max_threads();
+		const int threadCount = omp_get_max_threads();
 		std::vector<ThreadLocalBuffer> threadBuffers(threadCount);
 
 #pragma omp parallel
@@ -3575,8 +3575,12 @@ advance:
 			auto* __restrict dstNodes = buf.nodes.data();
 			auto* __restrict dstEdges = buf.edges.data();
 
-#pragma omp for schedule(static, 2048)
-			for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			// Manual static partition
+			const ptrdiff_t chunk = (totalCells + threadCount - 1) / threadCount;
+			const ptrdiff_t start = tid * chunk;
+			const ptrdiff_t end = std::min<ptrdiff_t>(start + chunk, totalCells);
+
+			for (ptrdiff_t idx = start; idx < end; ++idx) {
 				const auto ci = cellIterators[idx];
 				const int ciID = ci->info();
 				const auto& ciInfo = infoCells[ciID];
@@ -3707,11 +3711,16 @@ advance:
 
 		#pragma omp parallel
 		{
+			// Remove all barriers.
 			const int tid = omp_get_thread_num();
 			auto& local = localData[tid];
+			int nt = omp_get_num_threads();
 
-			#pragma omp for schedule(static)
-			for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			ptrdiff_t chunk = (totalCells + nt - 1) / nt;
+			ptrdiff_t start = tid * chunk;
+			ptrdiff_t end = std::min(start + chunk, (ptrdiff_t) totalCells);
+
+			for (ptrdiff_t idx = start; idx < end; ++idx) {
 				auto ci = cellIterators[idx];
 				const cell_size_t ciID = ci->info();
 
@@ -3741,7 +3750,7 @@ advance:
 					if (!ciType)
 						std::swap(face[0], face[2]);
 
-					local.localFaces.push_back(face);
+					local.localFaces.emplace_back(face[0], face[1], face[2]);
 				}
 			}
 		}

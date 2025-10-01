@@ -30,11 +30,6 @@
 #include <algorithm>
 using Clock = std::chrono::steady_clock;
 
-
-
-std::atomic<uint64_t> tries = 0;
-std::atomic<uint64_t> hits = 0;
-
 // This is (((uint64_t)((uint32_t&)std::numeric_limits<float>::max())) << 32);
 constexpr uint64_t kMaxCode = uint64_t(0x7F7FFFFF) << 32;
 

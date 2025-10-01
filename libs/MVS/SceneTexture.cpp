@@ -1590,6 +1590,9 @@ void MeshTexture::GlobalSeamLeveling()
 		}
 	}
 
+	std::atomic<int> totalColorsAssigned = 0;
+	std::atomic<int> badColors = 0;
+
 	// adjust texture patches using the correction colors
 	#ifdef TEXOPT_USE_OPENMP
 	#pragma omp parallel for schedule(dynamic)
@@ -1616,8 +1619,25 @@ void MeshTexture::GlobalSeamLeveling()
 		for (const FIndex idxFace: texturePatch.faces) {
 			const Face& face = faces[idxFace];
 			data.tri = faceTexcoords.Begin()+idxFace*3;
+#if 1 // JPB WIP BUG
+			for (int v = 0; v < 3; ++v) {
+				++totalColorsAssigned;
+				auto& tmp = vertpatch2rows[face[v]];
+				auto it = tmp.find(idxPatch);
+				if (it != tmp.end()) {
+					auto el = *it;
+					data.colors[v] = colorAdjustments.row(el.second);
+				}
+				else
+				{
+					data.colors[v] = Color(1, 0, 1);
+					++badColors;
+				}
+			}
+#else
 			for (int v=0; v<3; ++v)
 				data.colors[v] = colorAdjustments.row(vertpatch2rows[face[v]].at(idxPatch));
+#endif
 			// render triangle and for each pixel interpolate the color adjustment
 			// from the triangle corners using barycentric coordinates
 			ColorMap::RasterizeTriangleBary(data.tri[0], data.tri[1], data.tri[2], data);
@@ -1639,6 +1659,8 @@ void MeshTexture::GlobalSeamLeveling()
 			}
 		}
 	}
+
+	DEBUG("%d bad colors assigned in %d colors", badColors.load(), totalColorsAssigned.load());
 }
 
 // set to one in order to dilate also on the diagonal of the border

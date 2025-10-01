@@ -586,6 +586,11 @@ static __forceinline float FastAbsS(float x)
   return (std::max)(0.f - x, x);
 }
 
+static __forceinline double FastAbsD(double x)
+{
+  return (std::max)(0. - x, x);
+}
+
 static __forceinline _Data FastAbs(_Data vX)
 {
   /* https://stackoverflow.com/questions/5508628/how-to-absolute-2-double-or-4-floats-using-sse-instruction-set-up-to-sse4 */
