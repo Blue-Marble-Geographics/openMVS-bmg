@@ -474,7 +474,6 @@ public:
 template <typename T, typename Compare = std::less<T>>
 using small_vector_priority_queue = std::priority_queue<T, boost::container::small_vector<T, 64>, Compare>;
 
-
 template<class EAR>
     static void FillHoleEar(MESH &m, // The mesh to be filled
                             const PosType &p, // the particular hole to be filled
@@ -530,7 +529,27 @@ template<class EAR>
         f++;
       }
     }
+#if 1
+    template<class EAR>
+    static int EarCuttingFill(MESH& m, int sizeHole, bool selected = false, CallBackPos* cb = nullptr) {
+      std::vector<Info> vinfo;
+      GetInfo(m, selected, vinfo);
 
+      const size_t n = vinfo.size();
+      std::vector<FacePointer*> facePtrToBeUpdated;
+      facePtrToBeUpdated.reserve(m.fn * 0.1); // heuristic: ~10% faces may be affected
+
+      for (auto& info : vinfo) {
+        if (cb) (*cb)(int((facePtrToBeUpdated.size() * 10.0) / n), "Closing Holes");
+        if (info.size < sizeHole) {
+          facePtrToBeUpdated.clear();
+          FillHoleEar<EAR>(m, info.p, facePtrToBeUpdated);
+        }
+      }
+      return int(vinfo.size());
+    }
+
+#else
     template<class EAR>
     static int EarCuttingFill(MESH &m, int sizeHole, bool Selected = false, CallBackPos *cb=0)
     {
@@ -555,10 +574,108 @@ template<class EAR>
       }
       return holeCnt;
     }
+#endif
 
 /// Main Hole Filling function.
 /// Given a mesh search for all the holes smaller than a given size and fill them
 /// It returns the number of filled holes.
+#if 1
+    template<class EAR>
+    static int EarCuttingIntersectionFill(MESH& m, int sizeHole, bool selected = false, CallBackPos* cb = nullptr) {
+      std::vector<Info> vinfo;
+      GetInfo(m, selected, vinfo);
+      const int total = (int)vinfo.size();
+
+      // single reusable buffers
+      std::vector<int> ring;
+      std::vector<CoordType> verts;
+      ring.reserve(512);
+      verts.reserve(512);
+
+      int holeCnt = 0;
+      int indCb = 0;
+
+      for (auto& info : vinfo) {
+        ++indCb;
+        if (cb) (*cb)(indCb * 10 / total, "Closing Holes");
+        if (info.size >= sizeHole)
+          continue;
+
+        ++holeCnt;
+
+        // ---- Build contiguous vertex ring ----
+        ring.clear();
+        verts.clear();
+        PosType p = info.p;
+        int guard = 0;
+        do {
+          ring.push_back((int)(p.v - &*m.vert.begin()));  // compact vertex index
+          verts.push_back(p.v->cP());
+          p.NextB();
+        } while (p != info.p && ++guard < 10000);
+
+        const int n = (int)ring.size();
+        if (n < 3 || guard >= 10000)
+          continue; // skip degenerate or malformed hole
+
+        // ---- Ear cutting triangulation ----
+        std::vector<char> removed(n, 0);
+        int active = n;
+        int i = 0;
+        int safety = 0;
+        const int safetyLimit = n * n; // limit iterations
+
+        // simple projection: use XY plane of the first triangle
+        while (active > 2 && safety++ < safetyLimit) {
+          const int i0 = i % n;
+          if (removed[i0]) { ++i; continue; }
+
+          int i1 = (i0 + 1) % n;
+          while (removed[i1]) i1 = (i1 + 1) % n;
+          int i2 = (i1 + 1) % n;
+          while (removed[i2]) i2 = (i2 + 1) % n;
+          if (i0 == i1 || i1 == i2 || i2 == i0) break;
+
+          const CoordType& a = verts[i0];
+          const CoordType& b = verts[i1];
+          const CoordType& c = verts[i2];
+
+          // quick area test (2D projected XY)
+          const float cross = (b.X() - a.X()) * (c.Y() - a.Y()) -
+            (b.Y() - a.Y()) * (c.X() - a.X());
+          if (cross <= 0.f) { ++i; continue; }
+
+          bool valid = true;
+          for (int k = 0; k < n; ++k) {
+            if (removed[k] || k == i0 || k == i1 || k == i2)
+              continue;
+            const CoordType& pnt = verts[k];
+            const float s1 = (b.X() - a.X()) * (pnt.Y() - a.Y()) - (b.Y() - a.Y()) * (pnt.X() - a.X());
+            const float s2 = (c.X() - b.X()) * (pnt.Y() - b.Y()) - (c.Y() - b.Y()) * (pnt.X() - b.X());
+            const float s3 = (a.X() - c.X()) * (pnt.Y() - c.Y()) - (a.Y() - c.Y()) * (pnt.X() - c.X());
+            if ((s1 > 0 && s2 > 0 && s3 > 0) || (s1 < 0 && s2 < 0 && s3 < 0)) {
+              valid = false;
+              break;
+            }
+          }
+
+          if (valid) {
+            // allocate one new triangle in mesh
+            FaceIterator fi = vcg::tri::Allocator<MESH>::AddFaces(m, 1);
+            FacePointer nf = &*fi;
+            nf->V(0) = &m.vert[ring[i0]];
+            nf->V(1) = &m.vert[ring[i1]];
+            nf->V(2) = &m.vert[ring[i2]];
+            removed[i1] = 1;
+            --active;
+          }
+
+          ++i;
+        }
+      }
+      return holeCnt;
+    }
+#else
 template<class EAR>
     static int EarCuttingIntersectionFill(MESH &m, const int maxSizeHole, bool Selected, CallBackPos *cb=0)
     {
@@ -609,6 +726,7 @@ template<class EAR>
       }
       return holeCnt;
     }
+#endif
 
     static void GetInfo(MESH& m, bool Selected, std::vector<Info >& VHI)
     {

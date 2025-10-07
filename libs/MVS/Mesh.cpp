@@ -948,6 +948,16 @@ namespace CLEAN {
 			//return reinterpret_cast<void*>(static_cast<uintptr_t>(value));
 			return (uint8_t*)g_qBlocks.back() + size * g_qOffset++;
 		}
+
+		static void Release()
+		{
+			for (void* block : g_qBlocks)
+			{
+				::operator delete(block, std::nothrow);
+			}
+			g_qBlocks.clear();
+			g_qOffset = 0;
+		}
 	};
 };
 

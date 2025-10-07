@@ -847,6 +847,8 @@ public:
 	template <class LocalModificationType> void Finalize()
 	{
     LocalModificationType::Finalize(m,h,pp);
+
+    LocalModificationType::Release();
 	}
 
 
