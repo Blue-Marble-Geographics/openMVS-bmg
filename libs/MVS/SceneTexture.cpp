@@ -46,6 +46,8 @@ using namespace MVS;
 #define TEXOPT_USE_OPENMP
 #endif
 
+#define FASTER_OUTLIER_DETECTION
+
 // uncomment to use SparseLU for solving the linear systems
 // (should be faster, but not working on old Eigen)
 #if !defined(EIGEN_DEFAULT_TO_ROW_MAJOR) || EIGEN_WORLD_VERSION>3 || (EIGEN_WORLD_VERSION==3 && EIGEN_MAJOR_VERSION>2)
@@ -224,6 +226,7 @@ struct MeshTexture {
 			}
 		};
 		typedef cList<Patch,const Patch&,1,4,uint32_t> Patches;
+		std::unordered_map<uint32_t, uint16_t> patchIndexLookup;
 
 		VIndex idxVertex; // the index of this vertex
 		Patches patches; // the patches meeting at this vertex (two or more)
@@ -895,6 +898,81 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 
 	// perform outlier removal; abort if something goes wrong
 	// (number of inliers below threshold or can not invert the covariance)
+#ifdef FASTER_OUTLIER_DETECTION
+	size_t numInliers = faceDatas.GetSize();
+	Eigen::Vector3d mean;
+	Eigen::Matrix3d covariance;
+	Eigen::Matrix3d covarianceInv;
+
+	// Precompute squared Mahalanobis threshold once.
+	// exp(-0.5 * d2) > thOutlier  <=>  d2 < -2*log(thOutlier)
+	const double thMahalanobisSq = -2.0 * std::log(std::max(1e-300, std::min((double) thOutlier, 1.0 - 1e-16)));
+
+	for (unsigned iter = 0; iter < maxIterations; ++iter)
+	{
+		// === compute mean & covariance for inliers ===
+		const Eigen::Block<Eigen::Matrix3Xd, 3, Eigen::Dynamic, !Eigen::Matrix3Xd::IsRowMajor>
+			colors(colorsAll.leftCols(numInliers));
+
+		mean = colors.rowwise().mean();
+		const Eigen::Matrix3Xd centered(colors.colwise() - mean);
+		covariance = (centered * centered.transpose()) / std::max(1.0, double(colors.cols() - 1));
+
+		// stop if covariance nearly zero
+		if (covariance.array().abs().maxCoeff() < minCovariance)
+		{
+			RFOREACH(i, faceDatas)
+				if (!inliers[i])
+					faceDatas.RemoveAt(i);
+			return true;
+		}
+
+		// === fast stable inverse (LLT for SPD 3×3) ===
+		Eigen::LLT<Eigen::Matrix3d> llt(covariance);
+		if (llt.info() != Eigen::Success)
+			return false;
+		covarianceInv = llt.solve(Eigen::Matrix3d::Identity());
+
+		// === classify ===
+		size_t newCount = 0;
+		bool bChanged = false;
+
+		for (size_t i = 0; i < faceDatas.GetSize(); ++i)
+		{
+			const Eigen::Vector3d color(((const Color::EVec)faceDatas[i].color).cast<double>());
+			const double dx0 = color[0] - mean[0];
+			const double dx1 = color[1] - mean[1];
+			const double dx2 = color[2] - mean[2];
+
+			const double t0 = covarianceInv(0, 0) * dx0 + covarianceInv(0, 1) * dx1 + covarianceInv(0, 2) * dx2;
+			const double t1 = covarianceInv(1, 0) * dx0 + covarianceInv(1, 1) * dx1 + covarianceInv(1, 2) * dx2;
+			const double t2 = covarianceInv(2, 0) * dx0 + covarianceInv(2, 1) * dx1 + covarianceInv(2, 2) * dx2;
+
+			const double dist2 = dx0 * t0 + dx1 * t1 + dx2 * t2; // Mahalanobis distance squared
+
+			const bool isInlier = (dist2 < thMahalanobisSq);
+			bool& inlier = inliers[i];
+
+			if (isInlier)
+			{
+				colorsAll.col(newCount++) = color;
+				if (!inlier) { inlier = true; bChanged = true; }
+			}
+			else
+			{
+				if (inlier) { inlier = false; bChanged = true; }
+			}
+		}
+
+		numInliers = newCount;
+		if (numInliers == faceDatas.GetSize())
+			return true;
+		if (numInliers < minInliers)
+			return false;
+		if (!bChanged)
+			break;
+	}
+#else
 	size_t numInliers(faceDatas.GetSize());
 	Eigen::Vector3d mean;
 	Eigen::Matrix3d covariance;
@@ -952,6 +1030,7 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 		if (!bChanged)
 			break;
 	}
+#endif
 
 	#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_DAMPING
 	// select the final inliers
@@ -995,6 +1074,18 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 		typedef boost::graph_traits<Graph>::out_edge_iterator EdgeOutIter;
 		Graph graph;
 		LabelArr labels;
+
+		size_t maxIdxView = 0;
+		bool haveAny = false;
+		for (const FaceDataArr& fdArr : facesDatas) {
+			for (const FaceData& fd : fdArr) {
+				haveAny = true;
+				if ((size_t)fd.idxView > maxIdxView)
+					maxIdxView = (size_t)fd.idxView;
+			}
+		}
+		const size_t numViews = haveAny ? (maxIdxView + 1) : 0; // views are [0..maxIdxView]
+		const size_t numLabels = numViews + 1;                   // add label 0
 
 		// construct and use virtual faces for patch creation instead of actual mesh faces;
 		// the virtual faces are composed of coplanar triangles sharing same views
@@ -1186,7 +1277,7 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 						}
 						// set costs for label 0 (undefined)
 						inference.SetDataCost((Label)0, f, MaxEnergy);
-					}
+				}
 				}
 
 				// set data costs for all labels (except label 0 - undefined)
@@ -1948,6 +2039,194 @@ void MeshTexture::PoissonBlending(const Image32F3& src, Image32F3& dst, const Im
 	}
 }
 
+#if 1
+void MeshTexture::LocalSeamLeveling()
+{
+	ASSERT(!seamVertices.empty());
+	const uint32_t numPatches = (uint32_t)texturePatches.size() - 1;
+
+	// ----------------------------------------------------------------------
+	// Optional precomputation: build fast O(1) lookup for each seam vertex
+	// ----------------------------------------------------------------------
+	{
+		const uint32_t totalPatches = (uint32_t)texturePatches.size();
+		for (SeamVertex& v : seamVertices) {
+			v.patchIndexLookup.clear();
+			v.patchIndexLookup.reserve(v.patches.size());
+			for (uint32_t j = 0; j < v.patches.size(); ++j)
+				v.patchIndexLookup[v.patches[j].idxPatch] = (uint16_t)j;
+		}
+	}
+
+	std::vector<std::vector<uint32_t>> patchToSeamVertices(texturePatches.size());
+
+	for (uint32_t v = 0; v < seamVertices.size(); ++v) {
+		const auto& vertex = seamVertices[v];
+		for (const auto& patch : vertex.patches)
+			patchToSeamVertices[patch.idxPatch].push_back(v);
+	}
+
+
+#ifdef TEXOPT_USE_OPENMP
+#pragma omp parallel for schedule(dynamic)
+	for (int i = 0; i < (int)numPatches; ++i) {
+#else
+	for (uint32_t i = 0; i < numPatches; ++i) {
+#endif
+		const uint32_t idxPatch = (uint32_t)i;
+		const TexturePatch& texturePatch = texturePatches[idxPatch];
+		const Image8U3& image0 = images[texturePatch.label].image;
+
+		// Extract image region
+		Image32F3 image, imageOrg;
+		image0(texturePatch.rect).convertTo(image, CV_32FC3, 1.0f / 255.0f);
+		image.copyTo(imageOrg);
+
+		// Create coverage mask
+		Image8U mask(image.size());
+		mask.memset(0);
+
+		struct RasterMesh {
+			Image8U& image;
+			inline void operator()(const ImageRef& pt) const {
+				if (image.isInside(pt))
+					image(pt) = interior;
+			}
+		} raster{ mask };
+
+		for (const FIndex idxFace : texturePatch.faces) {
+			const TexCoord* tri = faceTexcoords.data() + idxFace * 3;
+			ColorMap::RasterizeTriangle(tri[0], tri[1], tri[2], raster);
+		}
+
+		const Sampler sampler;
+		const TexCoord offset(texturePatch.rect.tl());
+
+		// ------------------------------------------------------------------
+		// Main loop over seam vertices
+		// ------------------------------------------------------------------
+		for (uint32_t vIdx : patchToSeamVertices[idxPatch]) {
+			const SeamVertex& seamVertex0 = seamVertices[vIdx];
+			if (seamVertex0.patches.size() < 2)
+				continue;
+			const uint32_t idxVertPatch0 = seamVertex0.patchIndexLookup.at(idxPatch);
+
+			const SeamVertex::Patch& patch0 = seamVertex0.patches[idxVertPatch0];
+			const TexCoord p0(patch0.proj - offset);
+
+			// Each edge of this vertex
+			for (const SeamVertex::Patch::Edge& edge0 : patch0.edges) {
+				const SeamVertex& seamVertex1 = seamVertices[edge0.idxSeamVertex];
+
+				// === INLINE FIND via hash lookup
+				auto itAdj = seamVertex1.patchIndexLookup.find(idxPatch);
+				if (itAdj == seamVertex1.patchIndexLookup.end())
+					continue;
+				const uint32_t idxVertPatch0Adj = itAdj->second;
+
+				const SeamVertex::Patch& patch0Adj = seamVertex1.patches[idxVertPatch0Adj];
+				const TexCoord p0Adj(patch0Adj.proj - offset);
+
+				// find the other patch sharing the same edge
+				for (uint32_t idxVertPatch1 = 0; idxVertPatch1 < seamVertex0.patches.size(); ++idxVertPatch1) {
+					if (idxVertPatch1 == idxVertPatch0)
+						continue;
+
+					const SeamVertex::Patch& patch1 = seamVertex0.patches[idxVertPatch1];
+
+					// === INLINE FIND: patch1.edges.Find(edge0.idxSeamVertex)
+					const auto& edges = patch1.edges;
+					uint32_t idxEdge1 = SeamVertex::Patch::Edges::NO_INDEX;
+					for (uint32_t k = 0, n = (uint32_t)edges.size(); k < n; ++k) {
+						if (edges[k].idxSeamVertex == edge0.idxSeamVertex) {
+							idxEdge1 = k;
+							break;
+						}
+					}
+					if (idxEdge1 == SeamVertex::Patch::Edges::NO_INDEX)
+						continue;
+
+					const TexCoord& p1(patch1.proj);
+
+					// === INLINE FIND: seamVertex1.patches.Find(patch1.idxPatch)
+					auto itAdj1 = seamVertex1.patchIndexLookup.find(patch1.idxPatch);
+					if (itAdj1 == seamVertex1.patchIndexLookup.end())
+						continue;
+					const uint32_t idxVertPatch1Adj = itAdj1->second;
+
+					const SeamVertex::Patch& patch1Adj = seamVertex1.patches[idxVertPatch1Adj];
+					const TexCoord& p1Adj(patch1Adj.proj);
+
+					// this is an edge separating two (valid) patches;
+					// draw it on this patch as the mean color of the two patches
+					const Image8U3& image1 = images[texturePatches[patch1.idxPatch].label].image;
+					struct RasterPatch {
+						Image32F3& image;
+						Image8U& mask;
+						const Image32F3& image0;
+						const Image8U3& image1;
+						const TexCoord p0, p0Dir;
+						const TexCoord p1, p1Dir;
+						const float length;
+						const Sampler sampler;
+						inline RasterPatch(Image32F3& _image, Image8U& _mask, const Image32F3& _image0, const Image8U3& _image1,
+							const TexCoord& _p0, const TexCoord& _p0Adj, const TexCoord& _p1, const TexCoord& _p1Adj)
+							: image(_image), mask(_mask), image0(_image0), image1(_image1),
+							p0(_p0), p0Dir(_p0Adj - _p0), p1(_p1), p1Dir(_p1Adj - _p1), length((float)norm(p0Dir)), sampler() {
+						}
+						inline void operator()(const ImageRef& pt) {
+							const float l((float)norm(TexCoord(pt) - p0) / length);
+							// compute mean color
+							const TexCoord samplePos0(p0 + p0Dir * l);
+							const Color color0(image0.sample<Sampler, Color>(sampler, samplePos0));
+							const TexCoord samplePos1(p1 + p1Dir * l);
+							const Color color1(image1.sample<Sampler, Color>(sampler, samplePos1) / 255.f);
+							image(pt) = Color((color0 + color1) * 0.5f);
+							// set mask edge also
+							mask(pt) = border;
+						}
+					} data(image, mask, imageOrg, image1, p0, p0Adj, p1, p1Adj);
+
+					Image32F3::DrawLine(p0, p0Adj, data);
+					// skip remaining patches,
+					// as a manifold edge is shared by maximum two face (one in each patch), which we found already
+					break;
+
+				}
+			}
+
+			// render vertex color
+			AccumColor accumColor;
+			for (const SeamVertex::Patch& patch : seamVertex0.patches) {
+				const Image8U3& img = images[texturePatches[patch.idxPatch].label].image;
+				accumColor.Add(img.sample<Sampler, Color>(sampler, patch.proj) / 255.f, 1.f);
+			}
+
+			const ImageRef pt(ROUND2INT(patch0.proj - offset));
+			image(pt) = accumColor.Normalized();
+			mask(pt) = border;
+		}
+
+		ProcessMask(mask, 20);
+		PoissonBlending(imageOrg, image, mask);
+
+		// apply color correction to patch image
+		cv::Mat imagePatch(image0(texturePatch.rect));
+		for (int r = 0; r < image.rows; ++r) {
+			Pixel8U* row = imagePatch.ptr<Pixel8U>(r);
+			for (int c = 0; c < image.cols; ++c) {
+				if (mask(r, c) == empty)
+					continue;
+				const Color& a = image(r, c);
+				Pixel8U& v = row[c];
+				v[0] = (uint8_t)CLAMP(ROUND2INT(a[0] * 255.f), 0, 255);
+				v[1] = (uint8_t)CLAMP(ROUND2INT(a[1] * 255.f), 0, 255);
+				v[2] = (uint8_t)CLAMP(ROUND2INT(a[2] * 255.f), 0, 255);
+			}
+		}
+	}
+}
+#else
 void MeshTexture::LocalSeamLeveling()
 {
 	ASSERT(!seamVertices.empty());
@@ -2080,6 +2359,7 @@ void MeshTexture::LocalSeamLeveling()
 		}
 	}
 }
+#endif
 
 void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight)
 {

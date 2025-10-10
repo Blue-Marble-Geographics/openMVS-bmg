@@ -38,7 +38,7 @@
 #include "Platform.h"
 #include "PointCloud.h"
 #include <boost/container/small_vector.hpp>
-
+#include <type_traits>
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -274,6 +274,68 @@ protected:
 	#ifdef _USE_BOOST
 	// implement BOOST serialization
 	friend class boost::serialization::access;
+#if 1
+
+	template <typename T>
+	struct is_cList : std::false_type {};
+
+	template <typename T, typename C, int a, int b, typename I>
+	struct is_cList<SEACAVE::cList<T, C, a, b, I>> : std::true_type {};
+
+	// Portable accessor: works everywhere
+	template <typename T>
+	struct is_cList_v_helper {
+		static const bool value = is_cList<T>::value;
+	};
+
+	// Use like a function-style macro for simplicity
+#define is_cList_v(T) (is_cList_v_helper<T>::value)
+
+	// ================================================================
+	// serializeCList: handles cList<T> and nested cList<cList<T>>
+	// ================================================================
+	template <class Archive, typename T>
+	static void serializeCList(Archive& ar, T& clist)
+	{
+		size_t n = clist.size();
+		ar& n;
+		if constexpr (Archive::is_loading::value)
+			clist.resize(n);
+		if (n == 0) return;
+
+		using Elem = typename std::remove_reference<decltype(clist[0])>::type;
+
+		if constexpr (std::is_trivially_copyable<Elem>::value) {
+			if constexpr (Archive::is_saving::value)
+				ar.save_binary(clist.data(), n * sizeof(Elem));
+			else
+				ar.load_binary(clist.data(), n * sizeof(Elem));
+		}
+		else if constexpr (is_cList_v(Elem)) {
+			// recursive nested cList<cList<...>> path
+			for (size_t i = 0; i < n; ++i)
+				serializeCList(ar, clist[i]);
+		}
+		else {
+			// fallback for non-trivial types
+			for (size_t i = 0; i < n; ++i)
+				ar& clist[i];
+		}
+	}
+
+	template <class Archive>
+	void serialize(Archive& ar, const unsigned int /*version*/) {
+		serializeCList(ar, vertices);
+		serializeCList(ar, faces);
+		serializeCList(ar, vertexNormals);
+		serializeCList(ar, vertexVertices);
+		serializeCList(ar, vertexFaces);
+		serializeCList(ar, vertexBoundary);
+		serializeCList(ar, faceNormals);
+		serializeCList(ar, faceTexcoords);
+		ar& textureDiffuse;
+	}
+#else
 	template <class Archive>
 	void serialize(Archive& ar, const unsigned int /*version*/) {
 		ar & vertices;
@@ -286,6 +348,7 @@ protected:
 		ar & faceTexcoords;
 		ar & textureDiffuse;
 	}
+#endif
 	#endif
 };
 /*----------------------------------------------------------------*/

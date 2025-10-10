@@ -101,6 +101,8 @@
 #include <boost/serialization/list.hpp>
 #include <boost/serialization/map.hpp>
 #include <boost/serialization/set.hpp>
+#include <boost/archive/binary_oarchive.hpp>
+#include <boost/archive/binary_iarchive.hpp>
 #if (BOOST_VERSION / 100000) > 1 || (BOOST_VERSION / 100 % 1000) > 55
 #include <boost/serialization/unordered_map.hpp>
 #include <boost/serialization/unordered_set.hpp>
@@ -1765,11 +1767,28 @@ public:
 	#endif
 
 	#ifdef _USE_BOOST
+#if 1 // Serialize as a single block
+	template <class Archive>
+	void serialize(Archive& ar, const unsigned int /*version*/) {
+		int r = rows, c = cols;
+		ar& r;
+		ar& c;
+
+		if constexpr (Archive::is_loading::value) {
+			Base::create(r, c);
+		}
+
+		const size_t bytes = static_cast<size_t>(r) * c * sizeof(TYPE);
+		if (bytes > 0)
+			ar& boost::serialization::make_array((TYPE*)data, bytes / sizeof(TYPE));
+	}
+#else
 	// serialize
 	template <class Archive>
 	void serialize(Archive& ar, const unsigned int /*version*/) {
 		ar & boost::serialization::base_object<Base>(*this);
 	}
+#endif
 	#endif
 };
 /*----------------------------------------------------------------*/
@@ -2243,10 +2262,54 @@ public:
 
 	#ifdef _USE_BOOST
 	// serialize
+#if 1 // Serialize as a single block
+	template <class Archive>
+	void save(Archive& ar, const unsigned int /*version*/) const {
+		int r = rows, c = cols;
+		ar& r;
+		ar& c;
+
+		const size_t bytes = static_cast<size_t>(r) * c * sizeof(TYPE);
+		if (bytes == 0)
+			return;
+
+		if (cv::Mat::isContinuous()) {
+			ar.save_binary(data, bytes);
+		}
+		else {
+			for (int i = 0; i < r; ++i)
+				ar.save_binary(ptr(i), c * sizeof(TYPE));
+		}
+	}
+
+	template <class Archive>
+	void load(Archive& ar, const unsigned int /*version*/) {
+		int r, c;
+		ar& r;
+		ar& c;
+
+		Base::create(r, c);
+
+		const size_t bytes = static_cast<size_t>(r) * c * sizeof(TYPE);
+		if (bytes == 0)
+			return;
+
+		if (cv::Mat::isContinuous()) {
+			ar.load_binary(data, bytes);
+		}
+		else {
+			for (int i = 0; i < r; ++i)
+				ar.load_binary(ptr(i), c * sizeof(TYPE));
+		}
+	}
+
+	BOOST_SERIALIZATION_SPLIT_MEMBER()
+#else
 	template <class Archive>
 	void serialize(Archive& ar, const unsigned int /*version*/) {
 		ar & boost::serialization::base_object<Base>(*this);
 	}
+#endif
 	#endif
 };
 /*----------------------------------------------------------------*/

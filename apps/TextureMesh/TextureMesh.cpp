@@ -33,6 +33,9 @@
 #include "../../libs/MVS/Scene.h"
 #include <boost/program_options.hpp>
 
+ // Easier to configure this here.
+#pragma comment(linker, "/STACK:0x400000,0x400000")
+
 using namespace MVS;
 
 
@@ -73,6 +76,9 @@ String strExportType;
 String strConfigFileName;
 boost::program_options::variables_map vm;
 } // namespace OPT
+
+// JPB WIP BUG -patch-packing-heuristic 150 --export-type obj --empty-color 0 --archive-type 1
+// This forces "Skyline with waste map" and outputs the result to uncompressed binary.  This is much faster than the alternatives for big data.
 
 // initialize and parse the command line parameters
 bool Initialize(size_t argc, LPCTSTR* argv)

@@ -19,7 +19,7 @@ using namespace SEACAVE;
 #endif
 
 #define OBJ_INDEX_OFFSET 1
-
+#define FASTER_OBJ
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -130,6 +130,163 @@ bool ObjModel::MaterialLib::Load(const String& fileName)
 
 // S T R U C T S ///////////////////////////////////////////////////
 
+#ifdef FASTER_OBJ
+bool ObjModel::Save(const String& fileName, unsigned precision, bool texLossless) const
+{
+	if (vertices.empty())
+		return false;
+	const String prefix(Util::getFileFullName(fileName));
+	const String name(Util::getFileNameExt(prefix));
+
+	if (!material_lib.Save(prefix, texLossless))
+		return false;
+
+	std::ofstream out(prefix + ".obj", std::ios::binary);
+	if (!out.good())
+		return false;
+
+	constexpr size_t BUF_SIZE = 32 * 1024 * 1024;
+	std::vector<char> buf(BUF_SIZE);
+	out.rdbuf()->pubsetbuf(buf.data(), BUF_SIZE);
+
+	out << "mtllib " << name << ".mtl\n";
+	out.setf(std::ios::fixed);
+	out.precision(precision);
+
+	auto fmt = [precision](char* dst, double x, double y, double z) {
+		return std::snprintf(dst, 128, "%.*f %.*f %.*f\n",
+			precision, x, precision, y, precision, z);
+		};
+
+	// ------------------ parallel vertices ------------------
+	{
+		const size_t n = vertices.size();
+		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
+		std::vector<std::string> threadBuffers(omp_get_max_threads());
+
+#pragma omp parallel
+		{
+			int tid = omp_get_thread_num();
+			size_t start = tid * chunk;
+			size_t end = std::min(start + chunk, n);
+
+			std::string local;
+			local.reserve((end - start) * 40);
+
+			char line[128];
+			for (size_t i = start; i < end; ++i) {
+				const auto& v = vertices[i];
+				int len = std::snprintf(line, sizeof(line),
+					"v %.10g %.10g %.10g\n", (double)v[0], (double)v[1], (double)v[2]);
+				local.append(line, len);
+			}
+			threadBuffers[tid] = std::move(local);
+		}
+
+		for (auto& chunkStr : threadBuffers)
+			out.write(chunkStr.data(), chunkStr.size());
+	}
+
+	// ------------------ parallel texcoords ------------------
+	if (!texcoords.empty()) {
+		const size_t n = texcoords.size();
+		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
+		std::vector<std::string> threadBuffers(omp_get_max_threads());
+
+#pragma omp parallel
+		{
+			int tid = omp_get_thread_num();
+			size_t start = tid * chunk;
+			size_t end = std::min(start + chunk, n);
+
+			std::string local;
+			local.reserve((end - start) * 25);
+
+			char line[64];
+			for (size_t i = start; i < end; ++i) {
+				const auto& t = texcoords[i];
+				int len = std::snprintf(line, sizeof(line),
+					"vt %.10g %.10g\n", (double)t[0], (double)t[1]);
+				local.append(line, len);
+			}
+			threadBuffers[tid] = std::move(local);
+		}
+
+		for (auto& chunkStr : threadBuffers)
+			out.write(chunkStr.data(), chunkStr.size());
+	}
+
+	// ------------------ parallel normals ------------------
+	if (!normals.empty()) {
+		const size_t n = normals.size();
+		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
+		std::vector<std::string> threadBuffers(omp_get_max_threads());
+
+#pragma omp parallel
+		{
+			int tid = omp_get_thread_num();
+			size_t start = tid * chunk;
+			size_t end = std::min(start + chunk, n);
+
+			std::string local;
+			local.reserve((end - start) * 40);
+
+			char line[128];
+			for (size_t i = start; i < end; ++i) {
+				const auto& nrm = normals[i];
+				int len = std::snprintf(line, sizeof(line),
+					"vn %.10g %.10g %.10g\n",
+					(double)nrm[0], (double)nrm[1], (double)nrm[2]);
+				local.append(line, len);
+			}
+			threadBuffers[tid] = std::move(local);
+		}
+
+		for (auto& chunkStr : threadBuffers)
+			out.write(chunkStr.data(), chunkStr.size());
+	}
+
+	// ------------------ faces (single-threaded for determinism) ------------------
+	const bool hasTex = !texcoords.empty();
+	const bool hasNorm = !normals.empty();
+
+	for (const auto& group : groups) {
+		out << "usemtl " << group.material_name << "\n";
+
+		std::string bufLocal;
+		bufLocal.reserve(group.faces.size() * 80);
+
+		for (const Face& face : group.faces) {
+			char line[256];
+			char* p = line;
+			p += std::sprintf(p, "f");
+
+			for (int k = 0; k < 3; ++k) {
+				const uint32_t v = face.vertices[k] + OBJ_INDEX_OFFSET;
+				const uint32_t t = face.texcoords[k] + OBJ_INDEX_OFFSET;
+				const uint32_t n = face.normals[k] + OBJ_INDEX_OFFSET;
+
+				if (hasTex && hasNorm)
+					p += std::sprintf(p, " %u/%u/%u", v, t, n);
+				else if (hasTex)
+					p += std::sprintf(p, " %u/%u", v, t);
+				else if (hasNorm)
+					p += std::sprintf(p, " %u//%u", v, n);
+				else
+					p += std::sprintf(p, " %u", v);
+			}
+			*p++ = '\n';
+			bufLocal.append(line, p - line);
+		}
+
+		out.write(bufLocal.data(), bufLocal.size());
+	}
+
+	out.flush();
+	return true;
+}
+
+#else
 bool ObjModel::Save(const String& fileName, unsigned precision, bool texLossless) const
 {
 	if (vertices.empty())
@@ -187,6 +344,7 @@ bool ObjModel::Save(const String& fileName, unsigned precision, bool texLossless
 	}
 	return true;
 }
+#endif
 
 bool ObjModel::Load(const String& fileName)
 {
