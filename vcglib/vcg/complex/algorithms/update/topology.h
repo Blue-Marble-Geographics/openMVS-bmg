@@ -232,6 +232,66 @@ public:
   /// each edge is stored in the vector the number of times that it appears in the mesh, with the referring face.
   /// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
   static constexpr int edgeNext[] = { 1, 2, 0 };
+#if  1
+  static void FillEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec)
+  {
+    const int64_t faceCount = (int64_t)m.face.size();
+    if (faceCount == 0) return;
+
+    // Upper bound (3 edges per face)
+    edgeVec.resize(faceCount * 3);
+
+    auto* const v0 = &m.vert[0];
+
+    std::atomic<size_t> aliveCounter{ 0 };
+
+#pragma omp parallel
+    {
+      // Local scratch buffer to reduce atomic pressure
+      std::vector<PEdge2> localEdges;
+      localEdges.reserve(4096);
+
+#pragma omp for schedule(static)
+      for (int64_t i = 0; i < faceCount; ++i)
+      {
+        auto& f = m.face[i];
+        if (f.IsD()) continue;
+
+        const int vn = f.VN();
+        for (int j = 0; j < vn; ++j)
+        {
+          const int jNext = edgeNext[j];
+          PEdge2 e;
+          e.f = &f;
+          e.z = (uint8_t)j;
+          size_t i0 = f.V(j) - v0;
+          size_t i1 = f.V(jNext) - v0;
+          if (i0 > i1) std::swap(i0, i1);
+          e.key = (uint64_t(i0) << 32) | uint32_t(i1);
+          localEdges.push_back(e);
+        }
+
+        // Periodically flush to shared array to amortize atomics
+        if (localEdges.size() >= 4096) {
+          size_t offset = aliveCounter.fetch_add(localEdges.size(), std::memory_order_relaxed);
+          std::memcpy(&edgeVec[offset], localEdges.data(),
+            localEdges.size() * sizeof(PEdge2));
+          localEdges.clear();
+        }
+      }
+
+      // Final flush
+      if (!localEdges.empty()) {
+        size_t offset = aliveCounter.fetch_add(localEdges.size(), std::memory_order_relaxed);
+        std::memcpy(&edgeVec[offset], localEdges.data(),
+          localEdges.size() * sizeof(PEdge2));
+      }
+    }
+
+    // Trim to actual count
+    edgeVec.resize(aliveCounter.load(std::memory_order_relaxed));
+  }
+#else
   static void FillEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec)
   {
     const int64_t faceCount = (int64_t)m.face.size();
@@ -272,6 +332,7 @@ public:
       }
     }
   }
+#endif
 #else
 static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includeFauxEdge=true)
 {

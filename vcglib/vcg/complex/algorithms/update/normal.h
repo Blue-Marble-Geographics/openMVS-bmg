@@ -33,6 +33,8 @@
 
 #include "P2PUtils.h"
 
+#define FAST_NORMALIZE_PER_FACE
+
 namespace vcg {
 namespace tri {
 
@@ -583,13 +585,39 @@ static void NormalizePerVertex(ComputeMeshType& m)
 }
 
 /// \brief Normalize the length of the face normals.
+#ifdef FAST_NORMALIZE_PER_FACE
+static inline void NormalizePerFace(ComputeMeshType& m)
+{
+  auto* __restrict faces = &m.face[0];
+  const size_t n = m.face.size();
+  if (!n) return;
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i)
+  {
+    auto& f = faces[i];
+    if (!f.IsD())
+    {
+      auto& nrm = f.N();
+      const float len2 = nrm.SquaredNorm();
+      if (len2 > 0.0f)
+      {
+        const float invLen = 1.0f / FastSqrtS(len2);
+        nrm *= invLen;
+      }
+    }
+  }
+}
+#else
 static void NormalizePerFace(ComputeMeshType &m)
 {
   tri::RequirePerFaceNormal(m);
   for(FaceIterator fi=m.face.begin();fi!=m.face.end();++fi)
       if( !(*fi).IsD() )	(*fi).N().Normalize();
 }
-
+#endif
 /// \brief Set the length of the face normals to their area (without recomputing their directions).
 static void NormalizePerFaceByArea(ComputeMeshType &m)
 {

@@ -1256,6 +1256,336 @@ inline void FinalCleanup(CLEAN::Mesh& mesh,
 	}
 }
 
+#if 1 // Alternative
+
+static void RemoveSpikes(CLEAN::Mesh& mesh)
+{
+	int nTotalSpikes = 0;
+
+	if (mesh.fn == 0 || mesh.vn == 0) {
+		DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
+		return;
+	}
+
+	const int numVerts = (int)mesh.vert.size();
+	std::vector<int> valence(numVerts, 0);
+	std::vector<uint8_t> alive(numVerts, 0);
+
+	for (int i = 0; i < numVerts; ++i)
+		alive[i] = mesh.vert[i].IsD() ? 0u : 1u;
+
+	auto vpIndex = [&](CLEAN::Mesh::VertexPointer vp) -> int {
+		return int(vp - &mesh.vert[0]);
+		};
+
+	// Pass 1: count valence
+	size_t numFaceRefs = 0;
+	for (auto& f : mesh.face) {
+		if (f.IsD()) continue;
+		auto* v0 = f.V(0);
+		auto* v1 = f.V(1);
+		auto* v2 = f.V(2);
+		const int i0 = vpIndex(v0);
+		const int i1 = vpIndex(v1);
+		const int i2 = vpIndex(v2);
+
+		if (!(alive[i0] & alive[i1] & alive[i2])) continue;
+
+		valence[i0]++; valence[i1]++; valence[i2]++;
+		numFaceRefs += 3;
+	}
+
+	// CSR offsets
+	std::vector<uint32_t> incOffsets(numVerts + 1);
+	uint64_t run = 0;
+	for (int i = 0; i < numVerts; ++i) {
+		incOffsets[i] = (uint32_t)run;
+		run += (uint32_t)valence[i];
+	}
+	incOffsets[numVerts] = (uint32_t)run;
+
+	// Pass 2: fill flat incident-face array
+	std::vector<CLEAN::Mesh::FacePointer> incFacesFlat(numFaceRefs);
+	std::vector<uint32_t> cursor = incOffsets;
+	for (auto& f : mesh.face) {
+		if (f.IsD()) continue;
+		auto* v0 = f.V(0);
+		auto* v1 = f.V(1);
+		auto* v2 = f.V(2);
+		const int i0 = vpIndex(v0);
+		const int i1 = vpIndex(v1);
+		const int i2 = vpIndex(v2);
+		if (!(alive[i0] & alive[i1] & alive[i2])) continue;
+		incFacesFlat[cursor[i0]++] = &f;
+		incFacesFlat[cursor[i1]++] = &f;
+		incFacesFlat[cursor[i2]++] = &f;
+	}
+
+	auto facesBegin = [&](int vi) { return incFacesFlat.data() + incOffsets[vi]; };
+	auto facesEnd = [&](int vi) { return incFacesFlat.data() + incOffsets[vi + 1]; };
+
+	// Seed queue with spikes
+	std::vector<int> q;
+	q.reserve(numVerts);
+	for (int i = 0; i < numVerts; ++i)
+		if (alive[i] && valence[i] == 1)
+			q.push_back(i);
+
+	// Spike pruning
+	size_t head = 0;
+	while (head < q.size()) {
+		const int vi = q[head++];
+		if ((unsigned)vi >= (unsigned)numVerts || !alive[vi] || valence[vi] != 1)
+			continue;
+
+		// Delete all incident faces first
+		for (auto p = facesBegin(vi), e = facesEnd(vi); p != e; ++p) {
+			CLEAN::Mesh::FacePointer f = *p;
+			if (f && !f->IsD())
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *f);
+		}
+
+		// Delete vertex
+		vcg::tri::Allocator<CLEAN::Mesh>::DeleteVertex(mesh, mesh.vert[vi]);
+		alive[vi] = 0;
+		++nTotalSpikes;
+	}
+
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+
+	DEBUG_ULTIMATE("Removed %d spikes", nTotalSpikes);
+}
+void Mesh::Clean(
+	float fDecimate, float fSpurious, bool bRemoveSpikes,
+	unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean)
+{
+	if (vertices.IsEmpty() || faces.IsEmpty())
+		return;
+
+	TD_TIMER_STARTD();
+
+	CLEAN::Mesh mesh;
+	{
+		// Try to minimize reallocations by giving the mesh a generous amount of storage.
+		mesh.vert.reserve(vertices.size() * 2);
+
+		CLEAN::Mesh::VertexIterator vi = vcg::tri::Allocator<CLEAN::Mesh>::AddVertices(mesh, vertices.GetSize());
+		FOREACHPTR(pVert, vertices) {
+			const Vertex& p(*pVert);
+			CLEAN::Vertex::CoordType& P((*vi).P());
+			P[0] = p.x;
+			P[1] = p.y;
+			P[2] = p.z;
+			++vi;
+		}
+		vertices.Release();
+		vi = mesh.vert.begin();
+		std::vector<CLEAN::Mesh::VertexPointer> indices(mesh.vert.size());
+		for (CLEAN::Mesh::VertexPointer& idx : indices) {
+			idx = &*vi;
+			++vi;
+		}
+
+		// Try to minimize reallocations by giving the mesh a generous amount of storage.
+		mesh.face.reserve(faces.size() * 2);
+
+		CLEAN::Mesh::FaceIterator fi = vcg::tri::Allocator<CLEAN::Mesh>::AddFaces(mesh, faces.GetSize());
+		FOREACHPTR(pFace, faces) {
+			const Face& f(*pFace);
+			ASSERT((*fi).VN() == 3);
+			ASSERT(f[0] < (uint32_t)mesh.vn);
+			(*fi).V(0) = indices[f[0]];
+			ASSERT(f[1] < (uint32_t)mesh.vn);
+			(*fi).V(1) = indices[f[1]];
+			ASSERT(f[2] < (uint32_t)mesh.vn);
+			(*fi).V(2) = indices[f[2]];
+			++fi;
+		}
+		faces.Release();
+	}
+
+	constexpr CLEAN::Mesh::ScalarType eps = 1e-12;
+
+	auto CompactAndRefresh = [&]() {
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+		vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		};
+
+	auto LightRefresh = [&]() {
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		};
+
+	// -------------------------------------------------------------
+	// Phase 1: Decimation
+	// -------------------------------------------------------------
+	if (fDecimate > 0 && fDecimate < 1.0f) {
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+		LightRefresh();
+
+		vcg::tri::TriEdgeCollapseQuadricParameter pp;
+		pp.OptimalPlacement = true;
+		pp.PreserveBoundary = false;
+		pp.PreserveTopology = false;
+
+		const int targetFaces = ROUND2INT(fDecimate * mesh.fn);
+		vcg::math::Quadric<double> QZero; QZero.SetZero();
+		CLEAN::QuadricTemp TD(mesh.vert, QZero);
+		CLEAN::QHelper::TDp() = &TD;
+
+		vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
+		deci.Init<CLEAN::TriEdgeCollapse>();
+		deci.SetTargetSimplices(targetFaces);
+		deci.SetTimeBudget(0.1f);
+
+		Util::Progress progress(_T("Decimating"), mesh.fn - targetFaces);
+		while (deci.DoOptimization() && mesh.fn > targetFaces)
+			progress.display(mesh.fn - targetFaces);
+		deci.Finalize<CLEAN::TriEdgeCollapse>();
+		progress.close();
+
+		CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Phase 2: Spurious removal
+	// -------------------------------------------------------------
+	if (fSpurious > 0) {
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
+
+		FloatArr edgeLens(0, mesh.EN());
+		for (auto& e : mesh.edge) {
+			const auto& P0 = e.V(0)->cP();
+			const auto& P1 = e.V(1)->cP();
+			edgeLens.Insert((P1 - P0).SquaredNorm());
+		}
+
+		const float longEdge = sqrtf(edgeLens.GetNth(edgeLens.size() * 95 / 100)) * fSpurious;
+		const float longSize = sqrtf(edgeLens.GetNth(edgeLens.size() * 55 / 100)) * fSpurious;
+
+		vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, longEdge);
+		for (auto& f : mesh.face)
+			if (!f.IsD() && f.IsS())
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, f);
+
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(mesh, longSize);
+
+		mesh.edge.clear();
+		CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Phase 3: Spike removal
+	// -------------------------------------------------------------
+	if (bRemoveSpikes)
+		RemoveSpikes(mesh); // << wrap your custom spike code into helper function
+
+	// -------------------------------------------------------------
+	// Phase 4: Hole closing
+	// -------------------------------------------------------------
+	if (nCloseHoles > 0) {
+		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
+		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);
+
+		const int oldFn = mesh.fn;
+		const int holes = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingIntersectionFill<
+			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, nCloseHoles, false);
+		DEBUG("Closed %d holes (+%d faces)", holes, mesh.fn - oldFn);
+		CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Phase 5: Smoothing
+	// -------------------------------------------------------------
+	if (nSmooth > 0) {
+		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+		vcg::tri::Smooth<CLEAN::Mesh>::VertexCoordLaplacian(mesh, nSmooth, false, false);
+		if (vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps))
+			CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Phase 6: Remeshing
+	// -------------------------------------------------------------
+	if (fEdgeLength > 0) {
+		CLEAN::Mesh original;
+		vcg::tri::Append<CLEAN::Mesh, CLEAN::Mesh>::MeshCopy(original, mesh);
+
+		vcg::tri::IsotropicRemeshing<CLEAN::Mesh>::Params params;
+		params.SetTargetLen(fEdgeLength);
+		params.iter = 3;
+		params.cleanFlag = true;
+
+		try {
+			vcg::tri::IsotropicRemeshing<CLEAN::Mesh>::Do(mesh, original, params);
+		}
+		catch (vcg::MissingPreconditionException& e) {
+			VERBOSE("Remesh error: %s", e.what());
+		}
+
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
+		CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Final cleanup (once, not after each phase)
+	// -------------------------------------------------------------
+	vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
+	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
+	LightRefresh();
+
+	while (vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh) > 0 ||
+		vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldVertexFF(mesh) > 0)
+	{
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
+		vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
+		CompactAndRefresh();
+	}
+
+	// -------------------------------------------------------------
+	// Reimport back
+	// -------------------------------------------------------------
+	ASSERT(vertices.IsEmpty() && faces.IsEmpty());
+	vertices.Reserve(mesh.VN());
+	vcg::SimpleTempData<CLEAN::Mesh::VertContainer, VIndex> indices(mesh.vert);
+
+	VIndex idx = 0;
+	for (auto vi = mesh.vert.begin(); vi != mesh.vert.end(); ++vi) {
+		if (vi->IsD()) continue;
+		Vertex& v = vertices.AddEmpty();
+		const auto& P = vi->cP();
+		v.x = P[0]; v.y = P[1]; v.z = P[2];
+		indices[vi] = idx++;
+	}
+
+	faces.Reserve(mesh.FN());
+	for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+		if (fi->IsD()) continue;
+		Face& f = faces.AddEmpty();
+		f[0] = indices[fi->cV(0)];
+		f[1] = indices[fi->cV(1)];
+		f[2] = indices[fi->cV(2)];
+	}
+
+	DEBUG("Cleaned mesh: %u vertices, %u faces (%s)",
+		vertices.GetSize(), faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+}
+
+
+#else
+
 
 // decimate, clean and smooth mesh
 // fDecimate factor is in range (0..1], if 1 no decimation takes place
@@ -1683,6 +2013,8 @@ void Mesh::Clean(float fDecimate, float fSpurious, bool bRemoveSpikes, unsigned 
 	}
 	DEBUG("Cleaned mesh: %u vertices, %u faces (%s)", vertices.GetSize(), faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 } // Clean
+
+#endif
 /*----------------------------------------------------------------*/
 
 

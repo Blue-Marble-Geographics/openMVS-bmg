@@ -52,6 +52,9 @@
 #include "robin_map.h" // assumes robin_map.h is in include path
 #include <vcg/complex/algorithms/clean.h>
 
+#define NANOFANN_USE_OMP 1   // optional, but good hint
+#include "nanoflann.hpp"
+
 template <typename T>
 struct NoInitAllocator
 {
@@ -1645,11 +1648,12 @@ __forceinline void facetOrderIndices(const cell_handle_t& cell, int k, int idx[3
 // computes result = dot / sqrt(|N|^2 * |C|^2), clamps to [-1,1],
 // and returns 0.5f for degenerates (same as your scalar).
 // 2-space indent, braces same line, camelCase variables.
-__forceinline void computePlaneSphereAngle4(const delaunay_t& Tr,
+__forceinline void computeOneMinusPlaneSphereAngle4(const delaunay_t& Tr,
 	const cell_handle_t& cell,
-	float out[4]) {
+	_Data vQual,
+	float* out) {
 	if (Tr.is_infinite(cell)) {
-		out[0] = out[1] = out[2] = out[3] = 1.0f;
+		out[0] = out[1] = out[2] = out[3] = 0.0f;
 		return;
 	}
 
@@ -1755,11 +1759,17 @@ __forceinline void computePlaneSphereAngle4(const delaunay_t& Tr,
 	// degenerates -> 0.5f
 	__m128 zero = _mm_set1_ps(0.0f);
 	__m128 halfVal = _mm_set1_ps(0.5f);
+	// Compute mask for invalid facets
 	__m128 mBad = _mm_or_ps(_mm_or_ps(_mm_cmple_ps(fnLenSq, zero),
 		_mm_cmple_ps(ctLenSq, zero)),
 		_mm_cmple_ps(denom, zero));
+
+	// Select res or 0.5 for degenerates
 	__m128 outv = _mm_or_ps(_mm_and_ps(mBad, halfVal),
 		_mm_andnot_ps(mBad, res));
+
+	// outv = vQual * (1 - outv)
+	outv = _mm_mul_ps(vQual, _mm_sub_ps(one, outv));
 
 	_mm_storeu_ps(out, outv);
 
@@ -2031,22 +2041,24 @@ float Quantize(float cap, float maxCap)
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
 
-template<class T0, class T1, class T2>
+template<class T0, class T1, class T2, class T3>
 void permuteScatter2(
-	const std::vector<ptrdiff_t>& orderNewToOld,
-	const std::vector<T0>& src0, T0* __restrict dst0,
-	const std::vector<T1>& src1, std::vector<T1>& dst1,
-	const std::vector<T2>& src2, std::vector<T2>& dst2
+	const ptrdiff_t* __restrict orderNewToOld,
+	size_t cnt,
+	const T0* __restrict src0,
+	T0* __restrict dst0,
+	T1* __restrict dst0f,
+	const std::vector<T2>& src1, T2* __restrict dst1,
+	const std::vector<T3>& src2, T3* __restrict dst2
 )
 {
-	const size_t n = orderNewToOld.size();
-	dst1.resize(n);
-	dst2.resize(n);
-
-	tbb::parallel_for(tbb::blocked_range<size_t>(0, n, 1 << 16), [&](auto const& r) {
+	tbb::parallel_for(tbb::blocked_range<size_t>(0, cnt, 1 << 16), [&](auto const& r) {
 		for (size_t i = r.begin(); i != r.end(); ++i) {
 			const size_t oldId = static_cast<size_t>(orderNewToOld[i]); // indices[new]=old
+
+			auto& pt = src0[oldId];
 			dst0[i] = src0[oldId];
+			dst0f[i] = T1(pt[0], pt[1], pt[2]);
 			dst1[i] = src1[oldId];
 			dst2[i] = src2[oldId];
 		}
@@ -2062,79 +2074,147 @@ inline double dist2(const DELAUNAY::point_t& a, const DELAUNAY::point_t& b)
 	return dx * dx + dy * dy + dz * dz;
 }
 
-typedef CGAL::Simple_cartesian<double>              Kernel;
-typedef Kernel::Point_3                             CGALPoint;
-typedef CGAL::Search_traits_3<Kernel>               Traits;
-typedef CGAL::Kd_tree<Traits>                       Tree;
-typedef CGAL::Orthogonal_k_neighbor_search<Traits>  KSearch;
-typedef KSearch::Tree                              KdTree;
+struct PointCloudAdapter {
+	const Point3f* pts;
+	size_t n;
 
-static void knnMeanDist(const DELAUNAY::point_t* pts, size_t n, int k,
-	std::vector<double>& out)
+	inline size_t kdtree_get_point_count() const noexcept { return n; }
+
+	inline float kdtree_get_pt(const size_t idx, const size_t dim) const noexcept {
+		if (dim == 0) return pts[idx].x;
+		if (dim == 1) return pts[idx].y;
+		return pts[idx].z;
+	}
+
+	template<class BBOX>
+	bool kdtree_get_bbox(BBOX&) const noexcept { return false; }
+};
+
+static void knnMeanDist_nanoflann_fast(
+	const Point3f* pts, size_t n, int k, float* __restrict out)
 {
-	out.resize(n);
-	std::vector<CGALPoint> cloud;
-	cloud.reserve(n);
-	for (size_t i = 0; i < n; ++i)
-		cloud.emplace_back(pts[i].x(), pts[i].y(), pts[i].z());
+	using namespace nanoflann;
+	using KDTree = KDTreeSingleIndexAdaptor<
+		L2_Simple_Adaptor<float, PointCloudAdapter>,
+		PointCloudAdapter, 3>;
 
-	Tree tree(cloud.begin(), cloud.end());
+	PointCloudAdapter cloud{ pts, n };
+	KDTree index(3, cloud, KDTreeSingleIndexAdaptorParams(64)); // small leafs
+	index.buildIndex();
 
-#pragma omp parallel for schedule(static)
-	for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
-		KSearch search(tree, cloud[i], k + 1); // include self
-		double sum = 0.0;
-		int count = 0;
-		for (auto it = search.begin(); it != search.end(); ++it) {
-			if (count == 0) { count++; continue; } // skip self
-			sum += FastSqrtD(it->second);
-			count++;
+	struct alignas(64) ThreadBuffers {
+		uint32_t idx[64];   // enough for k < 65
+		float    d2[64];
+		char pad[64];       // ensure next instance on new cache line
+	};
+
+	const int T = omp_get_max_threads();
+	std::vector<ThreadBuffers> tbuf(T);  // local, per-call container
+
+#pragma omp parallel
+	{
+		const int tid = omp_get_thread_num();
+		ThreadBuffers& buf = tbuf[tid];
+		auto* idx = buf.idx;
+		auto* d2 = buf.d2;
+
+#pragma omp for schedule(static,1024)
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i)
+		{
+			const size_t found = index.knnSearch((float*)&pts[i], k + 1, idx, d2);
+			if (found <= 1) { out[i] = 0.0f; continue; }
+
+			// Vectorized sqrt-sum (process 8 distances per iteration)
+			const size_t end = found & ~7ULL;
+			__m128 acc0 = _mm_setzero_ps(), acc1 = _mm_setzero_ps();
+			size_t j = 1;
+			for (; j < end; j += 8)
+			{
+				__m128 v0 = _mm_loadu_ps(&d2[j]);
+				__m128 v1 = _mm_loadu_ps(&d2[j + 4]);
+				v0 = _mm_sqrt_ps(v0);
+				v1 = _mm_sqrt_ps(v1);
+				acc0 = _mm_add_ps(acc0, v0);
+				acc1 = _mm_add_ps(acc1, v1);
+			}
+			acc0 = _mm_add_ps(acc0, acc1);
+			__m128 tmp = _mm_movehl_ps(acc0, acc0);
+			acc0 = _mm_add_ps(acc0, tmp);
+			tmp = _mm_shuffle_ps(acc0, acc0, 1);
+			acc0 = _mm_add_ss(acc0, tmp);
+			float sum = _mm_cvtss_f32(acc0);
+			for (; j < found; ++j)
+				sum += FastSqrtS(d2[j]);
+			out[i] = sum / float(found - 1);
 		}
-		out[(size_t)i] = (count > 1 ? sum / (count - 1) : 0.0);
 	}
 }
 
-// Main routine: fills mask[0..n-1] with 1 = keep, 0 = drop
-void StatisticalOutlierRemoval(const DELAUNAY::point_t* pts, size_t n,
-	unsigned char* mask,
-	int k = 16, double stddevMul = 1.5)
+void StatisticalOutlierRemoval(
+	const Point3f* pts, size_t n,
+	unsigned char* __restrict mask,
+	int k = 16, float stddevMul = 2.0f,
+	float interiorMul = 0.5f) // lower side factor
 {
-	TD_TIMER_STARTD();
+	TD_TIMER_START();
+	if (n == 0) return;
 
-	int removed = 0;
-	if (n != 0) {
-		std::vector<double> meanDist;
-		knnMeanDist(pts, n, k, meanDist);
+	// allocate as float to cut memory traffic in half
+	float* meanDist = static_cast<float*>(_aligned_malloc(sizeof(float) * n, 64));
+	knnMeanDist_nanoflann_fast(pts, n, k, meanDist);
 
-		// Compute global mean and stdev
-		double mean = 0.0;
-		for (double v : meanDist) mean += v;
-		mean /= n;
+	// --- Welford’s one-pass algorithm for mean and variance -----------------
+	float mean = 0.0f, m2 = 0.0f;
+	size_t count = 0;
 
-		double var = 0.0;
-		for (double v : meanDist) {
-			double d = v - mean;
-			var += d * d;
+#pragma omp parallel
+	{
+		float local_mean = 0.0f, local_m2 = 0.0f;
+		size_t local_n = 0;
+
+#pragma omp for nowait
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
+			++local_n;
+			float delta = meanDist[i] - local_mean;
+			local_mean += delta / local_n;
+			local_m2 += delta * (meanDist[i] - local_mean);
 		}
-		var /= n;
-		double stdev = std::sqrt(var);
 
-		double threshold = mean + stddevMul * stdev;
-
-		// Write mask
-		for (size_t i = 0; i < n; ++i) {
-			mask[i] = (meanDist[i] <= threshold ? 1 : 0);
-			if (!mask[i]) {
-				++removed;
-			}
+#pragma omp critical
+		{
+			float delta = local_mean - mean;
+			size_t new_n = count + local_n;
+			mean += delta * (float)local_n / (float)new_n;
+			m2 += local_m2 + delta * delta * (float)count * (float)local_n / (float)new_n;
+			count = new_n;
 		}
 	}
 
-	DEBUG_EXTRA(
-		"%d point outliers removed in %s",
-		removed,
-		TD_TIMER_GET_FMT().c_str()
-	);
+	const float var = m2 / (float)n;
+	const float stdev = std::sqrtf(var);
+
+	// High outliers (sparse points)
+	const float upperThr = mean + stddevMul * stdev;
+	// Low outliers (interior / over-dense points)
+	const float lowerThr = mean - interiorMul * stdev;
+	// Clamp lowerThr to positive (just in case)
+	const float lowerBound = std::max(lowerThr, 1e-6f);
+
+	// --- Apply both filters in one pass ------------------------------------
+	int removed = 0;
+#pragma omp parallel for reduction(+:removed) schedule(static)
+	for (ptrdiff_t i = 0; i < (ptrdiff_t)n; ++i) {
+		const float d = meanDist[i];
+		// keep if within thresholds
+		const bool keep = (d >= lowerBound && d <= upperThr);
+		mask[i] = keep ? 1 : 0;
+		removed += !keep;
+	}
+
+	_aligned_free(meanDist);
+
+	DEBUG_EXTRA("%d filtered (k=%d, stddevMul=%.2f, interiorMul=%.2f, mean=%.4f, stdev=%.4f)",
+		removed, k, stddevMul, interiorMul, mean, stdev);
 }
 
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
@@ -2155,9 +2235,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	ASSERT(!pointcloud.IsEmpty());
 	mesh.Release();
 
-	std::vector<std::ptrdiff_t> indices(pointcloud.GetSize());
-	std::vector<uint32_t> offsets(pointcloud.GetSize());
-	std::vector<uint32_t> sizes(pointcloud.GetSize());
+	size_t numPtsCloud = pointcloud.GetSize();
+	ptrdiff_t* indices = (ptrdiff_t*)_aligned_malloc(sizeof(ptrdiff_t) * numPtsCloud, 64);
+	uint32_t* offsets = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numPtsCloud, 64);
+	uint32_t* sizes = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numPtsCloud, 64);
 #ifdef VALIDATE
 	delaunay_t2 delaunay2;
 	{
@@ -2287,11 +2368,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 	delaunay_t delaunay;
 
-	std::vector<cell_info_t> infoCells;
+	cell_info_t* __restrict infoCells;
 	std::vector<camera_cell_t> camCells;
 	std::vector<facet_t> hullFacets;
 	std::vector<delaunay_t::All_cells_iterator> cellIterators;
-	std::vector<vertex_handle_t> idToVertex; // indexed by uint32_t id
+	vertex_handle_t* idToVertex; // indexed by uint32_t id
 	
 	size_t numVertices;
 #ifdef FACET_DIAGNOSTICS
@@ -2301,18 +2382,17 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	size_t numDelaunayVertices;
 	std::unique_ptr<float[]> distsSq;
 	float approxMedian;
-	std::unique_ptr<point_t[]> vertices;
+	point_t* vertices;
 	const float distInsertSq(SQUARE(distInsert));
 	delaunay_t::Locate_type lt;
 	int li, lj;
 	size_t totalCells;
-	std::vector<unsigned char> mask;
+	uint8_t* mask;
 
 	{
 		TD_TIMER_STARTD();
 
-		std::vector<point_t> origVertices;
-		origVertices.resize(numPointCloudVertices);
+		point_t* origVertices = (point_t*) _aligned_malloc(sizeof(point_t) * numPointCloudVertices, 64);
 		{
 			TD_TIMER_STARTD();
 
@@ -2325,29 +2405,25 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				ProcessPoints<true>(
 					pointcloud.PointStream(),
 					numPointCloudVertices,
-					origVertices.data(),
-					indices.data(),
+					origVertices,
+					indices,
 					obb
 				) :
 				ProcessPoints<false>(
 					pointcloud.PointStream(),
 					numPointCloudVertices,
-					origVertices.data(),
-					indices.data(),
+					origVertices,
+					indices,
 					obb
 				);
 
-			indices.resize(numVertices);
-			origVertices.resize(numVertices);
-			offsets.resize(numVertices);
-			sizes.resize(numVertices);
 #ifndef VALIDATE
 			// sort vertices
 			typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
 			// JPB The runtime here is not consistent.
 			// Defaults on this work really well.
 			CGAL::spatial_sort<CGAL::Parallel_tag>(
-				indices.begin(), indices.end(),
+				indices, indices+numVertices,
 				Search_traits(&origVertices[0], delaunay.geom_traits())
 			);
 #endif
@@ -2355,29 +2431,43 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// origVertices[i] refers to the original data.
 			// indices[i] maps the sorted data to the original data.
 			// Rewrite the vertex data in index sorted form:
-			vertices.reset(new point_t[numVertices]);
+			
+			vertices = (point_t*)_aligned_malloc(sizeof(point_t) * numVertices, 64);
+			Point3f* verticesf = (Point3f*)_aligned_malloc(sizeof(Point3f) * numVertices, 64);
+
 			permuteScatter2(
 				indices,
-				origVertices, vertices.get(),
+				numVertices,
+				origVertices, vertices, verticesf,
 				pointcloud.pointViewsOffsets, offsets,
 				pointcloud.pointViewsSizes, sizes
 			);
-			decltype(origVertices)().swap(origVertices);
-			decltype(indices)().swap(indices);
+			_aligned_free(origVertices);
+			origVertices = 0;
+			_aligned_free(indices);
+			indices = 0;
 
 			// The points of the cloud are now kept in vertices.  Ancillary data, for view information,
 			// is also maintained.
 			// Go through the cloud and eliminate outliers, but do so in-place (without disturbing
 			// the ancillary data.
-			mask.resize(numVertices);
-			StatisticalOutlierRemoval(vertices.get(), numVertices, mask.data(), 32, 2);
+			// Mask[i] is a boolean indicating 0 = outlier.
+			mask = (uint8_t*)_aligned_malloc(sizeof(uint8_t) * numVertices, 64);
+			// 8/16 about the same, but better than 32, 64 much worse
+			// 16 removes more outliers.
+			StatisticalOutlierRemoval(verticesf, numVertices, mask, 16, 2);
+
+			_aligned_free(verticesf);
+			verticesf = 0;
 
 			// insert vertices
 			// 6x vertices is a generous worst case, but uses too much memory.
-			// Potentally allow some dynamic allocation to better keep
+			// Potentially allow some dynamic allocation to better keep
 			// memory within reasonable limits.
 			delaunay.tds().cells().reserve(numVertices*4); // May reserve dynamically
-			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.s
+			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.
+
+			// Can't avoid initialization.
 			allViews.resize(numVertices);
 
 			DEBUG_EXTRA("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
@@ -2393,7 +2483,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.10");
+		DEBUG("ReconstructMesh optimization version 1.1.11");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2411,15 +2501,16 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// InsertViews first parameter must be the dt's index --verified by validation code.
 		if (distInsert <= 0) {
 			for (size_t i = 0; i < numVertices; ++i) {
-				const point_t& p = vertices[i]; // These are the sorted vertices.
 				if (!mask[i]) {
-					continue;
+					goto advance;
 				}
+				const point_t& p = vertices[i]; // These are the sorted vertices.
 				// insert all points
 				hint = delaunay.insert(p, hint);
 				ASSERT(anchor != vertex_handle_t());
 				// update point visibility info
 				InsertViews(hint->info().idx, pointcloud, i);
+advance:
 				if (!(i & 255)) {
 					progress += 256;
 				}
@@ -2440,7 +2531,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 			for (; i < numVertices; ++i) {
 				if (!mask[i]) {
-					continue;
+					goto advance2;
 				}
 
 				const point_t& p = vertices[i];
@@ -2485,8 +2576,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const double qx = p.x(), qy = p.y(), qz = p.z();
 					const point_t& nearestPt = nearest->point();
 					double bestSq = fast_sqdist2(qx, qy, qz, nearestPt.x(), nearestPt.y(), nearestPt.z());
-
-					vertexMarks[nearest->info().idx] = marker;
 
 					// The key difference from the original code is that the original determines
 					// all adjacent cells and then looks at them.
@@ -2660,7 +2749,6 @@ refine_restart:
 				}
 				hint = nearest;
 
-
 				//const auto& hintPt2 = hint->point();
 				ASSERT(hint == delaunay.nearest_vertex(p, hint->cell()));
 
@@ -2710,13 +2798,18 @@ refine_restart:
 				// Visibility information not needed for the dt, but used in the next step.
 				// idx is the index of the spatially sorted point.
 				InsertViews(hint->info().idx, pointcloud, i);
-advance:
+advance2:
 				if (!(i & 255)) progress += 256;
 			}
 		}
 
 		progress.process();
 		progress.close();
+
+		_aligned_free(mask);
+		mask = 0;
+		_aligned_free(vertices);
+		vertices = 0;
 
 		decltype(cellQueue)().swap(cellQueue);
 		decltype(viewCameras)().swap(viewCameras);
@@ -2761,13 +2854,13 @@ advance:
 #if 1 // New idea for median calculation
 		// 25510599386 4.47s:
 		const auto maxIndex = vert_info_t::g_idx;
-		idToVertex.resize(maxIndex + 1); // or allocate based on vertex count
+		idToVertex = (vertex_handle_t*) _aligned_malloc(sizeof(vertex_handle_t)*(maxIndex + 1), 64); // or allocate based on vertex count
 		for (auto vit = delaunay.finite_vertices_begin(), end = delaunay.finite_vertices_end(); vit != end; ++vit) {
 			idToVertex[vit->info().idx] = vit;
 		}
 
 		const size_t totalEstimate = 6ull * finiteCells.size();
-		std::vector<uint64_t> edges(totalEstimate);
+		uint64_t* edges = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * totalEstimate, 64);
 
 #pragma omp parallel
 	{
@@ -2780,7 +2873,7 @@ advance:
 
 		// Each cell produces 6 edges and compute edge range
 		size_t edgeStart = 6 * cellStart;
-		uint64_t* __restrict p = edges.data() + edgeStart;
+		uint64_t* __restrict dst = edges + edgeStart;
 
 		for (size_t i = cellStart; i < cellEnd; ++i) {
 			const cell_handle_t ci = finiteCells[i];
@@ -2794,7 +2887,7 @@ advance:
 
 #define STORE(u, v) do { \
 			if ((u) > (v)) std::swap((u), (v)); \
-				*p++ = ((uint64_t)(u) << 32) | (v); \
+				*dst++ = ((uint64_t)(u) << 32) | (v); \
 			} while (0)
 
 			STORE(ids[0], ids[1]);
@@ -2809,13 +2902,14 @@ advance:
 		decltype(finiteCells)().swap(finiteCells);
 
 		// Sort and deduplicate
-		tbb::parallel_sort(edges.begin(), edges.end());
-		edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+		tbb::parallel_sort(edges, edges + totalEstimate);
+		uint64_t* newEnd = std::unique(edges, edges + totalEstimate);
+		size_t edgeCount = static_cast<size_t>(newEnd - edges);
 
-		std::vector<float> dists(edges.size());
+		float* dists = (float*)_aligned_malloc(sizeof(float) * edgeCount, 64);
 
 #pragma omp parallel for schedule(static)
-		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(edges.size()); ++i) {
+		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(edgeCount); ++i) {
 			uint64_t code = edges[i];
 			uint32_t id0 = code >> 32;
 			uint32_t id1 = code & 0xFFFFFFFF;
@@ -2832,9 +2926,11 @@ advance:
 			dists[i] = dx * dx + dy * dy + dz * dz;
 		}
 
-		const size_t numDistances = dists.size();
-		std::nth_element(dists.begin(), dists.begin() + numDistances/2, dists.end());
-		approxMedian = dists[numDistances/2];
+		_aligned_free(edges);
+		edges = 0;
+
+		std::nth_element(dists, dists + edgeCount/2, dists + edgeCount);
+		approxMedian = dists[edgeCount /2];
 #else
 		const int numThreads = omp_get_max_threads();
 		std::vector<std::vector<float>> threadDists(numThreads);
@@ -2898,14 +2994,21 @@ advance:
 		approxMedian = distsSq[totalSize/2];
 #endif
 
-		decltype(dists)().swap(dists);
+		_aligned_free(dists);
+		dists = 0;
 
 		auto t1 = rdtscEnd();
 
 		DEBUG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
 
-		infoCells.resize(totalCells);
-		memset(&infoCells[0], 0, sizeof(cell_info_t)*totalCells);
+		// Prefer memset as cell_info_t will value initialize multiple fields.
+		infoCells = (cell_info_t*)_aligned_malloc(sizeof(cell_info_t) * totalCells, 64);
+		// parallel-first touch and zero
+		// This becomes a single memset per thread.
+#pragma omp parallel for schedule(static)
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)totalCells; ++i) {
+			std::memset(&infoCells[i], 0, sizeof(cell_info_t));
+		}
 
 		// find all cells containing a camera
 		camCells.resize(images.GetSize());
@@ -3099,7 +3202,7 @@ advance:
 		delaunay_t::Vertex_iterator vertexIter(delaunay.vertices_begin());
 		const int64_t nVerts(delaunay.number_of_vertices());
 
-		std::vector<delaunay_t::Vertex_handle> vertexHandles(nVerts);
+		delaunay_t::Vertex_handle* vertexHandles = (delaunay_t::Vertex_handle*) _aligned_malloc(sizeof(delaunay_t::Vertex_handle) * nVerts, 64);
 		{
 			delaunay_t::Vertex_iterator it = delaunay.vertices_begin();
 			for (int64_t i = 0; i < nVerts; ++i, ++it) {
@@ -3177,7 +3280,7 @@ advance:
 				for (auto& i : viewInstance) {
 					auto* src = &pointcloud.pointViewsMemory[offsets[i]];
 					auto cnt = sizes[i];
-					std::copy(src, src + cnt, std::back_inserter(viewIdxs));
+					viewIdxs.insert(viewIdxs.end(), src, src + cnt);
 				}
 
 				std::sort(
@@ -3431,9 +3534,14 @@ advance:
 		progress.process();
 		progress.close();
 
+		_aligned_free(vertexHandles);
+		vertexHandles = 0;
+
 		decltype(allViews)().swap(allViews);
-		decltype(offsets)().swap(offsets);
-		decltype(sizes)().swap(sizes);
+		_aligned_free(offsets);
+		offsets = 0;
+		_aligned_free(sizes);
+		sizes = 0;
 		decltype(camCells)().swap(camCells);
 
 #ifdef FACET_DIAGNOSTICS
@@ -3459,14 +3567,24 @@ advance:
 		MaxFlow<cell_size_t,edge_cap_t> graph(cellIterators.size());
 
 		struct FacetAngleIndex {
+			FacetAngleIndex(int n) :
+				kQual_oneMinusAngle((float*) _aligned_malloc(n * 4 * sizeof(float), 64)),
+				cellIDToIdx((uint32_t*) _aligned_malloc(n * sizeof(uint32_t), 64))
+			{}
+			~FacetAngleIndex()
+			{
+				_aligned_free(kQual_oneMinusAngle);
+				_aligned_free(cellIDToIdx);
+			}
+
 			// Flat angle array, 4 per cell
-			PaddedVector<float> angle;             // size = 4 * totalCells
-			PaddedVector<int32_t> cellIDToIdx;     // size = totalCells
+			float* kQual_oneMinusAngle;     // size = 4 * totalCells
+			uint32_t* cellIDToIdx;     // size = totalCells
 		};
 
-		FacetAngleIndex facetData;
-		facetData.angle.resize(totalCells * 4); // 1.6 Gb
-		facetData.cellIDToIdx.resize(totalCells); // 400Mb
+		FacetAngleIndex facetData(totalCells);
+
+		_Data vQual = _Set(kQual);
 
 		// --- Compute facet angles in parallel ---
 		#pragma omp parallel for schedule(static)
@@ -3477,12 +3595,7 @@ advance:
 			// Safe single-thread write if cellIDs are unique
 			facetData.cellIDToIdx[cellID] = (int32_t)i;
 #if 1
-			float a4[4];
-			computePlaneSphereAngle4(delaunay, ci, a4);
-			facetData.angle[i * 4 + 0] = a4[0];
-			facetData.angle[i * 4 + 1] = a4[1];
-			facetData.angle[i * 4 + 2] = a4[2];
-			facetData.angle[i * 4 + 3] = a4[3];
+			computeOneMinusPlaneSphereAngle4(delaunay, ci, vQual, &facetData.kQual_oneMinusAngle[i * 4]);
 #else
 			facetData.angle[i * 4 + 0] = computePlaneSphereAngle(delaunay, facet_t(ci, 0));
 			facetData.angle[i * 4 + 1] = computePlaneSphereAngle(delaunay, facet_t(ci, 1));
@@ -3506,22 +3619,8 @@ advance:
 			edge_cap_t cap, revCap;
 		};
 
-		struct NodeDesc
-		{
-			NodeDesc() {}
-			NodeDesc(int id_, edge_cap_t source_, edge_cap_t sink_) :
-				id(id_),
-				source(source_),
-				sink(sink_)
-			{}
-
-			int id;
-			edge_cap_t source, sink;
-		};
-
 		struct alignas(64)  ThreadLocalBuffer
 		{
-			std::vector<NodeDesc> nodes;
 			std::vector<EdgeDesc> edges;
 			edge_cap_t flow = 0;
 			char pad[64 - sizeof(flow)]; // force `flow` onto its own cache line
@@ -3563,6 +3662,7 @@ advance:
 		const int threadCount = omp_get_max_threads();
 		std::vector<ThreadLocalBuffer> threadBuffers(threadCount);
 
+		auto& g = graph.graph;
 #pragma omp parallel
 		{
 			int tid = omp_get_thread_num();
@@ -3570,15 +3670,19 @@ advance:
 
 			const size_t est = (totalCells + threadCount - 1) / threadCount;
 			constexpr size_t pad = 2048; // schedule
-			buf.nodes.resize(est + pad); // 1.2Gb total
-			buf.edges.resize((est + pad) * 4); // Worst case. 6.4Gb total
-			auto* __restrict dstNodes = buf.nodes.data();
-			auto* __restrict dstEdges = buf.edges.data();
+			buf.edges.reserve((est + pad) * 4); // Worst case. 6.4Gb total
+			buf.edges.clear();
 
 			// Manual static partition
 			const ptrdiff_t chunk = (totalCells + threadCount - 1) / threadCount;
 			const ptrdiff_t start = tid * chunk;
 			const ptrdiff_t end = std::min<ptrdiff_t>(start + chunk, totalCells);
+
+			// constants
+			const __m128 kFour = _mm_set1_ps(4.0f);
+			const __m128 kHalf = _mm_set1_ps(0.5f);
+			const __m128 kQtr = _mm_set1_ps(0.25f);
+			const __m128 kMaxV = _mm_set1_ps(maxCap);
 
 			for (ptrdiff_t idx = start; idx < end; ++idx) {
 				const auto ci = cellIterators[idx];
@@ -3589,17 +3693,9 @@ advance:
 				edge_cap_t s = ciInfo.s;
 				edge_cap_t t = FastMinS(ciInfo.t, maxCap);
 
-				edge_cap_t f = graph.graph.nodes[ciID].excess;
-				if (f > 0) s += f;
-				else t -= f;
-
 				edge_cap_t push = FastMinS(s, t);
+				g.nodes[ciID].excess = s - t;
 				buf.flow += push;
-
-				dstNodes->id = ciID;
-				dstNodes->source = s;
-				dstNodes->sink = t;
-				++dstNodes;
 
 				for (int i = 0; i < 4; ++i) {
 					const auto cj = ci->neighbor(i);
@@ -3610,40 +3706,38 @@ advance:
 					const int j = cj->index(ci);
 					const auto& cjInfo = infoCells[cjID];
 
-					const float angleCi = facetData.angle[idx * 4 + i];
+					const float kQual_oneMinusAngleCi = facetData.kQual_oneMinusAngle[idx * 4 + i];
 					const int cjIdx = facetData.cellIDToIdx[cjID];
-					const float angleCj = facetData.angle[cjIdx * 4 + j];
+					const float kQual_oneMinusAngleCj = facetData.kQual_oneMinusAngle[cjIdx * 4 + j];
 
-					float minAngle = FastMinS(angleCi, angleCj);
-					dstEdges->from = ciID;
-					dstEdges->to = cjID;
-					uint32_t bits;
-					memcpy(&bits, &minAngle, sizeof(float));
+					float kQual_oneMinusMinAngle = FastMaxS(kQual_oneMinusAngleCi, kQual_oneMinusAngleCj);
+#if 1
+					// load both caps and apply q
+					// layout: [cj, ci, 0, 0]
+					// ci, cj >= 0
+					__m128 v = _mm_set_ps(0, 0, cjInfo.f[j] + kQual_oneMinusMinAngle, ciInfo.f[i] + kQual_oneMinusMinAngle);
 
-					// Fast finite check for float (avoids std::isfinite overhead)
-					if ((bits & 0x7f800000u) == 0x7f800000u) {
-						dstEdges->cap = dstEdges->revCap = maxCap; // NaN or Inf -> clamp to max
-					}
-					else {
-						const edge_cap_t q = (1.f - minAngle) * kQual;
-						const edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
-						const edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
-						dstEdges->cap = iCap;
-						dstEdges->revCap = jCap;
-					}
-					++dstEdges;
+					// identical clamp semantics
+					v = _mm_min_ps(v, kMaxV);
+
+					// identical quantization: multiply add truncate
+					v = _mm_add_ps(_mm_mul_ps(v, kFour), kHalf);
+					__m128i iscaled = _mm_cvttps_epi32(v);
+					__m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(iscaled), kQtr);
+
+					const float iCap = _mm_cvtss_f32(qv);
+					const float jCap = _mm_cvtss_f32(_mm_shuffle_ps(qv, qv, 1));
+#else
+					const edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
+					const edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
+#endif
+					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
 				}
 			}
-
-			buf.edges.resize(dstEdges - buf.edges.data());
 		}
 
 		for (const auto& buf : threadBuffers)
-			graph.graph.flow += buf.flow;
-
-		for (const auto& buf : threadBuffers)
-			for (const auto& n : buf.nodes)
-				graph.AddNode(n.id, n.source, n.sink);
+			g.flow += buf.flow;
 
 #if 1
 #pragma omp parallel for schedule(static)
@@ -3678,7 +3772,9 @@ advance:
 		}
 		#endif
 
-		std::vector<cell_info_t>().swap(infoCells); // release memory
+		_aligned_free(infoCells);
+		infoCells = 0;
+
 		auto t1 = rdtscEnd();
 	  //RestoreAffinity(originalMask); // Restore original affinity
 
@@ -3773,6 +3869,9 @@ advance:
 				}
 			}
 		}
+
+		_aligned_free(idToVertex);
+		idToVertex = 0;
 
 		// Remap local faces to global indices and insert
 		for (const auto& local : localData) {
