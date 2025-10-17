@@ -187,7 +187,7 @@ public:
     if ((end - begin) <= _limit) return;
 
     RandomAccessIterator m0 = begin, m8 = end;
-    if((end - begin) > 2048){ // 2^11, empirically a good cutoff
+    if((end - begin) > 32768 /* JPB from 2048 */) { // 2^11, empirically a good cutoff
       RandomAccessIterator m1, m2, m3, m4, m5, m6, m7;
       m4 = internal::hilbert_split(m0, m8, Cmp<x, upx>(_k));
 

@@ -194,6 +194,41 @@ public:
 
 	struct Node;
 
+#if 0 // BLock quaantize
+	struct Arc {
+		Node* head;
+		Arc* rev;
+		uint16_t	rCap;
+		unsigned char	isRevResidual;
+	};
+
+	struct Node {
+		static constexpr int kMaxArcs = 4;
+
+		// Group together arcCount + arcs for locality
+		std::atomic<int> arcCount;               // 4
+		Arc arcs[kMaxArcs];         // 32 (assuming Arc = 8 bytes)
+
+		EdgeCap excess;             // 4
+		Arc* parent;                // 8
+
+		Node* firstSon;             // 8
+		Node* nextPtr;              // 8
+
+		int lastAugTimestamp : 31;  // 4 (bitfield with next)
+		int isParentCurr : 1;
+
+		int label;                  // 4
+	};
+
+	__forceinline uint16_t EncodeCap(float cap, float invScale) noexcept {
+		float x = std::min(std::max(cap * invScale, 0.0f), 65535.0f);
+		return static_cast<uint16_t>(x + 0.5f);
+	}
+	__forceinline float DecodeCap(uint16_t q, float scale) noexcept {
+		return scale * static_cast<float>(q);
+	}
+#else
 	struct Arc {
 		Node*		head;
 		Arc*		rev;
@@ -219,6 +254,7 @@ public:
 
 		int label;                  // 4
 	};
+#endif
 
 	class ActiveList
 	{

@@ -636,9 +636,9 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 	{
 		std::vector<int> components_local(faces.size());
 
-		std::vector<FIndex> queue;
-		queue.reserve(64);
+		boost::container::small_vector<FIndex, 64> queue;
 		VertexWork local;
+		local.componentFaces.reserve(16);
 
 #pragma omp for schedule(static)
 		for (ptrdiff_t idxVert = 0; idxVert < (ptrdiff_t)nVerts; ++idxVert) {
@@ -704,7 +704,6 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 
 	// -------- Phase 2: Apply changes (serial) --------
 	unsigned numIssues = 0;
-	boost::container::small_vector<VIndex, 32> adjVerts;
 
 	for (size_t idxVert = 0; idxVert < nVerts; ++idxVert) {
 		VertexWork& vw = work[idxVert];
@@ -738,6 +737,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 		}
 
 		// Optional displacement of duplicates
+		boost::container::small_vector<VIndex, 32> adjVerts;
 		if (magDisplacementDuplicateVertices > 0) {
 			boost::container::small_vector<VIndex, 3> verts(vw.numComponents);
 			verts[0] = idxVert;
@@ -1256,6 +1256,23 @@ inline void FinalCleanup(CLEAN::Mesh& mesh,
 	}
 }
 
+template<class MESH>
+static inline void FastClean(MESH& m)
+{
+	using Tri = vcg::tri::Clean<MESH>;
+	using Topo = vcg::tri::UpdateTopology<MESH>;
+	using Alloc = vcg::tri::Allocator<MESH>;
+
+	Topo::FaceFace(m);
+	Topo::VertexFace(m);
+
+	int removedNMf = Tri::RemoveNonManifoldFace(m);
+	int removedUnref = Tri::RemoveUnreferencedVertex(m);
+
+	if (removedNMf + removedUnref)
+		Alloc::CompactEveryVector(m);
+}
+
 #if 1 // Alternative
 
 static void RemoveSpikes(CLEAN::Mesh& mesh)
@@ -1369,6 +1386,52 @@ void Mesh::Clean(
 	TD_TIMER_STARTD();
 
 	CLEAN::Mesh mesh;
+#if 0 // Avoid heavy vcglib init
+	const size_t numVerts = vertices.GetSize();
+	const size_t numFaces = faces.GetSize();
+
+	// generous reserve to avoid reallocations if you later add a few more
+	mesh.vert.reserve(numVerts * 2);
+	mesh.face.reserve(numFaces * 2);
+
+	// Direct resize (no pointer updater, no attribute resize)
+	mesh.vert.resize(numVerts);
+	mesh.vn = int(numVerts);
+
+	mesh.face.resize(numFaces);
+	mesh.fn = int(numFaces);
+
+	for (size_t i = 0; i < numVerts; ++i)
+	{
+		const Vertex& src = vertices[i];   // or vertices[i] if not pointer array
+		auto& dst = mesh.vert[i];
+		dst.P()[0] = src.x;
+		dst.P()[1] = src.y;
+		dst.P()[2] = src.z;
+	}
+
+	vertices.Release();
+
+	std::vector<CLEAN::Mesh::VertexPointer> vp(numVerts);
+	for (size_t i = 0; i < numVerts; ++i)
+		vp[i] = &mesh.vert[i];
+	
+	for (size_t i = 0; i < numFaces; ++i)
+	{
+		const Face& f = faces[i];
+		auto& dst = mesh.face[i];
+
+		// Assume all faces are triangles
+		dst.V(0) = vp[f[0]];
+		dst.V(1) = vp[f[1]];
+		dst.V(2) = vp[f[2]];
+	}
+	faces.Release();
+
+	// Rebuild topology
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+#else
 	{
 		// Try to minimize reallocations by giving the mesh a generous amount of storage.
 		mesh.vert.reserve(vertices.size() * 2);
@@ -1407,6 +1470,7 @@ void Mesh::Clean(
 		}
 		faces.Release();
 	}
+#endif
 
 	constexpr CLEAN::Mesh::ScalarType eps = 1e-12;
 
@@ -1546,6 +1610,9 @@ void Mesh::Clean(
 	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
 	LightRefresh();
 
+#if 1 // Faster
+	FastClean(mesh);
+#else
 	while (vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldEdgeFF(mesh) > 0 ||
 		vcg::tri::Clean<CLEAN::Mesh>::CountNonManifoldVertexFF(mesh) > 0)
 	{
@@ -1553,7 +1620,7 @@ void Mesh::Clean(
 		vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldVertex(mesh);
 		CompactAndRefresh();
 	}
-
+#endif
 	// -------------------------------------------------------------
 	// Reimport back
 	// -------------------------------------------------------------

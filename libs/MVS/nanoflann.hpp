@@ -231,7 +231,7 @@ class KNNResultSet
      * @return true if the search should be continued, false if the results are
      * sufficient
      */
-    bool addPoint(DistanceType dist, IndexType index)
+    __forceinline bool addPoint(DistanceType dist, IndexType index)
     {
         CountType i;
         for (i = count; i > 0; --i)

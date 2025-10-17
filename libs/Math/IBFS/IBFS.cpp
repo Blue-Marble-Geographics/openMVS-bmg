@@ -300,7 +300,7 @@ void IBFSGraph::adoption()
 
     if (x->label != (sTree ? 1 : -1)) {
       minLabel = x->label - (sTree ? 1 : -1);
-      for (int i = 0; i < x->arcCount; ++i) {
+      for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
         a = &x->arcs[i];
 				stats.incOrphanArcs1();
 				y = a->head;
@@ -336,7 +336,7 @@ void IBFSGraph::adoption()
     // relabel
 		minLabel = (sTree ? topLevelS : -topLevelT);
     if (x->label != minLabel) {
-      for (int i = 0; i < x->arcCount; ++i) {
+      for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
         a = &x->arcs[i];
 			stats.incOrphanArcs2();
 			y = a->head;
@@ -380,7 +380,7 @@ void IBFSGraph::adoption3Pass()
 			if (x->parent == NULL) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
 				destLabel = x->label - (sTree ? 1 : -1);
-				for (int i = 0; i < x->arcCount; ++i) {
+				for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
 					a = &x->arcs[i];
 					y = a->head;
 					if ((sTree ? a->isRevResidual : a->rCap) &&
@@ -407,7 +407,7 @@ void IBFSGraph::adoption3Pass()
 			// pass 3: lower potential sons and/or find first parent
 			if (x->label != (sTree ? topLevelS : -topLevelT)) {
 				minLabel = x->label + (sTree ? 1 : -1);
-				for (int i = 0; i < x->arcCount; ++i) {
+				for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
 					a = &x->arcs[i];
 					y = a->head;
 
@@ -454,7 +454,7 @@ void IBFSGraph::growth() {
 		if (dirS) stats.incGrowthS();
 		else stats.incGrowthT();
 
-    for (int i = 0; i < x->arcCount; ++i) {
+    for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
       Arc* a = &x->arcs[i];
 
 			if ((dirS ? a->rCap : a->isRevResidual) == 0) continue;

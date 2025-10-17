@@ -581,99 +581,46 @@ template<class EAR>
 /// It returns the number of filled holes.
 #if 1
     template<class EAR>
-    static int EarCuttingIntersectionFill(MESH& m, int sizeHole, bool selected = false, CallBackPos* cb = nullptr) {
+    static int EarCuttingIntersectionFill(MESH& m, int sizeHole, bool selected = false, CallBackPos* cb = nullptr)
+    {
       std::vector<Info> vinfo;
       GetInfo(m, selected, vinfo);
-      const int total = (int)vinfo.size();
+      const int total = int(vinfo.size());
+      int closed = 0, idx = 0;
 
-      // single reusable buffers
       std::vector<int> ring;
-      std::vector<CoordType> verts;
-      ring.reserve(512);
-      verts.reserve(512);
+      ring.reserve(256);
 
-      int holeCnt = 0;
-      int indCb = 0;
+      for (auto& info : vinfo)
+      {
+        if (cb) (*cb)(++idx * 10 / total, "Closing Holes");
+        if (info.size >= sizeHole) continue;
 
-      for (auto& info : vinfo) {
-        ++indCb;
-        if (cb) (*cb)(indCb * 10 / total, "Closing Holes");
-        if (info.size >= sizeHole)
-          continue;
-
-        ++holeCnt;
-
-        // ---- Build contiguous vertex ring ----
         ring.clear();
-        verts.clear();
         PosType p = info.p;
         int guard = 0;
         do {
-          ring.push_back((int)(p.v - &*m.vert.begin()));  // compact vertex index
-          verts.push_back(p.v->cP());
+          ring.push_back(int(p.v - &*m.vert.begin()));
           p.NextB();
         } while (p != info.p && ++guard < 10000);
 
         const int n = (int)ring.size();
-        if (n < 3 || guard >= 10000)
-          continue; // skip degenerate or malformed hole
+        if (n < 3 || guard >= 10000) continue;
+        ++closed;
 
-        // ---- Ear cutting triangulation ----
-        std::vector<char> removed(n, 0);
-        int active = n;
-        int i = 0;
-        int safety = 0;
-        const int safetyLimit = n * n; // limit iterations
+        // Fan root = first vertex in ring
+        int root = 0;
 
-        // simple projection: use XY plane of the first triangle
-        while (active > 2 && safety++ < safetyLimit) {
-          const int i0 = i % n;
-          if (removed[i0]) { ++i; continue; }
-
-          int i1 = (i0 + 1) % n;
-          while (removed[i1]) i1 = (i1 + 1) % n;
-          int i2 = (i1 + 1) % n;
-          while (removed[i2]) i2 = (i2 + 1) % n;
-          if (i0 == i1 || i1 == i2 || i2 == i0) break;
-
-          const CoordType& a = verts[i0];
-          const CoordType& b = verts[i1];
-          const CoordType& c = verts[i2];
-
-          // quick area test (2D projected XY)
-          const float cross = (b.X() - a.X()) * (c.Y() - a.Y()) -
-            (b.Y() - a.Y()) * (c.X() - a.X());
-          if (cross <= 0.f) { ++i; continue; }
-
-          bool valid = true;
-          for (int k = 0; k < n; ++k) {
-            if (removed[k] || k == i0 || k == i1 || k == i2)
-              continue;
-            const CoordType& pnt = verts[k];
-            const float s1 = (b.X() - a.X()) * (pnt.Y() - a.Y()) - (b.Y() - a.Y()) * (pnt.X() - a.X());
-            const float s2 = (c.X() - b.X()) * (pnt.Y() - b.Y()) - (c.Y() - b.Y()) * (pnt.X() - b.X());
-            const float s3 = (a.X() - c.X()) * (pnt.Y() - c.Y()) - (a.Y() - c.Y()) * (pnt.X() - c.X());
-            if ((s1 > 0 && s2 > 0 && s3 > 0) || (s1 < 0 && s2 < 0 && s3 < 0)) {
-              valid = false;
-              break;
-            }
-          }
-
-          if (valid) {
-            // allocate one new triangle in mesh
-            FaceIterator fi = vcg::tri::Allocator<MESH>::AddFaces(m, 1);
-            FacePointer nf = &*fi;
-            nf->V(0) = &m.vert[ring[i0]];
-            nf->V(1) = &m.vert[ring[i1]];
-            nf->V(2) = &m.vert[ring[i2]];
-            removed[i1] = 1;
-            --active;
-          }
-
-          ++i;
+        // Create fan faces
+        for (int i = 1; i + 1 < n; ++i)
+        {
+          FaceIterator fi = tri::Allocator<MESH>::AddFaces(m, 1);
+          fi->V(0) = &m.vert[ring[root]];
+          fi->V(1) = &m.vert[ring[i]];
+          fi->V(2) = &m.vert[ring[i + 1]];
         }
       }
-      return holeCnt;
+      return closed;
     }
 #else
 template<class EAR>

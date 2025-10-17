@@ -233,26 +233,60 @@ public:
   /// optionally it can skip the faux edges (to retrieve only the real edges of a triangulated polygonal mesh)
   static constexpr int edgeNext[] = { 1, 2, 0 };
 #if  1
-  static void FillEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec)
+  static void FillEdgeVector(MeshType& m, PEdge2*& edgeVec, uint32_t& numEdges)
   {
     const int64_t faceCount = (int64_t)m.face.size();
-    if (faceCount == 0) return;
+    if (faceCount == 0) {
+      edgeVec = nullptr;
+      numEdges = 0;
+      return;
+    }
 
-    // Upper bound (3 edges per face)
-    edgeVec.resize(faceCount * 3);
+    const int threadCount = omp_get_max_threads();
+    const size_t upperBound = (size_t)faceCount * 3;
+
+    // Allocate aligned memory (not zeroed)
+    edgeVec = (PEdge2*)_aligned_malloc(sizeof(PEdge2) * upperBound, 64);
+    if (!edgeVec)
+      throw std::bad_alloc();
+
+    // Faster to touch each cache line before we begin.
+    // Optional warm-up for large buffers (>24 MB)
+    if (upperBound > (1 << 20)) {
+#pragma omp parallel
+      {
+        const int tid = omp_get_thread_num();
+        const int T = omp_get_num_threads();
+        const size_t chunk = (upperBound + T - 1) / T;
+        const size_t start = tid * chunk;
+        const size_t end = std::min(start + chunk, upperBound);
+        const size_t step = 64 / sizeof(PEdge2); // touch once per cache line
+
+        for (size_t i = start; i < end; i += step)
+          edgeVec[i].key = 0;
+      }
+    }
 
     auto* const v0 = &m.vert[0];
-
-    std::atomic<size_t> aliveCounter{ 0 };
+    std::vector<size_t> threadCountOut(threadCount, 0);
+    std::vector<size_t> threadOffset(threadCount, 0);
 
 #pragma omp parallel
     {
-      // Local scratch buffer to reduce atomic pressure
-      std::vector<PEdge2> localEdges;
-      localEdges.reserve(4096);
+      const int tid = omp_get_thread_num();
+      const int T = omp_get_num_threads();
+      const size_t chunk = (faceCount + T - 1) / T;
+      const size_t startFace = tid * chunk;
+      const size_t endFace = std::min<size_t>(startFace + chunk, faceCount);
 
-#pragma omp for schedule(static)
-      for (int64_t i = 0; i < faceCount; ++i)
+      // Each thread owns its own contiguous region
+      const size_t startOut = startFace * 3;
+      PEdge2* out = edgeVec + startOut;
+      size_t outCount = 0;
+
+      PEdge2 localEdges[4096]; // ~96 KB, fits in L2
+
+      for (size_t i = startFace; i < endFace; ++i)
       {
         auto& f = m.face[i];
         if (f.IsD()) continue;
@@ -268,29 +302,46 @@ public:
           size_t i1 = f.V(jNext) - v0;
           if (i0 > i1) std::swap(i0, i1);
           e.key = (uint64_t(i0) << 32) | uint32_t(i1);
-          localEdges.push_back(e);
-        }
 
-        // Periodically flush to shared array to amortize atomics
-        if (localEdges.size() >= 4096) {
-          size_t offset = aliveCounter.fetch_add(localEdges.size(), std::memory_order_relaxed);
-          std::memcpy(&edgeVec[offset], localEdges.data(),
-            localEdges.size() * sizeof(PEdge2));
-          localEdges.clear();
+          localEdges[outCount++] = e;
+
+          // Flush every 4096 edges (~96 KB)
+          if (outCount == 4096)
+          {
+            std::memcpy(out, localEdges, outCount * sizeof(PEdge2));
+            out += outCount;
+            outCount = 0;
+          }
         }
       }
 
-      // Final flush
-      if (!localEdges.empty()) {
-        size_t offset = aliveCounter.fetch_add(localEdges.size(), std::memory_order_relaxed);
-        std::memcpy(&edgeVec[offset], localEdges.data(),
-          localEdges.size() * sizeof(PEdge2));
+      // Flush any remaining edges
+      if (outCount)
+      {
+        std::memcpy(out, localEdges, outCount * sizeof(PEdge2));
+        out += outCount;
       }
+
+      threadOffset[tid] = startOut;
+      threadCountOut[tid] = (size_t)(out - (edgeVec + startOut));
     }
 
-    // Trim to actual count
-    edgeVec.resize(aliveCounter.load(std::memory_order_relaxed));
+    // Compact contiguous regions (rarely needed)
+    size_t offset = 0;
+    for (int t = 0; t < threadCount; ++t)
+    {
+      size_t count = threadCountOut[t];
+      size_t srcOffset = threadOffset[t];
+      if (count > 0 && offset != srcOffset)
+        std::memmove(edgeVec + offset, edgeVec + srcOffset, count * sizeof(PEdge2));
+      offset += count;
+    }
+
+    numEdges = (uint32_t)offset;
   }
+
+
+
 #else
   static void FillEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec)
   {
@@ -345,28 +396,28 @@ static void FillEdgeVector(MeshType& m, std::vector<PEdge>& edgeVec, bool includ
 }
 #endif
 
-static void FillUniqueEdgeVector(MeshType& m, std::vector<PEdge2>& edgeVec, bool includeFauxEdge = true, bool computeBorderFlag = false)
+static void FillUniqueEdgeVector(MeshType& m, PEdge2*& edgeVec, uint32_t& numEdges, bool includeFauxEdge = true, bool computeBorderFlag = false)
 {
   if (!includeFauxEdge)
   {
     throw std::runtime_error("Unsupported");
   }
 
-  FillEdgeVector(m, edgeVec);
-  tbb::parallel_sort(edgeVec.begin(), edgeVec.end()); // oredering by vertex
+  FillEdgeVector(m, edgeVec, numEdges);
+  tbb::parallel_sort(edgeVec, edgeVec+numEdges); // oredering by vertex
 
   if (computeBorderFlag) {
-    for (size_t i = 0; i < edgeVec.size(); i++)
+    for (size_t i = 0; i < numEdges; i++)
       edgeVec[i].isBorder = true;
-    for (size_t i = 1; i < edgeVec.size(); i++) {
+    for (size_t i = 1; i < numEdges; i++) {
       if (edgeVec[i] == edgeVec[i - 1])
         edgeVec[i].isBorder = edgeVec[i - 1].isBorder = false;
     }
   }
 
-  typename std::vector< PEdge2>::iterator newEnd = std::unique(std::execution::par_unseq, edgeVec.begin(), edgeVec.end());
+  auto* newEnd = std::unique(std::execution::par_unseq, edgeVec, edgeVec+ numEdges);
 
-  edgeVec.resize(newEnd - edgeVec.begin()); // redundant! remove?
+  numEdges = newEnd - edgeVec; // redundant! remove?
 }
 
 static void FillSelectedFaceEdgeVector(MeshType &m, std::vector<PEdge> &edgeVec)
@@ -397,16 +448,17 @@ static void AllocateEdge(MeshType &m)
   tri::Allocator<MeshType>::CompactEdgeVector(m);
 
   // Compute and add edges
-  std::vector<PEdge2> Edges;
-  FillUniqueEdgeVector(m,Edges,true,tri::HasPerEdgeFlags(m) );
+  PEdge2* Edges = 0;
+  uint32_t numEdges = 0;
+  FillUniqueEdgeVector(m,Edges,numEdges,true,tri::HasPerEdgeFlags(m) );
   assert(m.edge.empty());
-  tri::Allocator<MeshType>::AddEdges(m,Edges.size());
-  assert(m.edge.size()==Edges.size());
+  tri::Allocator<MeshType>::AddEdges(m,numEdges);
+  assert(m.edge.size()== numEdges);
 
   // Setup adjacency relations
   if(tri::HasEVAdjacency(m))
   {
-    const int64_t cnt = (int64_t) Edges.size();
+    const int64_t cnt = (int64_t)numEdges;
     bool hasPerEdgeFlags = tri::HasPerEdgeFlags(m);
 #pragma omp parallel for // No conditional
     for (int64_t i = 0; i < cnt; ++i) {
@@ -424,7 +476,7 @@ static void AllocateEdge(MeshType &m)
     }
   } else {
     if (tri::HasPerEdgeFlags(m)){
-      for(size_t i=0; i< Edges.size(); ++i) {
+      for(size_t i=0; i< numEdges; ++i) {
           if (Edges[i].isBorder) m.edge[i].SetB(); else m.edge[i].ClearB();
       }
     }
@@ -432,7 +484,7 @@ static void AllocateEdge(MeshType &m)
 
   if(tri::HasEFAdjacency(m)) // Note it is an unordered relation.
   {
-    for(size_t i=0; i< Edges.size(); ++i)
+    for(size_t i=0; i< numEdges; ++i)
     {
       std::vector<FacePointer> fpVec;
       std::vector<int> eiVec;
@@ -444,7 +496,7 @@ static void AllocateEdge(MeshType &m)
 
   if(tri::HasFEAdjacency(m))
   {
-    for(size_t i=0; i< Edges.size(); ++i)
+    for(size_t i=0; i< numEdges; ++i)
     {
       std::vector<FacePointer> fpVec;
       std::vector<int> eiVec;
@@ -472,7 +524,8 @@ static void AllocateEdge(MeshType &m)
 //      m.edge[i].EFi() = ;
     }
   }
-
+  
+  _aligned_free(Edges);
 }
 
 /// \brief Clear the tetra-tetra topological relation, setting each involved pointer to null.
@@ -553,22 +606,23 @@ static void FaceFace(MeshType& m)
   RequireFFAdjacency(m);
   if (m.fn == 0) return;
 
-  std::vector<PEdge2> edges;
-  FillEdgeVector(m, edges);   // or <false>, depending on need
+  PEdge2* edges;
+  uint32_t numEdges = 0;
+  FillEdgeVector(m, edges, numEdges);   // or <false>, depending on need
 
   // Sort by canonical vertex pair
-  tbb::parallel_sort(edges.begin(), edges.end());
+  tbb::parallel_sort(edges, edges+numEdges);
 
   // Find run boundaries
   std::vector<size_t> runStarts;
-  runStarts.reserve(edges.size());
+  runStarts.reserve(numEdges);
   runStarts.push_back(0);
-  for (size_t i = 1; i < edges.size(); ++i)
+  for (uint32_t i = 1; i < numEdges; ++i)
   {
     if (!(edges[i] == edges[i - 1]))
       runStarts.push_back(i);
   }
-  runStarts.push_back(edges.size());
+  runStarts.push_back(numEdges);
 
   // Parallel wiring
 #pragma omp parallel for schedule(static, 10000)
@@ -584,6 +638,8 @@ static void FaceFace(MeshType& m)
       a.f->FFi(a.z) = b.z;
     }
   }
+
+  _aligned_free(edges);
 }
 
 /// \brief Update the vertex-tetra topological relation.
