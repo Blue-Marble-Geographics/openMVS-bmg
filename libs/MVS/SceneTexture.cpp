@@ -37,6 +37,7 @@
 #include <boost/graph/connected_components.hpp>
 
 using namespace MVS;
+#pragma optimize("", on) // JPB WIP BUG
 
 
 // D E F I N E S ///////////////////////////////////////////////////
@@ -159,9 +160,9 @@ struct MeshTexture {
 			Base::Clear();
 			faceMap.memset((uint8_t)NO_ID);
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(bary));
-			const Depth z(ComputeDepth(pbary));
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+			const Depth z(ComputeDepth(t, pbary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == 0 || depth > z) {
@@ -340,7 +341,7 @@ public:
 	void CreateSeamVertices();
 	void GlobalSeamLeveling();
 	void LocalSeamLeveling();
-	void GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight);
+	void GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize);
 
 	template <typename PIXEL>
 	static inline PIXEL RGB2YCBCR(const PIXEL& v) {
@@ -2361,26 +2362,69 @@ void MeshTexture::LocalSeamLeveling()
 }
 #endif
 
-void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight)
+void resizeHugeImage(const cv::Mat& src, cv::Mat& dst, int nMaxTextureSize)
+{
+	const int srcW = src.cols;
+	const int srcH = src.rows;
+
+	// scale factor
+	const double scale = static_cast<double>(nMaxTextureSize) /
+		static_cast<double>(std::max(srcW, srcH));
+	const int dstW = static_cast<int>(std::ceil(srcW * scale));
+	const int dstH = static_cast<int>(std::ceil(srcH * scale));
+
+	dst.create(dstH, dstW, src.type());
+	dst.setTo(0);
+
+	// process row strips in tiles
+	const int tileH = 2048; // you can tune this (balance speed vs memory)
+	cv::Mat strip, stripResized;
+
+	for (int y = 0; y < srcH; y += tileH)
+	{
+		int h = std::min(tileH, srcH - y);
+
+		// take a strip from source
+		cv::Rect roi(0, y, srcW, h);
+		strip = src(roi);
+
+		// resize this strip
+		double scaleY = scale; // same scale in both directions
+		cv::resize(strip, stripResized, cv::Size(), scale, scaleY, cv::INTER_AREA);
+
+		// compute destination y offset
+		int yDst = static_cast<int>(y * scale);
+		int hDst = stripResized.rows;
+		if (yDst + hDst > dst.rows)
+			hDst = dst.rows - yDst;
+
+		// copy into output
+		stripResized(cv::Rect(0, 0, dst.cols, hDst)).copyTo(dst(cv::Rect(0, yDst, dst.cols, hDst)));
+
+		std::cout << "Processed rows " << y << "–" << (y + h) << std::endl;
+	}
+}
+
+void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
 {
 	// project patches in the corresponding view and compute texture-coordinates and bounding-box
 	const int border(2);
-	faceTexcoords.resize(faces.size()*3);
-	#ifdef TEXOPT_USE_OPENMP
-	const unsigned numPatches(texturePatches.size()-1);
-	#pragma omp parallel for schedule(dynamic)
-	for (int_t idx=0; idx<(int_t)numPatches; ++idx) {
+	faceTexcoords.resize(faces.size() * 3);
+#ifdef TEXOPT_USE_OPENMP
+	const unsigned numPatches(texturePatches.size() - 1);
+#pragma omp parallel for schedule(dynamic)
+	for (int_t idx = 0; idx < (int_t)numPatches; ++idx) {
 		TexturePatch& texturePatch = texturePatches[(uint32_t)idx];
-	#else
-	for (TexturePatch *pTexturePatch=texturePatches.Begin(), *pTexturePatchEnd=texturePatches.End()-1; pTexturePatch<pTexturePatchEnd; ++pTexturePatch) {
+#else
+	for (TexturePatch* pTexturePatch = texturePatches.Begin(), *pTexturePatchEnd = texturePatches.End() - 1; pTexturePatch < pTexturePatchEnd; ++pTexturePatch) {
 		TexturePatch& texturePatch = *pTexturePatch;
-	#endif
+#endif
 		const Image& imageData = images[texturePatch.label];
 		AABB2f aabb(true);
-		for (const FIndex idxFace: texturePatch.faces) {
+		for (const FIndex idxFace : texturePatch.faces) {
 			const Face& face = faces[idxFace];
-			TexCoord* texcoords = faceTexcoords.data()+idxFace*3;
-			for (int i=0; i<3; ++i) {
+			TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+			for (int i = 0; i < 3; ++i) {
 				texcoords[i] = imageData.camera.ProjectPointP(vertices[face[i]]);
 				ASSERT(imageData.image.isInsideWithBorder(texcoords[i], border));
 				aabb.InsertFull(texcoords[i]);
@@ -2389,27 +2433,27 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		// compute relative texture coordinates
 		ASSERT(imageData.image.isInside(Point2f(aabb.ptMin)));
 		ASSERT(imageData.image.isInside(Point2f(aabb.ptMax)));
-		texturePatch.rect.x = FLOOR2INT(aabb.ptMin[0])-border;
-		texturePatch.rect.y = FLOOR2INT(aabb.ptMin[1])-border;
-		texturePatch.rect.width = CEIL2INT(aabb.ptMax[0]-aabb.ptMin[0])+border*2;
-		texturePatch.rect.height = CEIL2INT(aabb.ptMax[1]-aabb.ptMin[1])+border*2;
+		texturePatch.rect.x = FLOOR2INT(aabb.ptMin[0]) - border;
+		texturePatch.rect.y = FLOOR2INT(aabb.ptMin[1]) - border;
+		texturePatch.rect.width = CEIL2INT(aabb.ptMax[0] - aabb.ptMin[0]) + border * 2;
+		texturePatch.rect.height = CEIL2INT(aabb.ptMax[1] - aabb.ptMin[1]) + border * 2;
 		ASSERT(imageData.image.isInside(texturePatch.rect.tl()));
 		ASSERT(imageData.image.isInside(texturePatch.rect.br()));
 		const TexCoord offset(texturePatch.rect.tl());
-		for (const FIndex idxFace: texturePatch.faces) {
-			TexCoord* texcoords = faceTexcoords.data()+idxFace*3;
-			for (int v=0; v<3; ++v)
+		for (const FIndex idxFace : texturePatch.faces) {
+			TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+			for (int v = 0; v < 3; ++v)
 				texcoords[v] -= offset;
 		}
 	}
 	{
 		// init last patch to point to a small uniform color patch
 		TexturePatch& texturePatch = texturePatches.Last();
-		const int sizePatch(border*2+1);
-		texturePatch.rect = cv::Rect(0,0, sizePatch,sizePatch);
-		for (const FIndex idxFace: texturePatch.faces) {
-			TexCoord* texcoords = faceTexcoords.data()+idxFace*3;
-			for (int i=0; i<3; ++i)
+		const int sizePatch(border * 2 + 1);
+		texturePatch.rect = cv::Rect(0, 0, sizePatch, sizePatch);
+		for (const FIndex idxFace : texturePatch.faces) {
+			TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+			for (int i = 0; i < 3; ++i)
 				texcoords[i] = TexCoord(0.5f, 0.5f);
 		}
 	}
@@ -2435,9 +2479,9 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 	}
 
 	// merge texture patches with overlapping rectangles
-	for (unsigned i=0; i<texturePatches.size()-1; ++i) {
+	for (unsigned i = 0; i < texturePatches.size() - 1; ++i) {
 		TexturePatch& texturePatchBig = texturePatches[i];
-		for (unsigned j=1; j<texturePatches.size(); ++j) {
+		for (unsigned j = 1; j < texturePatches.size(); ++j) {
 			if (i == j)
 				continue;
 			TexturePatch& texturePatchSmall = texturePatches[j];
@@ -2446,10 +2490,10 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			if (!RectsBinPack::IsContainedIn(texturePatchSmall.rect, texturePatchBig.rect))
 				continue;
 			// translate texture coordinates
-			const TexCoord offset(texturePatchSmall.rect.tl()-texturePatchBig.rect.tl());
-			for (const FIndex idxFace: texturePatchSmall.faces) {
-				TexCoord* texcoords = faceTexcoords.data()+idxFace*3;
-				for (int v=0; v<3; ++v)
+			const TexCoord offset(texturePatchSmall.rect.tl() - texturePatchBig.rect.tl());
+			for (const FIndex idxFace : texturePatchSmall.faces) {
+				TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+				for (int v = 0; v < 3; ++v)
 					texcoords[v] += offset;
 			}
 			// join faces lists
@@ -2466,90 +2510,109 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		FOREACH(i, texturePatches)
 			rects[i] = texturePatches[i].rect;
 		int textureSize(RectsBinPack::ComputeTextureSize(rects, nTextureSizeMultiple));
-			// increase texture size till all patches fit
+		// increase texture size till all patches fit
 		while (true) {
 			TD_TIMER_STARTD();
 			bool bPacked(false);
-			const unsigned typeRectsBinPack(nRectPackingHeuristic/100);
-			const unsigned typeSplit((nRectPackingHeuristic-typeRectsBinPack*100)/10);
-			const unsigned typeHeuristic(nRectPackingHeuristic%10);
-				switch (typeRectsBinPack) {
-				case 0: {
-					MaxRectsBinPack pack(textureSize, textureSize);
+			const unsigned typeRectsBinPack(nRectPackingHeuristic / 100);
+			const unsigned typeSplit((nRectPackingHeuristic - typeRectsBinPack * 100) / 10);
+			const unsigned typeHeuristic(nRectPackingHeuristic % 10);
+			switch (typeRectsBinPack) {
+			case 0: {
+				MaxRectsBinPack pack(textureSize, textureSize);
 				bPacked = pack.Insert(rects, (MaxRectsBinPack::FreeRectChoiceHeuristic)typeHeuristic);
-					break; }
-				case 1: {
-					SkylineBinPack pack(textureSize, textureSize, typeSplit!=0);
+				break;
+			}
+			case 1: {
+				SkylineBinPack pack(textureSize, textureSize, typeSplit != 0);
 				bPacked = pack.Insert(rects, (SkylineBinPack::LevelChoiceHeuristic)typeHeuristic);
-					break; }
-				case 2: {
-					GuillotineBinPack pack(textureSize, textureSize);
+				break;
+			}
+			case 2: {
+				GuillotineBinPack pack(textureSize, textureSize);
 				bPacked = pack.Insert(rects, false, (GuillotineBinPack::FreeRectChoiceHeuristic)typeHeuristic, (GuillotineBinPack::GuillotineSplitHeuristic)typeSplit);
-					break; }
-				default:
-					ABORT("error: unknown RectsBinPack type");
-				}
+				break;
+			}
+			default:
+				ABORT("error: unknown RectsBinPack type");
+			}
 			DEBUG_ULTIMATE("\tpacking texture completed: %u patches, %u texture-size (%s)", rects.size(), textureSize, TD_TIMER_GET_FMT().c_str());
 			if (bPacked)
 				break;
-					textureSize *= 2;
+			textureSize *= 2;
 		}
-
 		// create texture image
 		textureDiffuse.create(textureSize, textureSize);
 		textureDiffuse.setTo(cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
-		#ifdef TEXOPT_USE_OPENMP
-		#pragma omp parallel for schedule(dynamic)
-		for (int_t i=0; i<(int_t)texturePatches.size(); ++i) {
+#ifdef TEXOPT_USE_OPENMP
+#pragma omp parallel for schedule(dynamic)
+		for (int_t i = 0; i < (int_t)texturePatches.size(); ++i) {
 			const uint32_t idxPatch((uint32_t)i);
-		#else
+#else
 		FOREACH(idxPatch, texturePatches) {
-		#endif
+#endif
 			const TexturePatch& texturePatch = texturePatches[idxPatch];
 			const RectsBinPack::Rect& rect = rects[idxPatch];
-				// copy patch image
-				ASSERT((rect.width == texturePatch.rect.width && rect.height == texturePatch.rect.height) ||
-					(rect.height == texturePatch.rect.width && rect.width == texturePatch.rect.height));
-				int x(0), y(1);
-				if (texturePatch.label != NO_ID) {
-					const Image& imageData = images[texturePatch.label];
-					cv::Mat patch(imageData.image(texturePatch.rect));
-					if (rect.width != texturePatch.rect.width) {
-						// flip patch and texture-coordinates
-						patch = patch.t();
-						x = 1; y = 0;
-					}
-				patch.copyTo(textureDiffuse(rect));
+			// copy patch image
+			ASSERT((rect.width == texturePatch.rect.width && rect.height == texturePatch.rect.height) ||
+				(rect.height == texturePatch.rect.width && rect.width == texturePatch.rect.height));
+			int x(0), y(1);
+			if (texturePatch.label != NO_ID) {
+				const Image& imageData = images[texturePatch.label];
+				cv::Mat patch(imageData.image(texturePatch.rect));
+				if (rect.width != texturePatch.rect.width) {
+					// flip patch and texture-coordinates
+					patch = patch.t();
+					x = 1; y = 0;
 				}
-				// compute final texture coordinates
-				const TexCoord offset(rect.tl());
-				for (const FIndex idxFace: texturePatch.faces) {
-					TexCoord* texcoords = faceTexcoords.data()+idxFace*3;
-					for (int v=0; v<3; ++v) {
-						TexCoord& texcoord = texcoords[v];
-						texcoord = TexCoord(
-							texcoord[x]+offset.x,
-							texcoord[y]+offset.y
-						);
-					}
+				patch.copyTo(textureDiffuse(rect));
+			}
+			// compute final texture coordinates
+			const TexCoord offset(rect.tl());
+			for (const FIndex idxFace : texturePatch.faces) {
+				TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+				for (int v = 0; v < 3; ++v) {
+					TexCoord& texcoord = texcoords[v];
+					texcoord = TexCoord(
+						texcoord[x] + offset.x,
+						texcoord[y] + offset.y
+					);
 				}
 			}
+		}
 		// apply some sharpening
 		if (fSharpnessWeight > 0) {
 			constexpr double sigma = 1.5;
-			    Image8U3 blurryTextureDiffuse;
-			    cv::GaussianBlur(textureDiffuse, blurryTextureDiffuse, cv::Size(), sigma);
-			    cv::addWeighted(textureDiffuse, 1+fSharpnessWeight, blurryTextureDiffuse, -fSharpnessWeight, 0, textureDiffuse);
+			Image8U3 blurryTextureDiffuse;
+			cv::GaussianBlur(textureDiffuse, blurryTextureDiffuse, cv::Size(), sigma);
+			cv::addWeighted(textureDiffuse, 1 + fSharpnessWeight, blurryTextureDiffuse, -fSharpnessWeight, 0, textureDiffuse);
+		}
+
+		const int nMaxTextureSize = 60000;
+		// only downscale if needed
+		if (textureDiffuse.cols > nMaxTextureSize || textureDiffuse.rows > nMaxTextureSize)
+		{
+			const double scale = static_cast<double>(nMaxTextureSize) /
+				static_cast<double>(std::max(textureDiffuse.cols, textureDiffuse.rows));
+
+			cv::Mat original = textureDiffuse.clone();
+			resizeHugeImage(original, textureDiffuse, nMaxTextureSize);
+
+			// *** rescale UVs to match the resized atlas ***
+			for (TexCoord& uv : faceTexcoords) {
+				uv.x *= static_cast<float>(scale);
+				uv.y *= static_cast<float>(scale);
 			}
 		}
 	}
+}
 
 // texture mesh
 //  - minCommonCameras: generate texture patches using virtual faces composed of coplanar triangles sharing at least this number of views (0 - disabled, 3 - good value)
 //  - fSharpnessWeight: sharpness weight to be applied on the texture (0 - disabled, 0.5 - good value)
 bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsigned minCommonCameras, float fOutlierThreshold, float fRatioDataSmoothness,
 	bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight,
-	const IIndexArr& views)
+	int nMaxTextureSize, const IIndexArr& views)
 {
 	MeshTexture texture(*this, nResolutionLevel, nMinResolution);
 
@@ -2564,7 +2627,7 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 	// generate the texture image and atlas
 	{
 		TD_TIMER_STARTD();
-		texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight);
+		texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize);
 		DEBUG_EXTRA("Generating texture atlas and image completed: %u patches, %u image size (%s)", texture.texturePatches.GetSize(), mesh.textureDiffuse.width(), TD_TIMER_GET_FMT().c_str());
 	}
 

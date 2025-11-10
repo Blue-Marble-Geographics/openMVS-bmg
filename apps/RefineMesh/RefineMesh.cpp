@@ -35,11 +35,14 @@
 
 using namespace MVS;
 
+// Easier to configure this here.
+#pragma comment(linker, "/STACK:0x400000,0x400000")
 
 // D E F I N E S ///////////////////////////////////////////////////
 
 #define APPNAME _T("RefineMesh")
 
+#undef LOCAL_BUILD // JPB WIP BUG
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -264,7 +267,12 @@ int main(int argc, LPCTSTR* argv)
 
 	// save the final mesh
 	const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
-	scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#ifdef LOCAL_BUILD
+	scene.Save(baseFileName + _T("2.mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#else
+	scene.Save(baseFileName + _T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#endif
+	scene.Save(baseFileName+_T("2.mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 	scene.mesh.Save(baseFileName+OPT::strExportType);
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2)

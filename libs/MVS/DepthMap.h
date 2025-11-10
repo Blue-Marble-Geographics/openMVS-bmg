@@ -1190,7 +1190,7 @@ struct MVS_API DepthEstimator {
 
 
 // Tools
-#if 0 // New version
+#if 1 // New version
 // Tools
 bool TriangulatePoints2DepthMap(
 	const DepthData::ViewData& image, const PointCloud& pointcloud, const IndexArr& points,

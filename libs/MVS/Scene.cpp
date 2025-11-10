@@ -630,9 +630,10 @@ bool Scene::Load(const String& fileName, bool bImport)
 		++nCalibratedImages;
 		nTotalPixels += imageData.width * imageData.height;
 	}
-	DEBUG_EXTRA("Scene loaded (%s):\n"
+	DEBUG("Scene loaded %s (%s):\n"
 				"\t%u images (%u calibrated) with a total of %.2f MPixels (%.2f MPixels/image)\n"
 				"\t%u points, %u vertices, %u faces",
+				fileName.c_str(),
 				TD_TIMER_GET_FMT().c_str(),
 				images.GetSize(), nCalibratedImages, (double)nTotalPixels/(1024.0*1024.0), (double)nTotalPixels/(1024.0*1024.0*nCalibratedImages),
 				pointcloud.NumPoints(), mesh.vertices.GetSize(), mesh.faces.GetSize());
@@ -673,9 +674,10 @@ bool Scene::Save(const String& fileName, ARCHIVE_TYPE type) const
 	// serialize out the current state
 	if (!SerializeSave(*this, fs, type))
 		return false;
-	DEBUG_EXTRA("Scene saved (%s):\n"
+	DEBUG("Scene saved %s (%s):\n"
 				"\t%u images (%u calibrated)\n"
 				"\t%u points, %u vertices, %u faces",
+				fileName.c_str(),
 				TD_TIMER_GET_FMT().c_str(),
 				images.GetSize(), nCalibratedImages,
 				pointcloud.NumPoints(), mesh.vertices.GetSize(), mesh.faces.GetSize());

@@ -20,42 +20,6 @@
 #define LBP_USE_OPENMP
 #endif
 
-#include <emmintrin.h> // for alignment hints if compiler uses them
-#include <malloc.h>   // for _aligned_malloc / _aligned_free
-#include <new>        // for std::bad_alloc
-#include <cstddef>    // for std::size_t
-
-template <typename T, std::size_t Alignment>
-struct AlignedAllocator
-{
-	using value_type = T;
-
-	AlignedAllocator() noexcept {}
-	template <class U> AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
-
-	T* allocate(std::size_t n)
-	{
-		void* p = _aligned_malloc(n * sizeof(T), Alignment);
-		if (!p) throw std::bad_alloc();
-		return static_cast<T*>(p);
-	}
-
-	void deallocate(T* p, std::size_t) noexcept
-	{
-		_aligned_free(p);
-	}
-
-	// required by MSVC allocator traits
-	template <class U> struct rebind { using other = AlignedAllocator<U, Alignment>; };
-};
-
-template <class T1, std::size_t A1, class T2, std::size_t A2>
-inline bool operator==(const AlignedAllocator<T1, A1>&, const AlignedAllocator<T2, A2>&) noexcept { return A1 == A2; }
-
-template <class T1, std::size_t A1, class T2, std::size_t A2>
-inline bool operator!=(const AlignedAllocator<T1, A1>&, const AlignedAllocator<T2, A2>&) noexcept { return A1 != A2; }
-
-
 namespace SEACAVE {
 
 // S T R U C T S ///////////////////////////////////////////////////

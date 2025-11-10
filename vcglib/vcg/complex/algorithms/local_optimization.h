@@ -30,6 +30,8 @@
 #include <algorithm>
 using Clock = std::chrono::steady_clock;
 
+//#pragma optimization("", off) // JPB WIP BUG
+
 // This is (((uint64_t)((uint32_t&)std::numeric_limits<float>::max())) << 32);
 constexpr uint64_t kMaxCode = uint64_t(0x7F7FFFFF) << 32;
 
@@ -679,7 +681,7 @@ public:
    return !h.empty();
  }
 #else
-  bool DoOptimization()
+  bool DoOptimization(size_t maxVertices)
   {
     using Leaf = vcg::tri::TriEdgeCollapseQuadric<CLEAN::Mesh,
       vcg::tri::BasicVertexPair<CLEAN::Vertex>,
@@ -692,9 +694,15 @@ public:
     assert(((tf & LOMetric) == 0) || (targetMetric != -1));
     assert(((tf & LOTime) == 0) || (timeBudget != -1));
 
+    static std::vector<void*> pairsScratch;
+    static std::vector<void*> toAddScratch;
+    pairsScratch.reserve(maxVertices);
+    toAddScratch.reserve(maxVertices);
+
     startTime = Clock::now();
     nPerformedOps = 0;
 
+    // JPB WIP BUG Double check this.
     // Faster to use all the threads and not worry about pinning. 43.213
     static HeapThreadPool pool(std::thread::hardware_concurrency() / 4);
 
@@ -737,18 +745,22 @@ public:
 
        // std::cout << "stored: v0 v1: " << &Leaf::QH::Qd(v0) << " " << &Leaf::QH::Qd(v1) << "\n";
 
+#if 1 // JPB WIP BUG
         _mm_prefetch((char*)v0, _MM_HINT_T1); // start loading Face* line
         _mm_prefetch((char*)v1, _MM_HINT_T1); // start loading Face* line
         _mm_prefetch((char*)&Leaf::QH::Qd(v0), _MM_HINT_T1);
         _mm_prefetch(((char*)&Leaf::QH::Qd(v0))+64, _MM_HINT_T1);
         _mm_prefetch((char*)&Leaf::QH::Qd(v1), _MM_HINT_T1);
         _mm_prefetch(((char*)&Leaf::QH::Qd(v1)) + 64, _MM_HINT_T1);
+#endif
         popHeapUltraFast(h);
         // The moment you pop the heap, it is likely a new minimum will replace it.
         // Begin prefetching its data now.
         if (!h.empty()) {
           Leaf* likelyMinimum = CodeToPtr<Leaf>(h.front().code);
+#if 1 // JPB WIP BUG
           _mm_prefetch((char*)likelyMinimum, _MM_HINT_T1);
+#endif
         }
       }
 
@@ -760,7 +772,7 @@ public:
 
       // I think exeucte and updateheap share FindSets info.
       locMod->Execute(m);
-      locMod->UpdateHeap((void*) &h, (void*)&hBuffer);
+      locMod->UpdateHeap((void*) &h, (void*)&hBuffer, pairsScratch, toAddScratch);
 
       // always pushes to the buffer.
       // Is buffer too big?

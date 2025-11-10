@@ -801,7 +801,7 @@ inline  void UpdateHeap(HeapType& h_ret)
 
 #else
 
-  __forceinline void UpdateHeap(void*h, void* hBuffer)
+  __forceinline void UpdateHeap(void*h, void* hBuffer, std::vector<void*>& pairsScratch, std::vector<void*>& toAddScratch)
   {
     const int mark = ++this->GlobalMark();
 
@@ -809,8 +809,7 @@ inline  void UpdateHeap(HeapType& h_ret)
 
     v1->IMark() = mark;
 
-    VertexType* vPairs[64];
-    VertexType** __restrict pvPairs = vPairs;
+    pairsScratch.clear();
 
     // First loop: clear visited flags and mark all incident vertices
     for (VFIterator vfi(v1); !vfi.End(); ++vfi) {
@@ -826,36 +825,37 @@ inline  void UpdateHeap(HeapType& h_ret)
       a->IMark() = mark;
       b->IMark() = mark;
 
-      *pvPairs++ = a;
-      *pvPairs++ = b;
+      pairsScratch.push_back(a);
+      pairsScratch.push_back(b);
     }
 
     // Second loop: test and add candidate collapses
-    pvPairs = vPairs;
-    VertexType* toAdd[64];
+    auto itPairs = pairsScratch.begin();
+    
+    toAddScratch.clear();
+
     int toAddCnt = 0;
 
     for (VFIterator vfi(v1); !vfi.End(); ++vfi) {
-      VertexType* __restrict a = *pvPairs++;
-      VertexType* __restrict b = *pvPairs++;
+      VertexType* __restrict a = (VertexType*) *itPairs++;
+      VertexType* __restrict b = (VertexType*)*itPairs++;
       VertexType* __restrict c = vfi.V0(); // anchor vertex
 
       if (!a->IsV()) { // Always rw && a->IsRW()) {
         a->SetV();
-        toAdd[toAddCnt++] = c;
-        toAdd[toAddCnt++] = a;
+        toAddScratch.push_back(c);
+        toAddScratch.push_back(a);
       }
 
       if (!b->IsV()) { // Always rw && b->IsRW()) {
         b->SetV();
-        toAdd[toAddCnt++] = b;
-        toAdd[toAddCnt++] = c;
+        toAddScratch.push_back(b);
+        toAddScratch.push_back(c);
       }
 
       // Always rw if (a->IsRW() && b->IsRW()) {
-      toAdd[toAddCnt++] = a;
-      toAdd[toAddCnt++] = b;
-      //}
+      toAddScratch.push_back(a);
+      toAddScratch.push_back(b);
     }
 
     VertexType* cache[4] = {}; // track last 4 seen vertices
@@ -863,12 +863,12 @@ inline  void UpdateHeap(HeapType& h_ret)
       return v != cache[0] && v != cache[1] && v != cache[2] && v != cache[3];
       };
 
-    VertexType** __restrict pvToAdd = toAdd;
-    for (int i = 0; i < toAddCnt; i += 2) {
+    auto pvToAdd = toAddScratch.begin();
+    for (int i = 0, cnt = (int) toAddScratch.size(); i < cnt; i += 2) {
 #if 1 // Provably better 33.630
       if (i + 2 < toAddCnt) {
-        auto* nextV0 = pvToAdd[i + 2];
-        auto* nextV1 = pvToAdd[i + 3];
+        auto* nextV0 = (VertexType*) pvToAdd[i + 2];
+        auto* nextV1 = (VertexType*) pvToAdd[i + 3];
 
         if (notInCache(nextV0)) {
           const QuadricType& q0 = QH::Qd(nextV0);
@@ -883,8 +883,8 @@ inline  void UpdateHeap(HeapType& h_ret)
       }
 #endif
 
-      VertexType* __restrict currV0 = pvToAdd[i];
-      VertexType* __restrict currV1 = pvToAdd[i + 1];
+      VertexType* __restrict currV0 = (VertexType*) pvToAdd[i];
+      VertexType* __restrict currV1 = (VertexType*) pvToAdd[i + 1];
       AddCollapseToHeap(h, hBuffer, currV0, currV1);
 
       // Notice, currV0 and currV1 on the first iteration

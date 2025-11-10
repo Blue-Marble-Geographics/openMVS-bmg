@@ -315,12 +315,26 @@ int main(int argc, LPCTSTR* argv)
 	if (!OPT::strViewsFileName.empty())
 		views = ParseViewsFile(MAKE_PATH_SAFE(OPT::strViewsFileName), scene);
 
-#if 1 // Clean mesh in advance
+#if 0// Clean mesh in advance
 	scene.mesh.Clean(1.f, 0.f, false, 0, 0, 0, true);
 #endif
 	// compute mesh texture
 	TD_TIMER_START();
-	if (!scene.TextureMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::minCommonCameras, OPT::fOutlierThreshold, OPT::fRatioDataSmoothness, OPT::bGlobalSeamLeveling, OPT::bLocalSeamLeveling, OPT::nTextureSizeMultiple, OPT::nRectPackingHeuristic, Pixel8U(OPT::nColEmpty), OPT::fSharpnessWeight, views))
+	if (!scene.TextureMesh(
+		OPT::nResolutionLevel,
+		OPT::nMinResolution,
+		OPT::minCommonCameras,
+		OPT::fOutlierThreshold,
+		OPT::fRatioDataSmoothness,
+		OPT::bGlobalSeamLeveling,
+		OPT::bLocalSeamLeveling,
+		OPT::nTextureSizeMultiple,
+		OPT::nRectPackingHeuristic,
+		Pixel8U(OPT::nColEmpty),
+		OPT::fSharpnessWeight,
+		OPT::nMaxTextureSize,
+		views)
+	)
 		return EXIT_FAILURE;
 	VERBOSE("Mesh texturing completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 

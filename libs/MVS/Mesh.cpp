@@ -1511,9 +1511,12 @@ void Mesh::Clean(
 		deci.SetTargetSimplices(targetFaces);
 		deci.SetTimeBudget(0.1f);
 
-		Util::Progress progress(_T("Decimating"), mesh.fn - targetFaces);
-		while (deci.DoOptimization() && mesh.fn > targetFaces)
-			progress.display(mesh.fn - targetFaces);
+		const size_t numVertices = mesh.vert.size();
+		const int OriginalFaceNum(mesh.face.size());
+    DEBUG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
+		Util::Progress progress(_T("Decimating"), OriginalFaceNum - targetFaces);
+		while (deci.DoOptimization(numVertices) && mesh.fn > targetFaces)
+			progress.display(OriginalFaceNum - mesh.fn);
 		deci.Finalize<CLEAN::TriEdgeCollapse>();
 		progress.close();
 
@@ -4846,20 +4849,23 @@ void Mesh::SamplePoints(REAL samplingDensity, unsigned mumPointsTheoretic, Point
 }
 /*----------------------------------------------------------------*/
 
-
 // project mesh to the given camera plane
 void Mesh::Project(const Camera& camera, DepthMap& depthMap) const
 {
 	struct RasterMesh : TRasterMesh<RasterMesh> {
 		typedef TRasterMesh<RasterMesh> Base;
 		RasterMesh(const VertexArr& _vertices, const Camera& _camera, DepthMap& _depthMap)
-			: Base(_vertices, _camera, _depthMap) {}
+			: Base(_vertices, _camera, _depthMap) {
+		}
 	};
 	RasterMesh rasterer(vertices, camera, depthMap);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
-	for (const Face& facet: faces)
-		rasterer.Project(facet);
+	for (const Face& facet : faces)
+		rasterer.Project(facet, triangleRasterizer);
 }
+
 void Mesh::Project(const Camera& camera, DepthMap& depthMap, Image8U3& image) const
 {
 	ASSERT(!faceTexcoords.empty() && !textureDiffuse.empty());
@@ -4870,21 +4876,22 @@ void Mesh::Project(const Camera& camera, DepthMap& depthMap, Image8U3& image) co
 		FIndex idxFaceTex;
 		TexCoord xt;
 		RasterMesh(const Mesh& _mesh, const Camera& _camera, DepthMap& _depthMap, Image8U3& _image)
-			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), image(_image) {}
+			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), image(_image) {
+		}
 		inline void Clear() {
 			Base::Clear();
 			image.memset(0);
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(bary));
-			const Depth z(ComputeDepth(pbary));
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+			const Depth z(ComputeDepth(t, pbary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == 0 || depth > z) {
 				depth = z;
-				xt  = mesh.faceTexcoords[idxFaceTex+0] * pbary[0];
-				xt += mesh.faceTexcoords[idxFaceTex+1] * pbary[1];
-				xt += mesh.faceTexcoords[idxFaceTex+2] * pbary[2];
+				xt = mesh.faceTexcoords[idxFaceTex + 0] * pbary[0];
+				xt += mesh.faceTexcoords[idxFaceTex + 1] * pbary[1];
+				xt += mesh.faceTexcoords[idxFaceTex + 2] * pbary[2];
 				image(pt) = mesh.textureDiffuse.sampleSafe(xt);
 			}
 		}
@@ -4892,11 +4899,13 @@ void Mesh::Project(const Camera& camera, DepthMap& depthMap, Image8U3& image) co
 	if (image.size() != depthMap.size())
 		image.create(depthMap.size());
 	RasterMesh rasterer(*this, camera, depthMap, image);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
 	FOREACH(idxFace, faces) {
 		const Face& facet = faces[idxFace];
-		rasterer.idxFaceTex = idxFace*3;
-		rasterer.Project(facet);
+		rasterer.idxFaceTex = idxFace * 3;
+		rasterer.Project(facet, triangleRasterizer);
 	}
 }
 // project mesh to the given camera plane, computing also the normal-map (in camera space)
@@ -4910,25 +4919,26 @@ void Mesh::Project(const Camera& camera, DepthMap& depthMap, NormalMap& normalMa
 		const Face::Type* idxVerts;
 		const Matrix3x3f R;
 		RasterMesh(const Mesh& _mesh, const Camera& _camera, DepthMap& _depthMap, NormalMap& _normalMap)
-			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), normalMap(_normalMap), R(camera.R) {}
+			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), normalMap(_normalMap), R(camera.R) {
+		}
 		inline void Clear() {
 			Base::Clear();
 			normalMap.memset(0);
 		}
-		inline void Project(const Face& facet) {
+		inline void Project(const Face& facet, TriangleRasterizer& tr) {
 			idxVerts = facet.ptr();
-			Base::Project(facet);
+			Base::Project(facet, tr);
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(bary));
-			const Depth z(ComputeDepth(pbary));
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+			const Depth z(ComputeDepth(t, pbary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == Depth(0) || depth > z) {
 				depth = z;
 				normalMap(pt) = R * normalized(
-					mesh.vertexNormals[idxVerts[0]] * pbary[0]+
-					mesh.vertexNormals[idxVerts[1]] * pbary[1]+
+					mesh.vertexNormals[idxVerts[0]] * pbary[0] +
+					mesh.vertexNormals[idxVerts[1]] * pbary[1] +
 					mesh.vertexNormals[idxVerts[2]] * pbary[2]
 				);
 			}
@@ -4937,10 +4947,12 @@ void Mesh::Project(const Camera& camera, DepthMap& depthMap, NormalMap& normalMa
 	if (normalMap.size() != depthMap.size())
 		normalMap.create(depthMap.size());
 	RasterMesh rasterer(*this, camera, depthMap, normalMap);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
 	// render the entire mesh
-	for (const Face& facet: faces)
-		rasterer.Project(facet);
+	for (const Face& facet : faces)
+		rasterer.Project(facet, triangleRasterizer);
 }
 // project mesh to the given camera plane using orthographic projection
 void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap) const
@@ -4948,13 +4960,14 @@ void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap) const
 	struct RasterMesh : TRasterMesh<RasterMesh> {
 		typedef TRasterMesh<RasterMesh> Base;
 		RasterMesh(const VertexArr& _vertices, const Camera& _camera, DepthMap& _depthMap)
-			: Base(_vertices, _camera, _depthMap) {}
-		inline bool ProjectVertex(const Mesh::Vertex& pt, int v) {
-			return (ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
-				depthMap.isInsideWithBorder<float,3>(pti[v] = camera.TransformPointC2I(Point2(ptc[v].x,ptc[v].y)));
+			: Base(_vertices, _camera, _depthMap) {
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Depth z(ComputeDepth(bary));
+		inline bool ProjectVertex(const Mesh::Vertex& pt, int v, Triangle& t) {
+			return (t.ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
+				depthMap.isInsideWithBorder<float, 3>(t.pti[v] = camera.TransformPointOrthoC2I(t.ptc[v]));
+		}
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Depth z(ComputeDepth(t, bary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == 0 || depth > z)
@@ -4962,9 +4975,11 @@ void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap) const
 		}
 	};
 	RasterMesh rasterer(vertices, camera, depthMap);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
-	for (const Face& facet: faces)
-		rasterer.Project(facet);
+	for (const Face& facet : faces)
+		rasterer.Project(facet, triangleRasterizer);
 }
 void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap, Image8U3& image) const
 {
@@ -4976,24 +4991,25 @@ void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap, Image8U3& imag
 		FIndex idxFaceTex;
 		TexCoord xt;
 		RasterMesh(const Mesh& _mesh, const Camera& _camera, DepthMap& _depthMap, Image8U3& _image)
-			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), image(_image) {}
+			: Base(_mesh.vertices, _camera, _depthMap), mesh(_mesh), image(_image) {
+		}
 		inline void Clear() {
 			Base::Clear();
 			image.memset(0);
 		}
-		inline bool ProjectVertex(const Mesh::Vertex& pt, int v) {
-			return (ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
-				depthMap.isInsideWithBorder<float,3>(pti[v] = camera.TransformPointC2I(Point2(ptc[v].x,ptc[v].y)));
+		inline bool ProjectVertex(const Mesh::Vertex& pt, int v, Triangle& t) {
+			return (t.ptc[v] = camera.TransformPointW2C(Cast<REAL>(pt))).z > 0 &&
+				depthMap.isInsideWithBorder<float, 3>(t.pti[v] = camera.TransformPointOrthoC2I(t.ptc[v]));
 		}
-		void Raster(const ImageRef& pt, const Point3f& bary) {
-			const Depth z(ComputeDepth(bary));
+		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+			const Depth z(ComputeDepth(t, bary));
 			ASSERT(z > Depth(0));
 			Depth& depth = depthMap(pt);
 			if (depth == 0 || depth > z) {
 				depth = z;
-				xt  = mesh.faceTexcoords[idxFaceTex+0] * bary[0];
-				xt += mesh.faceTexcoords[idxFaceTex+1] * bary[1];
-				xt += mesh.faceTexcoords[idxFaceTex+2] * bary[2];
+				xt = mesh.faceTexcoords[idxFaceTex + 0] * bary[0];
+				xt += mesh.faceTexcoords[idxFaceTex + 1] * bary[1];
+				xt += mesh.faceTexcoords[idxFaceTex + 2] * bary[2];
 				image(pt) = mesh.textureDiffuse.sampleSafe(xt);
 			}
 		}
@@ -5001,11 +5017,13 @@ void Mesh::ProjectOrtho(const Camera& camera, DepthMap& depthMap, Image8U3& imag
 	if (image.size() != depthMap.size())
 		image.create(depthMap.size());
 	RasterMesh rasterer(*this, camera, depthMap, image);
+	RasterMesh::Triangle triangle;
+	RasterMesh::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 	rasterer.Clear();
 	FOREACH(idxFace, faces) {
 		const Face& facet = faces[idxFace];
-		rasterer.idxFaceTex = idxFace*3;
-		rasterer.Project(facet);
+		rasterer.idxFaceTex = idxFace * 3;
+		rasterer.Project(facet, triangleRasterizer);
 	}
 }
 // assuming the mesh is properly oriented, ortho-project it to a camera looking from top to down
@@ -5045,7 +5063,6 @@ void Mesh::ProjectOrthoTopDown(unsigned resolution, Image8U3& image, Image8U& ma
 	center = camera.TransformPointI2W(Point3(xCenter.x, xCenter.y, depthCenter > 0 ? depthCenter : camera.C.z-center.z));
 }
 /*----------------------------------------------------------------*/
-
 
 // split mesh into sub-meshes such that each has maxArea
 bool Mesh::Split(FacesChunkArr& chunks, float maxArea)

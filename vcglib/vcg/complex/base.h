@@ -540,7 +540,10 @@ public:
 		return vert.empty() && edge.empty() && face.empty() && tetra.empty();
 	}
 
-	int & SimplexNumber(){ return fn;}
+	int SimplexNumber() {
+		return (int) face.size();
+	} // fn;
+
 	int & VertexNumber(){ return vn;}
 
 	/// The incremental mark

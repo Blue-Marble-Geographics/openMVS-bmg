@@ -36,6 +36,7 @@
 
 using namespace MVS;
 
+#undef LOCAL_BUILD // JPB WIP BUG
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -455,7 +456,11 @@ int main(int argc, LPCTSTR* argv)
 		scene.obb = initialOBB;
 
 		// save the final mesh
-		scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#ifdef LOCAL_BUILD
+		scene.Save(baseFileName+_T("_rm.mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#else
+		scene.Save(baseFileName + _T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+#endif
 		scene.mesh.Save(baseFileName+OPT::strExportType);
 		#if TD_VERBOSE != TD_VERBOSE_OFF
 		if (VERBOSITY_LEVEL > 2)

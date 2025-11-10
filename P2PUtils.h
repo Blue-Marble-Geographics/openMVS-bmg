@@ -118,6 +118,7 @@
 #define _Max _mm_max_ps
 #define _Blend Blend
 #define _AsArray(name, i) (name.m128_f32[i])
+#define _AsArrayD(name, i) (name.m128d_f64[i])
 #define _AsArrayI(name, i) (name.m128i_i32[i])
 #define _AsArrayS(name, i) (name.m128i_i16[i])
 

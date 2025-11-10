@@ -113,15 +113,20 @@ private:
 //    }
   }
 #else
-  enum { kMaxSize = 32 };
+  enum { kMaxSize = 64 };
   struct EdgeSet
   {
-    FaceType* av01Faces[kMaxSize];
-    int av01Vertices[kMaxSize*2];
-    FaceType* av0Faces[kMaxSize];
-    int av0Vertices[kMaxSize];
-    int av01Cnt;
-    int av0Cnt;
+    EdgeSet(int maxVertices)
+    {
+      av01Faces.reserve(maxVertices);
+      av01Vertices.reserve(maxVertices * 2);
+      av0Faces.reserve(maxVertices);
+      av0Vertices.reserve(maxVertices);
+    }
+    std::vector<FaceType*> av01Faces; // kMaxSize
+    std::vector<int> av01Vertices; // [kMaxSize * 2] ;
+    std::vector<FaceType*> av0Faces; // [kMaxSize] ;
+    std::vector<int> av0Vertices; // [kMaxSize] ;
   };
 
   static void FindSets(VertexPair& p, EdgeSet& es)
@@ -129,8 +134,11 @@ private:
     VertexType* __restrict v0 = p.V(0);
     VertexType* __restrict v1 = p.V(1);
 
-    int av01Cnt = 0;
-    int av0Cnt = 0;
+    es.av01Faces.clear();
+    es.av01Vertices.clear();
+    es.av0Faces.clear();
+    es.av0Vertices.clear();
+
     // Local stack (optional): avoids calling push_back if counts are known
     for (VFIterator x = VFIterator(v0); !x.End(); ++x) {
       FaceType* __restrict f = x.F();
@@ -145,18 +153,14 @@ private:
       if (match) {
         const int next = z + 1 - 3 * (z == 2);     // (z + 1) % 3
         const int nextNext = z + 2 - 3 * (z >= 1);     // (z + 2) % 3
-        es.av01Vertices[av01Cnt * 2] = next;
-        es.av01Vertices[av01Cnt * 2 + 1] = nextNext;
-        es.av01Faces[av01Cnt] = f;
-        ++av01Cnt;
+        es.av01Vertices.push_back(next);
+        es.av01Vertices.push_back(nextNext);
+        es.av01Faces.push_back(f);
       } else {
-        es.av0Faces[av0Cnt] = f;
-        es.av0Vertices[av0Cnt] = z;
-        ++av0Cnt;
+        es.av0Faces.push_back(f);
+        es.av0Vertices.push_back(z);
       }
     }
-    es.av01Cnt = av01Cnt;
-    es.av0Cnt = av0Cnt;
   }
 #endif
 
@@ -481,11 +485,11 @@ static int Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const
 #else
   static void Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const bool preserveFaceEdgeS = false)
   {
-     EdgeSet es;
+    static EdgeSet es(m.vert.size());
 
     FindSets(c,es);
 
-    for (int i = 0, cnt = es.av01Cnt; i < cnt; ++i) {
+    for (int i = 0, cnt = es.av01Faces.size(); i < cnt; ++i) {
       FaceType& f = *es.av01Faces[i];
       const int current = es.av01Vertices[i*2];
       const int next = es.av01Vertices[i*2 + 1];
@@ -499,7 +503,7 @@ static int Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const
     // - v[0] will be deleted so we substitute v[0] with v[1]
     // - we prepend that face to the list of the faces incident on v[1]
     auto& cv1 = c.V(1);
-    for (int i = 0, cnt = es.av0Cnt; i < cnt; ++i) {
+    for (int i = 0, cnt = es.av0Faces.size(); i < cnt; ++i) {
       FaceType& f = *es.av0Faces[i];
       int z = es.av0Vertices[i];
 

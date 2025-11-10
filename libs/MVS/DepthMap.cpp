@@ -2727,7 +2727,7 @@ std::pair<float,float> TriangulatePointsDelaunay(const DepthData::ViewData& imag
 	return depthBounds;
 }
 
-#if 0 // New version (removed for testing)
+#if 1 // New version (removed for testing)
 // roughly estimate depth and normal maps by triangulating the sparse point-cloud
 // and interpolating normal and depth for all pixels
 bool MVS::TriangulatePoints2DepthMap(
@@ -2913,37 +2913,40 @@ bool MVS::TriangulatePoints2DepthMap(
 		// rasterize triangles onto depthmap
 		struct RasterDepth : TRasterMeshBase<RasterDepth> {
 			typedef TRasterMeshBase<RasterDepth> Base;
+			using Base::Triangle;
 			using Base::camera;
 			using Base::depthMap;
-			using Base::ptc;
-			using Base::pti;
 			const Mesh::NormalArr& vertexNormals;
 			NormalMap& normalMap;
+			std::vector<uint8_t>& marks;
 			Mesh::Face face;
-			RasterDepth(const Mesh::NormalArr& _vertexNormals, const Camera& _camera, DepthMap& _depthMap, NormalMap& _normalMap)
-				: Base(_camera, _depthMap), vertexNormals(_vertexNormals), normalMap(_normalMap) {}
-			inline void operator()(const ImageRef& pt, const Point3f& bary) {
-				const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(bary));
-				const Depth z(ComputeDepth(pbary));
+			RasterDepth(const Mesh::NormalArr& _vertexNormals, const Camera& _camera, DepthMap& _depthMap, NormalMap& _normalMap, std::vector<uint8_t>& _marks)
+				: Base(_camera, _depthMap), vertexNormals(_vertexNormals), normalMap(_normalMap), marks(_marks) {
+			}
+			inline void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
+				const Point3f pbary(PerspectiveCorrectBarycentricCoordinates(t, bary));
+				const Depth z(ComputeDepth(t, pbary));
 				ASSERT(z > Depth(0));
-				depthMap.pix(pt) = z;
-				normalMap.pix(pt) = normalized(
-					vertexNormals[face[0]] * pbary[0]+
-					vertexNormals[face[1]] * pbary[1]+
+				depthMap(pt) = z;
+				normalMap(pt) = normalized(
+					vertexNormals[face[0]] * pbary[0] +
+					vertexNormals[face[1]] * pbary[1] +
 					vertexNormals[face[2]] * pbary[2]
 				);
 			}
 		};
-		RasterDepth rasterer = {mesh.vertexNormals, camera, depthMap, normalMap};
+		RasterDepth rasterer{ mesh.vertexNormals, camera, depthMap, normalMap, marks };
+		RasterDepth::Triangle triangle;
+		RasterDepth::TriangleRasterizer triangleRasterizer(triangle, rasterer);
 		for (const Mesh::Face& face : mesh.faces) {
 			rasterer.face = face;
-			rasterer.ptc[0].z = mesh.vertices[face[0]].z;
-			rasterer.ptc[1].z = mesh.vertices[face[1]].z;
-			rasterer.ptc[2].z = mesh.vertices[face[2]].z;
+			triangle.ptc[0].z = mesh.vertices[face[0]].z;
+			triangle.ptc[1].z = mesh.vertices[face[1]].z;
+			triangle.ptc[2].z = mesh.vertices[face[2]].z;
 			Image8U::RasterizeTriangleBary(
 				projs[face[0]],
 				projs[face[1]],
-				projs[face[2]], rasterer);
+				projs[face[2]], triangleRasterizer);
 		}
 	}
 	return true;
