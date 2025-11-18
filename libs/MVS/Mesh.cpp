@@ -227,6 +227,66 @@ Mesh::Vertex Mesh::GetCenter() const
 // extract array of vertices incident to each vertex
 void Mesh::ListIncidenteVertices()
 {
+#if 1
+	// vertices.size() = nVerts, faces.size() = nFaces
+	vertexVertices.clear();
+	vertexVertices.resize(vertices.size());
+
+	// ---------- 1.  count degree ----------
+	std::vector<uint32_t> degree(vertices.size(), 0);
+#pragma omp parallel for schedule(static)
+	for (int f = 0; f < (int)faces.size(); ++f) {
+		const Face& face = faces[f];
+		// each undirected edge contributes to both ends
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[0]]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[1]]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[1]]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[2]]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[2]]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&degree[face[0]]));
+	}
+
+	// ---------- 2.  prefix-sum offsets ----------
+	std::vector<uint64_t> offset(vertices.size() + 1, 0);
+	for (size_t v = 0; v < vertices.size(); ++v)
+		offset[v + 1] = offset[v] + degree[v];
+	const uint64_t nEdgesDir = offset.back();
+
+	std::vector<VIndex> adj(nEdgesDir);    // contiguous neighbor storage
+	std::fill(degree.begin(), degree.end(), 0);  // reuse as write cursor
+
+	// ---------- 3.  fill adjacency ----------
+#pragma omp parallel for schedule(static)
+	for (int f = 0; f < (int)faces.size(); ++f) {
+		const Face& face = faces[f];
+		for (int e = 0; e < 3; ++e) {
+			VIndex a = face[e];
+			VIndex b = face[(e + 1) % 3];
+			uint64_t posA = offset[a] + _InterlockedIncrement(reinterpret_cast<long*>(&degree[a])) - 1;
+			uint64_t posB = offset[b] + _InterlockedIncrement(reinterpret_cast<long*>(&degree[b])) - 1;
+			adj[posA] = b;
+			adj[posB] = a;
+		}
+	}
+
+	// ---------- 4.  deduplicate neighbors per vertex ----------
+#pragma omp parallel for schedule(static)
+	for (int v = 0; v < (int)vertices.size(); ++v) {
+		const uint64_t start = offset[v];
+		const uint64_t end = offset[v + 1];
+		auto first = adj.begin() + start;
+		auto last = adj.begin() + end;
+		std::sort(first, last);              // very small local sorts
+		last = std::unique(first, last);
+
+		const size_t uniqueCount = (last - first);
+		vertexVertices[v].clear();
+		vertexVertices[v].reserve(uniqueCount);
+		for (auto it = first; it != last; ++it) {
+			vertexVertices[v].push_back(*it);
+		}
+	}
+#else
 	vertexVertices.Empty();
 	vertexVertices.Resize(vertices.GetSize());
 	FOREACH(i, faces) {
@@ -240,6 +300,7 @@ void Mesh::ListIncidenteVertices()
 			}
 		}
 	}
+#endif
 }
 
 // extract the (ordered) array of triangles incident to each vertex
@@ -316,6 +377,53 @@ void Mesh::ListIncidenteFaceFaces()
 // (make sure you called ListIncidenteFaces() before)
 void Mesh::ListBoundaryVertices()
 {
+#if 1
+	vertexBoundary.clear();
+	vertexBoundary.resize(vertices.size());
+	vertexBoundary.Memset(0);
+
+#pragma omp parallel
+	{
+		std::vector<VIndex> neigh;
+		std::vector<uint8_t> count;
+
+		neigh.reserve(64);
+		count.reserve(64);
+
+#pragma omp for schedule(static)
+		for (int v = 0; v < (int)vertices.size(); ++v) {
+			const auto& vf = vertexFaces[v];
+			neigh.clear();
+			count.clear();
+
+			for (VIndex fIdx : vf) {
+				const Face& f = faces[fIdx];
+				for (int k = 0; k < 3; ++k) {
+					VIndex n = f[k];
+					if (n == v) continue;
+
+					int i;
+					for (i = 0; i < (int)neigh.size(); ++i)
+						if (neigh[i] == n) break;
+					if (i == (int)neigh.size()) {
+						neigh.push_back(n);
+						count.push_back(1);
+					}
+					else {
+						++count[i];
+					}
+				}
+			}
+
+			for (int i = 0; i < (int)neigh.size(); ++i) {
+				if (count[i] == 1) {
+					vertexBoundary[v] = true;
+					break;
+				}
+			}
+		}
+	}
+#else
 	vertexBoundary.clear();
 	vertexBoundary.resize(vertices.size());
 	vertexBoundary.Memset(0);
@@ -343,6 +451,7 @@ void Mesh::ListBoundaryVertices()
 		}
 		mapVerts.clear();
 	}
+#endif
 }
 
 
@@ -351,8 +460,9 @@ void Mesh::ComputeNormalFaces()
 {
 	faceNormals.Resize(faces.GetSize());
 	#ifndef _USE_CUDA
-	FOREACH(idxFace, faces)
-		faceNormals[idxFace] = normalized(FaceNormal(faces[idxFace]));
+		#pragma omp parallel for schedule(static)
+			for (int i = 0; i < (int)faces.size(); ++i)
+				faceNormals[i] = normalized(FaceNormal(faces[i]));
 	#else
 	if (kernelComputeFaceNormal.IsValid()) {
 		reportCudaError(kernelComputeFaceNormal((int)faces.size(),

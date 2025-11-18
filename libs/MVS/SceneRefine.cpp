@@ -37,6 +37,17 @@ using namespace MVS;
 #pragma optimize("", on) // JPB WIP BUG
 // D E F I N E S ///////////////////////////////////////////////////
 
+#define RASSERT(cond, fmt, ...)                                           \
+    do {                                                                    \
+      if (!(cond)) {                                                        \
+        DEBUG("ASSERT FAILED: %s\n  File: %s:%d\n  Function: %s\n  " fmt "\n",\
+              #cond, __FILE__, __LINE__, __func__, ##__VA_ARGS__);         \
+        __debugbreak();                                                     \
+      }                                                                     \
+    } while (0)
+
+#undef VALIDATE_GRADIENT
+
 // uncomment to ensure edge size and improve vertex valence
 // (should enable more stable flow)
 #define MESHOPT_ENSUREEDGESIZE 1 // 0 - at all resolution
@@ -66,6 +77,10 @@ using namespace MVS;
 #define DST_BitMatrix(var)
 #define DST_Image(var)
 #endif
+
+// choose a scale so gradients (usually within ±2) fit in int16
+constexpr float kScale = 1024.0f;
+constexpr float kInvScale = 1.0f / kScale;
 
 #pragma intrinsic(_InterlockedCompareExchange)
 static inline float AtomicAddFloat(float* addr, float val)
@@ -120,27 +135,26 @@ public:
 		typedef TImage<Grad> ImageGrad;
 		Image32F image; // image pixels
 		ImageGrad imageGrad; // image pixel gradients
-		TImage<Real> imageMean; // image pixels mean
-		TImage<Real> imageVar; // image pixels variance
-		std::vector<Point3f, AlignedAllocator<Point3f, 16>> ray;
-		std::vector<Point3f, AlignedAllocator<Point3f, 16>> X;
-		std::vector<float, AlignedAllocator<float, 16>> Nd;
-		std::vector<float, AlignedAllocator<float, 16>> invNd;
-		std::vector<Point3f, AlignedAllocator<Point3f, 16>> storedNormal;       // 3D point
-		std::vector<Point3f, AlignedAllocator<Point3f, 16>> bary;       // 3D point
-		std::vector<float, AlignedAllocator<float, 16>> gradX;
-		std::vector<float, AlignedAllocator<float, 16>> gradY;
-		std::vector<float, AlignedAllocator<float, 16>> gradBlock;
-		std::vector<cuint32_t, AlignedAllocator<cuint32_t, 16>> verticesPerPix;
-		std::vector<Normal, AlignedAllocator<Normal, 16>> facesNormalPerPix;
+		//TImage<Real> imageMean; // image pixels mean
+		//TImage<Real> imageVar; // image pixels variance
+		Point3f* ray = nullptr;
+		Point3f* X = nullptr;
+		//std::vector<float, AlignedAllocator<float, 16>> Nd;
+		float* invNd = nullptr;
+		Point3f* storedNormal = nullptr;
+		Point3f* bary = nullptr;
+		int16_t* gradBlockInt16 = nullptr;
+		cuint32_t* verticesPerPix = nullptr;
+		Normal* facesNormalPerPix = nullptr;
+		std::vector<uint8_t, AlignedAllocator<uint8_t, 16>> isValid;
 		FaceMap faceMap; // remember for each pixel what face projects there
 		DepthMap depthMap; // depth-map
 		BaryMap baryMap; // barycentric coordinates
-		std::vector<uint8_t, AlignedAllocator<uint8_t, 16>> isValid;
 		int width, height;
 		int blockWidth, blockStride;
-		std::vector<uint8_t> marks;
-		uint8_t currentMark;
+		int allocatedSize = 0;
+		//std::vector<uint8_t> marks;
+		//uint8_t currentMark;
 	};
 	typedef CLISTDEF2(View) ViewsArr;
 
@@ -182,12 +196,12 @@ public:
 
 	void ListVertexFacesPre();
 	void ListVertexFacesPost();
-	void ListCameraFaces();
+	void ListCameraFaces(bool rebuildOctree = true);
 
 	void ListFaceAreas(Mesh::AreaArr& maxAreas);
 	void SubdivideMesh(uint32_t maxArea, float fDecimate = 1.f, unsigned nCloseHoles = 15, unsigned nEnsureEdgeSize = 1);
 
-	double ScoreMesh(double* gradients);
+	double ScoreMesh(double* gradients, bool rebuildOctree = true);
 
 	// given a vertex position and a projection camera, compute the projected position and its derivative
 	template <typename TP, typename TX, typename T, typename TJ>
@@ -204,14 +218,19 @@ public:
 		const View& viewA,
 		const DepthMap& depthMapA, const Camera& cameraA,
 		const DepthMap& depthMapB, const Camera& cameraB,
-		const Image32F& imageB, Image32F& imageA, std::vector<uint8_t>& mask);
+		const Image32F& imageB, TImage<uint16_t>& imageAB, std::vector<uint8_t>& mask);
 	static void ComputeLocalVariance(
 		const Image32F& image, const  std::vector<uint8_t>& mask,
-		TImage<Real>& imageMean, TImage<Real>& imageVar);
+		TImage<uint16_t>& imageMean, TImage<Real>& imageVar);
+	static void ComputeLocalVariance2(
+		const TImage<uint16_t>& image,               // now can be CV_16U
+		const std::vector<uint8_t>& mask,
+		TImage<uint16_t>& imageMean,
+		TImage<Real>& imageVar);
 	static float ComputeLocalZNCC(
-		const Image32F& imageA, const TImage<Real>& imageMeanA, const TImage<Real>& imageVarA,
-		const Image32F& imageB, const TImage<Real>& imageMeanB, const TImage<Real>& imageVarB,
-		const  std::vector<uint8_t>& mask, TImage<Real>& imageDZNCC);
+		const Image32F& imageA, const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
+		const TImage<uint16_t>& imageB, const TImage<uint16_t>& imageMeanB, const TImage<Real>& imageVarB,
+		const std::vector<uint8_t>& mask, TImage<Real>& imageDZNCC);
 	static void ComputePhotometricGradient(
 		const Mesh::FaceArr& faces,
 		const Mesh::NormalArr& normals,
@@ -222,7 +241,7 @@ public:
 		const TImage<Real>& imageDZNCC,
 		const  std::vector<uint8_t>& mask,
 		GradArr& photoGrad,
-		std::vector<bool>& photoGradNorm,
+		std::vector<uint64_t>& photoGradNorm,
 		Real RegularizationScale);
 	static float ComputeSmoothnessGradient1(
 		const Mesh::VertexArr& vertices, const Mesh::VertexVerticesArr& vertexVertices, const BoolArr& vertexBoundary,
@@ -468,23 +487,37 @@ void MeshRefine::ListVertexFacesPost()
 }
 
 // extract array of faces viewed by each image
-void MeshRefine::ListCameraFaces()
+void MeshRefine::ListCameraFaces(bool rebuildOctree)
 {
+	// JPB WIP BUG Restrict multithreading?
+
 	// extract array of faces viewed by each camera
 	typedef CLISTDEF2(Mesh::FaceIdxArr) CameraFacesArr;
-	CameraFacesArr arrCameraFaces(images.GetSize()); {
-		Mesh::Octree octree;
-		Mesh::FacesInserter::CreateOctree(octree, scene.mesh);
-		FOREACH(ID, images) {
-			const Image& imageData = images[ID];
-			if (!imageData.IsValid())
-				continue;
-			typedef TFrustum<float, 5> Frustum;
-			const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
-			Mesh::FacesInserter inserter(arrCameraFaces[ID]);
-			octree.Traverse(frustum, inserter);
+
+	static thread_local CameraFacesArr arrCameraFaces;
+
+	if (rebuildOctree) {
+    arrCameraFaces.resize(images.GetSize());
+		for (auto& cameraFaces : arrCameraFaces) // Never drop capacity in the inner vectors.
+      cameraFaces.clear();
+
+		{
+			Mesh::Octree octree;
+			Mesh::FacesInserter::CreateOctree(octree, scene.mesh);
+			FOREACH(ID, images) {
+				const Image& imageData = images[ID];
+				if (!imageData.IsValid())
+					continue;
+				typedef TFrustum<float, 5> Frustum;
+				const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
+				Mesh::FacesInserter inserter(arrCameraFaces[ID]);
+				octree.Traverse(frustum, inserter);
+			}
 		}
 	}
+
+	// The rest of this applies even if we don't rebuild the octree since the
+  // vertex positions may have changed.
 
 	// compute face normals
 	// must occur before ListCameraFaces which prepares pre-calculated data.
@@ -497,10 +530,69 @@ void MeshRefine::ListCameraFaces()
 	WaitThreadWorkers(images.GetSize());
 }
 
+__forceinline void AtomicInc16(uint16_t& x) noexcept
+{
+	_InterlockedIncrement16(reinterpret_cast<volatile SHORT*>(&x));
+}
+
+__forceinline void AtomicMin16(uint16_t& dest, uint16_t value) noexcept
+{
+	volatile SHORT* ptr = reinterpret_cast<volatile SHORT*>(&dest);
+	SHORT old = *ptr;
+	while (old > (SHORT)value) {
+		SHORT prev = _InterlockedCompareExchange16(ptr, (SHORT)value, old);
+		if (prev == old) break;
+		old = prev;
+	}
+}
+
 // compute for each face the projection area as the maximum area in both images of a pair
 // (make sure ListCameraFaces() was called before)
 void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas)
 {
+#if 1
+	// for each image, compute the projection area of visible faces
+	typedef cList<Mesh::AreaArr> ImageAreaArr;
+	ImageAreaArr viewAreas(images.GetSize());
+#pragma omp parallel for schedule(dynamic, 1)
+	for (int idxImage = 0; idxImage < (int)images.GetSize(); ++idxImage) {
+		const Image& imageData = images[idxImage];
+		if (!imageData.IsValid())
+			continue;
+		Mesh::AreaArr& areas = viewAreas[idxImage];
+		areas.Resize(faces.GetSize());
+		areas.Memset(0);
+
+		const FaceMap& faceMap = views[idxImage].faceMap;
+		for (int j = 0; j < faceMap.rows; ++j) {
+			const FIndex* facePtr = faceMap.ptr<FIndex>(j);
+			for (int i = 0; i < faceMap.cols; ++i) {
+				const FIndex idxFace(facePtr[i]);
+				if (idxFace == NO_ID)
+					continue;
+				AtomicInc16(areas[idxFace]); // <-- thread-safe increment
+			}
+		}
+	}
+
+	// for each pair, mark the faces that have big projection areas in both images
+	maxAreas.Resize(faces.GetSize());
+	maxAreas.Memset(0);
+
+#pragma omp parallel for
+	for (int p = 0; p < (int)pairs.size(); ++p) {
+		const auto& pair = pairs[p];
+		const auto& areasA = viewAreas[pair.i];
+		const auto& areasB = viewAreas[pair.j];
+		const size_t n = areasA.size();
+
+		for (size_t f = 0; f < n; ++f) {
+			const uint16_t v = std::min(areasA[f], areasB[f]);
+			AtomicMin16(maxAreas[f], v);
+		}
+	}
+#else
+	// original
 	ASSERT(maxAreas.IsEmpty());
 	// for each image, compute the projection area of visible faces
 	typedef cList<Mesh::AreaArr> ImageAreaArr;
@@ -524,7 +616,7 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas)
 			}
 		}
 	}
-	// for each pair, mark the faces that have big projection areas in both images
+
 	maxAreas.Resize(faces.GetSize());
 	maxAreas.Memset(0);
 	FOREACHPTR(pPair, pairs) {
@@ -538,6 +630,7 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas)
 				maxArea = minArea;
 		}
 	}
+#endif
 }
 
 // decimate or subdivide mesh such that for each face there is no image pair in which
@@ -637,10 +730,10 @@ void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nClos
 
 // score mesh using photo-consistency
 // and compute vertices gradient using analytical method
-double MeshRefine::ScoreMesh(double* gradients)
+double MeshRefine::ScoreMesh(double* gradients, bool rebuildOctree)
 {
 	// extract array of faces viewed by each camera
-	ListCameraFaces();
+	ListCameraFaces(rebuildOctree);
 
 	// JPB WIP BUG Nneded twice?
 	scene.mesh.ComputeNormalFaces();
@@ -662,12 +755,17 @@ double MeshRefine::ScoreMesh(double* gradients)
 #if 1
 #pragma omp parallel
 	{
-		const int numVerts = (int)photoGrad.size();
-		GradArr localGrad;
-    localGrad.assign(numVerts, Grad(0, 0, 0));
-		std::vector<uint32_t> localNorm;
-    localNorm.assign(numVerts, 0);
+		static thread_local GradArr localGrad;
+		static thread_local std::vector<uint32_t> localNorm;
 
+		// This will be maintained as zero on thread exit.
+		const int numVerts = (int)photoGrad.size();
+		if (localGrad.empty()) {
+			localGrad.resize(numVerts, Grad(0, 0, 0));
+			localNorm.resize(numVerts, 0);
+		}
+
+		// JPB WIP BUG There is more we can do here with pairi/j
 		// Each thread processes its subset of pairs dynamically
 #pragma omp for schedule(dynamic)
 		for (int i = 0; i < (int)pairs.GetSize(); ++i) {
@@ -681,6 +779,8 @@ double MeshRefine::ScoreMesh(double* gradients)
 		for (int v = 0; v < numVerts; ++v) {
 			photoGrad[v] += localGrad[v];
 			photoGradNorm[v] += localNorm[v];
+			localGrad[v] = Grad(0, 0, 0);
+			localNorm[v] = 0;
 		}
 	} // end omp parallel
 #else
@@ -822,10 +922,32 @@ bool MeshRefine::IsDepthSimilar(const DepthMap& depthMap, const Point2f& pt, Dep
 #undef VALIDATE_RASTERIZER
 #undef VALIDATE_COUNT
 
-template <typename TYPE>
-TYPE EdgeFunction2(const TPoint2<TYPE>& x0, const TPoint2<TYPE>& x1, const TPoint2<TYPE>& x2) {
-	return TYPE((x1 - x0).cross(x2 - x0));  // swapped x1 and x2
+// Horizontal dot product of 4 floats in a and b, SSE2-only
+_forceinline float dot4_sse2(__m128 a, __m128 b) {
+	__m128 mul = _mm_mul_ps(a, b);
+	__m128 shuf = _mm_movehl_ps(mul, mul);      // {z,w,z,w}
+	__m128 sums = _mm_add_ps(mul, shuf);        // add high halves
+	shuf = _mm_shuffle_ps(sums, sums, 1);       // move y to x
+	sums = _mm_add_ss(sums, shuf);              // add x+y
+	return _mm_cvtss_f32(sums);
 }
+
+template <typename TYPE>
+float EdgeFunction2(const TPoint2<TYPE>& x0,
+	const TPoint2<TYPE>& x1,
+	const TPoint2<TYPE>& x2) {
+	// explicitly compute in float precision
+	float dx1 = static_cast<float>(x1.x - x0.x);
+	float dy1 = static_cast<float>(x1.y - x0.y);
+	float dx2 = static_cast<float>(x2.x - x0.x);
+	float dy2 = static_cast<float>(x2.y - x0.y);
+
+	// perform 2D cross product in float
+	return dx1 * dy2 - dy1 * dx2;
+}
+
+#undef INVARIANT1
+#undef INVARIANT2
 
 // project mesh to the given camera plane
 void MeshRefine::ProjectMesh(
@@ -840,14 +962,102 @@ void MeshRefine::ProjectMesh(
 	faceMap.create(size);
 	baryMap.create(size);
 
+#ifdef VALIDATE_RASTERIZER
+	depthMap.memset(0);
+	faceMap.memset((uint8_t)NO_ID);
+	baryMap.memset(0);
+#endif
+
 	view.isValid.assign(size.width * size.height, 0);
 
 	//depthMap.memset(0);
 	//faceMap.memset((uint8_t)NO_ID);
 	//baryMap.memset(0);
 
+	// Thread-local storage
+	static thread_local std::vector<uint32_t> mark;
+	static thread_local uint32_t markGen = 1;
+	static thread_local std::vector<uint32_t> usedVerts;
+	static thread_local std::vector<int> toCamIndex;
+
+	// Ensure mapping sized
+	if (toCamIndex.size() != vertices.size()) {
+		// Full reset if resized (must clear stale entries!)
+		toCamIndex.assign(vertices.size(), -1);
+	}
+
+	// Clear mappings from previous usedVerts
+	for (uint32_t v : usedVerts) {
+		toCamIndex[v] = -1;
+	}
+
+	// Clear usedVerts for this frame
+	usedVerts.clear();
+	usedVerts.reserve(cameraFaces.size() * 3);
+
+	// Ensure mark sized
+	if (mark.size() < vertices.size()) {
+		mark.resize(vertices.size(), 0);
+	}
+
+	markGen++;
+	if (markGen == 0) {
+		std::fill(mark.begin(), mark.end(), 0);
+		markGen = 1;
+	}
+
+	// Deduplicate
+	for (auto f : cameraFaces) {
+		const Face& face = faces[f];
+		uint32_t v0 = face[0];
+		uint32_t v1 = face[1];
+		uint32_t v2 = face[2];
+
+		if (mark[v0] != markGen) { mark[v0] = markGen; usedVerts.push_back(v0); }
+		if (mark[v1] != markGen) { mark[v1] = markGen; usedVerts.push_back(v1); }
+		if (mark[v2] != markGen) { mark[v2] = markGen; usedVerts.push_back(v2); }
+	}
+
+	// Fill mapping for this frame
+	for (size_t i = 0; i < usedVerts.size(); i++) {
+		toCamIndex[usedVerts[i]] = (int)i;
+	}
+
+	struct CamVert {
+		float x, y, z, invZ;
+	};
+
+	static thread_local std::vector<CamVert> camVerts;
+	camVerts.resize(usedVerts.size());
+
+	const float M00 = camera.Pf(0, 0);
+	const float M01 = camera.Pf(0, 1);
+	const float M02 = camera.Pf(0, 2);
+	const float M03 = camera.Pf(0, 3);
+	const float M10 = camera.Pf(1, 0);
+	const float M11 = camera.Pf(1, 1);
+	const float M12 = camera.Pf(1, 2);
+	const float M13 = camera.Pf(1, 3);
+	const float M20 = camera.Pf(2, 0);
+	const float M21 = camera.Pf(2, 1);
+	const float M22 = camera.Pf(2, 2);
+	const float M23 = camera.Pf(2, 3);
+
+	// Step 3: pre-transform camera-space vertices
+	for (int i = 0; i < (int)usedVerts.size(); i++) {
+		uint32_t vi = usedVerts[i];
+		const Vertex& v = vertices[vi];
+
+		float xc = M00 * v.x + M01 * v.y + M02 * v.z + M03;
+		float yc = M10 * v.x + M11 * v.y + M12 * v.z + M13;
+		// clamp small / invalid z
+		float zc = FastMaxS(M20 * v.x + M21 * v.y + M22 * v.z + M23, 1e-6f);
+    float invZc = 1.0f / zc;
+
+		camVerts[i] = { xc, yc, zc, invZc };
+	}
+
 	struct Triangle {
-		Point3 ptc[3];
 		Point2f pti[3];
 	};
 	Triangle t;
@@ -855,71 +1065,84 @@ void MeshRefine::ProjectMesh(
 	const int width = size.width;
 	const int height = size.height;
 
-	const float M00 = camera.Pf(0, 0);
-	const float M01 = camera.Pf(0, 1);
-	const float M02 = camera.Pf(0, 2);
-	const float M03 = camera.Pf(0, 3);
+	const float minX = 3.f;
+	const float minY = 3.f;
+	const float maxX = width - 4.f;
+	const float maxY = height - 4.f;
 
-	const float M10 = camera.Pf(1, 0);
-	const float M11 = camera.Pf(1, 1);
-	const float M12 = camera.Pf(1, 2);
-	const float M13 = camera.Pf(1, 3);
+	for (auto f : cameraFaces) {
+		const Face& face = faces[f];
+		// ==== Camera-space vertices (pre-transformed) ====
+		const CamVert& c0 = camVerts[toCamIndex[face[0]]];
+		const CamVert& c1 = camVerts[toCamIndex[face[1]]];
+		const CamVert& c2 = camVerts[toCamIndex[face[2]]];
+		{
+			// ==== Perspective divide ====
+			float u0 = c0.x * c0.invZ;
+			float v0i = c0.y * c0.invZ;
 
-	const float M20 = camera.Pf(2, 0);
-	const float M21 = camera.Pf(2, 1);
-	const float M22 = camera.Pf(2, 2);
-	const float M23 = camera.Pf(2, 3);
+			float u1 = c1.x * c1.invZ;
+			float v1i = c1.y * c1.invZ;
 
-	for (auto idxFace : cameraFaces) {
-		const Face& facet = faces[idxFace];
+			float u2 = c2.x * c2.invZ;
+			float v2i = c2.y * c2.invZ;
 
-		bool skipFace = false;
-		for (int i = 0; i < 3; ++i) {
-			const auto& p = vertices[facet[i]];
+			// ==== Scalar bounds check (simd not needed anymore) ====
+			if (u0 < minX || u0 > maxX ||
+				u1 < minX || u1 > maxX ||
+				u2 < minX || u2 > maxX ||
+				v0i < minY || v0i > maxY ||
+				v1i < minY || v1i > maxY ||
+				v2i < minY || v2i > maxY)
+				continue;
 
-			// ------------------------------------------------------------
-			//  world to camera projection using 3 4 matrix Pf
-			// ------------------------------------------------------------
-			float x = M00 * p.x + M01 * p.y + M02 * p.z + M03;
-			float y = M10 * p.x + M11 * p.y + M12 * p.z + M13;
-			float z = M20 * p.x + M21 * p.y + M22 * p.z + M23;
-			if (z <= 0.f) { skipFace = true; break; }
-
-			// normalized image coordinates
-			float invZ = 1.f / z;
-			float u = x * invZ;   // horizontal coordinate in pixels
-			float v = y * invZ;   // vertical coordinate in pixels
-
-			// check pixel bounds
-			if (u < 3.f || v < 3.f || u > width - 4.f || v > height - 4.f) {
-				skipFace = true;
-				break;
-			}
-
-			// store results
-			t.ptc[i] = { x, y, z };
-			t.pti[i] = { u, v };
+			// ==== Store results (same as your SSE path) ====
+			t.pti[0] = { u0, v0i };
+			t.pti[1] = { u1, v1i };
+			t.pti[2] = { u2, v2i };
 		}
-
-		if (skipFace)
-			continue;
-
 		// draw triangle
 		const auto& v1 = t.pti[0];
 		const auto& v2 = t.pti[1];
 		const auto& v3 = t.pti[2];
 
 		// compute bounding-box fully containing the triangle
-		const TPoint2<float> boxMin(MINF3(v1.x, v2.x, v3.x), MINF3(v1.y, v2.y, v3.y));
-		const TPoint2<float> boxMax(MAXF3(v1.x, v2.x, v3.x), MAXF3(v1.y, v2.y, v3.y));
-		// check the bounding-box intersects the image
-		if (boxMax.x < 0.f || boxMin.x >(float)(size.width - 1) ||
-			boxMax.y < 0.f || boxMin.y >(float)(size.height - 1))
-			continue;
-		// clip bounding-box to be fully contained by the image
-		ImageRef boxMinI(FLOOR2INT(boxMin));
-		ImageRef boxMaxI(CEIL2INT(boxMax));
+		float boxMinX = v1.x;
+		float boxMinY = v1.y;
+		float boxMaxX = v1.x;
+		float boxMaxY = v1.y;
 
+		if (v2.x < boxMinX) boxMinX = v2.x;
+		if (v3.x < boxMinX) boxMinX = v3.x;
+		if (v2.y < boxMinY) boxMinY = v2.y;
+		if (v3.y < boxMinY) boxMinY = v3.y;
+
+		if (v2.x > boxMaxX) boxMaxX = v2.x;
+		if (v3.x > boxMaxX) boxMaxX = v3.x;
+		if (v2.y > boxMaxY) boxMaxY = v2.y;
+		if (v3.y > boxMaxY) boxMaxY = v3.y;
+
+		// ---- Quick reject: fully outside screen ----
+		// This is the minimal correct check
+		if (boxMaxX < 0.0f || boxMinX >(width - 1) ||
+			boxMaxY < 0.0f || boxMinY >(height - 1))
+			continue;
+
+		// ---- Convert to integer bounding-box & clamp ----
+		int minXi = _cvt_ftoi_fast(boxMinX);
+		int minYi = _cvt_ftoi_fast(boxMinY);
+		int maxXi = _cvt_ftoi_fast(boxMaxX + 1);   // faster than ceil
+		int maxYi = _cvt_ftoi_fast(boxMaxY + 1);
+
+		if (minXi < 0) minXi = 0;
+		if (minYi < 0) minYi = 0;
+		if (maxXi > width)  maxXi = width;
+		if (maxYi > height) maxYi = height;
+
+		ImageRef boxMinI(minXi, minYi);
+		ImageRef boxMaxI(maxXi - 1, maxYi - 1);   // convert from half-open to inclusive
+
+#ifdef INVARIANT2
 		constexpr int border = 0;
 		if (boxMinI.x < border)
 			boxMinI.x = border;
@@ -929,11 +1152,14 @@ void MeshRefine::ProjectMesh(
 			boxMaxI.x = (size.width - (border + 1));
 		if (boxMaxI.y >= (size.height - border))
 			boxMaxI.y = (size.height - (border + 1));
+#endif
 
 		// ignore back oriented triangles (negative area)
-	// flip winding to match OpenMVS screen-space convention
+	  // flip winding to match OpenMVS screen-space convention
 		const float area = EdgeFunction2(v1, v2, v3);
-		if (area >= 0) continue;
+		if (area >= 0) {
+			continue;
+		}
 		const float invArea = 1.f / area;
 
 		// edge deltas
@@ -954,61 +1180,58 @@ void MeshRefine::ProjectMesh(
 		float w2_row = EdgeFunction2(v1, v2, { px0, py0 }) * invArea;
 
 		// vertex depths
-		float z0 = t.ptc[0].z;
-		float z1 = t.ptc[1].z;
-		float z2 = t.ptc[2].z;
-
-		// clamp small / invalid z
-		z0 = (z0 <= 0.f) ? 1e-6f : z0;
-		z1 = (z1 <= 0.f) ? 1e-6f : z1;
-		z2 = (z2 <= 0.f) ? 1e-6f : z2;
+		float z0 = c0.z;
+		float z1 = c1.z;
+		float z2 = c2.z;
 
 		// reciprocal depths
-		const float iz0 = 1.f / z0;
-		const float iz1 = 1.f / z1;
-		const float iz2 = 1.f / z2;
+		float iz0 = c0.invZ;
+		float iz1 = c1.invZ;
+		float iz2 = c2.invZ;
 
-		Depth* __restrict depthRow = nullptr;
-		cuint32_t* __restrict faceRow = (cuint32_t*)nullptr;
-		auto* __restrict baryRow = (Point3f*)nullptr;
+		Depth* __restrict depthPtr = depthMap.ptr<float>(boxMinI.y);
+		cuint32_t* __restrict facePtr = faceMap.ptr<cuint32_t>(boxMinI.y);
+		Point3f* __restrict baryPtr = baryMap.ptr<Point3f>(boxMinI.y);
+		uint8_t* __restrict validPtr = &view.isValid[boxMinI.y * width];
 
 		for (size_t y = boxMinI.y; y <= boxMaxI.y; ++y) {
+			Depth* __restrict depthRow = depthPtr;
+			cuint32_t* __restrict faceRow = facePtr;
+			Point3f* __restrict baryRow = baryPtr;
+			uint8_t* __restrict isValidRow = validPtr;
+
 			float w0 = w0_row, w1 = w1_row, w2 = w2_row;
 
-			depthRow = &depthMap[y * width];
-			faceRow = &faceMap[y * width];
-			baryRow = &baryMap[y * width];
-      uint8_t* __restrict isValidRow = &view.isValid[y * width];
-
 			for (size_t x = boxMinI.x; x <= boxMaxI.x; ++x) {
-				// inside test (branchless style)
-				if ((w0 >= 0.f) & (w1 >= 0.f) & (w2 >= 0.f)) {
-					// perspective-correct barycentrics
+				const uint32_t inside = (uint32_t)(w0 >= 0.f) & (uint32_t)(w1 >= 0.f) & (uint32_t)(w2 >= 0.f);
+				if (inside) {
 					const float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
-					if (fabsf(denom) >= 1e-10f) {
+					if (FastAbsS(denom) >= 1e-10f) {
 						const float invDenom = 1.f / denom;
 						const float bx = (w0 * iz0) * invDenom;
 						const float by = (w1 * iz1) * invDenom;
-						const float bz = 1.f - bx - by;     // third term implicit
-
-						// compute depth (2 FMAs)
+						const float bz = 1.f - bx - by;
 						const float z = bx * z0 + by * z1 + bz * z2;
 
 						Depth& depth = depthRow[x];
 						if (depth == 0.f || depth > z) {
 							depth = z;
-							faceRow[x] = idxFace;
+							faceRow[x] = f;
 							baryRow[x] = { bx, by, bz };
 							isValidRow[x] = 1;
 						}
 					}
 				}
-
-				// advance barycentrics horizontally
 				w0 += w0_dx;
 				w1 += w1_dx;
 				w2 += w2_dx;
 			}
+
+			// advance vertical pointers (single increment)
+			depthPtr += width;
+			facePtr += width;
+			baryPtr += width;
+			validPtr += width;
 
 			// advance barycentrics vertically
 			w0_row += w0_dy;
@@ -1071,15 +1294,17 @@ void MeshRefine::ProjectMesh(
 				++diffFaceCount;
 
 			// Barycentric difference
-			const Point3f& br = baryMap2(y, x);
-			const Point3f& bo = baryMap(y, x);
-			const double db0 = fabs((double)br.x - (double)bo.x);
-			const double db1 = fabs((double)br.y - (double)bo.y);
-			const double db2 = fabs((double)br.z - (double)bo.z);
-			const double bd = std::max(db0, std::max(db1, db2));
-			if (bd > 1e-3) {
-				++diffBaryCount;
-				if (bd > maxBaryDiff) maxBaryDiff = bd;
+			if (fr == fo) {
+				const Point3f& br = baryMap2(y, x);
+				const Point3f& bo = baryMap(y, x);
+				const double db0 = fabs((double)br.x - (double)bo.x);
+				const double db1 = fabs((double)br.y - (double)bo.y);
+				const double db2 = fabs((double)br.z - (double)bo.z);
+				const double bd = std::max(db0, std::max(db1, db2));
+				if (bd > 1e-3) {
+					++diffBaryCount;
+					if (bd > maxBaryDiff) maxBaryDiff = bd;
+				}
 			}
 		}
 	}
@@ -1102,52 +1327,85 @@ void MeshRefine::ProjectMesh(
 	const size_t rows = size.height;
 	const size_t cols = size.width;
 	const size_t count = rows * cols;
+
+	if (view.allocatedSize < count) {
+		// Will leak on exit.
+		_aligned_free(view.ray);
+		_aligned_free(view.X);
+		_aligned_free(view.storedNormal);
+		_aligned_free(view.invNd);
+		_aligned_free(view.verticesPerPix);
+		_aligned_free(view.facesNormalPerPix);
+		_aligned_free(view.bary);
+
+		view.ray = (Point3f*)_aligned_malloc(count * sizeof(Point3f), 16);
+		view.X = (Point3f*)_aligned_malloc(count * sizeof(Point3f), 16);
+		view.storedNormal = (Point3f*)_aligned_malloc(count * sizeof(Point3f), 16);
+		view.invNd = (float*)_aligned_malloc(count * sizeof(float), 16);
+		view.verticesPerPix = (cuint32_t*)_aligned_malloc(count * sizeof(cuint32_t) * 3, 16);
+		view.facesNormalPerPix = (Point3f*)_aligned_malloc(count * sizeof(Point3f), 16);
+		view.bary = (Point3f*)_aligned_malloc(count * sizeof(Point3f), 16);
+
+		view.allocatedSize = count;
+  }
+
 	view.width = cols;
 	view.height = rows;
 
-	// allocate SoA arrays (aligned)
-	view.ray.assign(count, Point3f(0, 0, 0));
-	view.X.assign(count, Point3f(0, 0, 0));
-	view.storedNormal.assign(count, Point3f(0, 0, 0));
-	view.Nd.assign(count, 0.0f);
-	view.invNd.assign(count, 0.0f);
-	view.verticesPerPix.assign(count * 3, NO_ID);
-	view.facesNormalPerPix.assign(count, Point3f(0, 0, 0));
-	// optional: barycentric coordinates as SoA if you plan to use them this way
-	view.bary.assign(count, TPoint3<float>(0, 0, 0));
-
-	// main pass: fill SoA arrays
 #ifdef VALIDATE_COUNT
 	int validCnt = 0;
 #endif
 
-	for (size_t r = 0; r < rows; ++r)	{
+	const Point3f cameraC = Cast<float>(camera.C);
+	const float r00 = camera.R(0, 0), r01 = camera.R(0, 1), r02 = camera.R(0, 2);
+	const float r10 = camera.R(1, 0), r11 = camera.R(1, 1), r12 = camera.R(1, 2);
+	const float r20 = camera.R(2, 0), r21 = camera.R(2, 1), r22 = camera.R(2, 2);
+	const float fx = camera.K(0, 0);
+	const float fy = camera.K(1, 1);
+	const float cx = camera.K(0, 2);
+	const float cy = camera.K(1, 2);
+	const float invFx = 1.0f / fx;
+	const float invFy = 1.0f / fy;
+	for (size_t r = 0; r < rows; ++r) {
+		cuint32_t* __restrict faceRow = faceMap.ptr<cuint32_t>(r);
+		float* __restrict depthRow = depthMap.ptr<float>(r);
 		uint8_t* __restrict isValidRow = &view.isValid[r * cols];
-		for (size_t c = 0; c < cols; ++c)	{
+		Point3f* __restrict baryRow = baryMap.ptr<Point3f>(r);
+		const float dy = (static_cast<float>(r) - cy) * invFy;  // (v - cy)/fy
+
+		for (size_t c = 0; c < cols; ++c) {
 			if (!isValidRow[c]) {
-				view.faceMap(r, c) = NO_ID;
+				faceRow[c] = NO_ID;
 				continue;
 			}
 
 			const size_t idx = r * cols + c;
 
 			// view.depthMap(r,c) guaranteed > 0
-			const float depth = view.depthMap(r, c);
+			const float depth = depthRow[c];
 
 			// Unnormalized direction in camera coords (z=1), rotated to world
 			// RayPoint = R^T * TransformPointI2C([ (u-cx)/fx, (v-cy)/fy, 1 ])
-			const Point3f rayW = camera.RayPoint(Point2(c, r));
 
+			//const Point3f rayW = camera.RayPoint(Point2(c, r));
 			// Reconstruct 3D point in world: X = C + (rayW * depth)
 			// (equivalently: X = R^T * ([x',y',1] * depth) + C)
-			const Point3f X = rayW * depth + Cast<float>(camera.C);
+			const float dx = (static_cast<float>(c) - cx) * invFx;  // (u - cx)/fx
+			const Point3f rayW(
+				r00 * dx + r10 * dy + r20,
+				r01 * dx + r11 * dy + r21,
+				r02 * dx + r12 * dy + r22
+			);
+
+			const Point3f X = rayW * depth + cameraC;
 
 			// Face index for this pixel
-			const FIndex f = view.faceMap(r, c);
+			const FIndex f = faceRow[c];
 			// view.faceMap(r,c) guaranteed not NO_ID
 
 			// Normalized ray ONLY for Nd
-			const float invLen = 1.0f / sqrtf(rayW.x * rayW.x + rayW.y * rayW.y + rayW.z * rayW.z);
+			const float lenSq = rayW.x * rayW.x + rayW.y * rayW.y + rayW.z * rayW.z;
+			const float invLen = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(lenSq)));
 			const Point3f dA = { rayW.x * invLen, rayW.y * invLen, rayW.z * invLen };
 			const Grad& N = faceNormals[f];
 			const float Nd = N.dot(dA);
@@ -1156,14 +1414,13 @@ void MeshRefine::ProjectMesh(
 				continue;
 			}
 
-
 			// Store SoA geometry
 			// normalized ray for Nd / later Jacobian use
 			view.ray[idx] = dA;
 
 			view.X[idx] = X;// full 3D point (world)
 			view.storedNormal[idx] = N;
-			view.Nd[idx] = Nd;
+			//view.Nd[idx] = Nd;
 
 			float invNd = 1.0f / Nd;
 
@@ -1172,7 +1429,7 @@ void MeshRefine::ProjectMesh(
 				continue;
 			}
 
-			view.invNd[idx] = 1.0f / Nd;
+			view.invNd[idx] = invNd;
 
 			const Face& face = faces[f];
 			FIndex faceIndexes[3] = { face[0], face[1], face[2] };
@@ -1180,11 +1437,10 @@ void MeshRefine::ProjectMesh(
 			view.verticesPerPix[idx * 3 + 0] = faceIndexes[0];
 			view.verticesPerPix[idx * 3 + 1] = faceIndexes[1];
 			view.verticesPerPix[idx * 3 + 2] = faceIndexes[2];
-			view.facesNormalPerPix[idx] = faceNormals[f];
+			view.facesNormalPerPix[idx] = N;
 
 			// Barycentrics if needed later
-			const Point3f& b = view.baryMap(r, c);
-			view.bary[idx] = b;
+			view.bary[idx] = baryRow[c];
 
 			// JPB WIP BUG Not needed isValidRow[c] = 1;
 #ifdef VALIDATE_COUNT
@@ -1209,7 +1465,7 @@ void MeshRefine::ImageMeshWarp(
 	const View& viewA,
 	const DepthMap& depthMapA, const Camera& cameraA,
 	const DepthMap& depthMapB, const Camera& cameraB,
-	const Image32F& imageB, Image32F& imageA, std::vector<uint8_t>& mask)
+	const Image32F& imageB, TImage<uint16_t>& imageAB, std::vector<uint8_t>& mask)
 {
 	ASSERT(!imageA.empty());
 	typedef Sampler::Linear<float> Sampler;
@@ -1217,8 +1473,9 @@ void MeshRefine::ImageMeshWarp(
   const size_t cols = depthMapA.cols;
   const size_t rows = depthMapA.rows;
 	for (size_t j = 0; j < rows; ++j) {
-    uint8_t* maskRow = &mask[j * depthMapA.cols];
+    uint8_t* __restrict maskRow = &mask[j * depthMapA.cols];
 		const uint8_t* __restrict isValidRow = &viewA.isValid[j * cols];
+		uint16_t* __restrict outRow = imageAB.ptr<uint16_t>(j);
 
 		for (size_t i = 0; i < depthMapA.cols; ++i) {
 			if (isValidRow[i]) {
@@ -1227,203 +1484,439 @@ void MeshRefine::ImageMeshWarp(
 				const Point3f ptC(cameraB.TransformPointW2C(X));
 				const Point2f pt(cameraB.TransformPointC2I(ptC));
 				if (!IsDepthSimilar(depthMapB, pt, ptC.z)) {
-					*maskRow++ = 0;
+					outRow[i] = 0;
+					maskRow[i] = 0;
 					continue;
 				}
-				imageA(j, i) = imageB.sample<Sampler, Sampler::Type>(sampler, pt);
-				*maskRow++ = 1;
+				float v = imageB.sample<Sampler, Sampler::Type>(sampler, pt);
+				if (v < 0.f) v = 0.f;
+				if (v > 1.f) v = 1.f;
+				outRow[i] = (uint16_t)(v * 65535.0f + 0.5f);
+				maskRow[i] = 1;
 			}
 			else {
-        *maskRow++ = 0;
+				outRow[i] = 0;
+        maskRow[i] = 0;
 			}
 		}
 	}
 }
 
 // compute local variance for each image pixel
-void MeshRefine::ComputeLocalVariance(const Image32F& image,
+void MeshRefine::ComputeLocalVariance(
+	const Image32F& image,
 	const std::vector<uint8_t>& mask,
-	TImage<Real>& imageMean,
-	TImage<Real>& imageVar) {
+	TImage<uint16_t>& imageMean,   // fixed-point 0..65535
+	TImage<Real>& imageVar)
+{
 	ASSERT(image.size() == mask.size());
 	imageMean.create(image.size());
 	imageVar.create(image.size());
 
-	const size_t hs = HalfSize;
-	const size_t rows = image.rows;
-	const size_t cols = image.cols;
-	constexpr size_t n = (2 * hs + 1) * (2 * hs + 1);
-	constexpr Real invN = 1.0 / static_cast<Real>(n);
+	const int rows = image.rows;
+	const int cols = image.cols;
 
-	const size_t rowStart = hs;
-	const size_t rowEnd = rows - hs;
-	const size_t colStart = hs;
-	const size_t colEnd = cols - hs;
+	const int hs = HalfSize;
+	const int window = 2 * hs + 1;
+	const int n = window * window;
+	const Real invN = Real(1.0) / Real(n);
 
-	// Column running sums for current vertical window [r-hs .. r+hs]
-	std::vector<Real> colSum(cols, 0.0);
-	std::vector<Real> colSumSq(cols, 0.0);
+	// Zero borders just like OpenMVS
+	imageMean.memset(0);
+	imageVar.memset(0);
 
-	// Seed vertical window for the first output row: rows [0 .. 2*hs]
-	for (size_t rr = 0; rr < 2 * hs + 1 && rr < rows; ++rr) {
+	if (rows == 0 || cols == 0)
+		return;
+
+	// Safe interior bounds
+	const int rowStart = std::max(0, hs);
+	const int rowEnd = std::min(rows, rows - hs);
+	const int colStart = std::max(0, hs);
+	const int colEnd = std::min(cols, cols - hs);
+
+	if (rowStart >= rowEnd || colStart >= colEnd)
+		return;  // window doesn't fit inside image
+
+	// Thread-local buffers
+	static thread_local std::vector<Real> colSum;
+	static thread_local std::vector<Real> colSumSq;
+
+	colSum.assign(cols, Real(0));
+	colSumSq.assign(cols, Real(0));
+
+	// Seed vertical window safely:
+	// sum rows [0 .. min(rows-1, 2*hs)]
+	const int vStart = 0;
+	const int vEnd = std::min(rows - 1, 2 * hs);
+
+	for (int rr = vStart; rr <= vEnd; ++rr) {
 		const float* src = image.ptr<float>(rr);
-		for (size_t c = 0; c < cols; ++c) {
-			Real v = src[c];
+		for (int c = 0; c < cols; ++c) {
+			Real v = Real(src[c]);
 			colSum[c] += v;
 			colSumSq[c] += v * v;
 		}
 	}
 
-	// Process each output row
-	for (size_t r = rowStart; r < rowEnd; ++r) {
-		Real winSum = 0.0;
-		Real winSumSq = 0.0;
+	// Main scanning loop
+	for (int r = rowStart; r < rowEnd; ++r) {
 
-		// Initialize horizontal window for column range [0 .. 2*hs]
-		for (size_t cc = 0; cc < 2 * hs + 1 && cc < cols; ++cc) {
+		// Compute actual vertical window bounds at this row
+		const int vTop = std::max(0, r - hs);
+		const int vBot = std::min(rows - 1, r + hs);
+
+		// If this differs from initial window, rebuild vertical window
+		if (vTop > vStart || vBot < vEnd) {
+
+			std::fill(colSum.begin(), colSum.end(), Real(0));
+			std::fill(colSumSq.begin(), colSumSq.end(), Real(0));
+
+			for (int rr = vTop; rr <= vBot; ++rr) {
+				const float* src = image.ptr<float>(rr);
+				for (int c = 0; c < cols; ++c) {
+					Real v = Real(src[c]);
+					colSum[c] += v;
+					colSumSq[c] += v * v;
+				}
+			}
+		}
+
+		// Build initial horizontal window at (r, colStart)
+		Real winSum = Real(0);
+		Real winSumSq = Real(0);
+
+		const int hLeft = std::max(0, colStart - hs);
+		const int hRight = std::min(cols - 1, colStart + hs);
+
+		for (int cc = hLeft; cc <= hRight; ++cc) {
 			winSum += colSum[cc];
 			winSumSq += colSumSq[cc];
 		}
 
-		Real* __restrict meanRow = imageMean.ptr<Real>(r);
+		uint16_t* __restrict meanRow = imageMean.ptr<uint16_t>(r);
 		Real* __restrict varRow = imageVar.ptr<Real>(r);
 		const uint8_t* __restrict maskRow = &mask[r * cols];
 
-		for (size_t c = colStart; c < colEnd; ++c) {
+		// Slide horizontally across interior
+		for (int c = colStart; c < colEnd; ++c) {
+
 			if (maskRow[c]) {
 				Real mean = winSum * invN;
 				Real var = winSumSq * invN - mean * mean;
-				if (var < 0.0001) var = 0.0001;
-				meanRow[c] = static_cast<Real>(mean);
-				varRow[c] = static_cast<Real>(var);
+
+				if (var < Real(0.0001)) var = Real(0.0001);
+				if (mean < Real(0)) mean = Real(0);
+				if (mean > Real(1)) mean = Real(1);
+
+				meanRow[c] = uint16_t(mean * 65535.0f + 0.5f);
+				varRow[c] = var;
 			}
 
-			// Slide horizontal window by one pixel
-			if (c + hs + 1 < cols) {
-				winSum += colSum[c + hs + 1] - colSum[c - hs];
-				winSumSq += colSumSq[c + hs + 1] - colSumSq[c - hs];
-			}
+			// Slide window one pixel right, safely
+			const int addC = c + hs + 1;
+			const int remC = c - hs;
+
+			if (addC < cols) winSum += colSum[addC];
+			if (remC >= 0)   winSum -= colSum[remC];
+
+			if (addC < cols) winSumSq += colSumSq[addC];
+			if (remC >= 0)   winSumSq -= colSumSq[remC];
 		}
 
-		// Advance vertical window after finishing row r:
-		// remove row (r - hs) and add row (r + hs + 1)
-		if (r + hs + 1 < rows) {
-			const float* __restrict addRow = image.ptr<float>(r + hs + 1);
-			const float* __restrict remRow = image.ptr<float>(r - hs);
+		// Slide vertical window
+		const int newAddR = r + hs + 1;
+		const int newRemR = r - hs;
+
+		if (newAddR < rows && newRemR >= 0) {
+			const float* __restrict addRow = image.ptr<float>(newAddR);
+			const float* __restrict remRow = image.ptr<float>(newRemR);
+
 			for (int c = 0; c < cols; ++c) {
-				Real a = addRow[c];
-				Real d = remRow[c];
-				colSum[c] += a - d;
-				colSumSq[c] += a * a - d * d;
+				Real a = Real(addRow[c]);
+				Real d = Real(remRow[c]);
+				colSum[c] += (a - d);
+				colSumSq[c] += (a * a - d * d);
 			}
 		}
 	}
 }
 
-// compute local ZNCC and its gradient for each image pixel
-float MeshRefine::ComputeLocalZNCC(
-	const Image32F& imageA, const TImage<Real>& imageMeanA, const TImage<Real>& imageVarA,
-	const Image32F& imageB, const TImage<Real>& imageMeanB, const TImage<Real>& imageVarB,
-	const std::vector<uint8_t>& mask, TImage<Real>& imageDZNCC)
+
+void MeshRefine::ComputeLocalVariance2(
+	const TImage<uint16_t>& image,
+	const std::vector<uint8_t>& mask,
+	TImage<uint16_t>& imageMean,
+	TImage<Real>& imageVar)
 {
-	ASSERT(imageA.size() == mask.size() && imageB.size() == mask.size() && !mask.empty());
+	ASSERT(image.size() == mask.size());
+	imageMean.create(image.size());
+	imageVar.create(image.size());
 
-	const size_t hs = HalfSize;
-	const size_t rows = imageA.rows;
-	const size_t cols = imageA.cols;
-	constexpr size_t n = (2 * hs + 1) * (2 * hs + 1);
-	constexpr float invN = 1.0f / static_cast<float>(n);
-	const size_t rowEnd = rows - hs;
-	const size_t colEnd = cols - hs;
+	const int rows = image.rows;
+	const int cols = image.cols;
 
-	static thread_local TImage<Real> imageZNCC;
-	if (imageZNCC.cols != cols || imageZNCC.rows != rows) {
-		imageZNCC.create(rows, cols);
+	const int hs = HalfSize;
+	const int window = 2 * hs + 1;
+	const int n = window * window;
+
+	const Real invN = Real(1) / Real(n);
+	const Real scale = Real(1.0 / 65535.0);
+
+	// Zero borders for consistency with OpenMVS
+	imageMean.memset(0);
+	imageVar.memset(0);
+
+	if (rows == 0 || cols == 0)
+		return;
+
+	// Clamp valid region to ensure safety even on tiny images
+	const int rowStart = std::max(0, hs);
+	const int rowEnd = std::min(rows, rows - hs);
+	const int colStart = std::max(0, hs);
+	const int colEnd = std::min(cols, cols - hs);
+
+	if (rowStart >= rowEnd || colStart >= colEnd)
+		return; // image too small for variance window
+
+	// Thread-local column accumulators
+	static thread_local std::vector<Real> colSum, colSumSq;
+	colSum.assign(cols, Real(0));
+	colSumSq.assign(cols, Real(0));
+
+	// Seed vertical window safely:
+	// sums rows[max(0, r-hs) .. min(rows-1, r+hs)]
+	const int vertStart = 0;
+	const int vertEnd = std::min(rows - 1, 2 * hs);
+
+	for (int rr = vertStart; rr <= vertEnd; ++rr) {
+		const uint16_t* src = image.ptr<uint16_t>(rr);
+		for (int c = 0; c < cols; ++c) {
+			Real v = Real(src[c]) * scale;
+			colSum[c] += v;
+			colSumSq[c] += v * v;
+		}
 	}
-	if (imageDZNCC.cols != cols || imageDZNCC.rows != rows) {
-		imageDZNCC.create(rows, cols);
-	}
 
-	// Invariant: we will only read/write to imageZNCC(r,c)  and imageDZNCC(r,c) if mask(r,c) is set; other values are undefined.
-	// This allows us to avoid initializing these images here.
+	// Main scanning loop
+	for (int r = rowStart; r < rowEnd; ++r) {
 
-	// --- build integral of (A * B) in float, single-threaded ---
-	static thread_local cv::Mat imageAB, imageABSum;
-	cv::multiply(imageA, imageB, imageAB, 1, CV_32F);
-	cv::integral(imageAB, imageABSum, CV_32F);
+		// Compute vertical window bounds
+		const int vTop = std::max(0, r - hs);
+		const int vBot = std::min(rows - 1, r + hs);
 
-	// --- first pass: compute local covariance (cv) and ZNCC ---
-	static thread_local TImage<Real> imageInvSqrtVAVB;
-	imageInvSqrtVAVB.create(rows, cols);
+		// Rebuild vertical window when needed
+		// (For normal OpenMVS sizes this path is never taken,
+		//  but it is required to be safe on tiny images.)
+		if (vTop > vertStart || vBot < vertEnd) {
+			// Rebuild the vertical window from scratch safely
+			std::fill(colSum.begin(), colSum.end(), Real(0));
+			std::fill(colSumSq.begin(), colSumSq.end(), Real(0));
 
-	for (size_t r = hs; r < rowEnd; ++r) {
-		const float* __restrict sumUp = imageABSum.ptr<float>(r - hs);
-		const float* __restrict sumDown = imageABSum.ptr<float>(r + hs + 1);
-		Real* __restrict znccRow = imageZNCC.ptr<Real>(r);
-		Real* __restrict invRow = imageInvSqrtVAVB.ptr<Real>(r);
+			for (int rr = vTop; rr <= vBot; ++rr) {
+				const uint16_t* src = image.ptr<uint16_t>(rr);
+				for (int c = 0; c < cols; ++c) {
+					Real v = Real(src[c]) * scale;
+					colSum[c] += v;
+					colSumSq[c] += v * v;
+				}
+			}
+		}
+
+		// Build initial horizontal window at (r, colStart)
+		Real winSum = Real(0);
+		Real winSumSq = Real(0);
+
+		int hLeft = std::max(0, colStart - hs);
+		int hRight = std::min(cols - 1, colStart + hs);
+
+		for (int cc = hLeft; cc <= hRight; ++cc) {
+			winSum += colSum[cc];
+			winSumSq += colSumSq[cc];
+		}
+
+		uint16_t* __restrict meanRow = imageMean.ptr<uint16_t>(r);
+		Real* __restrict varRow = imageVar.ptr<Real>(r);
 		const uint8_t* __restrict maskRow = &mask[r * cols];
 
-		for (size_t c = hs; c < colEnd; ++c) {
-			if (!maskRow[c]) continue;
+		for (int c = colStart; c < colEnd; ++c) {
+
+			if (maskRow[c]) {
+				Real mean = winSum * invN;
+				Real var = winSumSq * invN - mean * mean;
+
+				if (var < Real(0.0001)) var = Real(0.0001);
+				mean = std::max<Real>(0, std::min<Real>(1, mean));
+
+				meanRow[c] = uint16_t(mean * 65535.0f + 0.5f);
+				varRow[c] = var;
+			}
+
+			// Slide window horizontally one pixel, safely
+			int addC = c + hs + 1;
+			int remC = c - hs;
+
+			if (addC < cols)
+				winSum += colSum[addC];
+			if (remC >= 0)
+				winSum -= colSum[remC];
+
+			if (addC < cols)
+				winSumSq += colSumSq[addC];
+			if (remC >= 0)
+				winSumSq -= colSumSq[remC];
+		}
+
+		// Slide vertical window
+		int newAddR = r + hs + 1;
+		int newRemR = r - hs;
+
+		if (newAddR < rows && newRemR >= 0) {
+			const uint16_t* __restrict addRow = image.ptr<uint16_t>(newAddR);
+			const uint16_t* __restrict remRow = image.ptr<uint16_t>(newRemR);
+
+			for (int c = 0; c < cols; ++c) {
+				Real a = Real(addRow[c]) * scale;
+				Real d = Real(remRow[c]) * scale;
+				colSum[c] += (a - d);
+				colSumSq[c] += (a * a - d * d);
+			}
+		}
+	}
+}
+
+
+// compute local ZNCC and its gradient for each image pixel
+float MeshRefine::ComputeLocalZNCC(
+	const Image32F& imageA,
+	const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
+	const TImage<uint16_t>& imageB, const TImage<uint16_t>& imageMeanB,
+	const TImage<Real>& imageVarB,
+	const std::vector<uint8_t>& mask,
+	TImage<Real>& imageDZNCC)
+{
+	ASSERT(imageA.size() == imageB.size());
+	ASSERT(imageA.size() == mask.size());
+
+	const int rows = imageA.rows;
+	const int cols = imageA.cols;
+
+	const int hs = HalfSize;
+	const int rowStart = hs;
+	const int rowEnd = rows - hs;
+	const int colStart = hs;
+	const int colEnd = cols - hs;
+
+	const int n = (2 * hs + 1) * (2 * hs + 1);
+	const float invN = 1.0f / float(n);
+	const float scale16 = 1.0f / 65535.0f;
+
+	// output
+	imageDZNCC.create(rows, cols);
+	// no memset needed; we only write valid pixels
+
+	// integral buffer (thread-local to avoid alloc)
+	static thread_local cv::Mat integralAB;
+	integralAB.create(rows + 1, cols + 1, CV_32F);
+	if (integralAB.isContinuous()) {
+    memset(integralAB.ptr<float>(0), 0, (rows + 1) * (cols + 1) * sizeof(float));
+	} else {
+		integralAB.setTo(0);
+	}
+	// ----------------------------------------------------------------
+	// Build integral of A * B
+	// ----------------------------------------------------------------
+
+	for (int r = 0; r < rows; ++r) {
+		const float* __restrict aPtr = imageA.ptr<float>(r);
+		const uint16_t* __restrict bPtr = imageB.ptr<uint16_t>(r);
+
+		float* __restrict dst = integralAB.ptr<float>(r + 1);
+		const float* __restrict prev = integralAB.ptr<float>(r);
+
+		float acc = 0.f;
+		for (int c = 0; c < cols; ++c) {
+			acc += aPtr[c] * (float(bPtr[c]) * scale16);
+			dst[c + 1] = prev[c + 1] + acc;
+		}
+	}
+
+	// ----------------------------------------------------------------
+	// Main loop: compute ZNCC & gradient in one pass
+	// ----------------------------------------------------------------
+
+	float score = 0.0f;
+
+	for (int r = rowStart; r < rowEnd; ++r) {
+
+		const uint8_t* __restrict maskRow = &mask[r * cols];
+		const float* __restrict aRow = imageA.ptr<float>(r);
+		const uint16_t* __restrict bRow = imageB.ptr<uint16_t>(r);
+
+		const float* __restrict up = integralAB.ptr<float>(r - hs);
+		const float* __restrict dn = integralAB.ptr<float>(r + hs + 1);
+
+		Real* gradRow = imageDZNCC.ptr<Real>(r);
+
+		for (int c = colStart; c < colEnd; ++c) {
+
+			if (!maskRow[c])
+				continue;
 
 			const int x0 = c - hs;
 			const int x1 = c + hs + 1;
 
-			const float cov = (sumDown[x1] - sumDown[x0] -
-				sumUp[x1] + sumUp[x0]) * invN;
+			// covariance over window
+			const float sumAB = dn[x1] - dn[x0] - up[x1] + up[x0];
+			const Real cov = Real(sumAB * invN);
 
-			Real invSqrtVAVB = Real(1) / FastSqrtS(imageVarA(r, c) * imageVarB(r, c));
-			Real meanA = imageMeanA(r, c);
-			Real meanB = imageMeanB(r, c);
+			// unpack means
+			const Real meanA = Real(imageMeanA(r, c)) * scale16;
+			const Real meanB = Real(imageMeanB(r, c)) * scale16;
 
-			Real zncc = (cov - meanA * meanB) * invSqrtVAVB;
-			znccRow[c] = zncc;
-			invRow[c] = invSqrtVAVB;
-		}
-	}
-
-	// --- second pass: compute gradient and accumulate score ---
-	float score = 0.0f;
-
-	for (size_t r = hs; r < rowEnd; ++r) {
-		// early reject if an entire row of the mask is zero can t be tested here
-		// because mask(r,hs) is only one pixel; so just enter the loop.
-		Real* __restrict dRow = imageDZNCC.ptr<Real>(r);
-		const Real* __restrict znccRow = imageZNCC.ptr<Real>(r);
-		const Real* __restrict invRow = imageInvSqrtVAVB.ptr<Real>(r);
-		const uint8_t* __restrict maskRow = &mask[r * cols];
-
-		for (int c = hs; c < colEnd; ++c) {
-			if (!maskRow[c]) continue;
-
-			const Real zncc = znccRow[c];
-			const Real invS = invRow[c];
+			// variances
+			const Real varA = imageVarA(r, c);
 			const Real varB = imageVarB(r, c);
-			const Real meanA = imageMeanA(r, c);
-			const Real meanB = imageMeanB(r, c);
-			const Real aVal = static_cast<Real>(imageA(r, c));
-			const Real bVal = static_cast<Real>(imageB(r, c));
 
-			const Real znccInvVB = zncc / varB;
-			const Real dzncc = aVal * invS - bVal * znccInvVB
-				+ meanB * znccInvVB - meanA * invS;
+			// inverse sqrt(varA*varB)
+			float x = float(varA * varB);
+			if (x < 1e-12f) x = 1e-12f;
 
-			const Real minVAVB = MINF(imageVarA(r, c), varB);
-			const Real reliability = minVAVB / (minVAVB + Real(0.0015));
+			float invS = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x)));
+			invS = invS * (1.5f - 0.5f * x * invS * invS);
 
-			const Real grad = -reliability * dzncc;
-			dRow[c] = grad;
-			score += static_cast<float>(reliability * (Real(1) - zncc));
+			// ZNCC
+			const Real zncc = (cov - meanA * meanB) * invS;
+
+			// ZNCC gradient
+			const Real aVal = Real(aRow[c]);
+			const Real bVal = Real(bRow[c]) * scale16;
+
+			const Real ZNCCinvVB = zncc / varB;
+
+			const Real dZNCC =
+				aVal * invS
+				- bVal * ZNCCinvVB
+				+ meanB * ZNCCinvVB
+				- meanA * invS;
+
+			// reliability (OpenMVS)
+			const Real minV = (varA < varB ? varA : varB);
+			const Real reliability = minV / (minV + Real(0.0015));
+
+			gradRow[c] = -reliability * dZNCC;
+			score += float(reliability * (Real(1) - zncc));
 		}
 	}
 
 	return score;
 }
 
+
+
+
 #if 1
 
 #define FMA(a,b,c) _mm_add_ps(_mm_mul_ps(a,b),c)
-#undef VALIDATE_GRADIENT
 
 void MeshRefine::ComputePhotometricGradient(
 	const Mesh::FaceArr& faces,
@@ -1435,11 +1928,11 @@ void MeshRefine::ComputePhotometricGradient(
 	const TImage<Real>& imageDZNCC,
 	const std::vector<uint8_t>& mask,
 	GradArr& threadGrad,
-	std::vector<bool>& localNorm,
+	std::vector<uint64_t>& localNorm,
 	Real RegularizationScale)
 {
 	ASSERT(faces.GetSize() == normals.GetSize() && !faces.IsEmpty());
-	ASSERT(viewB.image.size() == viewB.imageGrad.size() && !viewB.image.empty());
+	//ASSERT(viewB.image.size() == viewB.imageGrad.size() && !viewB.image.empty());
 
   size_t cols = viewA.image.cols;
 	const size_t RowsEnd = viewA.image.rows - HalfSize;
@@ -1530,20 +2023,48 @@ void MeshRefine::ComputePhotometricGradient(
 
 #else
 #if 1 //local
-	static constexpr int LOCAL_CAP = TILEX * TILEY * 4;  // enough for most 32x32 tiles
-	uint32_t usedIdx[LOCAL_CAP];
-	Grad tileGrad[LOCAL_CAP];
+	constexpr int LOCAL_CAP = TILEX * TILEY * 4;  // enough for most 32x32 tiles
+	alignas(64) uint32_t usedIdx[LOCAL_CAP];
+	alignas(64) Grad tileGrad[LOCAL_CAP];
 	size_t usedCount = 0;
-	uint32_t tileVertices[LOCAL_CAP];
-	for (int i = 0; i < LOCAL_CAP; ++i) tileVertices[i] = 0xFFFFFFFF;
+
+  // tileVertices must be 0xFFFFFFFF initially, but we save from re-initializing it every time
+	// by having the flushing of the tile reset this.
+	alignas(64)static thread_local uint32_t tileVertices[LOCAL_CAP];
+	static thread_local bool initialized = false;
+	if (!initialized) {
+		for (int i = 0; i < LOCAL_CAP; ++i)
+			tileVertices[i] = 0xFFFFFFFF;
+		initialized = true;
+	}
 
 #endif
-	const uint8_t currentMark = viewA.currentMark;
 
 #ifdef VALIDATE_GRADIENT
+
 	int touched = 0;
+	int count = cols * viewA.image.rows;
+	GradArr myNewLocalGrad;
+	myNewLocalGrad.resize(threadGrad.size());
+	for (int i = 0; i < threadGrad.size(); ++i) {
+		myNewLocalGrad[i] = Grad(0, 0, 0);
+	}
+	GradArr myOrigLocalGrad;
+	myOrigLocalGrad.resize(threadGrad.size());
+	for (int i = 0; i < threadGrad.size(); ++i) {
+		myOrigLocalGrad[i] = Grad(0, 0, 0);
+	}
+
+	std::vector<float> gxarr(viewA.image.cols * viewA.image.rows, 0.f);
+	std::vector<float> gyarr(viewA.image.cols * viewA.image.rows, 0.f);
+	std::vector<float> gbxarr(viewA.image.cols * viewA.image.rows, 0.f);
+	std::vector<float> gbyarr(viewA.image.cols * viewA.image.rows, 0.f);
+	std::vector<float> gfracx(viewA.image.cols* viewA.image.rows, 0.f);
+	std::vector<float> gfracy(viewA.image.cols* viewA.image.rows, 0.f);
+
 #endif
 
+	const __m128 invScale = _mm_set1_ps(kInvScale);
 	for (size_t ty = 0; ty < RowsEnd; ty += TILEY) {
 		const size_t yEnd = std::min(ty + TILEY, RowsEnd);
 		for (size_t tx = 0; tx < ColsEnd; tx += TILEX) {
@@ -1556,6 +2077,7 @@ void MeshRefine::ComputePhotometricGradient(
 				const size_t base = r * stride;
 				size_t c = tx;
 				const uint8_t* __restrict maskRow = &mask[r * cols];
+				const float* __restrict pdZNCC = imageDZNCC.ptr<float>(r);
 
 				for (; c < xEnd; ++c) {
 					if (!maskRow[c]) continue;
@@ -1574,7 +2096,7 @@ void MeshRefine::ComputePhotometricGradient(
 
 					// w = P20*X0 + P21*X1 + P22*X2 + P23
 					float w = P[8] * X0 + P[9] * X1 + P[10] * X2 + P[11];
-					if (fabsf(w) < 1e-6f) continue; // skip invalid projections
+					if (FastAbsS(w) < 1e-6f) continue; // skip invalid projections
 					float invW = 1.0f / w;
 
 					// projected coordinates
@@ -1593,9 +2115,52 @@ void MeshRefine::ComputePhotometricGradient(
 					float fy = yB - yi;
 					const size_t bi = (yi * (stride- 1) + xi) * 8;
 
+#ifdef VALIDATE_GRADIENT
+					gfracx[idx] = fx;
+					gfracy[idx] = fy;
+					gxarr[idx] = xi;
+					gyarr[idx] = yi;
+#endif
+
+#if 0 //def VALIDATE_GRADIENT
+					float gx00f = viewB.gradBlockInt16[bi + 0] * kInvScale;
+					float gx01f = viewB.gradBlockInt16[bi + 1] * kInvScale;
+					float gx10f = viewB.gradBlockInt16[bi + 2] * kInvScale;
+					float gx11f = viewB.gradBlockInt16[bi + 3] * kInvScale;
+												
+					float gy00f = viewB.gradBlockInt16[bi + 4] * kInvScale;
+					float gy01f = viewB.gradBlockInt16[bi + 5] * kInvScale;
+					float gy10f = viewB.gradBlockInt16[bi + 6] * kInvScale;
+					float gy11f = viewB.gradBlockInt16[bi + 7] * kInvScale;
+
+
+					// Vertical interpolation
+					float gx0 = gx00f + fy * (gx10f - gx00f);
+					float gx1 = gx01f + fy * (gx11f - gx01f);
+
+					float gy0 = gy00f + fy * (gy10f - gy00f);
+					float gy1 = gy01f + fy * (gy11f - gy01f);
+
+					// Horizontal interpolation
+					float gx = gx0 + fx * (gx1 - gx0);
+					float gy = gy0 + fx * (gy1 - gy0);
+
+					float gBx = gx;
+					float gBy = gy;
+
+
+#else
 					// load 2 2 patch of gradients
-					__m128 gxv = _mm_load_ps(&viewB.gradBlock[bi + 0]); // gx00,gx01,gx10,gx11
-					__m128 gyv = _mm_load_ps(&viewB.gradBlock[bi + 4]); // gy00,gy01,gy10,gy11
+					// load 4 int16s -> 4 int32 -> 4 float
+					__m128i gx16 = _mm_loadl_epi64((__m128i*) & viewB.gradBlockInt16[bi + 0]); // gx00,gx01,gx10,gx11
+					__m128i gy16 = _mm_loadl_epi64((__m128i*) & viewB.gradBlockInt16[bi + 4]); // gy00,gy01,gy10,gy11
+
+					__m128 gxv = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(gx16));
+					__m128 gyv = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(gy16));
+
+					// rescale back to original float range
+					gxv = _mm_mul_ps(gxv, invScale);
+					gyv = _mm_mul_ps(gyv, invScale);
 
 					__m128 fxv = _mm_set1_ps(fx);
 					__m128 fyv = _mm_set1_ps(fy);
@@ -1624,6 +2189,12 @@ void MeshRefine::ComputePhotometricGradient(
 					// gBx, gBy now contain the scalar gradients from the bilinear sample
 					float gBx = gx;   // from the sampler above
 					float gBy = gy;
+#endif
+
+#ifdef VALIDATE_GRADIENT
+					gbxarr[idx] = gBx;
+					gbyarr[idx] = gBy;
+#endif
 
 					// ------------------------------------------------------------
 					//  Jacobian partials
@@ -1642,7 +2213,7 @@ void MeshRefine::ComputePhotometricGradient(
 					// ------------------------------------------------------------
 					//  Gradient scale
 					// ------------------------------------------------------------
-					float dZNCC = imageDZNCC[r * stride + c];
+					float dZNCC = pdZNCC[c];
 					float sg = (gBx * dot0 + gBy * dot1) * invNd * RegularizationScale * dZNCC;
 
 					// ------------------------------------------------------------
@@ -1709,12 +2280,15 @@ void MeshRefine::ComputePhotometricGradient(
 				uint32_t vi = tileVertices[slot];
 				const Grad& g = tileGrad[slot];
 
+#ifdef VALIDATE_GRADIENT
+				myNewLocalGrad[vi] += g;
+#endif
 				threadGrad[vi] += g;
 
 				if (localGen[vi] != localMark) {
 					// first write to this face in the current pass
 					localGen[vi] = localMark;
-					localNorm[vi] = 1;
+					localNorm[vi >> 6] |= (uint64_t(1) << (vi & 63));
 				}
 
 				tileVertices[slot] = 0xFFFFFFFF;
@@ -1730,8 +2304,8 @@ void MeshRefine::ComputePhotometricGradient(
 		ASSERT(faces.GetSize() == normals.GetSize() && !faces.IsEmpty());
 		ASSERT(depthMapA.size() == mask.size() && faceMapA.size() == mask.size() && baryMapA.size() == mask.size() && imageDZNCC.size() == mask.size() && !mask.empty());
 		ASSERT(viewB.image.size() == viewB.imageGrad.size() && !viewB.image.empty());
-		const int RowsEnd(mask.rows - HalfSize);
-		const int ColsEnd(mask.cols - HalfSize);
+		const int RowsEnd(viewA.image.rows - HalfSize);
+		const int ColsEnd(viewA.image.cols - HalfSize);
 		typedef Sampler::Linear<View::Grad::Type> Sampler;
 		const Sampler sampler;
 		TMatrix<Real, 2, 3> xJac;
@@ -1740,8 +2314,8 @@ void MeshRefine::ComputePhotometricGradient(
 		//photoGradNorm.Memset(0);
 		for (int r = HalfSize; r < RowsEnd; ++r) {
 			for (int c = HalfSize; c < ColsEnd; ++c) {
-				//if (!mask(r, c))
-				//	continue;
+				if (!mask[r*cols+c])
+					continue;
 				const FIndex idxFace(viewA.faceMap(r, c));
 				if (idxFace == NO_ID) continue;
 				//ASSERT(idxFace != NO_ID);
@@ -1758,37 +2332,119 @@ void MeshRefine::ComputePhotometricGradient(
 
 				ASSERT(depthA > 0);
 				const Point3 X(rayA * REAL(depthA) + cameraA.C);
+
+
+#if 0
+				// N and dA match.  X very slightly off
+				{
+					static std::mutex coutMutex;
+					int idx = r * cols + c;
+
+					const Point3f& X_new = viewA.X[idx];
+					const Point3f& X_orig = X;
+
+					float dx = X_new.x - X_orig.x;
+					float dy = X_new.y - X_orig.y;
+					float dz = X_new.z - X_orig.z;
+
+					if (fabs(dx) > 1e-7 ||
+						fabs(dy) > 1e-7 ||
+						fabs(dz) > 1e-7)
+					{
+						std::lock_guard<std::mutex> lock(coutMutex);
+
+						VERBOSE(
+							"X mismatch at pixel %d:\n"
+							"  X_orig = [%0.9f %0.9f %0.9f]\n"
+							"  X_new  = [%0.9f %0.9f %0.9f]\n"
+							"  diff   = [%0.9f %0.9f %0.9f]\n",
+							idx,
+							X_orig.x, X_orig.y, X_orig.z,
+							X_new.x, X_new.y, X_new.z,
+							dx, dy, dz
+						);
+					}
+				}
+#endif
+
+
 				// project point in second image and
 				// projection Jacobian matrix in the second image of the 3D point on the surface
 				MAYBEUNUSED const float depthB(ProjectVertex(cameraB.P.val, X.ptr(), xB.ptr(), xJac.val));
 				ASSERT(depthB > 0);
 				// compute gradient in image B
 				const TMatrix<Real, 1, 2> gB(viewB.imageGrad.sample<Sampler, View::Grad>(sampler, xB));
+
+#if 1
+				// N and dA match.
+				{
+					static std::mutex coutMutex;
+					int idx = r * cols + c;
+					if (fabs(std::floor(xB[0]) - gxarr[idx] > 0 ||
+						fabs(std::floor(xB[1]) - gyarr[idx]) > 0)) {
+						VERBOSE("gradient mismatch at pixel %d %f %f, %f %f\n", idx, xB[0], gxarr[idx], xB[1], gyarr[idx]);
+					}
+				}
+				{
+					static std::mutex coutMutex;
+					int idx = r * cols + c;
+					if (fabs(gB[0] - gbxarr[idx]) > 0.00001 ||
+						fabs(gB[1] - gbyarr[idx]) > 0.00001) {
+						VERBOSE("gradientv mismatch at pixel %d %f %f, %f %f\n", idx, gB[0], gbxarr[idx], gB[1], gbyarr[idx]);
+					}
+				}
+				{
+					static std::mutex coutMutex;
+					int idx = r * cols + c;
+					float gfx = xB[0] - std::floor(xB[0]);
+					float gfy = xB[1] - std::floor(xB[1]);
+					if (fabs(gfracx[idx] - gfx) > 0.00001 ||
+						fabs(gfracy[idx] - gfy) > 0.00001) {
+						VERBOSE("gradent frac  mismatch at pixel %d %f %f, %f %f\n", idx, gfx, gfracx[idx], gfy, gfracy[idx]);
+					}
+				}
+#endif
+
+
 				// compute gradient scale
 				const Real dZNCC(imageDZNCC(r, c));
 				const Real sg((gB * (xJac * (const TMatrix<Real, 3, 1>&)dA))(0) * dZNCC * RegularizationScale / Nd);
 				// add gradient to the three vertices
 				const Face& face(faces[idxFace]);
-				//const Point3f& b(baryMapA(r, c));
+				const Point3f& b(viewA.baryMap[r * cols + c]);
 				if (fabs(sg) >= 0.0000001f) ++origTouched;
-#if 0
 				for (int v = 0; v < 3; ++v) {
 					const Grad g(N * (sg * (Real)b[v]));
 					const VIndex idxVert(face[v]);
+
+					myOrigLocalGrad[v] += g;
+
 					//photoGrad[idxVert] += g;
 					//++photoGradNorm[idxVert];
 				}
-#endif
 			}
 		}
 	}
 
 #endif
 
-#ifdef VALIDATE_GRADIENT
+#if 0 // JPB WIP BUG VALIDATE_GRADIENT
 	{
 		static std::mutex coutMutex;
 		VERBOSE("Photometric gradient: touched %d / %d pixels (%.2f%%), orig %d\n", touched, count, 100.f * touched / count, origTouched);
+
+		for (int i = 0; i < myNewLocalGrad.size(); ++i) {
+			const Grad& gNew = myNewLocalGrad[i];
+			const Grad& gOrig = myOrigLocalGrad[i];
+			if (FastAbsS(gNew.x - gOrig.x) > 0.01f ||
+				FastAbsS(gNew.y - gOrig.y) > 0.01f ||
+				FastAbsS(gNew.z - gOrig.z) > 0.01f) {
+				VERBOSE("  Vertex %d: New Grad (%.4f, %.4f, %.4f) vs Orig Grad (%.4f, %.4f, %.4f)\n",
+					i,
+					gNew.x, gNew.y, gNew.z,
+					gOrig.x, gOrig.y, gOrig.z);
+      }
+		}
 	}
 #endif
 }
@@ -1959,6 +2615,13 @@ void MeshRefine::ThSelectNeighbors(uint32_t idxImage, std::unordered_set<uint64_
 		mapPairs.insert(MakePairIdx((uint32_t)idxImage, pNeighbor->ID));
 	}
 }
+
+__forceinline unsigned ctz64(uint64_t x) {
+	unsigned long idx;              // MSVC requires unsigned long
+	_BitScanForward64(&idx, x);     // undefined for x==0 (same as builtin)
+	return (unsigned)idx;
+}
+
 void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma)
 {
 	Image& imageData = images[idxImage];
@@ -1981,57 +2644,62 @@ void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma)
 	}
 	imageData.UpdateCamera(scene.platforms);
 	if (!nReduceMemory) {
+		throw; // Unsupported
+#if 0
 		// compute image mean and variance
 		ComputeLocalVariance(img, std::vector<uint8_t>(img.cols * img.rows, 0xFF), view.imageMean, view.imageVar);
+#endif
 	}
 	// compute image gradient
 	typedef View::Grad::Type GradType;
-	TImage<GradType> grad[2];
-#if 0
-	cv::Sobel(img, grad[0], cv::DataType<GradType>::type, 1, 0, 3, 1.0 / 8.0);
-	cv::Sobel(img, grad[1], cv::DataType<GradType>::type, 0, 1, 3, 1.0 / 8.0);
-#elif 1
+	static thread_local TImage<GradType> grad[2];
+	grad[0].create(img.rows, img.cols);
+	grad[1].create(img.rows, img.cols);
+
 	const TMatrix<GradType, 3, 5> kernel(CreateDerivativeKernel3x5());
 	cv::filter2D(img, grad[0], cv::DataType<GradType>::type, kernel);
 	cv::filter2D(img, grad[1], cv::DataType<GradType>::type, kernel.t());
-#else
-	const TMatrix<GradType, 5, 7> kernel(CreateDerivativeKernel5x7());
-	cv::filter2D(img, grad[0], cv::DataType<GradType>::type, kernel);
-	cv::filter2D(img, grad[1], cv::DataType<GradType>::type, kernel.t());
-#endif
+#ifdef VALIDATE_GRADIENT
 	cv::merge(grad, 2, view.imageGrad);
+#endif
 
 	// ------------------------------------------------------------------
-	// Build packed 2 2 gradient blocks for SIMD bilinear sampling
+	// Build packed 2x2 gradient blocks (int16 quantized)
 	// ------------------------------------------------------------------
 	const int width = view.width = grad[0].cols;
 	const int height = view.height = grad[0].rows;
+	const size_t numElems = static_cast<size_t>(height - 1) * (width - 1) * 8;
 
-	// one block per top-left pixel of each 2 2 region
-	view.gradBlock.resize((height - 1) * (width - 1) * 8);
+	_aligned_free(view.gradBlockInt16); // Will leak on exit.
+	view.gradBlockInt16 = (int16_t*)_aligned_malloc(numElems * sizeof(int16_t), 16);
 
-	for (int y = 0; y < height - 1; ++y)
-	{
+	for (int y = 0; y < height - 1; ++y) {
 		const GradType* gxRow0 = grad[0].ptr<GradType>(y);
 		const GradType* gxRow1 = grad[0].ptr<GradType>(y + 1);
 		const GradType* gyRow0 = grad[1].ptr<GradType>(y);
 		const GradType* gyRow1 = grad[1].ptr<GradType>(y + 1);
 
-		for (int x = 0; x < width - 1; ++x)
-		{
+		for (int x = 0; x < width - 1; ++x) {
 			const int bi = (y * (width - 1) + x) * 8;
 
+			auto quant = [](float f) -> int16_t {
+				float scaled = f * kScale;
+				if (scaled > 32767.f)  scaled = 32767.f;
+				if (scaled < -32767.f) scaled = -32767.f;
+				return static_cast<int16_t>(scaled);
+				};
+
 			// gx 00,01,10,11
-			view.gradBlock[bi + 0] = gxRow0[x];
-			view.gradBlock[bi + 1] = gxRow0[x + 1];
-			view.gradBlock[bi + 2] = gxRow1[x];
-			view.gradBlock[bi + 3] = gxRow1[x + 1];
+			view.gradBlockInt16[bi + 0] = quant(gxRow0[x]);
+			view.gradBlockInt16[bi + 1] = quant(gxRow0[x + 1]);
+			view.gradBlockInt16[bi + 2] = quant(gxRow1[x]);
+			view.gradBlockInt16[bi + 3] = quant(gxRow1[x + 1]);
 
 			// gy 00,01,10,11
-			view.gradBlock[bi + 4] = gyRow0[x];
-			view.gradBlock[bi + 5] = gyRow0[x + 1];
-			view.gradBlock[bi + 6] = gyRow1[x];
-			view.gradBlock[bi + 7] = gyRow1[x + 1];
+			view.gradBlockInt16[bi + 4] = quant(gyRow0[x]);
+			view.gradBlockInt16[bi + 5] = quant(gyRow0[x + 1]);
+			view.gradBlockInt16[bi + 6] = quant(gyRow1[x]);
+			view.gradBlockInt16[bi + 7] = quant(gyRow1[x + 1]);
 		}
 	}
 }
@@ -2068,56 +2736,61 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 
   size_t numPixels = imageA.cols * imageA.rows;
 	static thread_local std::vector<uint8_t> mask;
-	if (mask.size() != imageA.cols * imageA.rows)
-    mask.resize(numPixels);
+  mask.resize(numPixels);
 
-	DEC_Image(float, imageAB);
-	imageA.copyTo(imageAB);
+  static thread_local TImage<uint16_t> imageAB;
+  imageAB.create(imageA.rows, imageA.cols);
 	ImageMeshWarp(viewA, depthMapA, cameraA, depthMapB, cameraB, imageB, imageAB, mask);
+
 	// compute ZNCC and its gradient
-	const TImage<Real>* imageMeanA, * imageVarA;
+	const TImage<uint16_t>* imageMeanA;
+	const TImage<Real> * imageVarA;
 	if (nReduceMemory) {
-		DEC_Image(Real, _imageMeanA);
-		DEC_Image(Real, _imageVarA);
+		static thread_local TImage<uint16_t> _imageMeanA;
+		static thread_local TImage<Real> _imageVarA;
 		ComputeLocalVariance(viewA.image, mask, _imageMeanA, _imageVarA);
 		imageMeanA = &_imageMeanA;
 		imageVarA = &_imageVarA;
 	}
 	else {
+		throw; // Unsupported
+#if 0
 		imageMeanA = &viewA.imageMean;
 		imageVarA = &viewA.imageVar;
+#endif
 	}
-	DEC_Image(Real, imageMeanAB);
-	DEC_Image(Real, imageVarAB);
-	ComputeLocalVariance(imageAB, mask, imageMeanAB, imageVarAB);
+	static thread_local TImage<uint16_t> imageMeanAB;
+	static thread_local TImage<Real> imageVarAB;
+	ComputeLocalVariance2(imageAB, mask, imageMeanAB, imageVarAB);
 
 	static thread_local TImage<Real> imageDZNCC;
 	const float score(ComputeLocalZNCC(imageA, *imageMeanA, *imageVarA, imageAB, imageMeanAB, imageVarAB, mask, imageDZNCC));
-#ifdef MESHOPT_TYPEPOOL
-	DST_Image(imageVarAB);
-	DST_Image(imageMeanAB);
-	if (nReduceMemory) {
-		DST_Image(*((TImage<Real>*)imageMeanA));
-		DST_Image(*((TImage<Real>*)imageVarA));
-	}
-	DST_Image(imageAB);
-#endif
 	// compute field gradient
 	const Real RegularizationScale((Real)((REAL)(imageDataA.avgDepth * imageDataB.avgDepth) / (cameraA.GetFocalLength() * cameraB.GetFocalLength())));
 	//DEC_BitMatrix(localNorm);
 	//jpb wip bug set this here
 	//localNorm.memset(0);
-	static thread_local std::vector<bool> localNorm;
-  localNorm.assign(photoGrad.size(), false);
+	static thread_local std::vector<uint64_t> localNorm;
+	localNorm.assign((photoGrad.size() + 63) / 64, 0);
 	ComputePhotometricGradient(faces, faceNormals, viewA, cameraA, cameraB, viewB, imageDZNCC, mask, threadGrad, localNorm, RegularizationScale);
 
 	// threadGrad has been updated.
 	// localNorm must be merged to threadNorm:
+	uint32_t* __restrict norm = threadNorm.data();
+	const uint64_t* __restrict bits = localNorm.data();
+	size_t count = photoGrad.size();
+	size_t words = (count + 63) >> 6;
 
-	for (size_t i = 0, cnt = localNorm.size(); i < cnt; ++i) {
-		if (localNorm[i]) {
-			++threadNorm[i];
+	size_t idx = 0;
+	for (size_t w = 0; w < words; ++w) {
+		uint64_t mask = bits[w];
+		while (mask) {
+			uint64_t bit = mask & -mask;       // lowest set bit
+			unsigned i = ctz64(mask);
+			norm[idx + i] += 1;                // increment norm
+			mask ^= bit;                       // clear that bit
 		}
+		idx += 64;
 	}
 	//DST_BitMatrix(localNorm);
 
@@ -2325,6 +2998,9 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 			Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> gradients(refine.vertices.GetSize(), 3);
 			Util::Progress progress(_T("Processed iterations"), iters);
 			GET_LOGCONSOLE().Pause();
+
+      constexpr int numGradentApplicationsBeforeOctreeRebuild = 10;
+			int numGradientApplications = numGradentApplicationsBeforeOctreeRebuild;
 			for (int iter = 0; iter < iters; ++iter) {
 				refine.iteration = (unsigned)iter;
 				refine.nAlternatePair = (iter + 1 < iters ? nAlternatePair : 0);
@@ -2333,7 +3009,15 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				// evaluate residuals and gradients
 				if (bAdaptMesh)
 					refine.vertexDepth.Resize(refine.vertices.GetSize());
-				const double cost = refine.ScoreMesh(gradients.data());
+
+        // Octree rebuilding is very expensive so we limit its frequency.
+        // It is technically not accurate to do so, but in practice the vertices move slowly enough for this to be acceptable.
+				bool rebuildOctree = numGradientApplications >= numGradentApplicationsBeforeOctreeRebuild;
+				const double cost = refine.ScoreMesh(gradients.data(), rebuildOctree);
+				if (rebuildOctree) {
+					numGradientApplications = 0;
+				}
+				
 				double gv(0);
 				VIndex numVertsRemoved(0);
 				if (bAdaptMesh) {
@@ -2360,6 +3044,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 						refine.ListVertexFacesPost();
 					}
 					refine.vertexDepth.Empty();
+					numGradientApplications = numGradentApplicationsBeforeOctreeRebuild;
 				}
 				else {
 					// apply gradients
@@ -2369,6 +3054,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 						vert -= Cast<Vertex::Type>(grad * gstep);
 						gv += norm(grad);
 					}
+					++numGradientApplications;
 				}
 				DEBUG_EXTRA("\t%2d. f: %.5f (%.4e)\tg: %.5f (%.4e - %.4e)\ts: %.3f\tv: %5u", iter + 1, cost, cost / refine.vertices.GetSize(), gradients.norm(), gradients.norm() / refine.vertices.GetSize(), gv / refine.vertices.GetSize(), gstep, numVertsRemoved);
 				gstep *= 0.98;
