@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 11;
+	constexpr int version = 12;
 
 	return version;
 }
