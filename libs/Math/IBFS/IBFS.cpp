@@ -126,7 +126,7 @@ void IBFSGraph::initSize(int n, int)
 
 		for (int i = begin; i < end; ++i) {
 			Node& node = nodes[i];
-			node.arcCount = 0;
+			node.arcCountBuild.store(0, std::memory_order_relaxed);
 			node.excess = 0;
 			node.parent = nullptr;
 			node.firstSon = nullptr;
@@ -146,9 +146,9 @@ void IBFSGraph::initSize(int n, int)
 }
 
 template <bool sTree>
-void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
-	Node* y;
-	Arc* a;
+void IBFSGraph::augmentTree(Node* __restrict x, EdgeCap bottleneck) {
+	Node* __restrict y;
+	Arc* __restrict a;
 	int hopCount = 0;
 
 	while (true) {
@@ -195,10 +195,10 @@ void IBFSGraph::augmentTree(Node* x, EdgeCap bottleneck) {
 	}
 }
 
-void IBFSGraph::augment(Arc *bridge)
+void IBFSGraph::augment(Arc * __restrict bridge)
 {
-	Node* x;
-	Arc *a;
+	Node* __restrict x;
+	Arc* __restrict a;
 	EdgeCap bottleneck;
 	Real pushesBefore;
 
@@ -267,8 +267,8 @@ void IBFSGraph::augment(Arc *bridge)
 template <bool sTree>
 void IBFSGraph::adoption()
 {
-	Node *x, *y, *z;
-  Arc *a;
+	Node * __restrict x, * __restrict  y, * __restrict z;
+  Arc * __restrict  a;
   bool threePass = false;
   int minLabel, numOrphans = 0, numOrphansUniq = 0;
 
@@ -300,8 +300,8 @@ void IBFSGraph::adoption()
 
     if (x->label != (sTree ? 1 : -1)) {
       minLabel = x->label - (sTree ? 1 : -1);
-      for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
-        a = &x->arcs[i];
+			for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+				a = &x->arcs[i];
 				stats.incOrphanArcs1();
 				y = a->head;
         if ((sTree ? a->isRevResidual : a->rCap) && y->label == minLabel) {
@@ -336,8 +336,8 @@ void IBFSGraph::adoption()
     // relabel
 		minLabel = (sTree ? topLevelS : -topLevelT);
     if (x->label != minLabel) {
-      for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
-        a = &x->arcs[i];
+			for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+				a = &x->arcs[i];
 			stats.incOrphanArcs2();
 			y = a->head;
 			if ((sTree ? a->isRevResidual : a->rCap) &&
@@ -380,7 +380,7 @@ void IBFSGraph::adoption3Pass()
 			if (x->parent == NULL) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
 				destLabel = x->label - (sTree ? 1 : -1);
-				for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
+				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 					a = &x->arcs[i];
 					y = a->head;
 					if ((sTree ? a->isRevResidual : a->rCap) &&
@@ -407,7 +407,7 @@ void IBFSGraph::adoption3Pass()
 			// pass 3: lower potential sons and/or find first parent
 			if (x->label != (sTree ? topLevelS : -topLevelT)) {
 				minLabel = x->label + (sTree ? 1 : -1);
-				for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
+				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 					a = &x->arcs[i];
 					y = a->head;
 
@@ -454,8 +454,8 @@ void IBFSGraph::growth() {
 		if (dirS) stats.incGrowthS();
 		else stats.incGrowthT();
 
-    for (int i = 0; i < reinterpret_cast<int&>(x->arcCount); ++i) {
-      Arc* a = &x->arcs[i];
+		for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+			Arc* a = &x->arcs[i];
 
 			if ((dirS ? a->rCap : a->isRevResidual) == 0) continue;
 

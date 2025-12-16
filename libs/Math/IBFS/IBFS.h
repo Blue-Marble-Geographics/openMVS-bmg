@@ -180,6 +180,19 @@ public:
 	void setCompactSlowInitMode(bool a_compactSlowInitMode) {
 		compactSlowInitMode = a_compactSlowInitMode;
 	}
+
+	void IBFSGraph::finalizeGraph()
+	{
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < numNodes; ++i) {
+			nodes[i].arcCount =
+				nodes[i].arcCountBuild.load(std::memory_order_relaxed);
+		}
+
+		// Optional but documents the phase boundary
+		std::atomic_thread_fence(std::memory_order_acquire);
+	}
+
 	void initGraph();
 	EdgeCap computeMaxFlow();
 
@@ -230,8 +243,8 @@ public:
 	}
 #else
 	struct Arc {
-		Node*		head;
-		Arc*		rev;
+		Node* __restrict 	head;
+		Arc* __restrict 	rev;
 		EdgeCap			rCap;
 		unsigned char	isRevResidual;
 	};
@@ -240,11 +253,12 @@ public:
 		static constexpr int kMaxArcs = 4;
 
 		// Group together arcCount + arcs for locality
-		std::atomic<int> arcCount;               // 4
+		std::atomic<int> arcCountBuild;  // build phase only
+		int arcCount;               // 4
 		Arc arcs[kMaxArcs];         // 32 (assuming Arc = 8 bytes)
 
 		EdgeCap excess;             // 4
-		Arc* parent;                // 8
+		Arc* __restrict parent;                // 8
 
 		Node* firstSon;             // 8
 		Node* nextPtr;              // 8
@@ -368,8 +382,8 @@ public:
 	Buckets orphanBuckets;
 	bool verbose;
 
-	void augment(Arc *bridge);
-	template <bool sTree> void augmentTree(Node *x, EdgeCap bottleneck);
+	void augment(Arc* __restrict bridge);
+	template <bool sTree> void augmentTree(Node* __restrict x, EdgeCap bottleneck);
 	template <bool sTree> void adoption();
 	template <bool sTree> void adoption3Pass();
 	template <bool dirS> void growth();
@@ -433,8 +447,8 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 
 #if 1 // JPB WIP Faster than serial code by 25%
 	// Atomically get the next arc index for each node
-	int uArcIdx = u->arcCount.fetch_add(1, std::memory_order_relaxed);
-	int vArcIdx = v->arcCount.fetch_add(1, std::memory_order_relaxed);
+	int uArcIdx = u->arcCountBuild.fetch_add(1, std::memory_order_relaxed);
+	int vArcIdx = v->arcCountBuild.fetch_add(1, std::memory_order_relaxed);
 
 	Arc* __restrict uv = &u->arcs[uArcIdx];
 	Arc* __restrict vu = &v->arcs[vArcIdx];
@@ -453,7 +467,6 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 	vu->rCap = revCap;
 	vu->isRevResidual = (cap > 0);
 }
-
 
 inline bool IBFSGraph::isNodeOnSrcSide(int nodeIndex) const
 {

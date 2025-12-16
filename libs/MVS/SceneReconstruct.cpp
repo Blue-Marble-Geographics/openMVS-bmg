@@ -222,6 +222,11 @@ public:
 		return graph.isNodeOnSrcSide((int)n);
 	}
 
+	void FinalizeGraph()
+	{
+    graph.finalizeGraph();
+	}
+
 	graph_type graph;
 };
 #else
@@ -3811,8 +3816,10 @@ advance2:
 			// constants
 			const __m128 kTwo = _mm_set1_ps(2.0f);
 			const __m128 kFour = _mm_set1_ps(4.0f);
+			const __m128 kEight = _mm_set1_ps(8.0f);
 			const __m128 kHalf = _mm_set1_ps(0.5f);
 			const __m128 kQtr = _mm_set1_ps(0.25f);
+			const __m128 kEighth = _mm_set1_ps(1.0f/8.0f);
 			const __m128 kMaxV = _mm_set1_ps(maxCap);
 
 			for (ptrdiff_t idx = start; idx < end; ++idx) {
@@ -3856,6 +3863,13 @@ advance2:
 
 					// identical quantization: multiply add truncate
 #if 1
+					const __m128 vScaled = _mm_add_ps(_mm_mul_ps(v, _mm_set1_ps(8.0f)), kHalf);
+					const	__m128i ival = _mm_cvttps_epi32(vScaled);
+					const __m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(ival), _mm_set1_ps(1.0f / 8.0f));
+#else
+
+
+#if 1
 					v = _mm_add_ps(_mm_mul_ps(v, kTwo), kHalf);
 					__m128i iscaled = _mm_cvttps_epi32(v);
 					__m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(iscaled), kHalf); // Divide by 2.0f instead of 4.0f
@@ -3863,6 +3877,7 @@ advance2:
 					v = _mm_add_ps(_mm_mul_ps(v, kFour), kHalf);
 					__m128i iscaled = _mm_cvttps_epi32(v);
 					__m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(iscaled), kQtr);
+#endif
 #endif
 
 					const float iCap = _mm_cvtss_f32(qv);
@@ -3956,6 +3971,8 @@ advance2:
 
 		std::cout << "   Startup: " << rdtscToSeconds(t1 - t0, cpuHz) << "\n";
 
+		graph.FinalizeGraph();
+
 		// find graph-cut solution
 		const float maxflow(graph.ComputeMaxFlow());
 
@@ -3965,6 +3982,17 @@ advance2:
 		std::cout << "   Graph-cut itself: " << rdtscToSeconds(t2 - t1, cpuHz) << "\n";
 
 #if 1 // parallel surface extraction.
+		std::vector<uint8_t> nodeSide(g.numNodes);
+		const bool noActiveT = (g.activeT1.len == 0);
+
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < g.numNodes; ++i) {
+			const int lbl = g.nodes[i].label;
+			nodeSide[i] = (lbl != 0 && lbl != g.numNodes)
+				? (lbl > 0)
+				: noActiveT;
+		}
+
 		struct LocalMeshData {
 			std::vector<Mesh::Face> localFaces;
 		  std::vector<uint32_t> localVertexIDs; // vertex idxs
@@ -3992,9 +4020,12 @@ advance2:
 			ptrdiff_t start = tid * chunk;
 			ptrdiff_t end = std::min(start + chunk, (ptrdiff_t) totalCells);
 
+			const uint8_t* __restrict side = nodeSide.data();
+
 			for (ptrdiff_t idx = start; idx < end; ++idx) {
 				auto ci = cellIterators[idx];
 				const cell_size_t ciID = ci->info();
+				const bool ciType = side[ciID];
 
 				Mesh::Face face;
 				for (int f = 0; f < 4; ++f) {
@@ -4003,8 +4034,7 @@ advance2:
 					const cell_size_t cjID = cj->info();
 					if (ciID < cjID) continue;
 
-					const bool ciType = graph.IsNodeOnSrcSide(ciID);
-					if (ciType == graph.IsNodeOnSrcSide(cjID)) continue;
+					if (ciType == side[cjID]) continue;
 
 					const triangle_vhandles_t tri = getTriangle(ci, f);
 

@@ -16,7 +16,7 @@
 // FASTER_SIDE_ORIENTED_SPHERE can cause numerical instability and errors in output.
 // This may be useful in the future, if revised, but remains inactive for now.
 #undef FASTER_SIDE_ORIENTED_SPHERE
-#undef CGAL_USE_SSE2_MAX // JPB WIP BUG
+#define CGAL_USE_SSE2_MAX // JPB WIP BUG
 #include <CGAL/Profile_counter.h>
 #include <CGAL/Filtered_kernel/internal/Static_filters/Static_filter_error.h>
 

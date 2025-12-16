@@ -567,49 +567,77 @@ public:
         Cell_handle_union() {}
     };
     std::array <Cell_handle_union, maximal_nb_of_facets_of_small_hole> new_cells;
-    for (unsigned char local_facet_index = 0, end = static_cast<unsigned char>(facets.size());
-         local_facet_index < end; ++local_facet_index) {
-      const Facet f = mirror_facet(facets[local_facet_index]);
-      Cell_handle c = f.first;
-      f.first->tds_data().clear(); // was on boundary
-      
-      auto* __restrict indices = getFacetVertexIndices(f.second);
- 
-      const Vertex_handle u = c->vertex(indices[0]);
-      const Vertex_handle v = c->vertex(indices[1]);
-      const Vertex_handle w = c->vertex(indices[2]);
-      
-      u->set_cell(f.first);
-      v->set_cell(f.first);
-      w->set_cell(f.first);
+    for (size_t local_facet_index = 0, cnt = facets.size();
+         local_facet_index < cnt; ++local_facet_index) {
+
+      const Facet& f = facets[local_facet_index];
+
+      Cell_handle neighbor_cell = f.first->neighbor(f.second);
+      const int opposite_index = neighbor_cell->index(f.first);
+      neighbor_cell->tds_data().clear(); // was on boundary
+
+      // const Facet f = mirror_facet(facets[local_facet_index]);
+
+      auto* __restrict indices = getFacetVertexIndices(opposite_index);
+      const unsigned char idx_u = indices[0];
+      const unsigned char idx_v = indices[1];
+      const unsigned char idx_w = indices[2];
+
+      const Vertex_handle u = neighbor_cell->vertex(idx_u);
+      const Vertex_handle v = neighbor_cell->vertex(idx_v);
+      const Vertex_handle w = neighbor_cell->vertex(idx_w);
+      u->set_cell(neighbor_cell);
+      v->set_cell(neighbor_cell);
+      w->set_cell(neighbor_cell);
       const Cell_handle nc = create_cell(v, u, w, nv);
+
+
+
       new_cells[local_facet_index].h = nc;
       nv->set_cell(nc);
-      nc->set_neighbor(3, f.first);
-      f.first->set_neighbor(f.second, nc);
+      nc->set_neighbor(3, neighbor_cell);
+      neighbor_cell->set_neighbor(opposite_index, nc);
 
       vertex_pair_facet_map.set({u, v}, {local_facet_index,
-                                         static_cast<unsigned char>(nc->index(w))});
+                                         static_cast<unsigned char>(2)});
       vertex_pair_facet_map.set({v, w}, {local_facet_index,
-                                         static_cast<unsigned char>(nc->index(u))});
+                                         static_cast<unsigned char>(1)});
       vertex_pair_facet_map.set({w, u}, {local_facet_index,
-                                         static_cast<unsigned char>(nc->index(v))});
+                                         static_cast<unsigned char>(0)});
     }
 
-    for(auto it = vertex_pair_facet_map.begin(); it != vertex_pair_facet_map.end(); ++it){
-      const std::pair<Vertex_pair,Local_facet>& ef = *it;
-      if(ef.first.first < ef.first.second){
-        const Facet f = Facet{new_cells[ef.second.first].h, ef.second.second};
-        vertex_pair_facet_map.clear(it);
-        const auto p = vertex_pair_facet_map.get_and_erase(std::make_pair(ef.first.second, ef.first.first));
-        const Facet n = Facet{new_cells[p.first].h, p.second};
-        f.first->set_neighbor(f.second, n.first);
-        n.first->set_neighbor(n.second, f.first);
+    auto& map = vertex_pair_facet_map;
+    constexpr int map_capacity = maximal_nb_of_facets_of_small_hole * 8;
+    Vertex_pair reverse;
+    for (auto it = map.begin(); it != map.end(); ++it) {
+
+      const auto& ef = *it;
+      const Vertex_handle a = ef.first.first;
+      const Vertex_handle b = ef.first.second;
+
+      if (a < b) [[likely]] {
+
+        const int f0 = ef.second.first;
+        const int e0 = ef.second.second;
+
+        map.clear(it);
+
+        reverse.first = b;
+        reverse.second = a;
+
+        unsigned h = map.hash(reverse) & (map_capacity - 1);
+        const auto p = map.get_and_erase2(reverse, h);
+
+        Cell_handle c0 = new_cells[f0].h;
+        Cell_handle c1 = new_cells[p.first].h;
+
+        c0->set_neighbor(e0, c1);
+        c1->set_neighbor(p.second, c0);
       }
     }
-    for(Cell_handle c : cells){
-      c->tds_data().clear(); // was in conflict
-    }
+    //for(Cell_handle c : cells){
+    //  c->tds_data().clear(); // was in conflict
+   // }
     delete_cells(cells.begin(), cells.end());
     vertex_pair_facet_map.clear();
     return nv;

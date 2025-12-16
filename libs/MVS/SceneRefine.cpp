@@ -1391,6 +1391,7 @@ void MeshRefine::ProjectMesh(
 		uint8_t* __restrict validPtr = view.isValid.data();
 
 		for (size_t y = boxMinI.y; y <= boxMaxI.y; ++y) {
+
 			size_t base = size_t(y) * width;
 			uint16_t* __restrict depthGenRow = depthGenPtr + base;
 			Depth* __restrict depthRow = depthPtr + base;
@@ -1398,75 +1399,68 @@ void MeshRefine::ProjectMesh(
 			Point3f* __restrict baryRow = baryPtr + base;
 			uint8_t* __restrict validRow = validPtr + base;
 
-			float w0 = w0_row, w1 = w1_row, w2 = w2_row;
+			float w0 = w0_row;
+			float w1 = w1_row;
+			float w2 = w2_row;
 
-			const bool rowFullyInside = (w0 >= 0.f && w1 >= 0.f && w2 >= 0.f);
+			int x = minXi;
 
-			if (rowFullyInside) {
-				// ---------------------------------------------------------------
-				// FAST PATH: Entire scanline inside triangle → no inside test
-				// ---------------------------------------------------------------
-				for (int x = minXi; x <= maxXi; ++x) {
-					// Perspective-correct interpolation
-					const float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
-					float invDen = 1.f / denom;
-
-					const float bx = (w0 * iz0) * invDen;
-					const float by = (w1 * iz1) * invDen;
-					const float bz = 1.f - bx - by;
-
-					const float z = bx * z0 + by * z1 + bz * z2;
-
-					const float old = (depthGenRow[x] == depthCurGen)
-						? depthRow[x]
-						: std::numeric_limits<float>::infinity();
-
-					if (old > z) {
-						depthGenRow[x] = depthCurGen;
-						depthRow[x] = z;
-						faceRow[x] = (cuint32_t)fi;
-						baryRow[x] = { bx, by, bz };
-						validRow[x] = 1;
-					}
-
-					w0 += w0_dx;
-					w1 += w1_dx;
-					w2 += w2_dx;
+			// -------------------------------------------------------------------
+			// Phase 1: advance until entering triangle (cheap rejects only)
+			// -------------------------------------------------------------------
+			while (x <= maxXi) {
+				if (w0 >= 0.f && w1 >= 0.f && w0 + w1 <= 1.f) {
+					break; // found first inside pixel
 				}
-			}	else {
-				for (size_t x = boxMinI.x; x <= boxMaxI.x; ++x) {
-					const uint32_t inside = (uint32_t)(w0 >= 0.f) &
-						(uint32_t)(w1 >= 0.f) &
-						(uint32_t)(w2 >= 0.f);
 
-					if (inside) {
-						const float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
-						const float invDen = 1.f / denom;
+				w0 += w0_dx;
+				w1 += w1_dx;
+				w2 += w2_dx;
 
-						const float bx = (w0 * iz0) * invDen;
-						const float by = (w1 * iz1) * invDen;
-						const float bz = 1.f - bx - by;
-
-						const float z = bx * z0 + by * z1 + bz * z2;
-
-						const float old = (depthGenRow[x] == depthCurGen)
-							? depthRow[x]
-							: std::numeric_limits<float>::infinity();
-
-						if (old > z) {
-							depthGenRow[x] = depthCurGen;
-							depthRow[x] = z;
-							faceRow[x] = (cuint32_t)fi;
-							baryRow[x] = { bx, by, bz };
-							validRow[x] = 1;
-						}
-					}
-					w0 += w0_dx;
-					w1 += w1_dx;
-					w2 += w2_dx;
-				}
+				++x;
 			}
 
+			if (x > maxXi)
+				goto next_row; // entire row outside, skip
+
+			// -------------------------------------------------------------------
+			// Phase 2: inside span - no inside tests in main loop
+			// -------------------------------------------------------------------
+			for (; x <= maxXi; ++x) {
+
+				// perspective correct barycentrics
+				float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
+				float invDen = 1.f / denom;
+
+				float bx = (w0 * iz0) * invDen;
+				float by = (w1 * iz1) * invDen;
+				float bz = 1.f - bx - by;
+
+				float z = bx * z0 + by * z1 + bz * z2;
+
+				float old = (depthGenRow[x] == depthCurGen)
+					? depthRow[x]
+					: std::numeric_limits<float>::infinity();
+
+				if (old > z) {
+					depthGenRow[x] = depthCurGen;
+					depthRow[x] = z;
+					faceRow[x] = (cuint32_t)fi;
+					baryRow[x] = { bx, by, bz };
+					validRow[x] = 1;
+				}
+
+				// advance
+				w0 += w0_dx;
+				w1 += w1_dx;
+				w2 += w2_dx;
+
+				// exit span
+				if (w0 < 0.f || w1 < 0.f || (w0 + w1) > 1.f)
+					break;
+			}
+
+		next_row:
 			w0_row += w0_dy;
 			w1_row += w1_dy;
 			w2_row += w2_dy;

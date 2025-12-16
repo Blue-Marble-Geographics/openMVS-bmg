@@ -580,6 +580,80 @@ template<class EAR>
 /// Given a mesh search for all the holes smaller than a given size and fill them
 /// It returns the number of filled holes.
 #if 1
+    // New modernized version.
+    template<class EAR, class MESH>
+    static int EarCuttingIntersectionFill(
+      MESH& m,
+      int maxHoleSize,
+      bool selected = false,
+      CallBackPos* cb = nullptr)
+    {
+      std::vector<typename tri::Hole<MESH>::Info> vinfo;
+      tri::Hole<MESH>::GetInfo(m, selected, vinfo);
+      const size_t total = vinfo.size();
+      if (total == 0) return 0;
+
+      int closed = 0;
+      int idx = 0;
+
+      std::vector<typename MESH::VertexPointer> ring;
+      std::vector<typename MESH::FacePointer*> facePtrToBeUpdated;
+
+      for (auto& info : vinfo)
+      {
+        if (cb) (*cb)((++idx * 10) / total, "Closing Holes");
+
+        if (info.size >= maxHoleSize)
+          continue;
+
+        // Build boundary ring
+        ring.clear();
+        ring.reserve(info.size);
+
+        typename tri::Hole<MESH>::PosType p = info.p;
+        int guard = 0;
+        do {
+          ring.push_back(p.v);
+          p.NextB();
+        } while (p != info.p && ++guard < 100000);
+
+        if (ring.size() < 3 || guard >= 100000)
+          continue;
+
+        closed++;
+
+        // Build adjacency ring for only boundary-adjacent faces
+        EAR::AdjacencyRing().clear();
+        EAR::AdjacencyRing().reserve(info.size * 3);
+
+        p = info.p;
+        do {
+          typename tri::Hole<MESH>::PosType q = p;
+          do {
+            q.FlipE();
+            q.FlipF();
+            EAR::AdjacencyRing().push_back(q.f);
+          } while (!q.IsBorder());
+          p.NextB();
+        } while (p != info.p);
+
+        // Fill only local adjacency
+        facePtrToBeUpdated.clear();
+        facePtrToBeUpdated.reserve(EAR::AdjacencyRing().size());
+
+        for (auto fptr : EAR::AdjacencyRing())
+          facePtrToBeUpdated.push_back(&fptr);
+
+        tri::Hole<MESH>::FillHoleEar<EAR>(m, info.p, facePtrToBeUpdated);
+
+        EAR::AdjacencyRing().clear();
+      }
+
+      return closed;
+    }
+
+#else
+#if 0
     template<class EAR>
     static int EarCuttingIntersectionFill(MESH& m, int sizeHole, bool selected = false, CallBackPos* cb = nullptr)
     {
@@ -611,13 +685,21 @@ template<class EAR>
         // Fan root = first vertex in ring
         int root = 0;
 
-        // Create fan faces
-        for (int i = 1; i + 1 < n; ++i)
-        {
+        std::vector<typename MESH::VertexPointer> poly;
+        poly.reserve(n);
+        for (int i = 0; i < n; ++i)
+          poly.push_back(&m.vert[ring[i]]);
+
+        // VCGLib's ear cutting returns *indices* of the triangulation
+        std::vector<size_t> triIndices;
+        if (!EAR::EarCutting(poly, triIndices))
+          continue; // triangulation failed (rare)
+
+        for (size_t i = 0; i < triIndices.size(); i += 3) {
           FaceIterator fi = tri::Allocator<MESH>::AddFaces(m, 1);
-          fi->V(0) = &m.vert[ring[root]];
-          fi->V(1) = &m.vert[ring[i]];
-          fi->V(2) = &m.vert[ring[i + 1]];
+          fi->V(0) = poly[triIndices[i]];
+          fi->V(1) = poly[triIndices[i + 1]];
+          fi->V(2) = poly[triIndices[i + 2]];
         }
       }
       return closed;
@@ -673,6 +755,7 @@ template<class EAR>
       }
       return holeCnt;
     }
+#endif
 #endif
 
     static void GetInfo(MESH& m, bool Selected, std::vector<Info >& VHI)
