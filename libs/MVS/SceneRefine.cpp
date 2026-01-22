@@ -177,7 +177,7 @@ public:
 		}
 		void Clear() {
 			Base::Clear();
-			faceMap.memset((uint8_t)NO_ID);
+			faceMap.fill(NO_ID);
 			baryMap.memset(0);
 		}
 		void Raster(const ImageRef& pt, const Triangle& t, const Point3f& bary) {
@@ -278,6 +278,7 @@ public:
 	const unsigned nReduceMemory; // recompute image mean and variance in order to reduce memory requirements
 	unsigned nAlternatePair; // using an image pair alternatively as reference image (0 - both, 1 - alternate, 2 - only left, 3 - only right)
 	unsigned iteration; // current refinement iteration
+	double photoEnergyLast = 0.0;
 
 	Scene& scene; // the mesh vertices and faces
 
@@ -1035,22 +1036,35 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 		}
 	} // end omp parallel
 
+	// --------------------------------------------------
+	// DIAGNOSTICS: accumulate photometric energy
+	// (must be done BEFORE clearing tileEnergyAccum)
+	// --------------------------------------------------
+	double photoEnergyIter = 0.0;
+	for (size_t vid = 0; vid < views.size(); ++vid) {
+		const View& view = views[vid];
+		for (float e : view.tileEnergyAccum)
+			photoEnergyIter += e;
+	}
+
+	photoEnergyLast = photoEnergyIter;
+
 	// -----------------------------------------
 	// Update tileActive for the NEXT iteration
 	// -----------------------------------------
-	const float tileThreshold = 5e-4f;   // try 1e-3f for faster mode
+// Start conservative, get aggressive as we converge
+	float tileThreshold = (iteration < 3) ? 5e-4f : 1e-3f;
 
 	for (size_t vid = 0; vid < views.size(); ++vid)	{
 		View& view = views[vid];
 		size_t tcount = view.tilesX * view.tilesY;
 
-		for (size_t t = 0; t < tcount; ++t)	{
+		for (size_t t = 0; t < tcount; ++t) {
 			float E = view.tileEnergyAccum[t];
 
-			// The actual culling happens here:
 			view.tileActive[t] = (E > tileThreshold ? 1 : 0);
 
-			// Reset accumulator for next iteration
+			// Clear AFTER energy was captured
 			view.tileEnergyAccum[t] = 0.f;
 		}
 	}
@@ -1220,8 +1234,8 @@ void MeshRefine::ProjectMesh(
 	const auto& size = view.image.size();
 	const size_t numPixels = size.width * size.height;
 
-	thread_local std::vector<uint16_t> depthGen;
-	thread_local uint16_t depthCurGen = 1;
+	static thread_local std::vector<uint16_t> depthGen;
+	static thread_local uint16_t depthCurGen = 1;
 		// Resize if needed
 	if (depthGen.size() != numPixels) {
 		depthGen.assign(numPixels, 0);
@@ -1235,22 +1249,21 @@ void MeshRefine::ProjectMesh(
 	}
 
 	// init view data
+	// Maps must be completely filled or have a generator.
 	depthMap.create(size);
-	// Memset absolutely needed.
-	//depthMap.setTo(std::numeric_limits<float>::infinity());
 	faceMap.create(size);
 	baryMap.create(size);
 
 #ifdef VALIDATE_RASTERIZER
 	depthMap.memset(0);
-	faceMap.memset((uint8_t)NO_ID);
+	faceMap.fill(NO_ID);
 	baryMap.memset(0);
 #endif
 
 	view.isValid.assign(numPixels, 0);
 
 	//depthMap.memset(0);
-	//faceMap.memset((uint8_t)NO_ID);
+	//faceMap.memset(NO_ID); JPB WIP BUG Wrong format should be fill()
 	//baryMap.memset(0);
 
 	struct Triangle {
@@ -1264,6 +1277,9 @@ void MeshRefine::ProjectMesh(
 	const float minY = 3.f;
 	const float maxX = (float)(width - 4);
 	const float maxY = (float)(height - 4);
+
+	const float widthMinus1 = (float)(width - 1);
+	const float heightMinus1 = (float)(height - 1);
 
 	for (size_t fi = 0, cnt = rd.faces.size(); fi < cnt; ++fi) {
 		const Face& face = rd.faces[fi];
@@ -1304,7 +1320,7 @@ void MeshRefine::ProjectMesh(
 		// ignore back oriented triangles (negative area)
 		// flip winding to match OpenMVS screen-space convention
 		const float area = EdgeFunction2(v1, v2, v3);
-		if (area >= 0) {
+		if (area >= 0.f) {
 			continue;
 		}
 		// compute bounding-box fully containing the triangle
@@ -1325,8 +1341,8 @@ void MeshRefine::ProjectMesh(
 
 		// ---- Quick reject: fully outside screen ----
 		// This is the minimal correct check
-		if (boxMaxX < 0.0f || boxMinX >(width - 1) ||
-			boxMaxY < 0.0f || boxMinY >(height - 1))
+		if (boxMaxX < 0.0f || boxMinX > widthMinus1 ||
+			boxMaxY < 0.0f || boxMinY > heightMinus1)
 			continue;
 
 		// ---- Convert to integer bounding-box & clamp ----
@@ -1391,7 +1407,6 @@ void MeshRefine::ProjectMesh(
 		uint8_t* __restrict validPtr = view.isValid.data();
 
 		for (size_t y = boxMinI.y; y <= boxMaxI.y; ++y) {
-
 			size_t base = size_t(y) * width;
 			uint16_t* __restrict depthGenRow = depthGenPtr + base;
 			Depth* __restrict depthRow = depthPtr + base;
@@ -1403,11 +1418,10 @@ void MeshRefine::ProjectMesh(
 			float w1 = w1_row;
 			float w2 = w2_row;
 
-			int x = minXi;
-
 			// -------------------------------------------------------------------
 			// Phase 1: advance until entering triangle (cheap rejects only)
 			// -------------------------------------------------------------------
+			int x = minXi;
 			while (x <= maxXi) {
 				if (w0 >= 0.f && w1 >= 0.f && w0 + w1 <= 1.f) {
 					break; // found first inside pixel
@@ -1427,7 +1441,6 @@ void MeshRefine::ProjectMesh(
 			// Phase 2: inside span - no inside tests in main loop
 			// -------------------------------------------------------------------
 			for (; x <= maxXi; ++x) {
-
 				// perspective correct barycentrics
 				float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
 				float invDen = 1.f / denom;
@@ -1670,24 +1683,67 @@ void MeshRefine::ProjectMesh(
 						continue;
 					}
 
+					const FIndex f = faceRow[c];  // Needed for normal check anyway
+
           // JPB WIP BUG Experiment with depth discontinuity culling
 					// 1. Depth discontinuity pruning (A-side)
-					const float depthThresh = 0.05f * depth;
+					// Adaptive threshold: smaller for close, larger for far
+					const float depthThresh = 0.05f * depth + 0.01f;  // 5% + 1cm baseline
+					const float normalThresh = 0.15f;  // ~81' angle change
 
-					// left neighbor (only if inside tile)
-					if (c > tx) {
-						float dzdx = fabs(depth - depthRow[c - 1]);
-						if (dzdx > depthThresh) {
-							isValidRow[c] = 0;
-							continue;
+					bool isEdge = false;
+
+					// Combined horizontal + vertical depth check (branchless)
+					if (c > 0 && c < cols - 1) {
+						float dzdx = MAXF(fabs(depth - depthRow[c - 1]),
+							fabs(depth - depthRow[c + 1]));
+
+						if (r > 0 && r < rows - 1) {
+							float dzdy = MAXF(fabs(depth - depthMap.ptr<float>(r - 1)[c]),
+								fabs(depth - depthMap.ptr<float>(r + 1)[c]));
+
+							// Single comparison for both axes
+							if (MAXF(dzdx, dzdy) > depthThresh) {
+								isEdge = true;
+							}
+						}
+						else if (dzdx > depthThresh) {
+							isEdge = true;
 						}
 					}
 
-					// above neighbor
-					if (r > ty) {
-						float prevDepth = depthMap.ptr<float>(r - 1)[c];
-						float dzdy = fabs(depth - prevDepth);
-						if (dzdy > depthThresh) {
+					// Normal check (only if depth check passed)
+					if (!isEdge && c > 0 && c < cols - 1) {
+						const FIndex fLeft = faceRow[c - 1];
+						const FIndex fRight = faceRow[c + 1];
+
+						if (isValidRow[c - 1] && isValidRow[c + 1]) {
+							const FIndex fLeft = faceRow[c - 1];   // Safe: we know it's valid
+							const FIndex fRight = faceRow[c + 1];  // Safe: we know it's valid
+
+							// Now safe to access rd.normals[] with local indices
+							const Grad& N = rd.normals[f];
+							const float dotLeft = N.dot(rd.normals[fLeft]);
+							const float dotRight = N.dot(rd.normals[fRight]);
+
+							// Branchless: compute minimum dot product
+							const float minDot = (dotLeft < dotRight ? dotLeft : dotRight);
+
+							if (minDot < (1.0f - normalThresh)) {
+								isEdge = true;
+							}
+						}
+					}
+					if (isEdge) {
+						isValidRow[c] = 0;
+						continue;
+					}
+
+					// Make vertical symmetric with horizontal
+					if (r > 0 && r < rows - 1) {
+						float dzdy_above = fabs(depth - depthMap.ptr<float>(r - 1)[c]);
+						float dzdy_below = fabs(depth - depthMap.ptr<float>(r + 1)[c]);
+						if (dzdy_above > depthThresh && dzdy_below > depthThresh) {
 							isValidRow[c] = 0;
 							continue;
 						}
@@ -1695,23 +1751,29 @@ void MeshRefine::ProjectMesh(
 
 					// *** EARLY BARYCENTRIC PRUNE *** 
 					const Point3f& b = baryRow[c];
-					if (b.x <= 0.f || b.y <= 0.f || b.z <= 0.f) {
+					constexpr float epsilon = -1e-7f;  // Allow tiny negatives (numerical error)
+					if (b.x < epsilon || b.y < epsilon || b.z < epsilon) {
 						isValidRow[c] = 0;
 						continue;
 					}
 
 					// 2. Texture flatness prune (A-image)
 					// Remove low-information pixels before expensive steps.
-					{
-						const float center = view.image(r, c);
-						const float left = (c > 0) ? view.image(r, c - 1) : center;
-						const float up = (r > 0) ? view.image(r - 1, c) : center;
+					// Check 4-connected neighborhood
+					const float center = view.image(r, c);
+					const float left = (c > 0) ? view.image(r, c - 1) : center;
+					const float right = (c < cols - 1) ? view.image(r, c + 1) : center;
+					const float up = (r > 0) ? view.image(r - 1, c) : center;
+					const float down = (r < rows - 1) ? view.image(r + 1, c) : center;
 
-						// both horizontal + vertical contrast low?
-						if (fabs(center - left) < 0.01f && fabs(center - up) < 0.01f) {
-							isValidRow[c] = 0;
-							continue;
-						}
+					const float maxGrad = MAXF(
+						MAXF(fabs(center - left), fabs(center - right)),
+						MAXF(fabs(center - up), fabs(center - down))
+					);
+
+					if (maxGrad < 0.005f) {  // More permissive (0.5% instead of 1%)
+						isValidRow[c] = 0;
+						continue;
 					}
 
 					// At this point we know depth is OK, neighbors are OK, texture exists.
@@ -1727,8 +1789,6 @@ void MeshRefine::ProjectMesh(
 
 					const Point3f X = rayW * depth + cameraC;
 
-					const FIndex f = faceRow[c]; // Local face index
-
 					const float lenSq = rayW.x * rayW.x + rayW.y * rayW.y + rayW.z * rayW.z;
 					const float invLen = _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(lenSq)));
 					const Point3f dA = { rayW.x * invLen, rayW.y * invLen, rayW.z * invLen };
@@ -1742,24 +1802,14 @@ void MeshRefine::ProjectMesh(
 					// ---------------------------------------------------------------------
 
 					// 3. Grazing angle reject (relaxed threshold)
-					if (Nd > -0.2f) {
-						isValidRow[c] = 0;
-						continue;
-					}
-
-					// 4. Very shallow angles (extremely unstable photometric gradient)
-					if (fabs(Nd) < 0.05f) {
+					constexpr float minNd = -0.95f;  // ~18' from tangent (safe limit)
+					if (Nd > minNd) {  // Includes grazing angles + shallow angles
 						isValidRow[c] = 0;
 						continue;
 					}
 
 					// 5. Compute invNd and check (compact, no-branch math)
 					const float invNd = 1.0f / Nd;
-					if (invNd >= 0.f || invNd < -50.f) {   // more stable than old -10
-						isValidRow[c] = 0;
-						continue;
-					}
-					// ---------------------------------------------------------------------
 
 					tRay[localIdx] = dA;
 					tX[localIdx] = X;
@@ -1894,21 +1944,21 @@ void MeshRefine::ImageMeshWarp(
 	const size_t cols = depthMapA.cols;
 
 	// Camera A intrinsics
-	const float fxA = cameraA.K(0, 0);
-	const float fyA = cameraA.K(1, 1);
-	const float cxA = cameraA.K(0, 2);
-	const float cyA = cameraA.K(1, 2);
+	const float fxA = (float) cameraA.K(0, 0);
+	const float fyA = (float) cameraA.K(1, 1);
+	const float cxA = (float) cameraA.K(0, 2);
+	const float cyA = (float) cameraA.K(1, 2);
 	const float rfxA = 1.f / fxA;
 	const float rfyA = 1.f / fyA;
 
 	// Camera A extrinsics (R^t and C)
-	const float rA00 = cameraA.R(0, 0), rA01 = cameraA.R(0, 1), rA02 = cameraA.R(0, 2);
-	const float rA10 = cameraA.R(1, 0), rA11 = cameraA.R(1, 1), rA12 = cameraA.R(1, 2);
-	const float rA20 = cameraA.R(2, 0), rA21 = cameraA.R(2, 1), rA22 = cameraA.R(2, 2);
+	const float rA00 = (float) cameraA.R(0, 0), rA01 = (float) cameraA.R(0, 1), rA02 = (float) cameraA.R(0, 2);
+	const float rA10 = (float) cameraA.R(1, 0), rA11 = (float) cameraA.R(1, 1), rA12 = (float) cameraA.R(1, 2);
+	const float rA20 = (float) cameraA.R(2, 0), rA21 = (float) cameraA.R(2, 1), rA22 = (float) cameraA.R(2, 2);
 
-	const float cAx = cameraA.C.x;
-	const float cAy = cameraA.C.y;
-	const float cAz = cameraA.C.z;
+	const float cAx = (float) cameraA.C.x;
+	const float cAy = (float) cameraA.C.y;
+	const float cAz = (float) cameraA.C.z;
 
 	// Camera B intrinsics
 	const float fxB = cameraB.K(0, 0);
@@ -1917,9 +1967,9 @@ void MeshRefine::ImageMeshWarp(
 	const float cyB = cameraB.K(1, 2);
 
 	// Camera B extrinsics
-	const float rB00 = cameraB.R(0, 0), rB01 = cameraB.R(0, 1), rB02 = cameraB.R(0, 2);
-	const float rB10 = cameraB.R(1, 0), rB11 = cameraB.R(1, 1), rB12 = cameraB.R(1, 2);
-	const float rB20 = cameraB.R(2, 0), rB21 = cameraB.R(2, 1), rB22 = cameraB.R(2, 2);
+	const float rB00 = (float) cameraB.R(0, 0), rB01 = (float) cameraB.R(0, 1), rB02 = (float) cameraB.R(0, 2);
+	const float rB10 = (float) cameraB.R(1, 0), rB11 = (float) cameraB.R(1, 1), rB12 = (float) cameraB.R(1, 2);
+	const float rB20 = (float) cameraB.R(2, 0), rB21 = (float) cameraB.R(2, 1), rB22 = (float) cameraB.R(2, 2);
 
 	const float cBx = cameraB.C.x;
 	const float cBy = cameraB.C.y;
@@ -3013,7 +3063,7 @@ void MeshRefine::ComputePhotometricGradient(
 					const float gBy = _mm_cvtss_f32(gy_res);
 					
           // JPB WIP BUG Prune small gradients to improve performance.
-					if ((gBx * gBx + gBy * gBy) < 1e-4f) continue;
+					if ((gBx * gBx + gBy * gBy) < 1e-8f) continue;
 #endif
 
 #ifdef VALIDATE_GRADIENT
@@ -3037,10 +3087,6 @@ void MeshRefine::ComputePhotometricGradient(
 					const float dot0 = t0 - xB * tW;
 					const float dot1 = t1 - yB * tW;
 
-					// JPB WIP BUG
-					// This prunes pixels where even perfect gradients do not move geometry.
-					if ((dot0 * dot0 + dot1 * dot1) < 1e-6) continue;
-
 					// ------------------------------------------------------------
 					//  Gradient scale
 					// ------------------------------------------------------------
@@ -3049,7 +3095,9 @@ void MeshRefine::ComputePhotometricGradient(
 					// JPB WIP BUG
 					// This eliminates pixels where the photometric patch correlation is weak, 
 					// meaning the pixel is not contributing meaningful refinement signal.
-					if (dZNCC < 0.1f) continue;
+					// Instead of checking dZNCC gradient, check actual ZNCC score
+					// (requires passing ZNCC values from ComputeLocalZNCC)
+					//if (dZNCC < 0.1f) continue;
 					const float sg = (gBx * dot0 + gBy * dot1) * invW * invNd * RegularizationScale * dZNCC;
 					tileEnergy += sg * sg;  // per-thread accumulation
 
@@ -3985,12 +4033,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 					: 0.0;
 
 				// 3. Photometric energy sum
-				double photoEnergy = 0.0;
-				for (size_t vi = 0; vi < refine.views.size(); vi++) {
-					const MeshRefine::View& vw = refine.views[vi];
-					for (size_t t = 0; t < vw.tileEnergyAccum.size(); t++)
-						photoEnergy += vw.tileEnergyAccum[t];
-				}
+				double photoEnergy = refine.photoEnergyLast;
 
 				// 4. Smooth/photo gradient ratio (manual reduction)
 				double photoGradSum = 0.0;
@@ -4059,6 +4102,19 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				// Optional safety exit (rare)
 				if (iter > 0 && avgGrad < 1e-9) {
 					DEBUG_EXTRA("Early exit: avgGrad extremely small (%.6e)", avgGrad);
+					break;
+				}
+
+				const double energyPerTile =
+					(activeTiles > 0)
+					? (refine.photoEnergyLast / double(activeTiles))
+					: 0.0;
+
+				if (
+					iter > 2 &&
+					activeRatio < 5e-4 &&
+					maxDisp < 0.3 * scale
+					) {
 					break;
 				}
 

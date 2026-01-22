@@ -131,161 +131,338 @@ bool ObjModel::MaterialLib::Load(const String& fileName)
 // S T R U C T S ///////////////////////////////////////////////////
 
 #ifdef FASTER_OBJ
+
+class RawFileWriter {
+public:
+	explicit RawFileWriter(const char* path) {
+#ifdef _WIN32
+		handle = CreateFileA(
+			path,
+			GENERIC_WRITE,
+			0,
+			nullptr,
+			CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+			nullptr
+		);
+#else
+		fd = ::open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+#endif
+	}
+
+	~RawFileWriter() {
+#ifdef _WIN32
+		if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+#else
+		if (fd >= 0) ::close(fd);
+#endif
+	}
+
+	bool IsValid() const {
+#ifdef _WIN32
+		return handle != INVALID_HANDLE_VALUE;
+#else
+		return fd >= 0;
+#endif
+	}
+
+	void Write(const char* data, size_t size) {
+#ifdef _WIN32
+		DWORD written;
+		WriteFile(handle, data, (DWORD)size, &written, nullptr);
+#else
+		::write(fd, data, size);
+#endif
+	}
+
+private:
+#ifdef _WIN32
+	HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+	int fd = -1;
+#endif
+};
+
+constexpr double MaxSafeInt = 18446744073709551615.0; // UINT64_MAX
+// Static lookup table for pairs of digits
+static const char DigitTable[] =
+"00010203040506070809"
+"10111213141516171819"
+"20212223242526272829"
+"30313233343536373839"
+"40414243444546474849"
+"50515253545556575859"
+"60616263646566676869"
+"70717273747576777879"
+"80818283848586878889"
+"90919293949596979899";
+
+__forceinline char* WriteDouble(char* p, double v) noexcept {
+	if (!std::isfinite(v)) {
+		*p++ = '0'; return p;
+	}
+
+	if (v < 0.0) {
+		*p++ = '-';
+		v = -v;
+	}
+
+	// 1. Separate integer and fraction with rounding
+	// Use 1e6 for 6 decimal places
+	double integral;
+	double fractional = std::modf(v + 0.0000005, &integral);
+	uint64_t ip = (uint64_t)integral;
+	uint32_t f = (uint32_t)(fractional * 1000000.0);
+
+	// 2. Integer part (backward write)
+	char temp[24];
+	char* t = temp + 24;
+
+	if (ip == 0) {
+		*--t = '0';
+	}
+	else {
+		while (ip >= 100) {
+			const uint64_t idx = (ip % 100) << 1;
+			ip /= 100;
+			*--t = DigitTable[idx + 1];
+			*--t = DigitTable[idx];
+		}
+		if (ip >= 10) {
+			const uint64_t idx = ip << 1;
+			*--t = DigitTable[idx + 1];
+			*--t = DigitTable[idx];
+		}
+		else if (ip > 0) {
+			*--t = (char)('0' + ip);
+		}
+	}
+
+	size_t ipLen = (size_t)((temp + 24) - t);
+	memcpy(p, t, ipLen);
+	p += ipLen;
+
+	// 3. Fractional part (only if non-zero)
+	if (f > 0) {
+		*p++ = '.';
+		// Write 6 digits but you could optimize this to trim zeros
+		uint32_t div = 100000;
+		for (int i = 0; i < 6; ++i) {
+			uint32_t d = f / div;
+			*p++ = (char)('0' + d);
+			f %= div;
+			div /= 10;
+		}
+		// Optional: while (*(p-1) == '0') p--; // Trim trailing zeros
+	}
+
+	return p;
+}
+
+#include <charconv>
+
+__forceinline char* WriteUInt(char* out, uint32_t v) {
+	auto r = std::to_chars(out, out + 32, v);
+	return r.ptr;
+}
+
 bool ObjModel::Save(const String& fileName, unsigned precision, bool texLossless) const
 {
 	if (vertices.empty())
 		return false;
+
 	const String prefix(Util::getFileFullName(fileName));
 	const String name(Util::getFileNameExt(prefix));
 
 	if (!material_lib.Save(prefix, texLossless))
 		return false;
 
-	std::ofstream out(prefix + ".obj", std::ios::binary);
-	if (!out.good())
+	const String objPath = prefix + ".obj";
+	RawFileWriter file(objPath.c_str());
+	if (!file.IsValid())
 		return false;
 
-	constexpr size_t BUF_SIZE = 32 * 1024 * 1024;
-	std::vector<char> buf(BUF_SIZE);
-	out.rdbuf()->pubsetbuf(buf.data(), BUF_SIZE);
+	const int maxThreads = omp_get_max_threads();
 
-	out << "mtllib " << name << ".mtl\n";
-	out.setf(std::ios::fixed);
-	out.precision(precision);
+	constexpr size_t kComponentSize = 32;
+	constexpr size_t kVertexSize = 3 * kComponentSize + 5; // "v " + 3 components + "\n"
+	constexpr size_t kTexCoordSize = 2 * kComponentSize + 5; // "vt " + 2 components + "\n"
+	constexpr size_t kNormalSize = 3 * kComponentSize + 6; // "vn " + 3 components + "\n"
 
-	auto fmt = [precision](char* dst, double x, double y, double z) {
-		return std::snprintf(dst, 128, "%.*f %.*f %.*f\n",
-			precision, x, precision, y, precision, z);
-		};
+	const size_t nVertices = vertices.size();
+	const size_t chunkVertices = (nVertices + maxThreads - 1) / maxThreads;
+	char* vertexBlock = (char*)_aligned_malloc(kVertexSize * chunkVertices * maxThreads, 64);
 
-	// ------------------ parallel vertices ------------------
+	const size_t nTC = texcoords.size();
+	const size_t chunkTC = (nTC + maxThreads - 1) / maxThreads;
+	char* tcBlock = (char*)_aligned_malloc(kTexCoordSize * chunkTC * maxThreads, 64);
+
+	const size_t nNormals = normals.size();
+	const size_t chunkNormals = (nNormals + maxThreads - 1) / maxThreads;
+	char* nrmBlock = (char*)_aligned_malloc(kNormalSize * chunkNormals * maxThreads, 64);
+
+	std::vector<size_t> threadBufVertices(maxThreads);
+	std::vector<size_t> threadBufTC(maxThreads);
+	std::vector<size_t> threadBufNormals(maxThreads);
+
+	std::string header;
+	header.reserve(64);
+	header.append("mtllib ");
+	header.append(name);
+	header.append(".mtl\n");
+
+#ifndef _OPENMP
+#error "OpenMP is NOT enabled in project settings!"
+#endif
+
+	// ------------------------------------------------------------
+	// Vertices
+	// ------------------------------------------------------------
 	{
-		const size_t n = vertices.size();
-		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
-		std::vector<std::string> threadBuffers(omp_get_max_threads());
-
-#pragma omp parallel
+#pragma omp parallel num_threads(maxThreads)
 		{
-			int tid = omp_get_thread_num();
-			size_t start = tid * chunk;
-			size_t end = std::min(start + chunk, n);
+			const size_t tid = omp_get_thread_num();
+			auto& localSize = threadBufVertices[tid];
+			char* p = vertexBlock + tid * chunkVertices * kVertexSize;
+			localSize = 0;
 
-			std::string local;
-			local.reserve((end - start) * 40);
-
-			char line[128];
-			for (size_t i = start; i < end; ++i) {
+#pragma omp for schedule(static, chunkVertices)
+			for (int64_t i = 0; i < static_cast<int64_t>(nVertices); ++i) {
 				const auto& v = vertices[i];
-				int len = std::snprintf(line, sizeof(line),
-					"v %.10g %.10g %.10g\n", (double)v[0], (double)v[1], (double)v[2]);
-				local.append(line, len);
-			}
-			threadBuffers[tid] = std::move(local);
-		}
 
-		for (auto& chunkStr : threadBuffers)
-			out.write(chunkStr.data(), chunkStr.size());
+				*p++ = 'v'; *p++ = ' ';
+				p = WriteDouble(p, v[0]); *p++ = ' ';
+				p = WriteDouble(p, v[1]); *p++ = ' ';
+				p = WriteDouble(p, v[2]); *p++ = '\n';
+			}
+
+			localSize = (p - (vertexBlock + tid * chunkVertices * kVertexSize));
+		}
 	}
 
-	// ------------------ parallel texcoords ------------------
-	if (!texcoords.empty()) {
-		const size_t n = texcoords.size();
-		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
-		std::vector<std::string> threadBuffers(omp_get_max_threads());
-
-#pragma omp parallel
+	// ------------------------------------------------------------
+	// Texcoords
+	// ------------------------------------------------------------
+	if (nTC > 0) {
+#pragma omp parallel num_threads(maxThreads)
 		{
-			int tid = omp_get_thread_num();
-			size_t start = tid * chunk;
-			size_t end = std::min(start + chunk, n);
+			const size_t tid = omp_get_thread_num();
+			auto& localSize = threadBufTC[tid];
+			char* p = tcBlock + tid * chunkTC * kTexCoordSize;
+			localSize = 0;
 
-			std::string local;
-			local.reserve((end - start) * 25);
+#pragma omp for schedule(static, chunkTC)
+			for (int64_t i = 0; i < static_cast<int64_t>(nTC); ++i) {
+				const auto& tc = texcoords[i];
 
-			char line[64];
-			for (size_t i = start; i < end; ++i) {
-				const auto& t = texcoords[i];
-				int len = std::snprintf(line, sizeof(line),
-					"vt %.10g %.10g\n", (double)t[0], (double)t[1]);
-				local.append(line, len);
+				*p++ = 'v'; *p++ = 't'; *p++ = ' ';
+				p = WriteDouble(p, tc[0]); *p++ = ' ';
+				p = WriteDouble(p, tc[1]); *p++ = '\n';
 			}
-			threadBuffers[tid] = std::move(local);
-		}
 
-		for (auto& chunkStr : threadBuffers)
-			out.write(chunkStr.data(), chunkStr.size());
+			localSize = (p - (tcBlock + tid * chunkTC * kTexCoordSize));
+		}
 	}
 
-	// ------------------ parallel normals ------------------
-	if (!normals.empty()) {
-		const size_t n = normals.size();
-		const size_t chunk = (n + omp_get_max_threads() - 1) / omp_get_max_threads();
-		std::vector<std::string> threadBuffers(omp_get_max_threads());
-
-#pragma omp parallel
+	// ------------------------------------------------------------
+	// Normals
+	// ------------------------------------------------------------
+	if (nNormals > 0) {
+#pragma omp parallel num_threads(maxThreads)
 		{
-			int tid = omp_get_thread_num();
-			size_t start = tid * chunk;
-			size_t end = std::min(start + chunk, n);
+			const size_t tid = omp_get_thread_num();
+			auto& localSize = threadBufNormals[tid];
+			char* p = nrmBlock + tid * chunkNormals * kNormalSize;
+			localSize = 0;
 
-			std::string local;
-			local.reserve((end - start) * 40);
-
-			char line[128];
-			for (size_t i = start; i < end; ++i) {
+#pragma omp for schedule(static, chunkNormals)
+			for (int64_t i = 0; i < static_cast<int64_t>(nNormals); ++i) {
 				const auto& nrm = normals[i];
-				int len = std::snprintf(line, sizeof(line),
-					"vn %.10g %.10g %.10g\n",
-					(double)nrm[0], (double)nrm[1], (double)nrm[2]);
-				local.append(line, len);
-			}
-			threadBuffers[tid] = std::move(local);
-		}
 
-		for (auto& chunkStr : threadBuffers)
-			out.write(chunkStr.data(), chunkStr.size());
+				*p++ = 'v'; *p++ = 'n'; *p++ = ' ';
+
+				p = WriteDouble(p, nrm[0]); *p++ = ' ';
+				p = WriteDouble(p, nrm[1]); *p++ = ' ';
+				p = WriteDouble(p, nrm[2]); *p++ = '\n';
+			}
+
+			localSize = (p - (nrmBlock + tid * chunkNormals * kNormalSize));
+		}
 	}
 
-	// ------------------ faces (single-threaded for determinism) ------------------
+	// ------------------------------------------------------------
+	// Faces (single-threaded, deterministic)
+	// ------------------------------------------------------------
+	std::string facesBuf;
+	facesBuf.reserve(groups.size() * 128);
+
 	const bool hasTex = !texcoords.empty();
 	const bool hasNorm = !normals.empty();
 
 	for (const auto& group : groups) {
-		out << "usemtl " << group.material_name << "\n";
+		facesBuf.append("usemtl ");
+		facesBuf.append(group.material_name);
+		facesBuf.push_back('\n');
 
-		std::string bufLocal;
-		bufLocal.reserve(group.faces.size() * 80);
-
+		char line[128];
 		for (const Face& face : group.faces) {
-			char line[256];
 			char* p = line;
-			p += std::sprintf(p, "f");
+
+			*p++ = 'f';
 
 			for (int k = 0; k < 3; ++k) {
-				const uint32_t v = face.vertices[k] + OBJ_INDEX_OFFSET;
-				const uint32_t t = face.texcoords[k] + OBJ_INDEX_OFFSET;
-				const uint32_t n = face.normals[k] + OBJ_INDEX_OFFSET;
+				*p++ = ' ';
+				p = WriteUInt(p, face.vertices[k] + OBJ_INDEX_OFFSET);
 
-				if (hasTex && hasNorm)
-					p += std::sprintf(p, " %u/%u/%u", v, t, n);
-				else if (hasTex)
-					p += std::sprintf(p, " %u/%u", v, t);
-				else if (hasNorm)
-					p += std::sprintf(p, " %u//%u", v, n);
-				else
-					p += std::sprintf(p, " %u", v);
+				if (hasTex || hasNorm) {
+					*p++ = '/';
+					if (hasTex)
+						p = WriteUInt(p, face.texcoords[k] + OBJ_INDEX_OFFSET);
+					if (hasNorm) {
+						*p++ = '/';
+						p = WriteUInt(p, face.normals[k] + OBJ_INDEX_OFFSET);
+					}
+				}
 			}
-			*p++ = '\n';
-			bufLocal.append(line, p - line);
-		}
 
-		out.write(bufLocal.data(), bufLocal.size());
+			*p++ = '\n';
+			facesBuf.append(line, p - line);
+		}
 	}
 
-	out.flush();
+	// ------------------------------------------------------------
+	// Final assembly (single allocation, single write)
+	// ------------------------------------------------------------
+	size_t totalSize = header.size() + facesBuf.size();
+	for (const auto& s : threadBufVertices) totalSize += s;
+	for (const auto& s : threadBufTC) totalSize += s;
+	for (const auto& s : threadBufNormals) totalSize += s;
+
+	std::string finalBuf;
+	finalBuf.reserve(totalSize);
+
+	finalBuf.append(header);
+  for (int tid = 0; tid < maxThreads; ++tid) {
+		finalBuf.append(vertexBlock + tid * chunkVertices * kVertexSize, threadBufVertices[tid]);
+	}
+  _aligned_free(vertexBlock);
+
+	for (int tid = 0; tid < maxThreads; ++tid) {
+		finalBuf.append(tcBlock + tid * chunkTC * kTexCoordSize, threadBufTC[tid]);
+	}
+	_aligned_free(tcBlock);
+
+	for (int tid = 0; tid < maxThreads; ++tid) {
+		finalBuf.append(nrmBlock + tid * chunkNormals * kNormalSize, threadBufNormals[tid]);
+	}
+	_aligned_free(nrmBlock);
+
+	file.Write(finalBuf.data(), finalBuf.size());
+
+	file.Write(facesBuf.data(), facesBuf.size());
+
 	return true;
 }
-
 #else
 bool ObjModel::Save(const String& fileName, unsigned precision, bool texLossless) const
 {

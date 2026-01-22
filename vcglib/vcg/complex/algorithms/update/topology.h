@@ -615,7 +615,7 @@ static void FaceFace(MeshType& m)
 
   // Find run boundaries
   std::vector<size_t> runStarts;
-  runStarts.reserve(numEdges);
+  runStarts.reserve(numEdges+1);
   runStarts.push_back(0);
   for (uint32_t i = 1; i < numEdges; ++i)
   {
@@ -625,17 +625,28 @@ static void FaceFace(MeshType& m)
   runStarts.push_back(numEdges);
 
   // Parallel wiring
+  const ptrdiff_t nRuns = (ptrdiff_t)runStarts.size() - 1;
+
 #pragma omp parallel for schedule(static, 10000)
-  for (ptrdiff_t r = 0; r < (ptrdiff_t)runStarts.size() - 1; ++r)
+  for (ptrdiff_t r = 0; r < nRuns; ++r)
   {
-    size_t i = runStarts[r];
-    size_t j = runStarts[r + 1];
-    for (size_t k = i; k < j; ++k)
+    uint32_t i = runStarts[r];
+    uint32_t j = runStarts[r + 1];
+
+    uint32_t next = i + 1;
+    for (uint32_t k = i; k < j; ++k)
     {
-      auto& a = edges[k];
-      auto& b = edges[(k + 1 == j) ? i : k + 1]; // wrap
-      a.f->FFp(a.z) = b.f;
-      a.f->FFi(a.z) = b.z;
+      if (next == j)
+        next = i;
+
+      PEdge2& a = edges[k];
+      PEdge2& b = edges[next];
+
+      auto* __restrict fa = a.f;
+      fa->FFp(a.z) = b.f;
+      fa->FFi(a.z) = b.z;
+
+      ++next;
     }
   }
 

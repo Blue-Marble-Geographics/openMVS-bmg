@@ -84,7 +84,7 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 4;
+  constexpr int version = 5;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else
@@ -3253,6 +3253,99 @@ try_next_cell:
   // So, in order to test if p is seen outside from one of c's facets,
   // we just replace the corresponding point by p in the orientation
   // test.  We do this using the array below.
+#if 1
+  struct FacetPlane {
+    double nx, ny, nz;
+    double d;
+  };
+  FacetPlane planes[4];
+
+  const Point& p0 = c->vertex(0)->point();
+  const Point& p1 = c->vertex(1)->point();
+  const Point& p2 = c->vertex(2)->point();
+  const Point& p3 = c->vertex(3)->point();
+
+  // Helper lambda: build plane for facet opposite vi
+  auto buildPlane = [&](int i,
+    const Point& a,
+    const Point& b,
+    const Point& c,
+    const Point& vi)
+    {
+      // normal = (b - a) x (c - a)
+      const double abx = b.x() - a.x();
+      const double aby = b.y() - a.y();
+      const double abz = b.z() - a.z();
+
+      const double acx = c.x() - a.x();
+      const double acy = c.y() - a.y();
+      const double acz = c.z() - a.z();
+
+      double nx = aby * acz - abz * acy;
+      double ny = abz * acx - abx * acz;
+      double nz = abx * acy - aby * acx;
+
+      // Ensure outward orientation:
+      // orient(a,b,c,vi) must be POSITIVE
+      const double vx = vi.x() - a.x();
+      const double vy = vi.y() - a.y();
+      const double vz = vi.z() - a.z();
+
+      if (nx * vx + ny * vy + nz * vz < 0.0) {
+        nx = -nx;
+        ny = -ny;
+        nz = -nz;
+      }
+
+      planes[i].nx = nx;
+      planes[i].ny = ny;
+      planes[i].nz = nz;
+      planes[i].d = -(nx * a.x() + ny * a.y() + nz * a.z());
+    };
+
+  buildPlane(0, p1, p2, p3, p0);
+  buildPlane(1, p0, p3, p2, p1);
+  buildPlane(2, p0, p1, p3, p2);
+  buildPlane(3, p0, p2, p1, p3);
+
+  const double tx = t.x();
+  const double ty = t.y();
+  const double tz = t.z();
+
+  for (int i = 0; i != 4; ++i)
+  {
+    Cell_handle next = c->neighbor(i);
+    if (previous == next)
+      continue;
+
+    const FacetPlane& fp = planes[i];
+    const double s =
+      fp.nx * tx +
+      fp.ny * ty +
+      fp.nz * tz +
+      fp.d;
+
+    constexpr double eps = 1e-15;
+    if (s >= -eps)
+      continue;
+
+    if (next->has_vertex(infinite))
+      return next;
+
+    previous = c;
+    c = next;
+
+    if (could_lock_zone) {
+      if (!this->try_lock_cell(c)) {
+        *could_lock_zone = false;
+        return Cell_handle();
+      }
+    }
+
+    if (n_of_turns)
+      goto try_next_cell;
+  }
+#else
   const Point* pts[4] = { &(c->vertex(0)->point()),
                           &(c->vertex(1)->point()),
                           &(c->vertex(2)->point()),
@@ -3294,6 +3387,7 @@ try_next_cell:
 
     if(n_of_turns) goto try_next_cell;
   }
+#endif
 
   return c;
 }

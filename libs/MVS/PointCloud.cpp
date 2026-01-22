@@ -659,7 +659,7 @@ PointCloudStreaming::PointCloudStreaming(const PointCloud& src)
 	// Copy pointViews
 	if (!src.pointViews.IsEmpty()) {
 		ReservePointViewsSizeAndOffset(numPoints);
-		const size_t numFlatPointViewItems = std::accumulate(
+		const size_t numFlatPointViewItems = (size_t) std::accumulate(
 			std::begin(src.pointViews),
 			std::end(src.pointViews),
 			0,
@@ -784,6 +784,109 @@ bool PointCloudStreaming::Load(const String& fileName)
 } // Load
 
 // save the dense point cloud as PLY file
+#if 1 // Direct writing
+bool PointCloudStreaming::Save(const String& fileName, bool bLegacyTypes) const
+{
+	if (pointsXYZ.empty())
+		return false;
+
+	TD_TIMER_STARTD();
+
+	ASSERT(!fileName.IsEmpty());
+	Util::ensureFolder(fileName);
+
+	std::ofstream out(fileName.c_str(), std::ios::binary);
+	if (!out.is_open())
+		return false;
+
+	const size_t numPoints = NumPoints();
+	const bool hasNormals = !normalsXYZ.empty();
+	const bool hasColors = !colorsRGB.empty();
+
+	// ------------------------------------------------------------
+	// PLY header
+	// ------------------------------------------------------------
+	out << "ply\n";
+	out << "format binary_little_endian 1.0\n";
+
+	if (bLegacyTypes)
+		out << "comment legacy_type_names\n";
+
+	out << "element vertex " << numPoints << "\n";
+	out << "property float x\n";
+	out << "property float y\n";
+	out << "property float z\n";
+
+	if (hasNormals) {
+		out << "property float nx\n";
+		out << "property float ny\n";
+		out << "property float nz\n";
+	}
+
+	out << "property uchar red\n";
+	out << "property uchar green\n";
+	out << "property uchar blue\n";
+	out << "end_header\n";
+
+	// ------------------------------------------------------------
+	// Body: stream binary vertex data
+	// ------------------------------------------------------------
+	const float* __restrict pPoint = pointsXYZ.data();
+	const float* __restrict pNormal = hasNormals ? normalsXYZ.data() : nullptr;
+
+	const uint8_t white[3] = { 255, 255, 255 };
+	const uint8_t* __restrict pColor = hasColors ? colorsRGB.data() : white;
+	const size_t colorStride = hasColors ? 3 : 0;
+
+	// Optional: large output buffer (helps HDDs)
+	constexpr size_t kBufSize = 1 << 20; // 1 MB
+	std::vector<char> buffer;
+	buffer.reserve(kBufSize);
+
+	for (size_t i = 0; i < numPoints; ++i) {
+		// Position
+		buffer.insert(buffer.end(),
+			reinterpret_cast<const char*>(pPoint),
+			reinterpret_cast<const char*>(pPoint + 3));
+		pPoint += 3;
+
+		// Normal
+		if (hasNormals) {
+			buffer.insert(buffer.end(),
+				reinterpret_cast<const char*>(pNormal),
+				reinterpret_cast<const char*>(pNormal + 3));
+			pNormal += 3;
+		}
+
+		// Color
+		buffer.push_back((char)pColor[0]);
+		buffer.push_back((char)pColor[1]);
+		buffer.push_back((char)pColor[2]);
+		pColor += colorStride;
+
+		// Flush buffer if full
+		if (buffer.size() >= kBufSize) {
+			out.write(buffer.data(), buffer.size());
+			buffer.clear();
+		}
+	}
+
+	// Flush remainder
+	if (!buffer.empty()) {
+		out.write(buffer.data(), buffer.size());
+		buffer.clear();
+	}
+
+	out.flush();
+	out.close();
+
+	DEBUG_EXTRA("Point-cloud saved: %u points (%s)",
+		NumPoints(),
+		TD_TIMER_GET_FMT().c_str());
+
+	return true;
+}
+#else
 bool PointCloudStreaming::Save(const String& fileName, bool bLegacyTypes) const
 {
 	if (pointsXYZ.empty())
@@ -904,6 +1007,7 @@ bool PointCloudStreaming::Save(const String& fileName, bool bLegacyTypes) const
 	DEBUG_EXTRA("Point-cloud saved: %u points (%s)", NumPoints(), TD_TIMER_GET_FMT().c_str());
 	return true;
 } // Save
+#endif
 
 // save the dense point cloud having >=N views as PLY file
 bool PointCloudStreaming::SaveNViews(const String& fileName, uint32_t minViews, bool bLegacyTypes) const

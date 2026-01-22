@@ -271,8 +271,17 @@ IIndexArr ParseViewsFile(const String& filename, const Scene& scene) {
 	return views;
 }
 
+void EnableFastFp() {
+	_mm_setcsr(_mm_getcsr() | 0x8040); // FTZ | DAZ
+}
+
 int main(int argc, LPCTSTR* argv)
 {
+#pragma omp parallel
+	{
+		EnableFastFp();
+	}
+
 	#ifdef _DEBUGINFO
 	// set _crtBreakAlloc index to stop in <dbgheap.c> at allocation
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);// | _CRTDBG_CHECK_ALWAYS_DF);
@@ -339,7 +348,7 @@ int main(int argc, LPCTSTR* argv)
 	VERBOSE("Mesh texturing completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 
 	// save the final mesh
-	scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
+	// JPB WIP BUG Not needed. scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 	scene.mesh.Save(baseFileName+OPT::strExportType);
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2)

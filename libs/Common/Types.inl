@@ -2359,50 +2359,53 @@ template <typename T>
 void TImage<TYPE>::toGray(TImage<T>& out, int code, bool bNormalize, bool bSRGB) const
 {
 	#if 1
-	typedef typename RealType<T,float>::type Real;
-	ASSERT(code==cv::COLOR_RGB2GRAY || code==cv::COLOR_RGBA2GRAY || code==cv::COLOR_BGR2GRAY || code==cv::COLOR_BGRA2GRAY);
-	static const Real coeffsRGB[] = {Real(0.299), Real(0.587), Real(0.114)};
-	static const Real coeffsBGR[] = {Real(0.114), Real(0.587), Real(0.299)};
-	const Real* coeffs;
-	switch (code) {
-	case cv::COLOR_BGR2GRAY:
-	case cv::COLOR_BGRA2GRAY:
-		coeffs = coeffsBGR;
-		break;
-	case cv::COLOR_RGB2GRAY:
-	case cv::COLOR_RGBA2GRAY:
-		coeffs = coeffsRGB;
-		break;
-	default:
-		ASSERT("Unsupported image format" == NULL);
-	}
-	const Real &cb(coeffs[0]), &cg(coeffs[1]), &cr(coeffs[2]);
-	if (out.rows!=rows || out.cols!=cols)
-		out.create(rows, cols);
-	ASSERT(cv::Mat::isContinuous());
-	ASSERT(out.cv::Mat::isContinuous());
-	const int scn(this->cv::Mat::channels());
-	T* dst = out.cv::Mat::template ptr<T>();
-	T* const dstEnd = dst + out.area();
+	typedef typename RealType<T, float>::type Real;
 	typedef typename cv::DataType<TYPE>::channel_type ST;
+
+	ASSERT(code == cv::COLOR_BGR2GRAY ||
+		code == cv::COLOR_RGB2GRAY ||
+		code == cv::COLOR_BGRA2GRAY ||
+		code == cv::COLOR_RGBA2GRAY);
+
+	static constexpr Real coeffsBGR[3] = { Real(0.114), Real(0.587), Real(0.299) };
+	static constexpr Real coeffsRGB[3] = { Real(0.299), Real(0.587), Real(0.114) };
+
+	const Real* coeffs =
+		(code == cv::COLOR_BGR2GRAY || code == cv::COLOR_BGRA2GRAY)
+		? coeffsBGR : coeffsRGB;
+
+	const Real cb = coeffs[0];
+	const Real cg = coeffs[1];
+	const Real cr = coeffs[2];
+
+	if (out.rows != rows || out.cols != cols)
+		out.create(rows, cols);
+
+	const int scn = this->cv::Mat::channels();
+
+	const ST* __restrict src = this->cv::Mat::template ptr<ST>();
+	T* __restrict dst = out.cv::Mat::template ptr<T>();
+	T* const dstEnd = dst + out.area();
 	if (bSRGB) {
 		if (bNormalize) {
-			typedef typename CONVERT::NormsRGB2RGB_t<ST,Real> ColConv;
-			for (const ST* src=cv::Mat::template ptr<ST>(); dst!=dstEnd; src+=scn)
-				*dst++ = T(cb*ColConv(src[0]) + cg*ColConv(src[1]) + cr*ColConv(src[2]));
-		} else {
-			typedef typename CONVERT::NormsRGB2RGBUnNorm_t<ST,Real> ColConv;
-			for (const ST* src=cv::Mat::template ptr<ST>(); dst!=dstEnd; src+=scn)
-				*dst++ = T(cb*ColConv(src[0]) + cg*ColConv(src[1]) + cr*ColConv(src[2]));
+			typedef typename CONVERT::NormsRGB2RGB_t<ST, Real> ColConv;
+			for (const ST* src = cv::Mat::template ptr<ST>(); dst != dstEnd; src += scn)
+				*dst++ = T(cb * ColConv(src[0]) + cg * ColConv(src[1]) + cr * ColConv(src[2]));
+		}	else {
+			typedef typename CONVERT::NormsRGB2RGBUnNorm_t<ST, Real> ColConv;
+			for (const ST* src = cv::Mat::template ptr<ST>(); dst != dstEnd; src += scn)
+				*dst++ = T(cb * ColConv(src[0]) + cg * ColConv(src[1]) + cr * ColConv(src[2]));
 		}
 	} else {
 		if (bNormalize) {
-			typedef typename CONVERT::NormRGB_t<ST,Real> ColConv;
-			for (const ST* src=cv::Mat::template ptr<ST>(); dst!=dstEnd; src+=scn)
-				*dst++ = T(cb*ColConv(src[0]) + cg*ColConv(src[1]) + cr*ColConv(src[2]));
-		} else {
-			for (const ST* src=cv::Mat::template ptr<ST>(); dst!=dstEnd; src+=scn)
-				*dst++ = T(cb*src[0] + cg*src[1] + cr*src[2]);
+			const Real inv255 = Real(1) / Real(255);
+			for (; dst != dstEnd; src += scn) {
+				*dst++ = T((cb * src[0] + cg * src[1] + cr * src[2]) * inv255);
+			}
+		}	else {
+			for (; dst != dstEnd; src += scn) {
+				*dst++ = T(cb * src[0] + cg * src[1] + cr * src[2]);
+			}
 		}
 	}
 	#else

@@ -219,12 +219,21 @@ void TFinalize()
 
 } // unnamed namespace
 
+void EnableFastFp() {
+	_mm_setcsr(_mm_getcsr() | 0x8040); // FTZ | DAZ
+}
+
 int main(int argc, LPCTSTR* argv)
 {
 	#ifdef _DEBUGINFO
 	// set _crtBreakAlloc index to stop in <dbgheap.c> at allocation
 	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);// | _CRTDBG_CHECK_ALWAYS_DF);
 	#endif
+
+#pragma omp parallel
+		{
+			EnableFastFp();
+		}
 
 	if (!Initialize(argc, argv))
 		return EXIT_FAILURE;
@@ -272,7 +281,6 @@ int main(int argc, LPCTSTR* argv)
 #else
 	scene.Save(baseFileName + _T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 #endif
-	scene.Save(baseFileName+_T("2.mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 	scene.mesh.Save(baseFileName+OPT::strExportType);
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2)

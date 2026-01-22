@@ -107,6 +107,15 @@ namespace MVS {
 }
 DEFINE_CVDATATYPE(MVS::ViewsID)
 
+/* __m128 is ugly to write */
+typedef __m128 v4sf;  // vector of 4 float (sse1)
+
+typedef __m128i v4si; // vector of 4 int (sse2)
+
+#if defined(MORE_ACCURATE_WEIGHTS) || defined(DPC_FASTER_SCORE_PIXEL_DETAIL2)
+extern v4sf exp_ps(v4sf);
+#endif
+
 namespace MVS {
 
 DECOPT_SPACE(OPTDENSE)
@@ -495,7 +504,6 @@ struct MVS_API DepthData {
 typedef MVS_API CLISTDEFIDX(DepthData,IIndex) DepthDataArr;
 /*----------------------------------------------------------------*/
 
-
 struct MVS_API DepthEstimator {
 	enum { nSizeWindow = nSizeHalfWindow*2+1 };
 	enum { nSizeStep = 2 };
@@ -868,9 +876,6 @@ struct MVS_API DepthEstimator {
 		extern ImageRef __declspec( align( 16 ) ) sRemapImageRef[];
 		extern int __declspec( align( 16 ) ) sImageOffsets[];
 		extern float __declspec( align( 16 ) ) swSpatials[];
-#if defined(MORE_ACCURATE_WEIGHTS) || defined(DPC_FASTER_SCORE_PIXEL_DETAIL2)
-		extern _Data exp_ps(_Data);
-#endif
 
 #if DENSE_NCC != DENSE_NCC_WEIGHTED
 		STATIC_ASSERT(0); // Unsupported
@@ -1062,7 +1067,8 @@ struct MVS_API DepthEstimator {
 				// vFactorDeltaDepth appears very sensitive to error.  Use the highest precision exp.
 #ifdef DPC_FASTER_SCORE_PIXEL_DETAIL2
 				const float tmp = normSq0 * smoothSigmaDepthForDepthCalc;
-				vFactorDeltaDepth = exp_ps(_Set(tmp));
+				v4sf vTmp = _Set(tmp);
+				vFactorDeltaDepth = exp_ps(vTmp);
 #else
 				const float tmp = DENSE_EXP(normSq0 * smoothSigmaDepthForDepthCalc);
 				vFactorDeltaDepth = _Set(tmp);

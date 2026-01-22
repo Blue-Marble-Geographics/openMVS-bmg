@@ -962,21 +962,17 @@ FORCEINLINE INTTYPE Ceil2Int(double x) {
 	return static_cast<INTTYPE>(ceil(x));
 	#endif
 }
-template <typename INTTYPE=int>
-FORCEINLINE INTTYPE Round2Int(float x) {
-	#ifdef _FAST_FLOAT2INT
-	return CRound2Int(double(x)+_float2int_doublemagicdelta);
-	#else
-	return static_cast<INTTYPE>(floor(x+.5f));
-	#endif
+template <typename IntType = int>
+__forceinline IntType Round2Int(float x) {
+	return static_cast<IntType>(
+		_mm_cvtss_si32(_mm_set_ss(x))
+		);
 }
-template <typename INTTYPE=int>
-FORCEINLINE INTTYPE Round2Int(double x) {
-	#ifdef _FAST_FLOAT2INT
-	return CRound2Int(x+_float2int_doublemagicdelta);
-	#else
-	return static_cast<INTTYPE>(floor(x+.5));
-	#endif
+template <typename IntType = int>
+__forceinline IntType Round2Int(double x) {
+	return static_cast<IntType>(
+		_mm_cvtsd_si32(_mm_set_sd(x))
+		);
 }
 /*----------------------------------------------------------------*/
 
@@ -1552,6 +1548,15 @@ public:
 	// calculate right/left null-vector of this matrix ([n/m,1])
 	inline TMatrix<TYPE,n,1> RightNullVector(int flags = 0) const;
 	inline TMatrix<TYPE,m,1> LeftNullVector(int flags = 0) const;
+
+	template <typename TO>
+	inline TMatrix<TO, m, n> Cast() const {
+		TMatrix<TO, m, n> out;
+		for (int i = 0; i < elems; ++i) {
+			out.val[i] = static_cast<TO>(val[i]);
+		}
+		return out;
+	}
 
 	#ifdef _USE_BOOST
 	// serialize

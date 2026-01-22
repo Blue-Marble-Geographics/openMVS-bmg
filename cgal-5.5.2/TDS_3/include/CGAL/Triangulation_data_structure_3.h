@@ -104,6 +104,7 @@ public:
     uint32_t marker;
 
     unsigned char conflict_state;
+    unsigned char _pad;
 
     Cell_data() : conflict_state(0), marker(0) {}
     void clear()            { conflict_state = 0; }

@@ -880,7 +880,7 @@ public:
         if (now < startTime) return true;  // overflow not needed, but safe
         if (std::chrono::duration<double>(now - startTime).count() > timeBudget)
           return true;
-      }
+    }
     }
 		return false;
 	}

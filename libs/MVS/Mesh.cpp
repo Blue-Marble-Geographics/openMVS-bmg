@@ -337,6 +337,52 @@ void Mesh::ListIncidenteFaces()
 // each triple describes the adjacent face triangles for a given face
 // in the following edge order: v1v2, v2v3, v3v1;
 // NO_ID indicates there is no adjacent face on that edge
+#if 1
+void Mesh::ListIncidenteFaceFaces()
+{
+	ASSERT(vertexFaces.size() == vertices.size());
+
+	faceFaces.resize(faces.size());
+
+	FOREACH(f, faces) {
+		const Face& face = faces[f];
+
+		for (int e = 0; e < 3; ++e) {
+			const FaceIdxArr& A = vertexFaces[face[e]];
+			const FaceIdxArr& B = vertexFaces[face[(e + 1) % 3]];
+
+			FIndex adj = NO_ID;
+
+			// two-pointer scan (lists are sorted)
+			size_t i = 0, j = 0;
+			const size_t na = A.size();
+			const size_t nb = B.size();
+
+			while (i < na && j < nb) {
+				const FIndex fa = A[i];
+				const FIndex fb = B[j];
+
+				if (fa == fb) {
+					if (fa != f) {
+						adj = fa;
+						break;
+					}
+					++i;
+					++j;
+				}
+				else if (fa < fb) {
+					++i;
+				}
+				else {
+					++j;
+				}
+			}
+
+			faceFaces[f][e] = adj;
+		}
+	}
+}
+#else
 void Mesh::ListIncidenteFaceFaces()
 {
 	ASSERT(vertexFaces.size() == vertices.size());
@@ -372,6 +418,7 @@ void Mesh::ListIncidenteFaceFaces()
 		}
 	}
 }
+#endif
 
 // check each vertex if it is at the boundary or not
 // (make sure you called ListIncidenteFaces() before)
@@ -536,6 +583,85 @@ void Mesh::ComputeNormalVertices()
 //    allowed to take into consideration; higher angles are ignored
 //  - fOriginalWeight: weight (0..1] to use for current normal value when averaging with neighbor normals
 //  - nIterations: number of times to repeat the smoothening process
+#if 1
+void Mesh::SmoothNormalFaces(float fMaxGradient,
+	float fOriginalWeight,
+	unsigned nIterations)
+{
+	if (faceNormals.size() != faces.size())
+		ComputeNormalFaces();
+	if (vertexFaces.size() != vertices.size())
+		ListIncidenteFaces();
+	if (faceFaces.size() != faces.size())
+		ListIncidenteFaceFaces();
+
+	const float cosMaxGradient = COS(FD2R(fMaxGradient));
+	const float w0 = fOriginalWeight;
+	const float w1 = 1.0f - w0;
+
+	NormalArr newFaceNormals(faceNormals.size());
+
+	for (unsigned rep = 0; rep < nIterations; ++rep) {
+
+		FOREACH(idxFace, faces) {
+			const Normal& orig = faceNormals[idxFace];
+
+			Normal sum = Normal::ZERO;
+			int count = 0;
+
+			// at most 3 neighbors
+			for (int i = 0; i < 3; ++i) {
+				const FIndex fIdx = faceFaces[idxFace][i];
+				if (fIdx == NO_ID)
+					continue;
+
+				const Normal& nb = faceNormals[fIdx];
+
+				// dot product instead of ComputeAngleN
+				const float dot =
+					orig.x * nb.x + orig.y * nb.y + orig.z * nb.z;
+
+				if (dot >= cosMaxGradient) {
+					sum += nb;
+					++count;
+				}
+			}
+
+			Normal blended;
+
+			if (count > 0) {
+				// normalize neighbor sum once
+				const float invLen =
+					1.0f / sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+
+				const Normal avg(sum.x * invLen,
+					sum.y * invLen,
+					sum.z * invLen);
+
+				blended.x = orig.x * w0 + avg.x * w1;
+				blended.y = orig.y * w0 + avg.y * w1;
+				blended.z = orig.z * w0 + avg.z * w1;
+			}
+			else {
+				// no valid neighbors
+				blended = orig;
+			}
+
+			// final normalize (still required)
+			const float invLen =
+				1.0f / sqrt(blended.x * blended.x +
+					blended.y * blended.y +
+					blended.z * blended.z);
+
+			newFaceNormals[idxFace].x = blended.x * invLen;
+			newFaceNormals[idxFace].y = blended.y * invLen;
+			newFaceNormals[idxFace].z = blended.z * invLen;
+		}
+
+		newFaceNormals.Swap(faceNormals);
+	}
+}
+#else
 void Mesh::SmoothNormalFaces(float fMaxGradient, float fOriginalWeight, unsigned nIterations) {
 	if (faceNormals.size() != faces.size())
 		ComputeNormalFaces();
@@ -564,6 +690,7 @@ void Mesh::SmoothNormalFaces(float fMaxGradient, float fOriginalWeight, unsigned
 		newFaceNormals.Swap(faceNormals);
 	}
 }
+#endif
 /*----------------------------------------------------------------*/
 
 
@@ -1617,17 +1744,23 @@ void Mesh::Clean(
 		CLEAN::QHelper::TDp() = &TD;
 
 		vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
+
+		auto oldNested = omp_get_nested();
+		auto oldDynamic = omp_get_dynamic();  // must be called before any parallel region
+
 		deci.Init<CLEAN::TriEdgeCollapse>();
 		deci.SetTargetSimplices(targetFaces);
-		deci.SetTimeBudget(0.1f);
+		deci.SetTimeBudget(1.f);
 
 		const size_t numVertices = mesh.vert.size();
 		const int OriginalFaceNum(mesh.face.size());
-    DEBUG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
+		DEBUG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
 		Util::Progress progress(_T("Decimating"), OriginalFaceNum - targetFaces);
 		while (deci.DoOptimization(numVertices) && mesh.fn > targetFaces)
 			progress.display(OriginalFaceNum - mesh.fn);
 		deci.Finalize<CLEAN::TriEdgeCollapse>();
+		omp_set_nested(oldNested);
+		omp_set_dynamic(oldDynamic);
 		progress.close();
 
 		CompactAndRefresh();

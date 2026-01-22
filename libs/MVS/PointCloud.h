@@ -36,7 +36,9 @@
 // I N C L U D E S /////////////////////////////////////////////////
 
 #include "Image.h"
-
+#ifdef _USE_BOOST
+#include <boost/serialization/split_member.hpp>
+#endif
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -298,17 +300,88 @@ public:
 	#ifdef _USE_BOOST
 	// implement BOOST serialization
 	template <class Archive>
-	void serialize(Archive& ar, const unsigned int /*version*/) {
-		ar & pointsXYZ;
-		ar & pointViewsOffsets;
-		ar & pointViewsSizes;
-		ar & pointWeightsOffsets;
-		ar & pointWeightsSizes;
-		ar & pointViewsMemory;
-		ar & pointWeightsMemory;
-		ar & normalsXYZ;
-		ar & colorsRGB;
+	void save(Archive& ar, const unsigned int /*version*/) const {
+		uint64_t n;
+
+		n = (uint64_t)pointsXYZ.size();
+		ar& n;
+		if (n) ar.save_binary(pointsXYZ.data(), n * sizeof(pointsXYZ[0]));
+
+		n = (uint64_t)pointViewsOffsets.size();
+		ar& n;
+		if (n) ar.save_binary(pointViewsOffsets.data(), n * sizeof(pointViewsOffsets[0]));
+
+		n = (uint64_t)pointViewsSizes.size();
+		ar& n;
+		if (n) ar.save_binary(pointViewsSizes.data(), n * sizeof(pointViewsSizes[0]));
+
+		n = (uint64_t)pointWeightsOffsets.size();
+		ar& n;
+		if (n) ar.save_binary(pointWeightsOffsets.data(), n * sizeof(pointWeightsOffsets[0]));
+
+		n = (uint64_t)pointWeightsSizes.size();
+		ar& n;
+		if (n) ar.save_binary(pointWeightsSizes.data(), n * sizeof(pointWeightsSizes[0]));
+
+		n = (uint64_t)pointViewsMemory.size();
+		ar& n;
+		if (n) ar.save_binary(pointViewsMemory.data(), n * sizeof(pointViewsMemory[0]));
+
+		n = (uint64_t)pointWeightsMemory.size();
+		ar& n;
+		if (n) ar.save_binary(pointWeightsMemory.data(), n * sizeof(pointWeightsMemory[0]));
+
+		n = (uint64_t)normalsXYZ.size();
+		ar& n;
+		if (n) ar.save_binary(normalsXYZ.data(), n * sizeof(normalsXYZ[0]));
+
+		n = (uint64_t)colorsRGB.size();
+		ar& n;
+		if (n) ar.save_binary(colorsRGB.data(), n * sizeof(colorsRGB[0]));
 	}
+
+	template <class Archive>
+	void load(Archive& ar, const unsigned int /*version*/) {
+		uint64_t n;
+
+		ar& n;
+		pointsXYZ.resize((size_t)n);
+		if (n) ar.load_binary(pointsXYZ.data(), n * sizeof(pointsXYZ[0]));
+
+		ar& n;
+		pointViewsOffsets.resize((size_t)n);
+		if (n) ar.load_binary(pointViewsOffsets.data(), n * sizeof(pointViewsOffsets[0]));
+
+		ar& n;
+		pointViewsSizes.resize((size_t)n);
+		if (n) ar.load_binary(pointViewsSizes.data(), n * sizeof(pointViewsSizes[0]));
+
+		ar& n;
+		pointWeightsOffsets.resize((size_t)n);
+		if (n) ar.load_binary(pointWeightsOffsets.data(), n * sizeof(pointWeightsOffsets[0]));
+
+		ar& n;
+		pointWeightsSizes.resize((size_t)n);
+		if (n) ar.load_binary(pointWeightsSizes.data(), n * sizeof(pointWeightsSizes[0]));
+
+		ar& n;
+		pointViewsMemory.resize((size_t)n);
+		if (n) ar.load_binary(pointViewsMemory.data(), n * sizeof(pointViewsMemory[0]));
+
+		ar& n;
+		pointWeightsMemory.resize((size_t)n);
+		if (n) ar.load_binary(pointWeightsMemory.data(), n * sizeof(pointWeightsMemory[0]));
+
+		ar& n;
+		normalsXYZ.resize((size_t)n);
+		if (n) ar.load_binary(normalsXYZ.data(), n * sizeof(normalsXYZ[0]));
+
+		ar& n;
+		colorsRGB.resize((size_t)n);
+		if (n) ar.load_binary(colorsRGB.data(), n * sizeof(colorsRGB[0]));
+	}
+
+	BOOST_SERIALIZATION_SPLIT_MEMBER()
 	#endif
 
 	//

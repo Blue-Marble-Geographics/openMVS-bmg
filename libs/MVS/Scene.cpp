@@ -170,7 +170,7 @@ bool Scene::LoadInterface(const String & fileName)
 		// Each vertex is a Vertex which contains the point "X" and view array (an array of IDX).
 		pointcloud.ReservePointViewsSizeAndOffset(numObjVertices);
 		pointcloud.ReservePointWeightsSizeAndOffset(numObjVertices);
-
+		 
 		// Calculate the amount of space needed to store the point views and weights in a flat array.
 		size_t numFlatArrayItems = 0;
 		for (const auto& i : obj.vertices) {

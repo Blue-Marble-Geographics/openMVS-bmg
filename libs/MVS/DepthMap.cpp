@@ -501,11 +501,6 @@ DepthEstimator::DepthEstimator(
 # define ALIGN16_END __attribute__((aligned(16)))
 #endif
 
-/* __m128 is ugly to write */
-typedef __m128 v4sf;  // vector of 4 float (sse1)
-
-typedef __m128i v4si; // vector of 4 int (sse2)
-
 /* declare some SSE constants -- why can't I figure a better way to do that? */
 #define _PS_CONST(Name, Val)                                            \
   static const ALIGN16_BEG float _ps_##Name[4] ALIGN16_END = { Val, Val, Val, Val }
@@ -662,7 +657,7 @@ v4sf exp_ps(v4sf x) {
 	/* how to perform a floorf with SSE: just below */
 	emm0 = _mm_cvttps_epi32(fx);
 	tmp  = _mm_cvtepi32_ps(emm0);
-	/* if greater, substract 1 */
+	/* if greater, subtract 1 */
 	v4sf mask = _mm_cmpgt_ps(tmp, fx);
 	mask = _mm_and_ps(mask, one);
 	fx = _mm_sub_ps(tmp, mask);
@@ -1289,7 +1284,7 @@ void __declspec(safebuffers) DepthEstimator::GatherSampleInfo(
 	const _Data vBasisVY = sh.mvBasisVY;
 	const _Data vBasisVZ = sh.mvBasisVZ;
 
-	const _DataI vRowByteStride = _SetI(rowByteStride);
+	const _DataI vRowByteStride = _SetI((int) rowByteStride);
 	const _DataI vImageBasePtr = _mm_set1_epi64x((__int64) imageInfo.data2);
 	// Handle the 5 rows of 4 samples adjacent (everything else of the 5x5 block).
 	for (int i = 0; i < 5; ++i) {
@@ -3463,13 +3458,13 @@ bool MVS::EstimateNormalMap(const Matrix3x3f& K, const DepthMap& depthMap, Norma
 bool MVS::SaveDepthMap(const String& fileName, const DepthMap& depthMap)
 {
 	ASSERT(!depthMap.empty());
-	return SerializeSave(depthMap, fileName, ARCHIVE_DEFAULT);
+	return SerializeSave(depthMap, fileName, ARCHIVE_BINARY);
 } // SaveDepthMap
 /*----------------------------------------------------------------*/
 // load the depth map from our .dmap file format
 bool MVS::LoadDepthMap(const String& fileName, DepthMap& depthMap)
 {
-	return SerializeLoad(depthMap, fileName, ARCHIVE_DEFAULT);
+	return SerializeLoad(depthMap, fileName, ARCHIVE_BINARY);
 } // LoadDepthMap
 /*----------------------------------------------------------------*/
 
@@ -3491,13 +3486,13 @@ bool MVS::LoadNormalMap(const String& fileName, NormalMap& normalMap)
 bool MVS::SaveConfidenceMap(const String& fileName, const ConfidenceMap& confMap)
 {
 	ASSERT(!confMap.empty());
-	return SerializeSave(confMap, fileName, ARCHIVE_DEFAULT);
+	return SerializeSave(confMap, fileName, ARCHIVE_BINARY);
 } // SaveConfidenceMap
 /*----------------------------------------------------------------*/
 // load the confidence map from our .cmap file format
 bool MVS::LoadConfidenceMap(const String& fileName, ConfidenceMap& confMap)
 {
-	return SerializeLoad(confMap, fileName, ARCHIVE_DEFAULT);
+	return SerializeLoad(confMap, fileName, ARCHIVE_BINARY);
 } // LoadConfidenceMap
 /*----------------------------------------------------------------*/
 

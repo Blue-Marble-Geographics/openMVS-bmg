@@ -1106,21 +1106,30 @@ SkylineBinPack::Rect SkylineBinPack::ScoreRect(int width, int height, LevelChoic
 	return newNode;
 }
 
-bool SkylineBinPack::RectangleFits(int skylineNodeIndex, int width, int height, int &y) const
+bool SkylineBinPack::RectangleFits(int skylineNodeIndex, int width, int height, int& y) const
 {
-	int x = skyLine[skylineNodeIndex].x;
-	if (x + width > binWidth)
+	const int binW = binWidth;
+	const int binH = binHeight;
+	const auto* __restrict sl = skyLine.data();
+
+	int x = sl[skylineNodeIndex].x;
+	if (x + width > binW)
 		return false;
+
 	int widthLeft = width;
 	int i = skylineNodeIndex;
-	y = skyLine[skylineNodeIndex].y;
+	y = sl[i].y;
+
 	while (widthLeft > 0) {
-		y = MAXF(y, skyLine[i].y);
-		if (y + height > binHeight)
+		const int yi = sl[i].y;
+		if (yi > y)
+			y = yi;
+
+		if (y + height > binH)
 			return false;
-		widthLeft -= skyLine[i].width;
+
+		widthLeft -= sl[i].width;
 		++i;
-		ASSERT(i < (int)skyLine.size() || widthLeft <= 0);
 	}
 	return true;
 }
@@ -1266,16 +1275,16 @@ SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeBottomLeft(int width,
 		if (RectangleFits(i, height, width, y)) {
 			if (y + width < bestHeight || (y + width == bestHeight && skyLine[i].width < bestWidth)) {
 				bestHeight = y + width;
-				bestIndex = i;
-				bestWidth = skyLine[i].width;
-				newNode.x = skyLine[i].x;
-				newNode.y = y;
-				newNode.width = height;
-				newNode.height = width;
-				ASSERT(disjointRects.Disjoint(newNode));
+						bestIndex = i;
+						bestWidth = skyLine[i].width;
+						newNode.x = skyLine[i].x;
+						newNode.y = y;
+						newNode.width = height;
+						newNode.height = width;
+						ASSERT(disjointRects.Disjoint(newNode));
+					}
+				}
 			}
-		}
-	}
 
 	return newNode;
 }
