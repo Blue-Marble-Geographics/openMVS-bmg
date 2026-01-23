@@ -3673,7 +3673,7 @@ advance2:
 
 			facets.reserve(128); // JPB WIP OPT more?
 
-			constexpr int kMaxSteps = 64;
+			constexpr int kMaxSteps = 128;
 			size_t numViews = images.size();
 			pts.resize(numViews*2*kMaxSteps);
 			vis.resize(numViews * 2 * kMaxSteps);
