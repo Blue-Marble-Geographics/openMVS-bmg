@@ -2982,9 +2982,6 @@ advance:
 					views = pointcloud.pointViewsMemory.data() + offset;
 					_mm_prefetch((const char*)views, _MM_HINT_T0);
 
-					if (hint == nearest)
-						goto skip_bfs;
-
 					const double qx = p.x(), qy = p.y(), qz = p.z();
 					const point_t& nearestPt = nearest->point();
 					double bestSq = fast_sqdist2(qx, qy, qz, nearestPt.x(), nearestPt.y(), nearestPt.z());
@@ -2992,7 +2989,6 @@ advance:
 					// The key difference from the original code is that the original determines
 					// all adjacent cells and then looks at them.
 					// Here, we identify the adjacent cells as needed.
-
 					while (true) {
 						++marker;
 						if (marker == 0) {
@@ -3014,8 +3010,6 @@ advance:
 						start->tds_data().marker = marker;
 
 						size_t queueIndex = 0;
-						bool refined = false;
-
 #if 1
 						// inside your loop:
 						while (queueIndex < cellQueue.size()) {
@@ -3036,7 +3030,7 @@ advance:
 										const point_t& pt = v0->point();
 										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
 										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v0; refined = true; break; }
+										if (d2 < bestSq) { bestSq = d2; best = v0; goto refine_restart; }
 									}
 								}
 
@@ -3048,7 +3042,7 @@ advance:
 										const point_t& pt = v1->point();
 										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
 										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v1; refined = true; break; }
+										if (d2 < bestSq) { bestSq = d2; best = v1; goto refine_restart; }
 									}
 								}
 
@@ -3060,7 +3054,7 @@ advance:
 										const point_t& pt = v2->point();
 										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
 										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v2; refined = true; break; }
+										if (d2 < bestSq) { bestSq = d2; best = v2; goto refine_restart; }
 									}
 								}
 
@@ -3072,7 +3066,7 @@ advance:
 										const point_t& pt = v3->point();
 										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
 										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v3; refined = true; break; }
+										if (d2 < bestSq) { bestSq = d2; best = v3; goto refine_restart; }
 									}
 								}
 							}
@@ -3161,19 +3155,17 @@ advance:
 						}
 #endif
 
-						if (!refined)
+refine_restart:
+						if (best == nearest)
 							break;
 
 						nearest = best;
 						vertexMarks[nearest->info().idx] = marker;
-
 						const point_t& nearestPtNew = nearest->point();
 						bestSq = fast_sqdist2(qx, qy, qz, nearestPtNew.x(), nearestPtNew.y(), nearestPtNew.z());
 					}
 				}
-
 				hint = nearest;
-skip_bfs:
 
 				//const auto& hintPt2 = hint->point();
 				ASSERT(hint == delaunay.nearest_vertex(p, hint->cell()));
