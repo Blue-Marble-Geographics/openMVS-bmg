@@ -788,7 +788,9 @@ struct HeaderDepthDataRaw {
 	// camera, rotation and position matrices (row-major) at image resolution: double K[3][3], R[3][3], C[3]
 	// depth, normal, confidence maps: float depthMap[height][width], normalMap[height][width][3], confMap[height][width]
 	inline HeaderDepthDataRaw() : name(0), type(0), padding(0) {}
-	static uint16_t HeaderDepthDataRawName() { return *reinterpret_cast<const uint16_t*>("DR"); }
+	static uint16_t HeaderDepthDataRawName() {
+		return (uint16_t)'D' | ((uint16_t)'R' << 8);
+	}
 };
 /*----------------------------------------------------------------*/
 

@@ -3710,6 +3710,337 @@ bool MVS::ExportPointCloud(const String& fileName, const Image& imageData, const
 } // ExportPointCloud
 /*----------------------------------------------------------------*/
 
+#if 1 // JPB WIP BUG
+
+#pragma optimize("", on)
+#if 0
+#define DBG_BREAK(msg)                              \
+    do {                                              \
+      OutputDebugStringA(msg "\n");                   \
+      __debugbreak();                                 \
+    } while (0)
+
+#define DBG_BREAKF(fmt, ...)                        \
+    do {                                              \
+      char _dbgBuf[512];                              \
+      _snprintf_s(_dbgBuf, sizeof(_dbgBuf), _TRUNCATE,\
+                  fmt "\n", __VA_ARGS__);             \
+      OutputDebugStringA(_dbgBuf);                    \
+      __debugbreak();                                 \
+    } while (0)
+
+#define DBG_CHECK(cond, msg)                        \
+    do { if (!(cond)) DBG_BREAK(msg); } while (0)
+
+#define DBG_CHECKF(cond, fmt, ...)                  \
+    do { if (!(cond)) DBG_BREAKF(fmt, __VA_ARGS__); } while (0)
+#else
+#define DBG_BREAK(msg)          do {} while (0)
+#define DBG_BREAKF(fmt, ...)    do {} while (0)
+#define DBG_CHECK(cond, msg)    do {} while (0)
+#define DBG_CHECKF(cond, fmt, ...) do {} while (0)
+#endif
+
+
+static inline void* PtrAdvance(void*& p, size_t bytes) {
+	void* cur = p;
+	p = (char*)p + bytes;
+	return cur;
+}
+
+static inline bool AdvanceChecked(const uint8_t*& p, const uint8_t* end, size_t bytes, const uint8_t** outBegin = nullptr) {
+	if ((size_t)(end - p) < bytes) return false;
+	if (outBegin) *outBegin = p;
+	p += bytes;
+	return true;
+}
+
+static inline bool ReadU16(const uint8_t*& p, const uint8_t* end, uint16_t& v) {
+	const uint8_t* b = nullptr;
+	if (!AdvanceChecked(p, end, sizeof(uint16_t), &b)) return false;
+	memcpy(&v, b, sizeof(uint16_t));
+	return true;
+}
+
+static inline bool ReadU32(const uint8_t*& p, const uint8_t* end, uint32_t& v) {
+	const uint8_t* b = nullptr;
+	if (!AdvanceChecked(p, end, sizeof(uint32_t), &b)) return false;
+	memcpy(&v, b, sizeof(uint32_t));
+	return true;
+}
+
+bool MVS::ExportDepthDataRaw(
+	const String& fileName,
+	const String& imageFileName,
+	const IIndexArr& IDs,
+	const cv::Size& imageSize,
+	const KMatrix& K,
+	const RMatrix& R,
+	const CMatrix& C,
+	Depth dMin,
+	Depth dMax,
+	const DepthMap& depthMap,
+	const NormalMap& normalMap,
+	const ConfidenceMap& confMap,
+	const ViewsMap& viewsMap)
+{
+	DBG_CHECK(IDs.size() > 1 && IDs.size() < 256, "Export: invalid ID count");
+	DBG_CHECK(!depthMap.empty(), "Export: depthMap empty");
+
+	const size_t depthArea = depthMap.area();
+	DBG_CHECK(depthArea > 0, "Export: zero depth area");
+
+	if (!normalMap.empty())
+		DBG_CHECK(normalMap.area() == depthArea, "Export: normalMap area mismatch");
+	if (!confMap.empty())
+		DBG_CHECK(confMap.area() == depthArea, "Export: confMap area mismatch");
+	if (!viewsMap.empty())
+		DBG_CHECK(viewsMap.area() == depthArea, "Export: viewsMap area mismatch");
+
+	const bool hasNormal = !normalMap.empty();
+	const bool hasConf = !confMap.empty();
+	const bool hasViews = !viewsMap.empty();
+
+	const String relImageName(
+		MAKE_PATH_REL(
+			Util::getFullPath(Util::getFilePath(fileName)),
+			Util::getFullPath(imageFileName)));
+
+	const uint16_t nameLen = (uint16_t)relImageName.length();
+
+	size_t fileSize =
+		sizeof(HeaderDepthDataRaw) +
+		sizeof(uint16_t) + nameLen +
+		sizeof(uint32_t) + IDs.size() * sizeof(IIndex) +
+		sizeof(REAL) * (9 + 9 + 3) +
+		sizeof(float) * depthArea;
+
+	if (hasNormal) fileSize += sizeof(float) * 3 * depthArea;
+	if (hasConf)   fileSize += sizeof(float) * depthArea;
+	if (hasViews)  fileSize += sizeof(uint8_t) * 4 * depthArea;
+
+	HANDLE hFile = CreateFileA(
+		fileName.c_str(),
+		GENERIC_READ | GENERIC_WRITE,
+		0,
+		nullptr,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+
+	DBG_CHECKF(hFile != INVALID_HANDLE_VALUE,
+		"Export: CreateFile failed (err=%lu)", GetLastError());
+
+	LARGE_INTEGER li;
+	li.QuadPart = (LONGLONG)fileSize;
+	DBG_CHECKF(SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN),
+		"Export: SetFilePointerEx failed (err=%lu)", GetLastError());
+	DBG_CHECKF(SetEndOfFile(hFile),
+		"Export: SetEndOfFile failed (err=%lu)", GetLastError());
+
+	HANDLE hMap = CreateFileMappingA(
+		hFile, nullptr, PAGE_READWRITE,
+		(DWORD)(fileSize >> 32),
+		(DWORD)(fileSize & 0xffffffff),
+		nullptr);
+
+	DBG_CHECKF(hMap != nullptr,
+		"Export: CreateFileMapping failed (err=%lu)", GetLastError());
+
+	uint8_t* base = (uint8_t*)MapViewOfFile(hMap, FILE_MAP_WRITE, 0, 0, fileSize);
+	DBG_CHECKF(base != nullptr,
+		"Export: MapViewOfFile failed (err=%lu)", GetLastError());
+
+	uint8_t* p = base;
+
+	HeaderDepthDataRaw header;
+	header.name = HeaderDepthDataRaw::HeaderDepthDataRawName();
+	header.type = HeaderDepthDataRaw::HAS_DEPTH |
+		(hasNormal ? HeaderDepthDataRaw::HAS_NORMAL : 0) |
+		(hasConf ? HeaderDepthDataRaw::HAS_CONF : 0) |
+		(hasViews ? HeaderDepthDataRaw::HAS_VIEWS : 0);
+	header.imageWidth = imageSize.width;
+	header.imageHeight = imageSize.height;
+	header.depthWidth = depthMap.cols;
+	header.depthHeight = depthMap.rows;
+	header.dMin = dMin;
+	header.dMax = dMax;
+
+	memcpy(p, &header, sizeof(header)); p += sizeof(header);
+	memcpy(p, &nameLen, sizeof(nameLen)); p += sizeof(nameLen);
+	memcpy(p, relImageName.data(), nameLen); p += nameLen;
+
+	const uint32_t nIDs = (uint32_t)IDs.size();
+	memcpy(p, &nIDs, sizeof(nIDs)); p += sizeof(nIDs);
+	memcpy(p, IDs.data(), sizeof(IIndex) * nIDs); p += sizeof(IIndex) * nIDs;
+
+	memcpy(p, K.val, sizeof(REAL) * 9); p += sizeof(REAL) * 9;
+	memcpy(p, R.val, sizeof(REAL) * 9); p += sizeof(REAL) * 9;
+	memcpy(p, C.ptr(), sizeof(REAL) * 3); p += sizeof(REAL) * 3;
+
+	memcpy(p, depthMap.getData(), sizeof(float) * depthArea);
+	p += sizeof(float) * depthArea;
+
+	if (hasNormal) {
+		memcpy(p, normalMap.getData(), sizeof(float) * 3 * depthArea);
+		p += sizeof(float) * 3 * depthArea;
+	}
+	if (hasConf) {
+		memcpy(p, confMap.getData(), sizeof(float) * depthArea);
+		p += sizeof(float) * depthArea;
+	}
+	if (hasViews) {
+		memcpy(p, viewsMap.getData(), sizeof(uint8_t) * 4 * depthArea);
+		p += sizeof(uint8_t) * 4 * depthArea;
+	}
+
+	DBG_CHECKF(p == base + fileSize,
+		"Export: size mismatch (written=%zu expected=%zu)",
+		size_t(p - base), fileSize);
+
+	UnmapViewOfFile(base);
+	CloseHandle(hMap);
+	CloseHandle(hFile);
+	return true;
+}
+
+bool MVS::ImportDepthDataRaw(
+	const String& fileName,
+	String& imageFileName,
+	IIndexArr& IDs,
+	cv::Size& imageSize,
+	KMatrix& K,
+	RMatrix& R,
+	CMatrix& C,
+	Depth& dMin,
+	Depth& dMax,
+	DepthMap& depthMap,
+	NormalMap& normalMap,
+	ConfidenceMap& confMap,
+	ViewsMap& viewsMap,
+	unsigned flags)
+{
+	HANDLE hFile = CreateFileA(
+		fileName.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+
+	DBG_CHECKF(hFile != INVALID_HANDLE_VALUE,
+		"Import: CreateFile failed (err=%lu)", GetLastError());
+
+	LARGE_INTEGER li;
+	DBG_CHECKF(GetFileSizeEx(hFile, &li),
+		"Import: GetFileSizeEx failed (err=%lu)", GetLastError());
+
+	const size_t fileSize = (size_t)li.QuadPart;
+	DBG_CHECK(fileSize >= sizeof(HeaderDepthDataRaw),
+		"Import: file too small");
+
+	HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+	DBG_CHECKF(hMap != nullptr,
+		"Import: CreateFileMapping failed (err=%lu)", GetLastError());
+
+	const uint8_t* base =
+		(const uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+	DBG_CHECKF(base != nullptr,
+		"Import: MapViewOfFile failed (err=%lu)", GetLastError());
+
+	const uint8_t* p = base;
+	const uint8_t* end = base + fileSize;
+
+	HeaderDepthDataRaw header;
+	memcpy(&header, p, sizeof(header)); p += sizeof(header);
+
+	uint16_t rawName;
+	memcpy(&rawName, base, sizeof(uint16_t));
+
+	DBG_CHECK(header.name == HeaderDepthDataRaw::HeaderDepthDataRawName(),
+		"Import: bad magic");
+	DBG_CHECK(header.type & HeaderDepthDataRaw::HAS_DEPTH,
+		"Import: HAS_DEPTH not set");
+
+	imageSize.width = header.imageWidth;
+	imageSize.height = header.imageHeight;
+	dMin = header.dMin;
+	dMax = header.dMax;
+
+	uint16_t nameLen;
+	memcpy(&nameLen, p, sizeof(nameLen)); p += sizeof(nameLen);
+	DBG_CHECK(nameLen > 0 && nameLen < 4096, "Import: bad filename length");
+
+	imageFileName.assign((const char*)p, nameLen);
+	p += nameLen;
+
+	uint32_t nIDs;
+	memcpy(&nIDs, p, sizeof(nIDs)); p += sizeof(nIDs);
+	DBG_CHECK(nIDs > 0 && nIDs < 256, "Import: bad nIDs");
+
+	IDs.resize(nIDs);
+	memcpy(IDs.data(), p, sizeof(IIndex) * nIDs);
+	p += sizeof(IIndex) * nIDs;
+
+	memcpy(K.val, p, sizeof(REAL) * 9); p += sizeof(REAL) * 9;
+	memcpy(R.val, p, sizeof(REAL) * 9); p += sizeof(REAL) * 9;
+	memcpy(C.ptr(), p, sizeof(REAL) * 3); p += sizeof(REAL) * 3;
+
+	const size_t depthArea =
+		(size_t)header.depthWidth * (size_t)header.depthHeight;
+	const size_t depthBytes = sizeof(float) * depthArea;
+
+	DBG_CHECK((size_t)(end - p) >= depthBytes, "Import: truncated depth");
+
+	if (flags & HeaderDepthDataRaw::HAS_DEPTH) {
+		depthMap.create(header.depthHeight, header.depthWidth);
+		memcpy(depthMap.getData(), p, depthBytes);
+	}
+	p += depthBytes;
+
+	if (header.type & HeaderDepthDataRaw::HAS_NORMAL) {
+		const size_t bytes = sizeof(float) * 3 * depthArea;
+		DBG_CHECK((size_t)(end - p) >= bytes, "Import: truncated normal");
+		if (flags & HeaderDepthDataRaw::HAS_NORMAL) {
+			normalMap.create(header.depthHeight, header.depthWidth);
+			memcpy(normalMap.getData(), p, bytes);
+		}
+		p += bytes;
+	}
+
+	if (header.type & HeaderDepthDataRaw::HAS_CONF) {
+		const size_t bytes = sizeof(float) * depthArea;
+		DBG_CHECK((size_t)(end - p) >= bytes, "Import: truncated conf");
+		if (flags & HeaderDepthDataRaw::HAS_CONF) {
+			confMap.create(header.depthHeight, header.depthWidth);
+			memcpy(confMap.getData(), p, bytes);
+		}
+		p += bytes;
+	}
+
+	if (header.type & HeaderDepthDataRaw::HAS_VIEWS) {
+		const size_t bytes = sizeof(uint8_t) * 4 * depthArea;
+		DBG_CHECK((size_t)(end - p) >= bytes, "Import: truncated views");
+		if (flags & HeaderDepthDataRaw::HAS_VIEWS) {
+			viewsMap.create(header.depthHeight, header.depthWidth);
+			memcpy(viewsMap.getData(), p, bytes);
+		}
+		p += bytes;
+	}
+
+	DBG_CHECKF(p == end,
+		"Import: trailing or missing data (%zu bytes)",
+		size_t(end - p));
+
+	UnmapViewOfFile(base);
+	CloseHandle(hMap);
+	CloseHandle(hFile);
+	return true;
+}
+#pragma optimize("", on)
+
+#else
 //  - IDs are the reference view ID and neighbor view IDs used to estimate the depth-map (global ID)
 bool MVS::ExportDepthDataRaw(const String& fileName, const String& imageFileName,
 	const IIndexArr& IDs, const cv::Size& imageSize,
@@ -3884,6 +4215,7 @@ bool MVS::ImportDepthDataRaw(const String& fileName, String& imageFileName,
 	_fclose_nolock(f);
 	return bRet;
 } // ImportDepthDataRaw
+#endif
 /*----------------------------------------------------------------*/
 
 
