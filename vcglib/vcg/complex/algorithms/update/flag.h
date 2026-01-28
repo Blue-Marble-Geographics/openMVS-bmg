@@ -265,6 +265,46 @@ public:
         }
         else
         {
+#if 1 // JPB WIP BUG
+          thread_local std::vector<uint32_t> seenGen;
+          thread_local uint32_t seenCounter = 1;
+
+          if (seenGen.size() < m.vert.size())
+            seenGen.resize(m.vert.size(), 0);
+
+          for (VertexIterator vi = m.vert.begin(), end = m.vert.end(); vi != end; ++vi) {
+
+            const uint32_t gen = ++seenCounter;
+            if (gen == 0) {
+              std::fill(seenGen.begin(), seenGen.end(), 0);
+              seenCounter = 1;
+            }
+
+            VertexType* v0 = &*vi;
+
+            for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi) {
+              FaceType* f = vfi.f;
+              const int z = vfi.z;
+
+              VertexType* v1 = f->V1(z);
+              VertexType* v2 = f->V2(z);
+
+              const uint32_t i1 = uint32_t(v1 - &m.vert[0]);
+              if (seenGen[i1] != gen) {
+                seenGen[i1] = gen;
+                if (v0 < v1)
+                  f->Flags() |= BORDERFLAG[z];
+              }
+
+              const uint32_t i2 = uint32_t(v2 - &m.vert[0]);
+              if (seenGen[i2] != gen) {
+                seenGen[i2] = gen;
+                if (v0 < v2)
+                  f->Flags() |= BORDERFLAG[(z + 2) % 3];
+              }
+            }
+          }
+#else
           for (VertexIterator vi = m.vert.begin(); vi != m.vert.end(); ++vi)
           {
             for (face::VFIterator<FaceType> vfi(&*vi); !vfi.End(); ++vfi)
@@ -287,6 +327,7 @@ public:
                 vfi.f->Flags() |= BORDERFLAG[(vfi.z + 2) % 3];
             }
           }
+#endif
         }
         VertexType::DeleteBitFlag(visitedBit);
     }

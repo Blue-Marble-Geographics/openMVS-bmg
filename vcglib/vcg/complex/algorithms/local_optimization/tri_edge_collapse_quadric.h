@@ -363,6 +363,61 @@ public:
     if(IsSymmetric(pp))
     { // if the collapse is symmetric (e.g. u->v == v->u)
       h_ret.reserve(8 * m.vn);
+
+#if 1
+      thread_local std::vector<uint32_t> seenGen;
+      thread_local uint32_t genCounter = 1;
+
+      if (seenGen.size() < m.vert.size())
+        seenGen.resize(m.vert.size(), 0);
+
+      VertexType* baseVert = &m.vert[0];
+      auto vi = m.vert.begin();
+      auto viEnd = m.vert.end();
+
+      for (; vi != viEnd; ++vi) {
+
+        if (vi->IsD() || !vi->IsRW())
+          continue;
+
+        const uint32_t gen = ++genCounter;
+        VertexType* v0 = &*vi;
+
+        vcg::face::VFIterator<FaceType> x;
+        for (x.F() = v0->VFp(), x.I() = v0->VFi(); x.F() != 0; ++x) {
+
+          VertexType* v1 = x.V1();
+          if (v0 < v1 && v1->IsRW()) {
+            const uint32_t i1 = uint32_t(v1 - baseVert);
+            if (seenGen[i1] != gen) {
+              seenGen[i1] = gen;
+
+              auto* mod = new MYTYPE(
+                VertexPair(v0, v1),
+                TriEdgeCollapseQuadric<TriMeshType, VertexPair, MYTYPE>::GlobalMark()
+              );
+              float priority = mod->ComputePriority();
+              h_ret.emplace_back(mod, (uint32_t&)priority);
+            }
+          }
+
+          VertexType* v2 = x.V2();
+          if (v0 < v2 && v2->IsRW()) {
+            const uint32_t i2 = uint32_t(v2 - baseVert);
+            if (seenGen[i2] != gen) {
+              seenGen[i2] = gen;
+
+              auto* mod = new MYTYPE(
+                VertexPair(v0, v2),
+                TriEdgeCollapseQuadric<TriMeshType, VertexPair, MYTYPE>::GlobalMark()
+              );
+              float priority = mod->ComputePriority();
+              h_ret.emplace_back(mod, (uint32_t&)priority);
+            }
+          }
+        }
+      }
+#else
       for(auto vi=m.vert.begin();vi!=m.vert.end();++vi)
         if(!(*vi).IsD() && (*vi).IsRW())
         {
@@ -390,6 +445,7 @@ public:
             }
           }
         }
+#endif
     }
 #if 0
     else
