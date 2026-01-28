@@ -191,7 +191,7 @@ public:
   typedef Triangulation_simplex_3<Tds>             Simplex;
 
   typedef std::pair<Vertex_handle,Vertex_handle> Vertex_pair;
-  typedef std::pair<unsigned char, unsigned char> Local_facet;
+  typedef uint16_t Local_facet;
 
   struct Small_pair_hash {
 
@@ -202,7 +202,6 @@ public:
 
       return hf ^ 419 * hs;
     }
-
   };
   static const int maximal_nb_of_facets_of_small_hole = 128;
   typedef Small_unordered_map<Vertex_pair, Local_facet,
@@ -592,34 +591,30 @@ public:
       w->set_cell(neighbor_cell);
       const Cell_handle nc = create_cell(v, u, w, nv);
 
-
-
       new_cells[local_facet_index].h = nc;
-      nv->set_cell(nc);
+      //nv->set_cell(nc);
       nc->set_neighbor(3, neighbor_cell);
       neighbor_cell->set_neighbor(opposite_index, nc);
 
-      vertex_pair_facet_map.set({u, v}, {local_facet_index,
-                                         static_cast<unsigned char>(2)});
-      vertex_pair_facet_map.set({v, w}, {local_facet_index,
-                                         static_cast<unsigned char>(1)});
-      vertex_pair_facet_map.set({w, u}, {local_facet_index,
-                                         static_cast<unsigned char>(0)});
+      uint16_t value = ((uint16_t)local_facet_index) << 2;
+      vertex_pair_facet_map.set({ u, v }, value + 2);
+      vertex_pair_facet_map.set({ v, w }, value + 1);
+      vertex_pair_facet_map.set({ w, u }, value);
     }
+    nv->set_cell(new_cells[0].h);
 
     auto& map = vertex_pair_facet_map;
     constexpr int map_capacity = maximal_nb_of_facets_of_small_hole * 8;
     Vertex_pair reverse;
     for (auto it = map.begin(); it != map.end(); ++it) {
-
       const auto& ef = *it;
       const Vertex_handle a = ef.first.first;
       const Vertex_handle b = ef.first.second;
 
       if (a < b) [[likely]] {
 
-        const int f0 = ef.second.first;
-        const int e0 = ef.second.second;
+        const int f0 = ef.second >> 2;
+        const int e0 = ef.second & 3;
 
         map.clear(it);
 
@@ -627,13 +622,14 @@ public:
         reverse.second = a;
 
         unsigned h = map.hash(reverse) & (map_capacity - 1);
-        const auto p = map.get_and_erase2(reverse, h);
+        const auto value = map.get_and_erase2(reverse, h);
 
+        // p first is local_facet_index, p.second is 0,1,2
         Cell_handle c0 = new_cells[f0].h;
-        Cell_handle c1 = new_cells[p.first].h;
+        Cell_handle c1 = new_cells[value >> 2].h;
 
         c0->set_neighbor(e0, c1);
-        c1->set_neighbor(p.second, c0);
+        c1->set_neighbor(value&3, c0);
       }
     }
     //for(Cell_handle c : cells){

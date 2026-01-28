@@ -243,30 +243,34 @@ public:
 	}
 #else
 	struct Arc {
-		Node* __restrict 	head;
-		Arc* __restrict 	rev;
-		EdgeCap			rCap;
-		unsigned char	isRevResidual;
+		Node* head;        // 8
+		EdgeCap  rCap;        // 4
+		uint8_t  revIdx;      // 1
+		uint8_t  isRevResidual; // 1
+		uint8_t  pad[2];      // explicit
 	};
 
 	struct Node {
 		static constexpr int kMaxArcs = 4;
 
-		// Group together arcCount + arcs for locality
-		std::atomic<int> arcCountBuild;  // build phase only
-		int arcCount;               // 4
-		Arc arcs[kMaxArcs];         // 32 (assuming Arc = 8 bytes)
+		// ---- hot path ----
+		EdgeCap excess;              // 4
+		int     label;               // 4
 
-		EdgeCap excess;             // 4
-		Arc* __restrict parent;                // 8
+		Arc* parent;              // 8
+		Node* firstSon;            // 8
+		Node* nextPtr;             // 8
 
-		Node* firstSon;             // 8
-		Node* nextPtr;              // 8
+		uint32_t lastAugTimestamp;   // 4
+		uint8_t  isParentCurr;       // 1
+		uint8_t  pad0[3];            // align
 
-		int lastAugTimestamp : 31;  // 4 (bitfield with next)
-		int isParentCurr : 1;
+		// ---- arc data (hot but secondary) ----
+		int arcCount;                // 4
+		Arc arcs[kMaxArcs];          // 4 * sizeof(Arc)
 
-		int label;                  // 4
+		// ---- cold / build-only ----
+		std::atomic<int> arcCountBuild;
 	};
 #endif
 
@@ -383,7 +387,21 @@ public:
 	bool verbose;
 
 	void augment(Arc* __restrict bridge);
-	template <bool sTree> void augmentTree(Node* __restrict x, EdgeCap bottleneck);
+
+	struct NodeArcPair
+	{
+		NodeArcPair() {}
+		NodeArcPair(Node* _n, Arc* _a) : n(_n), a(_a) {}
+		Node* n;
+		Arc* a;
+	};
+
+	template <bool sTree> void augmentTree(
+		EdgeCap bottleneck,
+		Node** __restrict nodePath,
+		Arc** __restrict arcPath,
+		int nodeCount
+	);
 	template <bool sTree> void adoption();
 	template <bool sTree> void adoption3Pass();
 	template <bool dirS> void growth();
@@ -457,13 +475,16 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 	Arc* vu = &v->arcs[v->arcCount++];
 #endif
 
+	// forward arc
 	uv->head = v;
-	uv->rev = vu;
+	uv->revIdx = static_cast<uint8_t>(vArcIdx);
 	uv->rCap = cap;
 	uv->isRevResidual = (revCap > 0);
 
+
+	// reverse arc
 	vu->head = u;
-	vu->rev = uv;
+	vu->revIdx = static_cast<uint8_t>(uArcIdx);
 	vu->rCap = revCap;
 	vu->isRevResidual = (cap > 0);
 }

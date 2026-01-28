@@ -84,36 +84,6 @@ public:
     CGAL_error();
   }
 
-  __forceinline void set2(const K& k, const T& t, unsigned int h)
-  {
-    unsigned i = h;
-#ifdef CGAL_SMALL_UNORDERED_MAP_STATS
-    int collision = 0;
-#endif
-    do {
-      if(!occupied[i]){
-        occupied[i] = 1;
-        data[i].first = k;
-        data[i].second = t;
-        unfreelist[i] = head;
-        head = i;
-#ifdef  CGAL_SMALL_UNORDERED_MAP_STATS
-        if(collision>19){
-          std::cerr << collision << " collisions" << std::endl;
-        }else{
-          ++collisions[collision];
-        }
-#endif
-        return;
-      }
-      i = (i+1)%M;
-#ifdef CGAL_SMALL_UNORDERED_MAP_STATS
-      ++collision;
-#endif
-    }while(i != h);
-    CGAL_error();
-  }
-
   // et only once as it is erased
   const T& get_and_erase(const K& k) const
   {

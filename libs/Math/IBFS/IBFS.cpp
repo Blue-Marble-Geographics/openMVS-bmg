@@ -34,10 +34,9 @@ If you require another license, please contact the above.
 
 #include "Common.h"
 #include "IBFS.h"
+#include "boost/container/small_vector.hpp"
 
 using namespace IBFS;
-
-constexpr float kMinResidual = 0.025f;  // Half of the smallest quantized step (0.05)
 
 //
 // Orphan handling
@@ -146,31 +145,36 @@ void IBFSGraph::initSize(int n, int)
 }
 
 template <bool sTree>
-void IBFSGraph::augmentTree(Node* __restrict x, EdgeCap bottleneck) {
-	Node* __restrict y;
-	Arc* __restrict a;
-	int hopCount = 0;
+__forceinline void IBFSGraph::augmentTree(
+	EdgeCap bottleneck,
+	Node** __restrict nodePath,
+	Arc** __restrict arcPath,
+	int nodeCount
+) {
+	Node* x = nodePath[0];
 
-	while (true) {
-		if (x->excess) break;
-
-		a = x->parent;
+	for (int i = 0; i < nodeCount - 1; ++i) {
+		Arc* a = arcPath[i];
+		Arc& rev = a->head->arcs[a->revIdx];
 
 		if (sTree) {
+			// used reverse residual
 			a->rCap += bottleneck;
-			a->rev->isRevResidual = 1;
-			a->rev->rCap -= bottleneck;
-		} else {
-			a->rev->rCap += bottleneck;
+			rev.isRevResidual = 1;
+			rev.rCap -= bottleneck;
+		}
+		else {
+			// used forward residual
+			rev.rCap += bottleneck;
 			a->isRevResidual = 1;
 			a->rCap -= bottleneck;
 		}
 
-		if ((sTree ? a->rev->rCap : a->rCap) == 0) {
+		if ((sTree ? rev.rCap : a->rCap) == 0) {
 			if (sTree) a->isRevResidual = 0;
-			else a->rev->isRevResidual = 0;
-
-			y = a->head->firstSon;
+			else rev.isRevResidual = 0;		
+	
+			Node* y = a->head->firstSon;
 			if (y == x) {
 				a->head->firstSon = x->nextPtr;
 			}
@@ -179,21 +183,45 @@ void IBFSGraph::augmentTree(Node* __restrict x, EdgeCap bottleneck) {
 				if (y) y->nextPtr = x->nextPtr;
 			}
 
+			// orphan creation
 			x->nextPtr = IB_ORPHANS_END;
-			if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
-			else orphanFirst = orphanLast = x;
+			if (orphanFirst != IB_ORPHANS_END)
+				orphanLast = orphanLast->nextPtr = x;
+			else
+				orphanFirst = orphanLast = x;
 		}
-
-		x = a->head;
+		x = nodePath[i + 1];
 	}
 
+	// terminal
 	x->excess += (sTree ? -bottleneck : bottleneck);
 	if (x->excess == 0) {
 		x->nextPtr = IB_ORPHANS_END;
-		if (orphanFirst != IB_ORPHANS_END) orphanLast = orphanLast->nextPtr = x;
-		else orphanFirst = orphanLast = x;
+		if (orphanFirst != IB_ORPHANS_END)
+			orphanLast = orphanLast->nextPtr = x;
+		else
+			orphanFirst = orphanLast = x;
 	}
 }
+
+enum { kSmallSize = 128 };
+
+struct Scratch
+{
+	IBFSGraph::Node* smallSNode[kSmallSize];
+	IBFSGraph::Arc* smallSArc[kSmallSize];
+
+	IBFSGraph::Node* smallTNode[kSmallSize];
+	IBFSGraph::Arc* smallTArc[kSmallSize];
+};
+
+thread_local std::vector<IBFSGraph::Node*> bigSNode;
+thread_local std::vector<IBFSGraph::Arc*> bigSArc;
+
+thread_local std::vector<IBFSGraph::Node*> bigTNode;
+thread_local std::vector<IBFSGraph::Arc*> bigTArc;
+
+__declspec(thread) Scratch scratch; // Must be POD
 
 void IBFSGraph::augment(Arc * __restrict bridge)
 {
@@ -207,10 +235,167 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	stats.incAugs();
 	stats.incPushes();
 
+	Node** __restrict sNode = scratch.smallSNode;
+	Arc** __restrict sArc = scratch.smallSArc;
+
 	// bottleneck in S
+	bottleneck = bridge->rCap;
+	int lenS = 0;
+	bool overflow = false;
+
+	for (x = bridge->head->arcs[bridge->revIdx].head;;) {
+		// ---- overflow check once per full iteration ----
+		if (lenS + 1 >= kSmallSize) {
+			overflow = true;
+			break;
+		}
+
+		// ================== step 0 ==================
+		sNode[lenS] = x;
+
+		if (x->excess) {
+			++lenS;
+			break;
+		}
+
+		a = x->parent;
+		sArc[lenS] = a;
+
+    Node* aHead0 = a->head;
+
+		{
+			const Arc& rev0 = aHead0->arcs[a->revIdx];
+			if (bottleneck > rev0.rCap)
+				bottleneck = rev0.rCap;
+		}
+
+		++lenS;
+		x = aHead0;
+
+		// ================== step 1 ==================
+		sNode[lenS] = x;
+
+		if (x->excess) {
+			++lenS;
+			break;
+		}
+
+		a = x->parent;
+		sArc[lenS] = a;
+
+		Node* aHead1 = a->head;
+
+		{
+			const Arc& rev1 = aHead1->arcs[a->revIdx];
+			if (bottleneck > rev1.rCap)
+				bottleneck = rev1.rCap;
+		}
+
+		++lenS;
+		x = aHead1;
+	}
+
+	if (!overflow && bottleneck > x->excess)
+		bottleneck = x->excess;
+
+
+	Node** __restrict tNode = scratch.smallTNode;
+	Arc** __restrict tArc = scratch.smallTArc;
+
+	int lenT = 0;
+
+	for (x = bridge->head;;) {
+		// ---- overflow check once per full iteration ----
+		if (lenT + 1 >= kSmallSize) {
+			overflow = true;
+			break;
+		}
+
+		// ================== step 0 ==================
+		tNode[lenT] = x;
+
+		if (x->excess) {
+			++lenT;
+			break;
+		}
+
+		a = x->parent;
+		tArc[lenT] = a;
+
+		if (bottleneck > a->rCap)
+			bottleneck = a->rCap;
+
+		++lenT;
+		x = a->head;
+
+		// ================== step 1 ==================
+		tNode[lenT] = x;
+
+		if (x->excess) {
+			++lenT;
+			break;
+		}
+
+		a = x->parent;
+		tArc[lenT] = a;
+
+		if (bottleneck > a->rCap)
+			bottleneck = a->rCap;
+
+		++lenT;
+		x = a->head;
+	}
+
+	if (!overflow && bottleneck > (-x->excess))
+		bottleneck = (-x->excess);
+
+	if (overflow) {
+		bottleneck = bridge->rCap;
+
+		bigSNode.clear();
+		bigSNode.reserve(1024);
+		bigSArc.clear();
+		bigSArc.reserve(1024);
+
+		for (x = bridge->head->arcs[bridge->revIdx].head; ; x = a->head) {
+			bigSNode.push_back(x);
+
+			if (x->excess)
+				break;
+
+			a = x->parent;
+			bigSArc.push_back(a);
+
+			Arc& rev = a->head->arcs[a->revIdx];
+			if (bottleneck > rev.rCap)
+				bottleneck = rev.rCap;
+		}
+
+		if (bottleneck > x->excess)
+			bottleneck = x->excess;
+
+		bigTNode.clear();
+		bigTNode.reserve(1024);
+		bigTArc.clear();
+		bigTArc.reserve(1024);
+
+		for (x = bridge->head; ; x = a->head) {
+			bigTNode.push_back(x);
+			if (x->excess) break;
+			a = x->parent;
+			bigTArc.push_back(a);
+			if (bottleneck > a->rCap)
+				bottleneck = a->rCap;
+		}
+
+		if (bottleneck > (-x->excess))
+			bottleneck = (-x->excess);
+	}
+#if 0
 	bottleneck = bridge->rCap;
 	for (x=bridge->rev->head; ; x=a->head)
 	{
+		sScratch.push_back(x);
 		stats.incPushes();
 		if (x->excess) break;
 		a = x->parent;
@@ -225,6 +410,7 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	// bottleneck in T
 	for (x=bridge->head; ; x=a->head)
 	{
+		tScratch.push_back(x);
 		stats.incPushes();
 		if (x->excess) break;
 		a = x->parent;
@@ -235,6 +421,7 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	if (bottleneck > (-x->excess)) {
 		bottleneck = (-x->excess);
 	}
+#endif
 
 	// stats
 	if (IBSTATS) {
@@ -243,21 +430,33 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	}
 
 	// augment connecting arc
-	bridge->rev->rCap += bottleneck;
+	Arc& rev = bridge->head->arcs[bridge->revIdx];
+	rev.rCap += bottleneck;
 	bridge->isRevResidual = 1;
 	bridge->rCap -= bottleneck;
 	if (bridge->rCap == 0) {
-		bridge->rev->isRevResidual = 0;
+		rev.isRevResidual = 0;
 	}
+
 
 	// augment T
 	augTimestamp++;
-	augmentTree<false>(bridge->head, bottleneck);
+	augmentTree<false>(
+		bottleneck,
+		overflow ? bigTNode.data() : tNode,
+		overflow ? bigTArc.data() : tArc,
+		overflow ? (int)bigTNode.size() : lenT
+	);
 	adoption<false>();
 
 	// augment S
 	augTimestamp++;
-	augmentTree<true>(bridge->rev->head, bottleneck);
+	augmentTree<true>(
+		bottleneck,
+		overflow ? bigSNode.data() : sNode,
+		overflow ? bigSArc.data() : sArc,
+		overflow ? (int)bigSNode.size() : lenS
+	);
 	adoption<true>();
 
 	flow += bottleneck;
@@ -304,7 +503,9 @@ void IBFSGraph::adoption()
 				a = &x->arcs[i];
 				stats.incOrphanArcs1();
 				y = a->head;
-        if ((sTree ? a->isRevResidual : a->rCap) && y->label == minLabel) {
+
+				if ((sTree ? a->isRevResidual : a->rCap) && y->label == minLabel) {
+
 					x->parent = a;
 					x->nextPtr = y->firstSon;
 					y->firstSon = x;
@@ -338,15 +539,15 @@ void IBFSGraph::adoption()
     if (x->label != minLabel) {
 			for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 				a = &x->arcs[i];
-			stats.incOrphanArcs2();
-			y = a->head;
+				stats.incOrphanArcs2();
+				y = a->head;
 			if ((sTree ? a->isRevResidual : a->rCap) &&
-            (sTree ? y->label > 0 : y->label < 0) &&
-            (sTree ? y->label < minLabel : y->label > minLabel)) {
-          minLabel = y->label;
-				x->parent = a;
-          if (minLabel == x->label) break;
-        }
+					(sTree ? y->label > 0 : y->label < 0) &&
+					(sTree ? y->label < minLabel : y->label > minLabel)) {
+					minLabel = y->label;
+					x->parent = a;
+					if (minLabel == x->label) break;
+				}
 			}
 		}
 
@@ -369,17 +570,19 @@ void IBFSGraph::adoption()
 template <bool sTree>
 void IBFSGraph::adoption3Pass()
 {
-	Arc *a;
-	Node *x, *y;
+	Arc* a;
+	Node* x, * y;
 	int minLabel, destLabel;
 
-	for (int level=2; level <= orphanBuckets.maxBucket; level++) {
-		while ((x = orphanBuckets.popFront(level)) != NULL) {
+	for (int level = 2; level <= orphanBuckets.maxBucket; level++) {
+		while ((x = orphanBuckets.popFront(level)) != nullptr) {
 			testNode(x);
+
 			// pass 2: find lowest level parent
-			if (x->parent == NULL) {
+			if (x->parent == nullptr) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
 				destLabel = x->label - (sTree ? 1 : -1);
+
 				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 					a = &x->arcs[i];
 					y = a->head;
@@ -393,10 +596,12 @@ void IBFSGraph::adoption3Pass()
 						if ((minLabel = y->label) == destLabel) break;
 					}
 				}
-				if (x->parent == NULL) {
+
+				if (x->parent == nullptr) {
 					x->label = numNodes;
 					continue;
 				}
+
 				x->label = minLabel + (sTree ? 1 : -1);
 				if (x->label != (sTree ? level : -level)) {
 					orphanBuckets.add<sTree>(x);
@@ -407,19 +612,22 @@ void IBFSGraph::adoption3Pass()
 			// pass 3: lower potential sons and/or find first parent
 			if (x->label != (sTree ? topLevelS : -topLevelT)) {
 				minLabel = x->label + (sTree ? 1 : -1);
+
 				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 					a = &x->arcs[i];
 					y = a->head;
 
-					// lower potential sons
+					Arc& rev = a->head->arcs[a->revIdx];
 					if ((sTree ? a->rCap : a->isRevResidual) &&
-						((!sTree && y->label == numNodes) ||
-						// the above implicitly holds by condition below when sTree=true
-						(sTree ? (minLabel < y->label) : (minLabel > y->label))))
-					{
-						if (y->label != numNodes) orphanBuckets.remove<sTree>(y);
+							((!sTree && y->label == numNodes) ||
+								// the above implicitly holds by condition below when sTree=true
+								(sTree ? (minLabel < y->label) : (minLabel > y->label))))
+						{
+						if (y->label != numNodes)
+							orphanBuckets.remove<sTree>(y);
+
 						y->label = minLabel;
-						y->parent = a->rev;
+						y->parent = &rev;
 						orphanBuckets.add<sTree>(y);
 					}
 				}
@@ -429,11 +637,15 @@ void IBFSGraph::adoption3Pass()
 			x->nextPtr = x->parent->head->firstSon;
 			x->parent->head->firstSon = x;
 			x->isParentCurr = 0;
+
 			// add to active list of the next growth phase
 			if (sTree) {
-				if (x->label == topLevelS) activeS1.add(x);
-			} else {
-				if (x->label == -topLevelT) activeT1.add(x);
+				if (x->label == topLevelS)
+					activeS1.add(x);
+			}
+			else {
+				if (x->label == -topLevelT)
+					activeT1.add(x);
 			}
 		}
 	}
@@ -442,14 +654,20 @@ void IBFSGraph::adoption3Pass()
 }
 
 
+
 template <bool dirS>
-void IBFSGraph::growth() {
-	Node *x, *y;
+void IBFSGraph::growth()
+{
+	Node* x, * y;
 
-  for (Node** active = active0.list; active != active0.list + active0.len; ++active) {
-    x = *active;
+	for (Node** active = active0.list;
+		active != active0.list + active0.len;
+		++active) {
 
-    if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1))) continue;
+		x = *active;
+
+		if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
+			continue;
 
 		if (dirS) stats.incGrowthS();
 		else stats.incGrowthT();
@@ -461,19 +679,32 @@ void IBFSGraph::growth() {
 
 			y = a->head;
 
-      if (y->label == numNodes) {
+			Arc& rev = a->head->arcs[a->revIdx];
+			if (y->label == numNodes) {
 				y->isParentCurr = 0;
-        y->label = x->label + (dirS ? 1 : -1);
-				y->parent = a->rev;
+				y->label = x->label + (dirS ? 1 : -1);
+
+				// parent assignment
+				y->parent = &rev;
+
 				y->nextPtr = x->firstSon;
 				x->firstSon = y;
+
 				if (dirS) activeS1.add(y);
 				else activeT1.add(y);
-      } else if (dirS ? (y->label < 0) : (y->label > 0)) {
-        augment(dirS ? a : a->rev);
 
-        if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1))) break;
-        if ((dirS ? a->rCap : a->isRevResidual)) --i;
+			}
+			else if (dirS ? (y->label < 0) : (y->label > 0)) {
+
+				// found augmenting bridge
+				augment(dirS ? a : &rev);
+
+				if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
+					break;
+
+				// recheck same arc if it still has residual
+				if (dirS ? a->rCap : a->isRevResidual)
+					--i;
 			}
 		}
 	}

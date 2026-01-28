@@ -84,7 +84,7 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 5;
+  constexpr int version = 6;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else
@@ -1294,7 +1294,7 @@ public:
     return v;
   }
 
- // Internal function, cells should already be marked.
+  // Internal function, cells should already be marked.
   template <class Cells, class Facets>
   Vertex_handle _insert_in_small_hole(const Point& p,
                                       const Cells& cells,
@@ -3202,8 +3202,10 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   CGAL_triangulation_expensive_assertion(start == Cell_handle() ||
                                          tds().is_simplex(start));
 
+#if 0
   if(could_lock_zone)
     *could_lock_zone = true;
+#endif
 
   if(dimension() < 3)
     return start;
@@ -3212,6 +3214,7 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   if(start == Cell_handle())
     start = infinite_cell();
 
+#if 0
   // CJTODO: useless?
   if(could_lock_zone)
   {
@@ -3221,6 +3224,7 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
       return Cell_handle();
     }
   }
+#endif
 
   int ind_inf;
   if(start->has_vertex(infinite, ind_inf))
@@ -3236,6 +3240,7 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   Cell_handle previous = Cell_handle();
   Cell_handle c = start;
 
+#if 0
   if(could_lock_zone)
   {
     if(!this->try_lock_cell(c))
@@ -3244,6 +3249,7 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
       return Cell_handle();
     }
   }
+#endif
 
   // Now treat the cell c.
 try_next_cell:
@@ -3256,7 +3262,7 @@ try_next_cell:
 #if 1
   struct FacetPlane {
     double nx, ny, nz;
-    double d;
+    double ax, ay, az; // anchor point on the plane
   };
   FacetPlane planes[4];
 
@@ -3300,7 +3306,9 @@ try_next_cell:
       planes[i].nx = nx;
       planes[i].ny = ny;
       planes[i].nz = nz;
-      planes[i].d = -(nx * a.x() + ny * a.y() + nz * a.z());
+      planes[i].ax = a.x();
+      planes[i].ay = a.y();
+      planes[i].az = a.z();
     };
 
   buildPlane(0, p1, p2, p3, p0);
@@ -3318,29 +3326,34 @@ try_next_cell:
     if (previous == next)
       continue;
 
+    if (next->has_vertex(infinite))
+      return next;
+
     const FacetPlane& fp = planes[i];
+    const double dx = tx - fp.ax;
+    const double dy = ty - fp.ay;
+    const double dz = tz - fp.az;
+
     const double s =
-      fp.nx * tx +
-      fp.ny * ty +
-      fp.nz * tz +
-      fp.d;
+      fp.nx * dx +
+      fp.ny * dy +
+      fp.nz * dz;
 
     constexpr double eps = 1e-15;
     if (s >= -eps)
       continue;
 
-    if (next->has_vertex(infinite))
-      return next;
-
     previous = c;
     c = next;
 
+#if 0
     if (could_lock_zone) {
       if (!this->try_lock_cell(c)) {
         *could_lock_zone = false;
         return Cell_handle();
       }
     }
+#endif
 
     if (n_of_turns)
       goto try_next_cell;
@@ -4065,8 +4078,10 @@ insert_in_conflict(const Point& p,
                    Hidden_points_visitor& hider,
                    bool *could_lock_zone)
 {
+#if 0 // JPB WIP BUG
   if(could_lock_zone)
     *could_lock_zone = true;
+#endif
 
   switch(dimension())
   {
@@ -4091,6 +4106,7 @@ insert_in_conflict(const Point& p,
 
       boost::container::small_vector<Facet, 32768> facets;
 
+#if 0 // JPB WIP BUG
       // Parallel
       if(could_lock_zone)
       {
@@ -4119,14 +4135,16 @@ insert_in_conflict(const Point& p,
       // Sequential
       else
       {
+#endif
         find_conflicts(c,
                        tester,
                        make_triple(
                          std::back_inserter(facets),
                          std::back_inserter(cells),
                          Emptyset_iterator()));
-      }
-
+#if 0 // JPB WIP BUG
+    }
+#endif
       facet = facets.back();
 
       // Remember the points that are hidden by the conflicting cells,
@@ -4134,11 +4152,11 @@ insert_in_conflict(const Point& p,
       hider.process_cells_in_conflict(cells.begin(), cells.end());
 
       Vertex_handle v =
-        tds().is_small_hole(facets.size()) ?
-        _insert_in_small_hole(p, cells, facets) :
-        _insert_in_hole(p,
-                        cells.begin(), cells.end(),
-                        facet.first, facet.second);
+          tds().is_small_hole(facets.size()) ?
+          _insert_in_small_hole(p, cells, facets) :
+          _insert_in_hole(p,
+            cells.begin(), cells.end(),
+            facet.first, facet.second);
 
       // Store the hidden points in their new cells.
       hider.reinsert_vertices(v);

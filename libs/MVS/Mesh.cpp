@@ -847,57 +847,88 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 	VertexIdxArr* duplicatedVertices)
 {
 	ASSERT(!vertices.empty() && !faces.empty());
-	if (vertexFaces.size() != vertices.size())
-		ListIncidenteFaces();
 
 	const size_t nVerts = vertices.size();
 	const size_t nFaces = faces.size();
+
+	if (vertexFaces.size() != vertices.size())
+		ListIncidenteFaces();
+
+	// ---- Build local CSR view of vertexFaces ----
+	std::vector<uint32_t> vfOffset(nVerts + 1);
+	vfOffset[0] = 0;
+
+	for (size_t v = 0; v < nVerts; ++v) {
+		vfOffset[v + 1] = vfOffset[v] + (uint32_t)vertexFaces[v].size();
+	}
+
+	std::vector<FIndex> vfFlat(vfOffset[nVerts]);
+
+#pragma omp parallel for schedule(static)
+	for (ptrdiff_t v = 0; v < (ptrdiff_t)nVerts; ++v) {
+		uint32_t out = vfOffset[v];
+		for (FIndex f : vertexFaces[v]) {
+			vfFlat[out++] = f;
+		}
+	}
 
 	// Reserve space for growth
 	vertices.reserve(vertices.size() * 2);
 	vertexFaces.reserve(vertices.size() * 2);
 
-	// Global face tags reused across vertices
-	std::vector<int> components(nFaces, -1);
-	std::vector<int> genTag(nFaces, -1);
-	std::atomic<int> curGen{ 0 };
+	struct ComponentRange {
+		uint32_t begin;
+		uint32_t count;
+	};
 
 	struct VertexWork {
 		int numComponents = 0;
-		std::vector<std::vector<FIndex>> componentFaces; // faces per component
+		std::vector<FIndex> facesFlat;          // all faces, contiguous
+		std::vector<ComponentRange> components; // ranges into facesFlat
+
+		inline void Clear() {
+			numComponents = 0;
+			facesFlat.clear();     // keeps capacity
+			components.clear();    // keeps capacity
+		}
 	};
 	std::vector<VertexWork> work(nVerts);
+
+	for (size_t i = 0; i < nVerts; ++i) {
+		size_t deg = vertexFaces[i].size();
+		work[i].facesFlat.reserve(deg);
+		work[i].components.reserve(deg);
+	}
 
 	// -------- Phase 1: Parallel discovery --------
 #pragma omp parallel
 	{
-		std::vector<int> components_local(faces.size());
-
+		std::vector<int> components_local(nFaces, -1);
 		boost::container::small_vector<FIndex, 64> queue;
-		VertexWork local;
-		local.componentFaces.reserve(16);
 
 #pragma omp for schedule(static)
 		for (ptrdiff_t idxVert = 0; idxVert < (ptrdiff_t)nVerts; ++idxVert) {
-			local.componentFaces.clear();
-			local.numComponents = 0;
 
-			const FaceIdxArr& vertFaces = vertexFaces[idxVert];
-			if (vertFaces.empty()) {
-				work[idxVert] = local;
+			VertexWork& out = work[idxVert];
+			out.Clear();
+
+			uint32_t vfBegin = vfOffset[idxVert];
+			uint32_t vfEnd = vfOffset[idxVert + 1];
+			if (vfBegin == vfEnd)
 				continue;
-			}
 
 			// Reset only incident faces
-			for (FIndex iF : vertFaces)
-				components_local[iF] = -1;
+			for (uint32_t it = vfBegin; it < vfEnd; ++it)
+				components_local[vfFlat[it]] = -1;
 
 			FIndex idxFaceNext = 0;
 			int component = 0;
 
+			uint32_t itFaceNext = vfBegin;
+
 			while (true) {
-				while (idxFaceNext < vertFaces.size()) {
-					FIndex iF = vertFaces[idxFaceNext++];
+				while (itFaceNext < vfEnd) {
+					FIndex iF = vfFlat[itFaceNext++];
 					if (components_local[iF] == -1) {
 						queue.clear();
 						queue.push_back(iF);
@@ -909,13 +940,13 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 
 			ProcessComponent:
 				{
-					std::vector<FIndex> compFaces;
-					compFaces.reserve(vertFaces.size());
+					ComponentRange range;
+					range.begin = (uint32_t)out.facesFlat.size();
 
 					while (!queue.empty()) {
 						FIndex curF = queue.back();
 						queue.pop_back();
-						compFaces.push_back(curF);
+						out.facesFlat.push_back(curF);
 
 						const Face& face = faces[curF];
 						for (int i = 0; i < 3; ++i) {
@@ -929,13 +960,13 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 						}
 					}
 
-					local.componentFaces.push_back(std::move(compFaces));
+					range.count = (uint32_t)out.facesFlat.size() - range.begin;
+					out.components.push_back(range);
 					++component;
 				}
 			}
 
-			local.numComponents = component;
-			work[idxVert] = local;
+			out.numComponents = component;
 		}
 	}
 
@@ -949,6 +980,8 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 
 		// Duplicate vertices for each extra component
 		for (int c = 1; c < vw.numComponents; ++c) {
+			const ComponentRange& r = vw.components[c];
+
 			const VIndex idxVertNew = vertices.size();
 			const Vertex v = vertices[idxVert];
 			vertices.emplace_back(v);
@@ -957,19 +990,22 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 				duplicatedVertices->emplace_back(idxVert);
 
 			FaceIdxArr& vertFacesNew = vertexFaces.emplace_back();
-			vertFacesNew.reserve(vw.componentFaces[c].size());
+			vertFacesNew.reserve(r.count);
 
 			// Rewire faces in this component
-			for (FIndex fidx : vw.componentFaces[c]) {
+			const uint32_t end = r.begin + r.count;
+			for (uint32_t i = r.begin; i < end; ++i) {
+				const FIndex fidx = vw.facesFlat[i];
 				Face& f = faces[fidx];
-				for (int i = 0; i < 3; ++i) {
-					if (f[i] == idxVert) {
-						f[i] = idxVertNew;
+				for (int k = 0; k < 3; ++k) {
+					if (f[k] == idxVert) {
+						f[k] = idxVertNew;
 						vertFacesNew.push_back(fidx);
 						break;
 					}
 				}
 			}
+
 			++numIssues;
 		}
 

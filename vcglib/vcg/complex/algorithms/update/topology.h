@@ -250,6 +250,7 @@ public:
     if (!edgeVec)
       throw std::bad_alloc();
 
+#if 0
     // Faster to touch each cache line before we begin.
     // Optional warm-up for large buffers (>24 MB)
     if (upperBound > (1 << 20)) {
@@ -266,6 +267,7 @@ public:
           edgeVec[i].key = 0;
       }
     }
+#endif
 
     auto* const v0 = &m.vert[0];
     std::vector<size_t> threadCountOut(threadCount, 0);
@@ -295,9 +297,12 @@ public:
         for (int j = 0; j < vn; ++j)
         {
           const int jNext = edgeNext[j];
+
+          // Although not likely needed, we force define every edge we emit.
           PEdge2 e;
           e.f = &f;
           e.z = (uint8_t)j;
+          e.isBorder = false;
           size_t i0 = f.V(j) - v0;
           size_t i1 = f.V(jNext) - v0;
           if (i0 > i1) std::swap(i0, i1);

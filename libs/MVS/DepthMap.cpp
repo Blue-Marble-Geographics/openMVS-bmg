@@ -3932,7 +3932,7 @@ bool MVS::ImportDepthDataRaw(
 	DBG_CHECKF(hFile != INVALID_HANDLE_VALUE,
 		"Import: CreateFile failed (err=%lu)", GetLastError());
 
-	LARGE_INTEGER li;
+  LARGE_INTEGER li = {};
 	DBG_CHECKF(GetFileSizeEx(hFile, &li),
 		"Import: GetFileSizeEx failed (err=%lu)", GetLastError());
 

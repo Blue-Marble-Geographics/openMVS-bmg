@@ -499,69 +499,88 @@ public:
 #ifdef FAST_REMOVEUNREFVERTEX
 		tri::RequirePerVertexFlags(m);
 
-		const int64_t nVerts = m.vert.size(); // Not m.vn
+		const int64_t nVerts = (int64_t)m.vert.size(); // not m.vn
+		const int64_t numFaces = (int64_t)m.face.size();
+		const int64_t numEdges = (int64_t)m.edge.size();
+
 		std::vector<uint8_t> referredVec(nVerts, 0);
 
-		const int64_t numFaces = (int64_t) m.face.size(); // Not m.fn
-		const auto start = m.vert.begin();
+		const VertexType* baseVert = &m.vert[0];
 
-		if (m.hasDeletedFaces)
+#ifdef _OPENMP
+		const int numThreads = omp_get_max_threads();
+		std::vector<std::vector<uint8_t>> localMarks(numThreads,
+			std::vector<uint8_t>(nVerts, 0));
+#endif
+
+		// ------------------------------------------------------------
+		// Phase 1: mark referenced vertices (parallel, race-free)
+		// ------------------------------------------------------------
+#pragma omp parallel
 		{
-			// the stores are technically UB, but for our purposes it isn't a race.
-#pragma omp parallel for schedule(static)
-			for (int i = 0; i < numFaces; ++i) {
-				const FaceType& f = m.face[i];
-				if (f.IsD()) continue;
-				for (int j = 0; j < f.VN(); ++j)
-					referredVec[f.V(j) - &*start] = 1;
-					}
-				}
-		else
-		{
-#pragma omp parallel for schedule(static)
-			for (int i = 0; i < numFaces; ++i) {
-				const FaceType& f = m.face[i];
-				for (int j = 0; j < f.VN(); ++j)
-					referredVec[f.V(j) - &*start] = 1;
-					}
-				}
+#ifdef _OPENMP
+			const int tid = omp_get_thread_num();
+			auto& local = localMarks[tid];
+#else
+			auto& local = referredVec;
+#endif
 
-		const int64_t numEdges = m.edge.size(); // Not m.en
-#pragma omp parallel for schedule(static)
-		for (int i = 0; i < numEdges; ++i) {
-			const auto &e = m.edge[i];
-			if (e.IsD()) continue;
-			referredVec[tri::Index(m, e.V(0))] = 1;
-			referredVec[tri::Index(m, e.V(1))] = 1;
-		}
+#pragma omp for schedule(static)
+			for (int64_t i = 0; i < numFaces; ++i) {
+				const FaceType& f = m.face[i];
+				if (m.hasDeletedFaces && f.IsD()) continue;
 
-		// Unused
-		for(auto ti=m.tetra.begin(); ti!=m.tetra.end();++ti)
-			if( !(*ti).IsD() ){
-				referredVec[tri::Index(m, (*ti).V(0))] = 1;
-				referredVec[tri::Index(m, (*ti).V(1))] = 1;
-				referredVec[tri::Index(m, (*ti).V(2))] = 1;
-				referredVec[tri::Index(m, (*ti).V(3))] = 1;
+				for (int j = 0; j < f.VN(); ++j) {
+					const int idx = int(f.V(j) - baseVert);
+					local[idx] = 1;
+				}
 			}
 
+#pragma omp for schedule(static)
+			for (int64_t i = 0; i < numEdges; ++i) {
+				const auto& e = m.edge[i];
+				if (e.IsD()) continue;
+
+				local[tri::Index(m, e.V(0))] = 1;
+				local[tri::Index(m, e.V(1))] = 1;
+			}
+		}
+
+		// ------------------------------------------------------------
+		// Phase 1b: merge thread-local marks (parallel, safe)
+		// ------------------------------------------------------------
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+		for (int64_t i = 0; i < nVerts; ++i) {
+			for (int t = 0; t < numThreads; ++t) {
+				if (localMarks[t][i]) {
+					referredVec[i] = 1;
+					break;
+				}
+			}
+		}
+#endif
+
+		// ------------------------------------------------------------
+		// Phase 2: count only (optional, parallel)
+		// ------------------------------------------------------------
 		if (!DeleteVertexFlag) {
-			size_t count = 0;
+			int64_t count = 0;
 #pragma omp parallel for reduction(+:count)
-			for (int i = 0; i < nVerts; ++i) {
+			for (int64_t i = 0; i < nVerts; ++i) {
 				if (!referredVec[i]) ++count;
 			}
 			return static_cast<int>(count);
 		}
 
+		// ------------------------------------------------------------
+		// Phase 3: serial deletion (required for correctness)
+		// ------------------------------------------------------------
 		int64_t deleted = 0;
-#pragma omp parallel for reduction(+:deleted)
 		for (int64_t i = 0; i < nVerts; ++i) {
-			VertexType &v = m.vert[i];
-			if (!v.IsD() && !referredVec[tri::Index(m, v)]) {
-#pragma omp critical
-				{
-					Allocator<MeshType>::DeleteVertex(m, v); // Decrements m.vn
-				}
+			VertexType& v = m.vert[i];
+			if (!v.IsD() && !referredVec[i]) {
+				Allocator<MeshType>::DeleteVertex(m, v);
 				++deleted;
 			}
 		}

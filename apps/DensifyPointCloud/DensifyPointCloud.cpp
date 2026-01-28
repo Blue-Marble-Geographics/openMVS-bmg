@@ -115,7 +115,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 	// Now we default both to DPC_NUM_ITERS (3) and the CUDA path
 	// will manually set this to 4 in CUDA-specific code.
 #ifdef FORCIBLY_DISABLE_CUDA
-	const unsigned nNumViewsDefault(5);
+	const unsigned nNumViewsDefault(5); // 0, 1, 8, 12 Doesn't make much of a difference?
 	const unsigned numIters(DPC_NUM_ITERS);
 #else
 	// group of options allowed both on command line and in config file
