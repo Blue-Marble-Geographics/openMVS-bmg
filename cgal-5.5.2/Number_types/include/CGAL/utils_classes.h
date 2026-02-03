@@ -162,7 +162,6 @@ inline double sse2min(double a, double b, double c)
   __m128d B =_mm_load_sd(&b);
   __m128d C =_mm_load_sd(&c);
 
-  __debugbreak();
   __m128d AB = _mm_min_sd(A,B);
   A = _mm_min_sd(AB,C);
   _mm_store_sd(&a, A);
@@ -173,7 +172,6 @@ inline double sse2min(double a, double b)
 {
   __m128d A =_mm_load_sd(&a);
   __m128d B =_mm_load_sd(&b);
-  __debugbreak();
 
   __m128d C = _mm_min_sd(A,B);
   _mm_store_sd(&a, C);
