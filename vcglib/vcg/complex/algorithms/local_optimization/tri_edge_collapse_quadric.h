@@ -39,7 +39,7 @@
 // Don't collpase candidates (add to the heap), if they look poor.
 #undef REJECT_BAD_CANDIDATES // Not as helpful as it seems.
 
-float g_ScaleFactor;
+double g_ScaleFactor;
 constexpr uint8_t nextPacked[3] = { 0x12, 0x20, 0x01 };
 
 namespace vcg{
@@ -553,7 +553,7 @@ public:
     // Now Simulate the collapse 
     v[0]->P() = v[1]->P() = this->optimalPos;
     
-    ScalarType newQual = 0.3f;
+    ScalarType newQual = 0.3f * 0.3f; // Squared now
     static int cntr = 1;
     for (int vi = 0; vi < 2; ++vi) {
       const VertexType* __restrict current = (vi == 0 ? v[0] : v[1]);
@@ -579,6 +579,7 @@ public:
           const VertexType* __restrict a = f->V(aIndex);
           const VertexType* __restrict b = f->V(bIndex);
           if (a != other && b != other) {
+            // Notice we actually calculate QualityFace^2 and compensate below.
             newQual = FastMinS(QualityFace(*f), newQual);
 #ifdef TAKE_FIRST_GOOD_COLLAPSE
             if (newQual < 0.09f) goto earlyExit;
@@ -635,10 +636,10 @@ return ScalarType(QuadErr * (1.0f - newQual));
 
   //  newQual = FastSqrtS(newQual);
 
-QuadricType qq = QH::Qd(v[0]);
-qq += QH::Qd(v[1]);
+    QuadricType qq = QH::Qd(v[0]);
+    qq += QH::Qd(v[1]);
 
-    extern float g_ScaleFactor;
+    extern double g_ScaleFactor;
     double QuadErr = std::min(g_ScaleFactor * qq.Apply(Point3d::Construct(v[1]->P())), 0.3);
 
     assert(!math::IsNAN(QuadErr));
@@ -652,10 +653,10 @@ qq += QH::Qd(v[1]);
     v[0]->P()=OldPos0;
     v[1]->P()=OldPos1;
     
-    return (ScalarType)(QuadErr / newQual);
+    // Square again since this expression squared is monotonic and preserves ordering: return (ScalarType)(QuadErr / FastSqrtS(newQual));
+    return (ScalarType)(QuadErr * QuadErr / newQual);
 #endif
 #endif
-
   }
   
   

@@ -86,7 +86,7 @@ IBFSGraph::~IBFSGraph() {
 	activeS1.release();
 	activeT1.release();
 	orphanBuckets.release();
-	delete[] nodes;
+	_aligned_free(nodes);
 }
 
 
@@ -112,28 +112,19 @@ void IBFSGraph::initGraph() {
 void IBFSGraph::initSize(int n, int)
 {
 	numNodes = n;
-	nodes = new Node[n];
+	nodes = static_cast<Node*>(_aligned_malloc(sizeof(Node) * n, 64));
 
-#pragma omp parallel
-	{
-		const int tid = omp_get_thread_num();
-		const int tcount = omp_get_num_threads();
-
-		const int chunkSize = (n + tcount - 1) / tcount;
-		const int begin = tid * chunkSize;
-		const int end = std::min(begin + chunkSize, n);
-
-		for (int i = begin; i < end; ++i) {
-			Node& node = nodes[i];
-			node.arcCountBuild.store(0, std::memory_order_relaxed);
-			node.excess = 0;
-			node.parent = nullptr;
-			node.firstSon = nullptr;
-			node.nextPtr = nullptr;
-			node.lastAugTimestamp = 0;
-			node.isParentCurr = 0;
-			node.label = 0;
-		}
+#pragma omp parallel for schedule(static)
+	for (int i = 0; i < n; ++i) {
+		Node& node = nodes[i];
+		node.arcCountBuild.store(0, std::memory_order_relaxed);
+		node.excess = 0;
+		node.parent = nullptr;
+		node.firstSon = nullptr;
+		node.nextPtr = nullptr;
+		node.lastAugTimestamp = 0;
+		node.isParentCurr = 0;
+		node.label = 0;
 	}
 
 	nodeEnd = nodes + n;

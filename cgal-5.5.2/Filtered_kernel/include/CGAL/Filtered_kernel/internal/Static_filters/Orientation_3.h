@@ -74,21 +74,17 @@ public:
           double maxx = CGAL::abs(pqx);
           double maxy = CGAL::abs(pqy);
           double maxz = CGAL::abs(pqz);
-
-          double aprx = CGAL::abs(prx);
-          double apsx = CGAL::abs(psx);
-
-          double apry = CGAL::abs(pry);
-          double apsy = CGAL::abs(psy);
-
-          double aprz = CGAL::abs(prz);
-          double apsz = CGAL::abs(psz);
 #ifdef CGAL_USE_SSE2_MAX
-          CGAL::Max<double> mmax;
+          {
+            __m128d tx = _mm_max_sd(_mm_set_sd(maxx), _mm_set_sd(abs(prx)));
+            maxx = _mm_cvtsd_f64(_mm_max_sd(tx, _mm_set_sd(abs(psx))));
 
-          maxx = mmax(maxx, aprx, apsx);
-          maxy = mmax(maxy, apry, apsy);
-          maxz = mmax(maxz, aprz, apsz);
+            __m128d ty = _mm_max_sd(_mm_set_sd(maxy), _mm_set_sd(abs(pry)));
+            maxy = _mm_cvtsd_f64(_mm_max_sd(ty, _mm_set_sd(abs(psy))));
+
+            __m128d tz = _mm_max_sd(_mm_set_sd(maxz), _mm_set_sd(abs(prz)));
+            maxz = _mm_cvtsd_f64(_mm_max_sd(tz, _mm_set_sd(abs(psz))));
+          }
 #else
           if (maxx < aprx) maxx = aprx;
           if (maxx < apsx) maxx = apsx;
@@ -104,15 +100,22 @@ public:
           double eps = 5.1107127829973299e-15 * maxx * maxy * maxz;
 
 #ifdef CGAL_USE_SSE2_MAX
-#if 0
-          CGAL::Min<double> mmin;
-          double tmp = mmin(maxx, maxy, maxz);
-          maxz = mmax(maxx, maxy, maxz);
-          maxx = tmp;
-#else
-          sse2minmax(maxx,maxy,maxz);
-          // maxy can contain ANY element
-#endif
+          {
+            __m128d vx = _mm_set_sd(maxx);
+            __m128d vy = _mm_set_sd(maxy);
+            __m128d vz = _mm_set_sd(maxz);
+
+            // pairwise reduction
+            __m128d min_xy = _mm_min_sd(vx, vy);
+            __m128d max_xy = _mm_max_sd(vx, vy);
+
+            __m128d min_all = _mm_min_sd(min_xy, vz);
+            __m128d max_all = _mm_max_sd(max_xy, vz);
+
+            maxx = _mm_cvtsd_f64(min_all);
+            maxz = _mm_cvtsd_f64(max_all);
+            // maxy intentionally ignored
+          }
 #else
           // Sort maxx < maxy < maxz.
           if (maxx > maxz)

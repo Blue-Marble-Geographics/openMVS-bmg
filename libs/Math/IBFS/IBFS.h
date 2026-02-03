@@ -181,7 +181,7 @@ public:
 		compactSlowInitMode = a_compactSlowInitMode;
 	}
 
-	void IBFSGraph::finalizeGraph()
+	void finalizeGraph()
 	{
 #pragma omp parallel for schedule(static)
 		for (int i = 0; i < numNodes; ++i) {
@@ -201,6 +201,159 @@ public:
 	}
 	inline EdgeCap getFlow() {
 		return flow;
+	}
+
+#if 1
+	int CollapseDegree1Nodes()
+	{
+		const float maxCap = 1e8f;
+
+		std::vector<uint8_t> removed(numNodes, 0);
+		std::vector<int> q;
+		q.reserve(numNodes);
+
+		// 1) Seed queue with all removable degree-1 nodes
+		for (int u = 0; u < numNodes; ++u) {
+			Node& nu = nodes[u];
+			if (nu.arcCount == 1 && nu.excess < maxCap) {
+				q.push_back(u);
+			}
+		}
+
+		int numRemoved = 0;
+
+		// 2) Process queue
+		for (size_t qi = 0; qi < q.size(); ++qi) {
+			const int u = q[qi];
+			if (removed[u]) continue;
+
+			Node& nu = nodes[u];
+
+			// Conditions may have changed since enqueue
+			if (nu.arcCount != 1) continue;
+			if (nu.excess >= maxCap) continue;
+
+			Arc& a = nu.arcs[0];
+			const int v = int(a.head - nodes);
+			if (removed[v]) continue;
+
+			Node& nv = nodes[v];
+
+			// ---- Flow-safe contraction ----
+
+			// Absorb excess
+			nv.excess += nu.excess;
+
+			// Remove reverse arc v -> u by saturating and compacting
+			const int ridx = a.revIdx;
+			Arc& rv = nv.arcs[ridx];
+			rv.rCap += a.rCap;
+
+			// Compact v's arcs
+			nv.arcCount--;
+			if (ridx != nv.arcCount) {
+				nv.arcs[ridx] = nv.arcs[nv.arcCount];
+
+				// Fix reverse index of the moved arc
+				Arc& moved = nv.arcs[ridx];
+				Node* other = moved.head;
+				other->arcs[moved.revIdx].revIdx = ridx;
+			}
+
+			// Remove u
+			nu.arcCount = 0;
+			removed[u] = 1;
+			++numRemoved;
+
+			// 3) If v becomes degree-1 and is removable, enqueue it
+			if (nv.arcCount == 1 && nv.excess < maxCap && !removed[v]) {
+				q.push_back(v);
+			}
+		}
+
+		return numRemoved;
+	}
+#else
+	int CollapseDegree1Nodes()
+	{
+		int numRemoved = 0;
+
+		std::vector<uint8_t> removed(numNodes, 0);
+
+		constexpr float maxCap = 1e8f;     // safe, tight
+
+		bool changed;
+		do {
+			changed = false;
+
+			for (int u = 0; u < numNodes; ++u) {
+				if (removed[u]) continue;
+
+				Node& nu = nodes[u];
+
+				// hard terminal nodes must remain
+				if (nu.excess >= maxCap)
+					continue;
+
+				if (nu.arcCount != 1)
+					continue;
+
+				Arc& a = nu.arcs[0];
+				const int v = int(a.head - nodes);
+				if (removed[v]) continue;
+
+				Node& nv = nodes[v];
+
+				// absorb terminal excess
+				nv.excess += nu.excess;
+
+				// remove reverse arc v -> u
+				const int ridx = a.revIdx;
+				Arc& rv = nv.arcs[ridx];
+				rv.rCap += a.rCap;
+
+				// compact v arcs
+				nv.arcCount--;
+				if (ridx != nv.arcCount) {
+					nv.arcs[ridx] = nv.arcs[nv.arcCount];
+
+					// FIX reverse index of moved arc
+					Arc& moved = nv.arcs[ridx];
+					Node* other = moved.head;
+					other->arcs[moved.revIdx].revIdx = ridx;
+				}
+
+				// mark u removed
+				nu.arcCount = 0;
+				removed[u] = 1;
+        ++numRemoved;
+
+				changed = true;
+			}
+		} while (changed);
+
+		return numRemoved;
+	}
+#endif
+
+	void PrelabelDominantNodes()
+	{
+		for (int u = 0; u < numNodes; ++u) {
+			Node& n = nodes[u];
+			if (n.arcCount == 0)
+				continue;
+
+			float sumCaps = 0;
+			for (int i = 0; i < n.arcCount; ++i)
+				sumCaps += n.arcs[i].rCap;
+
+			if (n.excess >= sumCaps) {
+				n.label = 1;   // forced source
+			}
+			else if (-n.excess >= sumCaps) {
+				n.label = -1;  // forced sink
+			}
+		}
 	}
 
 	bool isNodeOnSrcSide(int nodeIndex) const;

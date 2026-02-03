@@ -29,6 +29,7 @@
 *      containing it.
 */
 
+#define FIX_MANIFOLD // No manifold repair at all
 #define MANIFOLD_FIXUP
 #undef PRE_OPENMVS21
 #define APPROXIMATE_GRAPHCUT
@@ -130,9 +131,7 @@ struct SmallQueue {
 	T inlineData[InlineCap];
 	std::vector<T> overflow; // only used if needed
 
-	SmallQueue() : _size(0) {
-		overflow.reserve(InlineCap); // optional
-	}
+	SmallQueue() : _size(0) {}
 
 	__forceinline void clear() {
 		_size = 0;
@@ -145,15 +144,18 @@ struct SmallQueue {
 		}
 		else {
 			overflow.push_back(v);
-			++_size;
 		}
 	}
 
 	inline size_t size() const {
-		return _size;
+		return _size + overflow.size();
 	}
 
-	__forceinline T operator[](size_t i) const {
+	__forceinline T& operator[](size_t i) {
+    return const_cast<T&>(static_cast<const SmallQueue&>(*this)[i]);
+	}
+
+	__forceinline const T& operator[](size_t i) const {
 		if (i < InlineCap)
 			return inlineData[i];
 		return overflow[i - InlineCap];
@@ -278,6 +280,15 @@ public:
     graph.finalizeGraph();
 	}
 
+	int CollapseDegree1Nodes()
+	{
+		return graph.CollapseDegree1Nodes();
+	}
+
+	void PrelabelDominantNodes()
+	{
+		graph.PrelabelDominantNodes();
+	}
 	graph_type graph;
 };
 #else
@@ -579,25 +590,36 @@ static inline int orientation(const point_t& a, const point_t& b, const point_t&
 	return CGAL::orientation(a, b, c, p);
 	#else
 	// inexact_orientation
-	const double& px = a.x(); const double& py = a.y(); const double& pz = a.z();
-	const double pqx(b.x()-px); const double prx(c.x()-px); const double psx(p.x()-px);
-	const double pqy(b.y()-py); const double pry(c.y()-py); const double psy(p.y()-py);
-	#if 1
-	const double det((pqx*pry-prx*pqy)*(p.z()-pz) - (pqx*psy-psx*pqy)*(c.z()-pz) + (prx*psy-psx*pry)*(b.z()-pz));
-	const double eps(1e-12);
-	#else // very slow due to ABS()
-	const double pqz(b.z()-pz); const double prz(c.z()-pz); const double psz(p.z()-pz);
-	const double det(CGAL::determinant(
-		pqx, pqy, pqz,
-		prx, pry, prz,
-		psx, psy, psz));
-	const double max0(MAXF3(ABS(pqx), ABS(pqy), ABS(pqz)));
-	const double max1(MAXF3(ABS(prx), ABS(pry), ABS(prz)));
-	const double eps(5.1107127829973299e-15 * MAXF(max0, max1));
-	#endif
-	if (det >  eps) return CGAL::POSITIVE;
+	const double px = a.x(), py = a.y(), pz = a.z();
+
+	const double pqx = b.x() - px;
+	const double pqy = b.y() - py;
+	const double pqz = b.z() - pz;
+
+	const double prx = c.x() - px;
+	const double pry = c.y() - py;
+	const double prz = c.z() - pz;
+
+	const double psx = p.x() - px;
+	const double psy = p.y() - py;
+	const double psz = p.z() - pz;
+
+	const double det =
+		(pqx * pry - prx * pqy) * psz
+		- (pqx * psy - psx * pqy) * prz
+		+ (prx * psy - psx * pry) * pqz;
+
+	const double max0 = std::max({ fabs(pqx), fabs(pqy), fabs(pqz) });
+	const double max1 = std::max({ fabs(prx), fabs(pry), fabs(prz) });
+	const double max2 = std::max({ fabs(psx), fabs(psy), fabs(psz) });
+
+	const double eps =
+		5.1107127829973299e-15 * max0 * max1 * max2;
+
+	if (det > eps) return CGAL::POSITIVE;
 	if (det < -eps) return CGAL::NEGATIVE;
-	return CGAL::COPLANAR;
+
+	return CGAL::orientation(a, b, c, p); // exact fallback
 	#endif
 }
 #if _PLATFORM_X86 && defined(__GNUC__)
@@ -625,9 +647,8 @@ void fetchCellFacets(const delaunay_t& Tr, const Frustum& viewFrustum, const std
 	if (!Tr.is_infinite(cell)) {
 		// store all 4 facets of the cell
 		for (int i=0; i<4; ++i) {
-			const facet_t f(cell, i);
-			ASSERT(!Tr.is_infinite(f));
-			facets.push_back(f);
+			facets.emplace_back(cell, i);
+			ASSERT(!Tr.is_infinite(facets.back()));
 		}
 		return;
 	}
@@ -1120,7 +1141,8 @@ static constexpr uint32_t facetIdx[4][3] = {
 //  coplanar [out] : pointer to the 3 int array of indices of the edges coplanar with (s)
 // return -1 if there is no intersection or
 // the number of edges coplanar with the segment (0 = intersection inside the triangle)
-#if 1 // try agin
+#if 0
+#if 1 // try again
 __forceinline int intersect(
 	const IntersectHelper& ih,
 	int* __restrict coplanar
@@ -1239,6 +1261,7 @@ int intersect(const vertex_handle_t vs[3], const segment_t& s, const double* __r
 	return -1;
 }
 #endif
+#endif
 
 #if 0
 __forceinline bool IntersectsPrecheck(
@@ -1298,7 +1321,8 @@ __forceinline bool IntersectsPrecheckFast(
 	double v0x, double v0y, double v0z,
 	double nx, double ny, double nz,
 	double prevDist, bool bigger,
-	double& voOut, double& vdOut) {
+	double& voOut, double& vdOut)
+{
 	const double dx = ray.m_vDir.x(), dy = ray.m_vDir.y(), dz = ray.m_vDir.z();
 	const double ox = ray.m_pOrig.x(), oy = ray.m_pOrig.y(), oz = ray.m_pOrig.z();
 
@@ -1310,8 +1334,9 @@ __forceinline bool IntersectsPrecheckFast(
 	const double vo = -(nx * ox + ny * oy + nz * oz + d);
 
 	const double delta = vo - prevDist * vd;
-	const bool isGreater = (vd >= 0.0) ? (delta > 0.0) : (delta < 0.0);
-	if (isGreater != bigger) return false;
+
+	// branchless sign-consistent comparison
+	if (((delta * vd) > 0.0) != bigger) return false;
 
 	voOut = vo; vdOut = vd;
 	return true;
@@ -1322,40 +1347,46 @@ __forceinline bool IntersectsPrecheckFast(
 #if 1 // JPB WIP BUG Alternative version which drops the "1" case and improves performance
 template<bool UseP>
 __forceinline int CheckEdges2FastCore(
-	double sx, double sy, double sz,   // segment (q - p) if UseP, else (p - q)
-	double ax, double ay, double az,   // -(endpoint - v0)
+	double sx, double sy, double sz,   // ray direction from endpoint
+	double ax, double ay, double az,   // endpoint - v0
 	double bx, double by, double bz,   // v1 - endpoint
 	double cx, double cy, double cz,   // v2 - endpoint
-	int* __restrict coplanar) {
+	int* __restrict coplanar)
+{
 	constexpr double eps = 1e-12;
 	int nCop = 0;
 
-	// (-ay*sx) - (-ax*sy)
-	// a = -aysx + aysy
-	// ay*sy - ay*sx
-	const double sxa_y = ax * sy - sx * ay; // sx * ay - ax * sy;
-	const double sxb_y = sx * by - bx * sy;
-	const double sxc_y = cx * sy - sx * cy; // sx * cy - cx * sy;
+	// Mixed reusable terms
+	const double sxaY = ax * sy - sx * ay;
+	const double sxbY = sx * by - bx * sy;
+	const double sxcY = cx * sy - sx * cy;
 
+	// Reused 2D cross products
+	const double abXY = ax * by - ay * bx;
+	const double bcXY = bx * cy - by * cx; // == bx*cy - cx*by
+	const double caXY = cx * ay - cy * ax; // == -(ax*cy - cx*ay)
 
-	{ // (s, ab)
-		const double t3 = bx * ay - ax * by; // ax * by - bx * ay;
-		const double det = sxa_y * bz + sxb_y * az + t3 * sz; // sxa_y * bz - sxb_y * az + t3 * sz;
+	// (a, b): original t3 = bx*ay - ax*by = -(ax*by - ay*bx) = -abXY
+	{
+		const double det = sxaY * bz + sxbY * az - abXY * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 0;
 	}
-	{ // (s, bc)
-		const double t3 = bx * cy - cx * by;
-		const double det = sxb_y * cz + sxc_y * bz + t3 * sz; // sxb_y * cz - sxc_y * bz + t3 * sz;
+
+	// (b, c): original t3 = bx*cy - cx*by = bcXY  (PLUS term!)
+	{
+		const double det = sxbY * cz + sxcY * bz + bcXY * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 1;
 	}
-	{ // (s, ca)
-		const double t3 = ax * cy - cx * ay; // cx* ay - ax * cy;
-		const double det = sxc_y * az - sxa_y * cz + t3 * sz; // sxc_y * az - sxa_y * cz + t3 * sz;
+
+	// (c, a): original t3 = ax*cy - cx*ay = -caXY
+	{
+		const double det = sxcY * az - sxaY * cz - caXY * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 2;
 	}
+
 	return nCop;
 }
 
@@ -1386,13 +1417,16 @@ __forceinline int IntersectPlaneAndEdges(
 	const double dq = nx * qax + ny * qay + nz * qaz;
 
 	constexpr double eps = 1e-12;
-	const int sp = (dp > eps) - (dp < -eps);
-	const int sq = (dq > eps) - (dq < -eps);
 
-	if ((sp > 0 && sq > 0) || (sp < 0 && sq < 0)) return -1;
-	if (sp == 0 && sq == 0) return 3;
+	const bool pPos = dp > eps;
+	const bool pNeg = dp < -eps;
+	const bool qPos = dq > eps;
+	const bool qNeg = dq < -eps;
 
-	if (sp >= 0 && sq <= 0) {
+	if ((pPos && qPos) || (pNeg && qNeg)) return -1;
+	if (!(pPos | pNeg | qPos | qNeg)) return 3;
+
+	if (!pNeg && !qPos) {
 		// P-side endpoint = p: a = -(p-v0), b = v1-p, c = v2-p
 		const double bxP = v1x - px, byP = v1y - py, bzP = v1z - pz;
 		const double cxP = v2x - px, cyP = v2y - py, czP = v2z - pz;
@@ -1441,11 +1475,14 @@ bool intersect(const delaunay_t& Tr,
 		const double v2x = v2.x(), v2y = v2.y(), v2z = v2.z();
 
 		// plane normal
+		double nx, ny, nz;
+
 		const double bax = v1x - v0x, bay = v1y - v0y, baz = v1z - v0z;
 		const double cax = v2x - v0x, cay = v2y - v0y, caz = v2z - v0z;
-		const double nx = bay * caz - baz * cay;
-		const double ny = baz * cax - bax * caz;
-		const double nz = bax * cay - bay * cax;
+
+		nx = bay * caz - baz * cay;
+		ny = baz * cax - bax * caz;
+		nz = bax * cay - bay * cax;
 
 		// p-v0, q-v0
 		const double pax = px - v0x, pay = py - v0y, paz = pz - v0z;
@@ -1485,7 +1522,8 @@ bool intersect(const delaunay_t& Tr,
 		if (nbCoplanar <= 1) {
 			inter.type = intersection_t::FACET;
 
-			out_facets.resize(0);
+			out_facets.clear();
+
 			const cell_handle_t nc(inter.facet.first->neighbor(inter.facet.second));
 			ASSERT(!Tr.is_infinite(nc));
 
@@ -1512,7 +1550,7 @@ bool intersect(const delaunay_t& Tr,
 			// Treat edge-like as FACET (cheap, conservative)
 			inter.type = intersection_t::FACET;
 
-			out_facets.resize(0);
+			out_facets.clear();
 
 			const cell_handle_t nc(inter.facet.first->neighbor(inter.facet.second));
 			ASSERT(!Tr.is_infinite(nc));
@@ -1552,12 +1590,10 @@ bool intersect(const delaunay_t& Tr,
 		inter.v1 = inter.facet.first->vertex(vi);
 		ASSERT(!Tr.is_infinite(inter.v1));
 
+		out_facets.clear();
 		if (inter.v1->point() == seg.target()) {
-			out_facets.resize(0);
 			return false;
 		}
-
-		out_facets.resize(0);
 
 		struct cell_back_inserter_t {
 			const delaunay_t& Tr;
@@ -1588,7 +1624,7 @@ bool intersect(const delaunay_t& Tr,
 		return true;
 	}
 
-	out_facets.resize(0);
+	out_facets.clear();
 	return false;
 }
 
@@ -1989,7 +2025,7 @@ __forceinline void facetOrderIndices(const cell_handle_t& cell, int k, int idx[3
 __forceinline void computeOneMinusPlaneSphereAngle4(const delaunay_t& Tr,
 	const cell_handle_t& cell,
 	_Data vQual,
-	float* out) {
+	float* __restrict out) {
 	if (Tr.is_infinite(cell)) {
 		out[0] = out[1] = out[2] = out[3] = 0.0f;
 		return;
@@ -2109,7 +2145,7 @@ __forceinline void computeOneMinusPlaneSphereAngle4(const delaunay_t& Tr,
 	// outv = vQual * (1 - outv)
 	outv = _mm_mul_ps(vQual, _mm_sub_ps(one, outv));
 
-	_mm_storeu_ps(out, outv);
+	_mm_store_ps(out, outv); // Aligned malloc guarantees this.
 
 #else
 	// Scalar fallback identical to your math (kept for portability)
@@ -2251,7 +2287,7 @@ static inline float AtomicAddFloat(float* addr, float val)
 {
 	static_assert(sizeof(float) == sizeof(LONG), "float and LONG must be same size");
 
-	volatile LONG* intAddr = reinterpret_cast<volatile LONG*>(addr);
+	LONG* intAddr = reinterpret_cast<LONG*>(addr);
 	LONG oldInt = *intAddr;
 	float oldVal;
 
@@ -2316,28 +2352,7 @@ size_t ProcessPoints(
 	}
 	else {
 		const int64_t cnt = numVertices;
-
-		// Optional warm-up for large arrays (>16 MB)
-		const size_t totalBytes = sizeof(DELAUNAY::point_t) * (size_t)cnt;
-		if (totalBytes > (1 << 24)) { // ~16 MB
-#pragma omp parallel
-			{
-				const int tid = omp_get_thread_num();
-				const int T = omp_get_num_threads();
-				const size_t chunk = (cnt + T - 1) / T;
-				const size_t start = tid * chunk;
-				const size_t end = std::min(start + chunk, (size_t)cnt);
-				const size_t step = 64 / sizeof(DELAUNAY::point_t); // touch one element per cache line
-
-				for (size_t i = start; i < end; i += step)
-					(float&) origVertices[i] = 0.0f; // one write per line, faults in pages
-#ifndef VALIDATE
-				for (size_t i = start; i < end; i += (64 / sizeof(int64_t)))
-					indices[i] = 0;
-#endif
-			}
-		}
-
+		// Faster without warmingg.
 		// NOTE: More than twice as fast when parallelized.
 #pragma omp parallel for schedule(static)
 		for (int64_t i = 0; i < cnt; ++i)
@@ -2443,9 +2458,43 @@ void permuteScatter2(
 	tbb::parallel_for(tbb::blocked_range<size_t>(0, cnt, 1 << 16),
 		[&](auto const& r)
 		{
-			for (size_t i = r.begin(); i != r.end(); ++i)
-			{
-				const size_t oldId = static_cast<size_t>(orderNewToOld[i]); // indices[new]=old
+			size_t i = r.begin();
+			const size_t end = r.end();
+
+			for (; i + 3 < end; i += 4) {
+				const size_t o0 = orderNewToOld[i + 0];
+				const size_t o1 = orderNewToOld[i + 1];
+				const size_t o2 = orderNewToOld[i + 2];
+				const size_t o3 = orderNewToOld[i + 3];
+
+				const T0& p0 = src0[o0];
+				const T0& p1 = src0[o1];
+				const T0& p2 = src0[o2];
+				const T0& p3 = src0[o3];
+
+				dst0[i + 0] = p0;
+				dst0[i + 1] = p1;
+				dst0[i + 2] = p2;
+				dst0[i + 3] = p3;
+
+				dst0f[i + 0] = T1(p0[0], p0[1], p0[2]);
+				dst0f[i + 1] = T1(p1[0], p1[1], p1[2]);
+				dst0f[i + 2] = T1(p2[0], p2[1], p2[2]);
+				dst0f[i + 3] = T1(p3[0], p3[1], p3[2]);
+
+				dst1[i + 0] = src1[o0];
+				dst1[i + 1] = src1[o1];
+				dst1[i + 2] = src1[o2];
+				dst1[i + 3] = src1[o3];
+
+				dst2[i + 0] = src2[o0];
+				dst2[i + 1] = src2[o1];
+				dst2[i + 2] = src2[o2];
+				dst2[i + 3] = src2[o3];
+			}
+
+			for (; i < end; ++i) {
+				const size_t oldId = orderNewToOld[i];
 				const T0& pt = src0[oldId];
 
 				dst0[i] = pt;
@@ -2491,14 +2540,7 @@ static void knnMeanDistSq_nanoflann_fast(
 		PointCloudAdapter, 3 > ;
 
 	if (n == 0) return;
-
-	// Optional warm-up for very large 'out' array (>16 MB)
-	const size_t totalBytes = sizeof(float) * n;
-	if (totalBytes > (1 << 24)) { // ~16 MB threshold
-#pragma omp parallel for schedule(static)
-		for (ptrdiff_t i = 0; i < (ptrdiff_t)n; i += 16)
-			out[i] = 0.0f;
-	}
+	// No need to warm up output data.
 
 	PointCloudAdapter cloud{ pts, n };
 	KDTree index(3, cloud, KDTreeSingleIndexAdaptorParams(64));
@@ -2801,7 +2843,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	std::vector<camera_cell_t> camCells;
 	std::vector<facet_t> hullFacets;
 	std::vector<delaunay_t::All_cells_iterator> cellIterators;
-	vertex_handle_t* idToVertex; // indexed by uint32_t id
 	Point3f* idToPoint;
 
 	size_t numVertices;
@@ -2830,6 +2871,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			if (bUseOnlyROI && !IsBounded())
 				bUseOnlyROI = false;
 
+			// 21ms
 			numVertices =
 				bUseOnlyROI ?
 				ProcessPoints<true>(
@@ -2848,7 +2890,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				);
 
 #ifndef VALIDATE
-			// sort vertices
+			// sort vertices (1.17s)
 			typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
 			// JPB The runtime here is not consistent.
 			// Defaults on this work really well.
@@ -2865,6 +2907,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			vertices = (point_t*)_aligned_malloc(sizeof(point_t) * numVertices, 64);
 			Point3f* verticesf = (Point3f*)_aligned_malloc(sizeof(Point3f) * numVertices, 64);
 
+			// 69ms
 			permuteScatter2(
 				indices,
 				numVertices,
@@ -2885,6 +2928,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			mask = (uint8_t*)_aligned_malloc(sizeof(uint8_t) * numVertices, 64);
 			// 8/16 about the same, but better than 32, 64 much worse
 			// 16 removes more outliers.
+			// 1.39s/1.286s
 			StatisticalOutlierRemoval(verticesf, numVertices, mask, 16, 2);
 
 			_aligned_free(verticesf);
@@ -2894,12 +2938,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// 6x vertices is a generous worst case, but uses too much memory.
 			// Potentially allow some dynamic allocation to better keep
 			// memory within reasonable limits.
+			// 178ms
 			delaunay.tds().cells().reserve(numVertices * 4); // May reserve dynamically
 			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.
 
 			// Can't avoid initialization.
 			allViews = (view_vec_t*)_aligned_malloc(sizeof(view_vec_t) * numVertices, 64);
 
+			//42ms
 #pragma omp parallel for schedule(static)
 			for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i)
 				new (&allViews[i]) view_vec_t();
@@ -2917,7 +2963,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.16");
+		DEBUG("ReconstructMesh optimization version 1.1.17");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2930,6 +2976,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		SmallQueue<cell_handle_t, kMaxCells> cellQueue;
 
 		vertex_handle_t hint;
+		const vertex_handle_t infV = delaunay.infinite_vertex();  // cheap pointer compare
 
 		// InsertViews first parameter must be the dt's index --verified by validation code.
 		if (distInsert <= 0) {
@@ -2952,7 +2999,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		else {
 			std::vector<uint32_t> vertexMarks(numVertices); // Must be uint32_t
 			uint32_t marker = 0;
-			const vertex_handle_t infV = delaunay.infinite_vertex();  // cheap pointer compare
 
 			uint32_t i = 0;
 			for (bool done = false; !done; ++i) {
@@ -3039,54 +3085,37 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							const vertex_handle_t v2 = c->vertex(2);
 							const vertex_handle_t v3 = c->vertex(3);
 
+#define TRY_VERTEX_ZFIRST(vh, rejectLabel) do {                    \
+  if ((vh) != nearest && (vh) != infV) {                           \
+    uint32_t* m = &vertexMarks[(vh)->info().idx];                  \
+    if (*m != marker) {                                            \
+      *m = marker;                                                 \
+      const point_t& pt = (vh)->point();                           \
+      const double dz = pt.z() - qz;                                \
+      double d2 = dz * dz;                                         \
+      if (d2 >= bestSq) goto rejectLabel;                           \
+      const double dx = pt.x() - qx;                                \
+      d2 += dx * dx;                                               \
+      if (d2 >= bestSq) goto rejectLabel;                           \
+      const double dy = pt.y() - qy;                                \
+      d2 += dy * dy;                                               \
+      if (d2 < bestSq) { bestSq = d2; best = (vh); goto refine_restart; } \
+    }                                                              \
+  }                                                                \
+} while (0)
+
 							{
-								// v0
-								if (v0 != nearest && v0 != infV) {
-									uint32_t* m = &vertexMarks[v0->info().idx];
-									if (*m != marker) {
-										*m = marker;
-										const point_t& pt = v0->point();
-										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
-										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v0; goto refine_restart; }
-									}
-								}
+								TRY_VERTEX_ZFIRST(v0, reject0);
+							reject0:;
 
-								// v1
-								if (v1 != nearest && v1 != infV) {
-									uint32_t* m = &vertexMarks[v1->info().idx];
-									if (*m != marker) {
-										*m = marker;
-										const point_t& pt = v1->point();
-										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
-										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v1; goto refine_restart; }
-									}
-								}
+								TRY_VERTEX_ZFIRST(v1, reject1);
+							reject1:;
 
-								// v2
-								if (v2 != nearest && v2 != infV) {
-									uint32_t* m = &vertexMarks[v2->info().idx];
-									if (*m != marker) {
-										*m = marker;
-										const point_t& pt = v2->point();
-										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
-										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v2; goto refine_restart; }
-									}
-								}
+								TRY_VERTEX_ZFIRST(v2, reject2);
+							reject2:;
 
-								// v3
-								if (v3 != nearest && v3 != infV) {
-									uint32_t* m = &vertexMarks[v3->info().idx];
-									if (*m != marker) {
-										*m = marker;
-										const point_t& pt = v3->point();
-										const double dx = pt.x() - qx, dy = pt.y() - qy, dz = pt.z() - qz;
-										const double d2 = dx * dx + dy * dy + dz * dz;
-										if (d2 < bestSq) { bestSq = d2; best = v3; goto refine_restart; }
-									}
-								}
+								TRY_VERTEX_ZFIRST(v3, reject3);
+							reject3:;
 							}
 
 							// === Only expand neighbors if no refinement happened ===
@@ -3210,18 +3239,31 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						break;
 					}
 
-					const float invPez = 1.f / pez;
-					const float invPnz = 1.f / pnz;
+					const float zprod = pez * pnz;
+					const float bound = distInsert * zprod;
 
-					const float pex = (camera[0] * pxF + camera[1] * pyF + camera[2] * pzF + camera[3]) * invPez;
-					const float pnx = (camera[0] * nxF + camera[1] * nyF + camera[2] * nzF + camera[3]) * invPnz;
+					// ---- X axis only ----
+					const float pex = camera[0] * pxF + camera[1] * pyF + camera[2] * pzF + camera[3];
+					const float pnx = camera[0] * nxF + camera[1] * nyF + camera[2] * nzF + camera[3];
 
-					const float pey = (camera[4] * pxF + camera[5] * pyF + camera[6] * pzF + camera[7]) * invPez;
-					const float pny = (camera[4] * nxF + camera[5] * nyF + camera[6] * nzF + camera[7]) * invPnz;
+					const float dx = pex * pnz - pnx * pez;
+					if (FastAbsS(dx) > bound) {
+						shouldInsert = true;
+						break;
+					}
 
-					const float dx = pex - pnx;
-					const float dy = pey - pny;
-					if (dx * dx + dy * dy > distInsertSq) {
+					// ---- Y axis only (only if X passed) ----
+					const float pey = camera[4] * pxF + camera[5] * pyF + camera[6] * pzF + camera[7];
+					const float pny = camera[4] * nxF + camera[5] * nyF + camera[6] * nzF + camera[7];
+
+					const float dy = pey * pnz - pny * pez;
+					if (FastAbsS(dy) > bound) {
+						shouldInsert = true;
+						break;
+					}
+
+					// ---- Exact check only if both axes passed ----
+					if (dx * dx + dy * dy > distInsertSq * zprod * zprod) {
 						shouldInsert = true;
 						break;
 					}
@@ -3260,45 +3302,39 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 		DWORD64 t0 = __rdtsc();
 
-		// Exact edges 4.36 s
-		std::vector<cell_handle_t> finiteCells;
-		finiteCells.reserve(delaunay.number_of_cells());
-		size_t infiniteCells = 0;
+		cell_handle_t* __restrict finiteCells = (cell_handle_t*)_aligned_malloc(sizeof(cell_handle_t) * delaunay.number_of_cells(), 64);
+		size_t numFiniteCells = 0;
+		size_t numInfiniteCells = 0;
 
 		for (delaunay_t::All_cells_iterator ci = delaunay.all_cells_begin(), eci = delaunay.all_cells_end(); ci != eci; ++ci, ++ciID) {
 			cellIterators.push_back(ci);
 			ci->info() = ciID;
 
-			// skip the finite cells
-			if (!delaunay.is_infinite(ci)) {
-				finiteCells.push_back(ci);
-				continue;
+			if (ci->vertex(0) != infV && ci->vertex(1) != infV && ci->vertex(2) != infV && ci->vertex(3) != infV) {
+				// skip the finite cells
+				finiteCells[numFiniteCells++] = ci;
 			}
-			++infiniteCells;
-			int inf = ci->index(delaunay.infinite_vertex());
-			facet_t facet(ci, inf);
-			hullFacets.push_back(facet);
+			else {
+				++numInfiniteCells;
+				hullFacets.emplace_back(ci, ci->index(delaunay.infinite_vertex()));
+			}
 		}
-
 		totalCells = ciID;
 
 #if 1 // New idea for median calculation
 		const auto maxIndex = vert_info_t::g_idx;
-		idToVertex = (vertex_handle_t*)_aligned_malloc(sizeof(vertex_handle_t) * (maxIndex + 1), 64); // or allocate based on vertex count
 		idToPoint = (Point3f*)_aligned_malloc(sizeof(Point3f) * (maxIndex + 1), 64);
 		for (auto vit = delaunay.finite_vertices_begin(), end = delaunay.finite_vertices_end(); vit != end; ++vit) {
 
 			const auto& p = vit->point();
 			const uint32_t id = vit->info().idx;
 
-			idToVertex[id] = vit;
 			idToPoint[id].x = float(p.x());
 			idToPoint[id].y = float(p.y());
 			idToPoint[id].z = float(p.z());
 		}
 
-		const size_t numFiniteCells = finiteCells.size();
-		const size_t totalEstimate = 6ull * finiteCells.size();
+		const size_t totalEstimate = 6ull * numFiniteCells;
 		uint64_t* __restrict edges = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * totalEstimate, 64);
 
 #pragma omp parallel
@@ -3309,7 +3345,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// Assign cell range to this thread
 			size_t cellStart = numFiniteCells * tid / numThreads;
 			size_t cellEnd = numFiniteCells * (tid + 1) / numThreads;
-			const cell_handle_t* __restrict cellsPtr = finiteCells.data();
+			const cell_handle_t* __restrict cellsPtr = finiteCells;
 
 			// Each cell produces 6 edges and compute edge range
 			size_t edgeStart = 6 * cellStart;
@@ -3338,7 +3374,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			}
 		}
 
-		decltype(finiteCells)().swap(finiteCells);
+		_aligned_free(finiteCells);
 
 		// Sort and deduplicate
 		tbb::parallel_sort(edges, edges + totalEstimate);
@@ -3362,11 +3398,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			dists[i] = dx * dx + dy * dy + dz * dz;
 		}
 
-		_aligned_free(edges);
-		edges = 0;
-
 		std::nth_element(dists, dists + edgeCount/2, dists + edgeCount);
 		approxMedian = dists[edgeCount /2];
+
+		_aligned_free(edges);
+		edges = 0;
 #else
 		const int numThreads = omp_get_max_threads();
 		std::vector<std::vector<float>> threadDists(numThreads);
@@ -3476,7 +3512,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, numFiniteFacets,  numFacets-numFiniteFacets, TD_TIMER_GET_FMT().c_str());
 #else
 		DEBUG_EXTRA("Delaunay tetrahedralization completed: %u points -> %u vertices, %u (+%u) cells, faces not calculated (%s)",
-			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, TD_TIMER_GET_FMT().c_str());
+			numVertices, delaunay.number_of_vertices(), numFiniteCells, numInfiniteCells, TD_TIMER_GET_FMT().c_str());
 #endif
 	}
 
@@ -3622,7 +3658,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			DEBUG_ULTIMATE("\tweighting completed in %s", TD_TIMER_GET_FMT().c_str());
 		}
 #else
-		constexpr int kViewBatch = 4;   // 4 or 8 are usually best
+		constexpr int kViewBatch = 32;   // 4 or 8 are usually best (slightly faster with large batch).
 		constexpr int kMaxSteps = 512;
 		constexpr int kMaxStepsPerBatch = kViewBatch * kMaxSteps;
 
@@ -3676,7 +3712,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 #endif
 		{
 			// First one sets up everything.
-			#pragma omp single
+#pragma omp single
 			{
 				int numThreads = omp_get_num_threads();
 				perThreadData.resize(numThreads);
@@ -3692,7 +3728,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			viewCounts.resize(images.size());
 
 #pragma omp for schedule(static, 1024) // 1024 better than alternatives on 7950X
-			for (int64_t i=0; i<nVerts; ++i) {
+			for (int64_t i = 0; i < nVerts; ++i) {
 #if 1
 				auto vi = vertexHandles[i];
 #else
@@ -3905,14 +3941,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						const size_t base = i << 2;
 
 						// load pointers
-						float* p0 = pPts[base+0];
-						float* p1 = pPts[base+1];
-						float* p2 = pPts[base+2];
-						float* p3 = pPts[base+3];
+						float* p0 = pPts[base + 0];
+						float* p1 = pPts[base + 1];
+						float* p2 = pPts[base + 2];
+						float* p3 = pPts[base + 3];
 
 						// SIMD math
-						const _Data vDists = _Load(pDist + base);
-						const _Data vAlphaVis = _Load(pVis + base);
+						const _Data vDists = _LoadA(pDist + base);
+						const _Data vAlphaVis = _LoadA(pVis + base);
 						const _Data vDistsSq = _Mul(vDists, vDists);
 						const _Data vDistsSqFactor = _Mul(vDistsSq, vInv2SigmaSq);
 						_Data vExp = BetterFastExpSse(vDistsSqFactor);
@@ -3931,10 +3967,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							p0 != p2 && p1 != p3)
 						{
 #endif
-							AtomicAddFloat(p0, v0);
-							AtomicAddFloat(p1, v1);
-							AtomicAddFloat(p2, v2);
-							AtomicAddFloat(p3, v3);
+						AtomicAddFloat(p0, v0);
+						AtomicAddFloat(p1, v1);
+						AtomicAddFloat(p2, v2);
+						AtomicAddFloat(p3, v3);
 #if 1
 						}
 						else
@@ -3944,7 +3980,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 								AtomicAddFloat(p0, v0 + v1);
 								AtomicAddFloat(p2, v2);
 								AtomicAddFloat(p3, v3);
-							}
+					}
 							else if (p2 == p3) {
 								AtomicAddFloat(p0, v0);
 								AtomicAddFloat(p1, v1);
@@ -3984,8 +4020,8 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						}
 
 						// SIMD math (always 4-wide)
-						const _Data vD = _Load(tmpDist);
-						const _Data vAlphaVis = _Load(tmpVis);
+						const _Data vD = _LoadA(tmpDist);
+						const _Data vAlphaVis = _LoadA(tmpVis);
 						const _Data vSq = _Mul(vD, vD);
 						const _Data vF = _Mul(vSq, vInv2SigmaSq);
 						_Data vExp = BetterFastExpSse(vF);
@@ -4014,32 +4050,31 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const Camera& camera = imageData.camera;
 					const camera_cell_t& camCell = camCells[imageID];
 					// compute the ray used to find point intersection
-					const Point3 vecCamPoint(pt-camera.C);
-					const REAL invLenCamPoint(REAL(1)/norm(vecCamPoint));
+					const Point3 vecCamPoint(pt - camera.C);
+					const REAL invLenCamPoint(REAL(1) / norm(vecCamPoint));
 					// find faces intersected by the camera-point segment
 					const segment_t segCamPoint(MVS2CGAL(camera.C), p);
 
 					std::cout << "oldi (first):   ";
-					intersection_t inter(pt, Point3(vecCamPoint*invLenCamPoint));
+					intersection_t inter(pt, Point3(vecCamPoint * invLenCamPoint));
 					if (!intersectv(delaunay, segCamPoint, camCell.facets, facets, inter))
 						continue;
 					do {
 						// assign score, weighted by the distance from the point to the intersection
-						const edge_cap_t w(alpha_vis*(1.f-EXP(-SQUARE((float)inter.dist)*inv2SigmaSq)));
+						const edge_cap_t w(alpha_vis * (1.f - EXP(-SQUARE((float)inter.dist) * inv2SigmaSq)));
 						std::cout << w << " ";
 						//edge_cap_t& f(infoCells[inter.facet.first->info()].f[inter.facet.second]);
 						//#ifdef DELAUNAY_USE_OPENMP
 						//#pragma omp atomic
 						//#endif
 						//f += w;
-					}
-					while (intersectv(delaunay, segCamPoint, facets, facets, inter));
+					} while (intersectv(delaunay, segCamPoint, facets, facets, inter));
 					std::cout << "\n\noldi (second):   ";
 
 					ASSERT(facets.empty() && inter.type == intersection_t::VERTEX && inter.v1 == vi);
 					// find faces intersected by the endpoint-point segment
 					inter.dist = FLT_MAX; inter.bigger = false;
-					const Point3 endPoint2(pt+vecCamPoint*(invLenCamPoint*sigma));
+					const Point3 endPoint2(pt + vecCamPoint * (invLenCamPoint * sigma));
 					const segment_t segEndPoint2(MVS2CGAL(endPoint2), p);
 					const cell_handle_t endCell(delaunay.locate(segEndPoint2.source(), vi->cell()));
 					ASSERT(endCell != cell_handle_t());
@@ -4052,7 +4087,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					while (intersectv(delaunay, segEndPoint2, facets, facets, inter)) {
 						// assign score, weighted by the distance from the point to the intersection
 						const facet_t& mf(delaunay.mirror_facet(inter.facet));
-						const edge_cap_t w(alpha_vis*(1.f-EXP(-SQUARE((float)inter.dist)*inv2SigmaSq)));
+						const edge_cap_t w(alpha_vis * (1.f - EXP(-SQUARE((float)inter.dist) * inv2SigmaSq)));
 						std::cout << w << " ";
 						//edge_cap_t& f(infoCells[mf.first->info()].f[mf.second]);
 						//#ifdef DELAUNAY_USE_OPENMP
@@ -4170,9 +4205,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					float* p7 = pp[7];
 
 					const _Data vDists = _Load(d);
-					const _Data vDists2 = _Load(d+4);
+					const _Data vDists2 = _Load(d + 4);
 					const _Data vAlphaVis = _Load(v);
-					const _Data vAlphaVis2 = _Load(v+4);
+					const _Data vAlphaVis2 = _Load(v + 4);
 					const _Data vDistsSq = _Mul(vDists, vDists);
 					const _Data vDistsSq2 = _Mul(vDists2, vDists2);
 					const _Data vDistsSqFactor = _Mul(vDistsSq, vInv2SigmaSq);
@@ -4209,7 +4244,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				}
 
 				for (size_t i = 0; i < numRemaining; ++i, ++d, ++v, ++pp) {
-					float tmp = (*v*(1.f- JPBEXP(SQUARE((float)*d)*(inv2SigmaSq))));
+					float tmp = (*v * (1.f - JPBEXP(SQUARE((float)*d) * (inv2SigmaSq))));
 #ifdef VALIDATE
 					std::cout << tmp << " ";
 #endif
@@ -4222,7 +4257,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				std::cout << "\n";
 #endif
 
-				if (!(i&1023)) { progress += 1024; }
+				if (!(i & 1023)) { progress += 1024; }
 			}
 		} // parallel
 #endif
@@ -4233,6 +4268,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		_aligned_free(vertexHandles);
 		vertexHandles = 0;
 
+		// Confirmed faster to parallel destroy.
 #pragma omp parallel for schedule(static, 256)
 		for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i)
 			allViews[i].~view_vec_t();
@@ -4264,7 +4300,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		auto t0 = rdtscStart();
 
 		// create graph
-		constexpr edge_cap_t maxCap(3.402823466e+34f/*FLT_MAX*0.0001f*/);
+		constexpr edge_cap_t maxCap = 1e8f;     // safe, tight
 
 #if 1 // parallel graph-cut set up brings 29s to about 9s
 		MaxFlow<cell_size_t,edge_cap_t> graph(cellIterators.size());
@@ -4289,7 +4325,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 		_Data vQual = _Set(kQual);
 
-		std::vector<bool> cellMask(totalCells, false);
+		std::vector<uint8_t> cellMask(totalCells, false);
 
 		// --- Compute facet angles in parallel ---
 		#pragma omp parallel for schedule(static)
@@ -4300,20 +4336,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			const auto ci = cellIterators[i];
 			const cell_size_t cellID = ci->info();
 
-			float totalWeight = 0;
-			for (int f = 0; f < 4; ++f) totalWeight += infoCells[cellID].f[f];
+			const auto& w = infoCells[cellID].f;
+			float totalWeight = w[0] + w[1] + w[2] + w[3];
 			cellMask[i] = (totalWeight > 1e-6f); // Threshold tunable; skip very low-weight cells
 
 			// Safe single-thread write if cellIDs are unique
 			facetData.cellIDToIdx[cellID] = (int32_t)i;
-#if 1
 			computeOneMinusPlaneSphereAngle4(delaunay, ci, vQual, &facetData.kQual_oneMinusAngle[i * 4]);
-#else
-			facetData.angle[i * 4 + 0] = computePlaneSphereAngle(delaunay, facet_t(ci, 0));
-			facetData.angle[i * 4 + 1] = computePlaneSphereAngle(delaunay, facet_t(ci, 1));
-			facetData.angle[i * 4 + 2] = computePlaneSphereAngle(delaunay, facet_t(ci, 2));
-			facetData.angle[i * 4 + 3] = computePlaneSphereAngle(delaunay, facet_t(ci, 3));
-#endif
 		}
 
 		// --- Graph construction pass ---
@@ -4334,8 +4363,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		struct alignas(64)  ThreadLocalBuffer
 		{
 			std::vector<EdgeDesc> edges;
-			edge_cap_t flow = 0;
-			char pad[64 - sizeof(flow)]; // force `flow` onto its own cache line
+			alignas(64) edge_cap_t flow;
 		};
 
 #if 0
@@ -4421,20 +4449,27 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			const __m128 kQtr = _mm_set1_ps(0.25f);
 			const __m128 kEighth = _mm_set1_ps(1.0f/8.0f);
 			const __m128 kMaxV = _mm_set1_ps(maxCap);
+			const __m128 kSixteen = _mm_set1_ps(16.0f);
+			const __m128 kSixteenth = _mm_set1_ps(1.f/16.0f);
 
 			for (ptrdiff_t idx = start; idx < end; ++idx) {
-				const auto ci = cellIterators[idx];
-				const int ciID = ci->info();
 				//++weakConsidered;
-				if (!cellMask[ciID]) {
+				if (!cellMask[idx]) {
 					//++weakDropped;
 					continue;
 				}
+				const auto ci = cellIterators[idx];
+				const int ciID = ci->info();
+
 				const auto& ciInfo = infoCells[ciID];
+				auto& node = g.nodes[ciID];
 
 				// Compute terminal capacities
 				edge_cap_t s = ciInfo.s;
 				edge_cap_t t = FastMinS(ciInfo.t, maxCap);
+				const edge_cap_t push = FastMinS(s, t);
+				const edge_cap_t excess = (s == kInf) ? maxCap : (s - t);
+				const int base = idx << 2; // idx * 4
 
 				bool hasEdge = false;
 
@@ -4447,7 +4482,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const int j = cj->index(ci);
 					const auto& cjInfo = infoCells[cjID];
 
-					const float kQual_oneMinusAngleCi = facetData.kQual_oneMinusAngle[idx * 4 + i];
+					const float kQual_oneMinusAngleCi = facetData.kQual_oneMinusAngle[base + i];
 					const int cjIdx = facetData.cellIDToIdx[cjID];
 					const float kQual_oneMinusAngleCj = facetData.kQual_oneMinusAngle[cjIdx * 4 + j];
 
@@ -4463,9 +4498,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 					// identical quantization: multiply add truncate
 #if 1
-					const __m128 vScaled = _mm_add_ps(_mm_mul_ps(v, _mm_set1_ps(16.0f)), kHalf);
+					const __m128 vScaled = _mm_add_ps(_mm_mul_ps(v, kSixteen), kHalf);
 					const	__m128i ival = _mm_cvttps_epi32(vScaled);
-					const __m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(ival), _mm_set1_ps(1.0f / 16.0f));
+					const __m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(ival), kSixteenth);
 #else
 
 
@@ -4498,19 +4533,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
 				}
 
-				// --- Now decide whether to keep this node ---
-				// keep if:  hard source, has any sink weight, or any edge
-				if (s == kInf || t > 0.0f || hasEdge)
-				{
-					g.nodes[ciID].excess = (s == kInf) ? maxCap : (s - t);
-					if (s > 0.0f && s < kInf)
-						buf.flow += FastMinS(s, t);
-				}
-				// else: no terminals and no edges -> totally unreferenced cell
-				// skip (do not write to g.nodes or edges)
-
-				edge_cap_t push = FastMinS(s, t);
-				g.nodes[ciID].excess = s - t;
+				node.excess = excess;
 				buf.flow += push;
 			}
 		}
@@ -4563,15 +4586,51 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		}
 		#endif
 
-		VirtualFree(infoCells, 0, MEM_RELEASE);
-		infoCells = 0;
-
 		auto t1 = rdtscEnd();
 	  //RestoreAffinity(originalMask); // Restore original affinity
 
-		std::cout << "   Startup: " << rdtscToSeconds(t1 - t0, cpuHz) << "\n";
-
 		graph.FinalizeGraph();
+
+#if 0 // validate graph
+		// 1) Sum of excess over graph nodes
+		edge_cap_t sum_excess = 0;
+		for (int i = 0; i < g.numNodes; ++i)
+			sum_excess += g.nodes[i].excess;
+
+		// 2) Sum of (s - t) over *masked* cells only
+		edge_cap_t st_masked = 0;
+		edge_cap_t pushSum = 0;
+
+		for (int idx = 0; idx < totalCells; ++idx) {
+			if (!cellMask[idx]) continue;
+
+			const cell_size_t ciID = cellIterators[idx]->info();
+			edge_cap_t s = infoCells[ciID].s;
+			edge_cap_t t = FastMinS(infoCells[ciID].t, maxCap);
+
+			edge_cap_t excess = (s == kInf) ? maxCap : (s - t);
+			st_masked += excess;
+
+			pushSum += FastMinS(s, t);
+		}
+
+		// These are the *only* valid invariants
+		HARD_ASSERT(sum_excess == st_masked);
+		HARD_ASSERT(pushSum == g.flow);
+#endif
+
+		VirtualFree(infoCells, 0, MEM_RELEASE);
+		infoCells = 0;
+
+#if 1
+		int numRemoved = graph.CollapseDegree1Nodes();
+    std::cout << "   Removed " << numRemoved << " degree-1 nodes.\n";	
+
+		// One or both of these is wrong.
+		graph.PrelabelDominantNodes();
+#endif
+
+		std::cout << "   Startup: " << rdtscToSeconds(t1 - t0, cpuHz) << "\n";
 
 		// find graph-cut solution
 		const float maxflow(graph.ComputeMaxFlow());
@@ -4623,6 +4682,8 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			const uint8_t* __restrict side = nodeSide.data();
 
 			for (ptrdiff_t idx = start; idx < end; ++idx) {
+				// Do not mask during surface extraction as flow may have been propagated
+				// through the cell.
 				auto ci = cellIterators[idx];
 				const cell_size_t ciID = ci->info();
 				const bool ciType = side[ciID];
@@ -4666,19 +4727,16 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		mesh.vertices.Reserve((Mesh::VIndex)numVertices);
 		mesh.faces.Reserve((Mesh::FIndex)numVertices * 4); // Worst-case
 
-for (const auto& local : localData) {
-  for (uint32_t idx : local.localVertexIDs) {
-    if (idxToGlobalIndex[idx] == kInvalid) {
-      idxToGlobalIndex[idx] = mesh.vertices.GetSize();
+		for (const auto& local : localData) {
+			for (uint32_t idx : local.localVertexIDs) {
+				if (idxToGlobalIndex[idx] == kInvalid) {
+					idxToGlobalIndex[idx] = mesh.vertices.GetSize();
 
-      const Point3f& p = idToPoint[idx];
-      mesh.vertices.Insert(p);
-    }
-  }
-}
-
-		_aligned_free(idToVertex);
-		idToVertex = 0;
+					const Point3f& p = idToPoint[idx];
+					mesh.vertices.Insert(p);
+				}
+			}
+		}
 
 		// Remap local faces to global indices and insert
 		for (const auto& local : localData) {
@@ -4733,6 +4791,9 @@ for (const auto& local : localData) {
 		DEBUG_EXTRA("Delaunay tetrahedras graph-cut completed (%g flow): %u vertices, %u faces (%s)", maxflow, mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 
+#ifdef FIX_MANIFOLD
+	auto tfs = rdtscStart();
+
 #ifdef MANIFOLD_FIXUP
 #ifdef PRE_OPENMVS21
 	// fix non-manifold vertices and edges
@@ -4743,6 +4804,11 @@ for (const auto& local : localData) {
 	// fix non-manifold vertices and edges
 	mesh.FixNonManifold();
 #endif
+#endif
+
+	auto tfe = rdtscEnd();
+	DEBUG_EXTRA("Manifold time %g", rdtscToSeconds(tfe - tfs, cpuHz));
+
 #endif
 
 	return true;

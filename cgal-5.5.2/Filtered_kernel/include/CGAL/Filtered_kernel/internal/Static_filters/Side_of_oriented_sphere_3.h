@@ -154,10 +154,22 @@ public:
           double astz = CGAL::abs(stz);
 
 #ifdef CGAL_USE_SSE2_MAX
-          CGAL::Max<double> mmax;
-          maxx = mmax(maxx, aqtx, artx, astx);
-          maxy = mmax(maxy, aqty, arty, asty);
-          maxz = mmax(maxz, aqtz, artz, astz);
+          {
+            // maxx = max(maxx, aqtx, artx, astx)
+            __m128d t0 = _mm_max_sd(_mm_set_sd(maxx), _mm_set_sd(aqtx));
+            __m128d t1 = _mm_max_sd(t0, _mm_set_sd(artx));
+            maxx = _mm_cvtsd_f64(_mm_max_sd(t1, _mm_set_sd(astx)));
+
+            // maxy = max(maxy, aqty, arty, asty)
+            t0 = _mm_max_sd(_mm_set_sd(maxy), _mm_set_sd(aqty));
+            t1 = _mm_max_sd(t0, _mm_set_sd(arty));
+            maxy = _mm_cvtsd_f64(_mm_max_sd(t1, _mm_set_sd(asty)));
+
+            // maxz = max(maxz, aqtz, artz, astz)
+            t0 = _mm_max_sd(_mm_set_sd(maxz), _mm_set_sd(aqtz));
+            t1 = _mm_max_sd(t0, _mm_set_sd(artz));
+            maxz = _mm_cvtsd_f64(_mm_max_sd(t1, _mm_set_sd(astz)));
+          }
 #else
           if (maxx < aqtx) maxx = aqtx;
           if (maxx < artx) maxx = artx;
@@ -175,15 +187,17 @@ public:
           double eps = 1.2466136531027298e-13 * maxx * maxy * maxz;
 
 #ifdef CGAL_USE_SSE2_MAX
-          /*
-          CGAL::Min<double> mmin;
-          double tmp = mmin(maxx, maxy, maxz);
-          maxz = mmax(maxx, maxy, maxz);
-          maxx = tmp;
-          */
-          sse2minmax(maxx,maxy,maxz);
-          // maxy can contain ANY element
+          {
+            // ---- maxx ----
+            __m128d tx0 = _mm_max_sd(_mm_set_sd(maxx), _mm_set_sd(aqtx));
+            __m128d tx1 = _mm_max_sd(tx0, _mm_set_sd(artx));
+            maxx = _mm_cvtsd_f64(_mm_max_sd(tx1, _mm_set_sd(astx)));
 
+            // ---- maxz ----
+            __m128d tz0 = _mm_max_sd(_mm_set_sd(maxz), _mm_set_sd(aqtz));
+            __m128d tz1 = _mm_max_sd(tz0, _mm_set_sd(artz));
+            maxz = _mm_cvtsd_f64(_mm_max_sd(tz1, _mm_set_sd(astz)));
+          }
 #else
           // Sort maxx < maxy < maxz.
           if (maxx > maxz)

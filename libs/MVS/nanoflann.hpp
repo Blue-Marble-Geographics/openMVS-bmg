@@ -1223,9 +1223,6 @@ class KDTreeBaseClass
       BoundingBox right_bbox(bbox);
       right_bbox[cutfeat].low = cutval;
 
-      _mm_prefetch((const char*)(obj.vAcc_.data() + left + (idx >> 1)), _MM_HINT_T0);
-      _mm_prefetch((const char*)(obj.vAcc_.data() + left + idx + ((cnt - idx) >> 1)), _MM_HINT_T0);
-
       node->child1 = this->divideTree(obj, left, left + idx, left_bbox);
       node->child2 = this->divideTree(obj, left + idx, right, right_bbox);
 

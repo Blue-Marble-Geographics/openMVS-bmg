@@ -46,7 +46,7 @@ namespace tri{
 
 constexpr int Info()
 {
-	constexpr int version = 13;
+	constexpr int version = 14;
 
 	return version;
 }
@@ -494,7 +494,7 @@ public:
 			@param DeleteVertexFlag if false prevent the vertex deletion and just count it.
 			@return The number of removed vertices
 			*/
-	static int RemoveUnreferencedVertex( MeshType& m, bool DeleteVertexFlag=true)   // V1.0
+	static int RemoveUnreferencedVertex(MeshType& m, bool DeleteVertexFlag = true)   // V1.0
 	{
 #ifdef FAST_REMOVEUNREFVERTEX
 		tri::RequirePerVertexFlags(m);
@@ -534,15 +534,6 @@ public:
 					const int idx = int(f.V(j) - baseVert);
 					local[idx] = 1;
 				}
-			}
-
-#pragma omp for schedule(static)
-			for (int64_t i = 0; i < numEdges; ++i) {
-				const auto& e = m.edge[i];
-				if (e.IsD()) continue;
-
-				local[tri::Index(m, e.V(0))] = 1;
-				local[tri::Index(m, e.V(1))] = 1;
 			}
 		}
 
@@ -589,36 +580,36 @@ public:
 #else
 		tri::RequirePerVertexFlags(m);
 
-		std::vector<bool> referredVec(m.vert.size(),false);
+		std::vector<bool> referredVec(m.vert.size(), false);
 		int deleted = 0;
 
-		for(auto fi = m.face.begin(); fi != m.face.end(); ++fi)
-			if( !(*fi).IsD() )
-				for(auto j=0; j < (*fi).VN(); ++j)
-					referredVec[tri::Index(m, (*fi).V(j))]=true;
+		for (auto fi = m.face.begin(); fi != m.face.end(); ++fi)
+			if (!(*fi).IsD())
+				for (auto j = 0; j < (*fi).VN(); ++j)
+					referredVec[tri::Index(m, (*fi).V(j))] = true;
 
-		for(auto ei=m.edge.begin();ei!=m.edge.end();++ei)
-			if( !(*ei).IsD() ){
-				referredVec[tri::Index(m, (*ei).V(0))]=true;
-				referredVec[tri::Index(m, (*ei).V(1))]=true;
+		for (auto ei = m.edge.begin(); ei != m.edge.end(); ++ei)
+			if (!(*ei).IsD()) {
+				referredVec[tri::Index(m, (*ei).V(0))] = true;
+				referredVec[tri::Index(m, (*ei).V(1))] = true;
 			}
 
-		for(auto ti=m.tetra.begin(); ti!=m.tetra.end();++ti)
-			if( !(*ti).IsD() ){
-				referredVec[tri::Index(m, (*ti).V(0))]=true;
-				referredVec[tri::Index(m, (*ti).V(1))]=true;
-				referredVec[tri::Index(m, (*ti).V(2))]=true;
-				referredVec[tri::Index(m, (*ti).V(3))]=true;
+		for (auto ti = m.tetra.begin(); ti != m.tetra.end(); ++ti)
+			if (!(*ti).IsD()) {
+				referredVec[tri::Index(m, (*ti).V(0))] = true;
+				referredVec[tri::Index(m, (*ti).V(1))] = true;
+				referredVec[tri::Index(m, (*ti).V(2))] = true;
+				referredVec[tri::Index(m, (*ti).V(3))] = true;
 			}
 
 
-		if(!DeleteVertexFlag)
-			return std::count(referredVec.begin(),referredVec.end(),false);
+		if (!DeleteVertexFlag)
+			return std::count(referredVec.begin(), referredVec.end(), false);
 
-		for(auto vi=m.vert.begin();vi!=m.vert.end();++vi)
-			if( (!(*vi).IsD()) && (!referredVec[tri::Index(m,*vi)]) )
+		for (auto vi = m.vert.begin(); vi != m.vert.end(); ++vi)
+			if ((!(*vi).IsD()) && (!referredVec[tri::Index(m, *vi)]))
 			{
-				Allocator<MeshType>::DeleteVertex(m,*vi);
+				Allocator<MeshType>::DeleteVertex(m, *vi);
 				++deleted;
 			}
 		return deleted;

@@ -423,9 +423,10 @@ __forceinline float Quality(
     const P3ScalarType nz = dx1 * dy2 - dy1 * dx2;
 
     const P3ScalarType area2 = nx * nx + ny * ny + nz * nz;
-    if (area2 == 0) return P3ScalarType(0);
+    // if (area2 == 0) return P3ScalarType(0);
 
-    return FastSqrtS(area2) / maxEdge2;
+    //return FastSqrtS(area2) / maxEdge2;
+    return area2 / (maxEdge2 * maxEdge2); // Square the quality and have the caller adjust.
 #endif
 
 #ifdef RANKING6

@@ -84,13 +84,91 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 6;
+  constexpr int version = 7;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else
   return { false, version };
 #endif
 }
+
+template<typename T, size_t InlineCap, bool SingleThreaded = true>
+struct SmallStack {
+  size_t size;
+
+  // Raw, uninitialized inline storage
+  alignas(T) unsigned char inlineStorage[sizeof(T) * InlineCap];
+
+  std::vector<T> overflow;
+
+  __forceinline SmallStack() : size(0) {}
+
+  __forceinline ~SmallStack() {
+    clear();
+  }
+
+  __forceinline void clear() {
+    if constexpr (SingleThreaded) {
+      const size_t n = size < InlineCap ? size : InlineCap;
+      for (size_t i = 0; i < n; ++i) {
+        inlinePtr(i)->~T();
+      }
+      size = 0;
+      overflow.clear();
+    }
+    else {
+      // MT-safe variant would need locking or atomics here
+      const size_t n = size < InlineCap ? size : InlineCap;
+      for (size_t i = 0; i < n; ++i) {
+        inlinePtr(i)->~T();
+      }
+      size = 0;
+      overflow.clear();
+    }
+  }
+
+  __forceinline bool empty() const {
+    if constexpr (SingleThreaded) {
+      return size == 0;
+    }
+    else {
+      return size == 0 && overflow.empty();
+    }
+  }
+
+  __forceinline void push(const T& v) {
+    if (size < InlineCap) {
+      new (inlinePtr(size)) T(v);
+    }
+    else {
+      overflow.push_back(v);
+    }
+    ++size;
+  }
+
+  __forceinline T pop() {
+    --size;
+
+    if (size < InlineCap) {
+      T v = std::move(*inlinePtr(size));
+      inlinePtr(size)->~T();
+      return v;
+    }
+
+    T v = overflow.back();
+    overflow.pop_back();
+    return v;
+  }
+
+private:
+  __forceinline T* inlinePtr(size_t i) {
+    return reinterpret_cast<T*>(inlineStorage + i * sizeof(T));
+  }
+
+  __forceinline const T* inlinePtr(size_t i) const {
+    return reinterpret_cast<const T*>(inlineStorage + i * sizeof(T));
+  }
+};
 
 template < class GT, class Tds = Default,
            class Lock_data_structure = Default >
@@ -1359,9 +1437,54 @@ protected:
     CGAL_triangulation_precondition(tester(d));
 
     // To store the boundary cells, in case we need to rollback
-    typedef boost::container::small_vector<Cell_handle,8192> SV;
-    SV sv;
-    std::stack<Cell_handle, SV > cell_stack(sv);
+#if 1 //st only
+    SmallStack<Cell_handle, 8192> stack; // Not MT safe
+
+    stack.push(d);
+    d->tds_data().mark_in_conflict();
+
+    *it.second++ = d;
+
+    const int deg = dimension() + 1;
+    do
+    {
+      Cell_handle c = stack.pop();
+
+      for (int i = 0; i < deg; ++i)
+      {
+        Cell_handle test = c->neighbor(i);
+
+        if (test->tds_data().is_in_conflict())
+        {
+          Facet f(c, i);
+          if (c < test) {
+            *it.third++ = f;
+          }
+          continue;
+        }
+
+        if (test->tds_data().is_clear() && tester(test))
+        {
+          stack.push(test);
+          test->tds_data().mark_in_conflict();
+          *it.second++ = test;
+
+          Facet f(c, i);
+          if (c < test) {
+            *it.third++ = f;
+          }
+          continue;
+        }
+
+        test->tds_data().mark_on_boundary();
+
+        Facet f(c, i);
+        *it.first++ = f;
+      }
+    } while (!stack.empty()); 
+#else
+    // To store the boundary cells, in case we need to rollback
+    SmallStack<Cell_handle, 8192> cell_stack; // Not MT safe
 
     cell_stack.push(d);
     d->tds_data().mark_in_conflict();
@@ -1446,6 +1569,7 @@ protected:
       }
     }
     while(!cell_stack.empty());
+#endif
 
     return it;
   }
@@ -3251,100 +3375,67 @@ inexact_locate(const Point& t, Cell_handle start, int n_of_turns,
   }
 #endif
 
+#if 1
   // Now treat the cell c.
 try_next_cell:
-  n_of_turns--;
-
-  // We know that the 4 vertices of c are positively oriented.
-  // So, in order to test if p is seen outside from one of c's facets,
-  // we just replace the corresponding point by p in the orientation
-  // test.  We do this using the array below.
-#if 1
-  struct FacetPlane {
-    double nx, ny, nz;
-    double ax, ay, az; // anchor point on the plane
-  };
-  FacetPlane planes[4];
+  --n_of_turns;
 
   const Point& p0 = c->vertex(0)->point();
   const Point& p1 = c->vertex(1)->point();
   const Point& p2 = c->vertex(2)->point();
   const Point& p3 = c->vertex(3)->point();
 
-  // Helper lambda: build plane for facet opposite vi
-  auto buildPlane = [&](int i,
-    const Point& a,
-    const Point& b,
-    const Point& c,
-    const Point& vi)
-    {
-      // normal = (b - a) x (c - a)
-      const double abx = b.x() - a.x();
-      const double aby = b.y() - a.y();
-      const double abz = b.z() - a.z();
-
-      const double acx = c.x() - a.x();
-      const double acy = c.y() - a.y();
-      const double acz = c.z() - a.z();
-
-      double nx = aby * acz - abz * acy;
-      double ny = abz * acx - abx * acz;
-      double nz = abx * acy - aby * acx;
-
-      // Ensure outward orientation:
-      // orient(a,b,c,vi) must be POSITIVE
-      const double vx = vi.x() - a.x();
-      const double vy = vi.y() - a.y();
-      const double vz = vi.z() - a.z();
-
-      if (nx * vx + ny * vy + nz * vz < 0.0) {
-        nx = -nx;
-        ny = -ny;
-        nz = -nz;
-      }
-
-      planes[i].nx = nx;
-      planes[i].ny = ny;
-      planes[i].nz = nz;
-      planes[i].ax = a.x();
-      planes[i].ay = a.y();
-      planes[i].az = a.z();
-    };
-
-  buildPlane(0, p1, p2, p3, p0);
-  buildPlane(1, p0, p3, p2, p1);
-  buildPlane(2, p0, p1, p3, p2);
-  buildPlane(3, p0, p2, p1, p3);
-
   const double tx = t.x();
   const double ty = t.y();
   const double tz = t.z();
 
-  for (int i = 0; i != 4; ++i)
-  {
-    Cell_handle next = c->neighbor(i);
-    if (previous == next)
-      continue;
+  // Preload neighbors
+  Cell_handle n0 = c->neighbor(0);
+  Cell_handle n1 = c->neighbor(1);
+  Cell_handle n2 = c->neighbor(2);
+  Cell_handle n3 = c->neighbor(3);
 
-    if (next->has_vertex(infinite))
-      return next;
+#define TEST_FACET(pa,pb,pc,pvi,nextCell)                           \
+  do {                                                              \
+    if (previous == nextCell) break;                                \
+    if (nextCell->has_vertex(infinite)) return nextCell;            \
+                                                                    \
+    const double abx = (pb).x() - (pa).x();                          \
+    const double aby = (pb).y() - (pa).y();                          \
+    const double abz = (pb).z() - (pa).z();                          \
+                                                                    \
+    const double acx = (pc).x() - (pa).x();                          \
+    const double acy = (pc).y() - (pa).y();                          \
+    const double acz = (pc).z() - (pa).z();                          \
+                                                                    \
+    const double nx = aby * acz - abz * acy;                         \
+    const double ny = abz * acx - abx * acz;                         \
+    const double nz = abx * acy - aby * acx;                         \
+                                                                    \
+    const double vx = (pvi).x() - (pa).x();                          \
+    const double vy = (pvi).y() - (pa).y();                          \
+    const double vz = (pvi).z() - (pa).z();                          \
+                                                                    \
+    double s = nx * (tx - (pa).x()) +                                \
+               ny * (ty - (pa).y()) +                                \
+               nz * (tz - (pa).z());                                 \
+                                                                    \
+    if (nx*vx + ny*vy + nz*vz < 0.0)                                 \
+      s = -s;                                                       \
+                                                                    \
+    if (s < -1e-15) {                                                \
+      previous = c;                                                  \
+      c = nextCell;                                                  \
+      if (n_of_turns) goto try_next_cell;                            \
+    }                                                                \
+  } while (0)
 
-    const FacetPlane& fp = planes[i];
-    const double dx = tx - fp.ax;
-    const double dy = ty - fp.ay;
-    const double dz = tz - fp.az;
+  TEST_FACET(p1, p2, p3, p0, n0);
+  TEST_FACET(p0, p3, p2, p1, n1);
+  TEST_FACET(p0, p1, p3, p2, n2);
+  TEST_FACET(p0, p2, p1, p3, n3);
 
-    const double s =
-      fp.nx * dx +
-      fp.ny * dy +
-      fp.nz * dz;
-
-    constexpr double eps = 1e-15;
-    if (s >= -eps)
-      continue;
-
-    previous = c;
-    c = next;
+#undef TEST_FACET
 
 #if 0
     if (could_lock_zone) {
@@ -3354,10 +3445,6 @@ try_next_cell:
       }
     }
 #endif
-
-    if (n_of_turns)
-      goto try_next_cell;
-  }
 #else
   const Point* pts[4] = { &(c->vertex(0)->point()),
                           &(c->vertex(1)->point()),
@@ -3365,21 +3452,21 @@ try_next_cell:
                           &(c->vertex(3)->point()) };
 
   // (non-stochastic) visibility walk
-  for(int i=0; i != 4; ++i)
+  for (int i = 0; i != 4; ++i)
   {
     Cell_handle next = c->neighbor(i);
-    if(previous == next) continue;
+    if (previous == next) continue;
 
     // We temporarily put p at i's place in pts.
     const Point* backup = pts[i];
     pts[i] = &t;
-    if(inexact_orientation(*pts[0], *pts[1], *pts[2], *pts[3]) != NEGATIVE)
+    if (inexact_orientation(*pts[0], *pts[1], *pts[2], *pts[3]) != NEGATIVE)
     {
       pts[i] = backup;
       continue;
     }
 
-    if(next->has_vertex(infinite))
+    if (next->has_vertex(infinite))
     {
       // We are outside the convex hull.
       return next;
@@ -3387,21 +3474,23 @@ try_next_cell:
 
     previous = c;
     c = next;
-    if(could_lock_zone)
+    /*
+    if (could_lock_zone)
     {
       //previous->unlock(); // DON'T do that, "c" may be in
       // the same locking cell as "previous"
-      if(!this->try_lock_cell(c))
+      if (!this->try_lock_cell(c))
       {
         *could_lock_zone = false;
         return Cell_handle();
       }
     }
+    */
 
-    if(n_of_turns) goto try_next_cell;
+    if (n_of_turns) goto try_next_cell;
   }
 #endif
-
+  
   return c;
 }
 #endif // no CGAL_NO_STRUCTURAL_FILTERING
