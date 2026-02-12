@@ -2963,7 +2963,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.17");
+		DEBUG("ReconstructMesh optimization version 1.1.18");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -3931,6 +3931,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					}
 
 					// Here we apply the deferred intersection results to the edges all at once.
+					// Not faster on 8s
 					const _Data vInv2SigmaSq = _Set(inv2SigmaSq);
 					const _Data vOne = { 1.f, 1.f, 1.f, 1.f };
 

@@ -251,6 +251,11 @@ public:
 	bool TransferTexture(Mesh& mesh, unsigned textureSize=1024);
 
 	// file IO
+
+	void ValidateFaceFaces() const;
+	void ValidateEdgeConsistency() const;
+	void ValidateVertexFacesSorted() const;
+
 	bool Load(const String& fileName);
 	bool Save(const String& fileName, const cList<String>& comments=cList<String>(), bool bBinary=true) const;
 	bool Save(const FacesChunkArr&, const String& fileName, const cList<String>& comments=cList<String>(), bool bBinary=true) const;

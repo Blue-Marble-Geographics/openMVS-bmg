@@ -3043,6 +3043,56 @@ bool TImage<TYPE>::Load(const String& fileName)
 }
 /*----------------------------------------------------------------*/
 
+#include <turbojpeg.h>
+
+static bool SaveJpegTurbo(
+	const cv::Mat& img,   // MUST be CV_8UC3 + continuous
+	const String& file,
+	int quality
+) {
+	tjhandle tj = tjInitCompress();
+	if (!tj)
+		return false;
+
+	unsigned char* jpegBuf = nullptr;
+	unsigned long jpegSize = 0;
+
+	const int pitch = (int)img.step;
+
+	int ret = tjCompress2(
+		tj,
+		img.data,
+		img.cols,
+		pitch,
+		img.rows,
+		TJPF_BGR,
+		&jpegBuf,
+		&jpegSize,
+    TJSAMP_444, // For texture-atlases, 4:4:4 is often better than 4:2:0
+		quality,
+		TJFLAG_FASTDCT
+	);
+
+	if (ret != 0) {
+		tjDestroy(tj);
+		return false;
+	}
+
+	FILE* f = fopen(file.c_str(), "wb");
+	if (!f) {
+		tjFree(jpegBuf);
+		tjDestroy(tj);
+		return false;
+	}
+
+	fwrite(jpegBuf, 1, jpegSize, f);
+	fclose(f);
+
+	tjFree(jpegBuf);
+	tjDestroy(tj);
+	return true;
+}
+
 template <typename TYPE>
 bool TImage<TYPE>::Save(const String& fileName) const
 {
@@ -3053,8 +3103,12 @@ bool TImage<TYPE>::Save(const String& fileName) const
 		compression_params.push_back(6);
 	} else
 	if (ext == ".jpg") {
-		compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
-		compression_params.push_back(95);
+		// No continuity checks. No clone. We assume correctness.
+		const int quality = 95; // 85 would be 2–4× faster than 95
+		return SaveJpegTurbo(*this, fileName, quality);
+
+		//compression_params.push_back(cv::IMWRITE_JPEG_QUALITY);
+		//compression_params.push_back(95);
 	} else
 	if (ext == ".pfm") {
 		if (Base::depth() != CV_32F)

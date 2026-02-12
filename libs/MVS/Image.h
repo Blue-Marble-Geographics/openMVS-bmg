@@ -81,9 +81,12 @@ public:
 	static IMAGEPTR OpenImage(const String& fileName);
 	static IMAGEPTR ReadImageHeader(const String& fileName);
 	static IMAGEPTR ReadImage(const String& fileName, Image8U3& image);
+	static IMAGEPTR ReadImageRaw(const String& fileName, Image8U3& image);
 	static bool ReadImage(IMAGEPTR pImage, Image8U3& image);
+	static bool ReadImageRaw(IMAGEPTR pImage, Image8U3& image);
 	bool LoadImage(const String& fileName, unsigned nMaxResolution=0);
-	bool ReloadImage(unsigned nMaxResolution=0, bool bLoadPixels=true);
+	bool ReloadImage(unsigned nMaxResolution = 0, bool bLoadPixels = true);
+	bool ReloadImageRaw(unsigned nMaxResolution = 0);
 	void ReleaseImage();
 	float ResizeImage(unsigned nMaxResolution=0);
 	unsigned RecomputeMaxResolution(unsigned& level, unsigned minImageSize, unsigned maxImageSize=INT_MAX) const;

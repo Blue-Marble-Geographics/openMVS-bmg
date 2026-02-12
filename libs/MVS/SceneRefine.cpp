@@ -4211,6 +4211,8 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #endif
 	}
 
+	// Mesh was mutated and may no longer be valid.
+
 	return true;
 } // RefineMesh
 /*----------------------------------------------------------------*/

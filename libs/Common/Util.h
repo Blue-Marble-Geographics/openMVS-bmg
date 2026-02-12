@@ -736,7 +736,7 @@ public:
 		const Timer::SysType start; // time when the work started
 		Timer::Type lastElapsed; // time when the last progress was displayed
 		size_t lastMsgLen; // how many characters had the last message
-		volatile size_t processed; // number of jobs already processed
+		size_t processed; // number of jobs already processed
 		CriticalSection cs; // multi-threading safety only for the incremental operator
 
 		Progress(const String& _msg, size_t _total, Timer::Type _slp=100/*ms*/)

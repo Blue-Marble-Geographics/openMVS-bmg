@@ -221,9 +221,8 @@ __forceinline float calculateFastApprox(float area2, float maxedge2) {
 /// It Returns 2*AreaTri/(MaxEdge^2),
 /// the range is range [0.0, 0.866]
 /// e.g. Equilateral triangle sqrt(3)/2, halfsquare: 1/2, ... up to a line that has zero quality.
-template<class P3ScalarType>
 __forceinline float Quality(
-  Point3<P3ScalarType> const &p0, Point3<P3ScalarType> const & p1,  Point3<P3ScalarType> const & p2)
+  float const * __restrict p0, float const * __restrict p1, float const * __restrict p2)
 {
 #ifdef RANKING1
 
@@ -395,6 +394,8 @@ __forceinline float Quality(
 #endif
 
 #ifdef ORIG_RANKING
+    using P3ScalarType = float;
+
     const P3ScalarType dx1 = p1[0] - p0[0];
     const P3ScalarType dy1 = p1[1] - p0[1];
     const P3ScalarType dz1 = p1[2] - p0[2];
@@ -415,7 +416,9 @@ __forceinline float Quality(
     P3ScalarType maxEdge2 = l2_10;
     if (l2_20 > maxEdge2) maxEdge2 = l2_20;
     if (l2_12 > maxEdge2) maxEdge2 = l2_12;
-    if (maxEdge2 == 0) return P3ScalarType(0);
+    constexpr float eps = 1e-20f;   // for squared edge length
+    if (maxEdge2 <= eps)
+      return 0.0f;
 
     // Cross product
     const P3ScalarType nx = dy1 * dz2 - dz1 * dy2;
@@ -670,7 +673,7 @@ __forceinline float Quality(
 template<class TriangleType>
 __forceinline float QualityFace(const TriangleType &t)
 {
-  return Quality(t.cP(0), t.cP(1), t.cP(2));
+  return Quality((float*) &t.cP(0), (float*)&t.cP(1), (float*)&t.cP(2));
 }
 
 /// Compute a shape quality measure of the triangle composed by points p0,p1,p2

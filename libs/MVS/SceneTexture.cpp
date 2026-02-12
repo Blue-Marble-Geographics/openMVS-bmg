@@ -39,7 +39,6 @@
 #include <boost/graph/connected_components.hpp>
 
 using namespace MVS; 
-#pragma optimize("", on) // JPB WIP BUG
 
 // D E F I N E S ///////////////////////////////////////////////////
 
@@ -129,6 +128,21 @@ struct TRWSInference {
 };
 }
 #endif
+
+#if defined(_MSC_VER)
+#define DEBUG_BREAK() __debugbreak()
+#else
+#define DEBUG_BREAK() __builtin_trap()
+#endif
+
+#define HARD_ASSERT(cond) \
+  do { \
+    if (!(cond)) { \
+      (void)__FILE__; \
+      (void)__LINE__; \
+      DEBUG_BREAK(); \
+    } \
+  } while (0)
 
 
 // S T R U C T S ///////////////////////////////////////////////////
@@ -229,12 +243,55 @@ struct MeshTexture {
 			}
 		};
 		typedef cList<Patch,const Patch&,1,4,uint32_t> Patches;
-		std::unordered_map<uint32_t, uint16_t> patchIndexLookup;
+		struct PatchEntry 
+		{
+			PatchEntry() {}
+			PatchEntry(uint32_t _patch, uint16_t _idx) : patch(_patch), idx(_idx) {}
+			uint32_t patch;
+			uint16_t idx;
+		};
+		struct PatchContainer
+		{
+			void clear() { storage.clear(); }
+			void reserve(uint32_t cnt) { storage.reserve(cnt); }
+			void Insert(uint32_t patch, uint16_t idx) {
+				for (auto& i : storage) {
+					if (i.patch == patch) {
+						i.idx = idx;
+						return;
+					}
+				}
+				storage.emplace_back(patch, idx);
+			}
+
+			uint16_t At(uint32_t patch) const
+			{
+				const uint16_t* p = Find(patch);
+				HARD_ASSERT(p != nullptr);
+				return *p;
+			}
+
+			const uint16_t* Find(uint32_t patch) const
+			{
+				for (const auto& i : storage) {
+					if (i.patch == patch) {
+						return &i.idx;
+					}
+				}
+				return nullptr;
+			}
+
+      std::vector<PatchEntry> storage;
+		};
+
+		PatchContainer patchIndexLookup;
 
 		VIndex idxVertex; // the index of this vertex
 		Patches patches; // the patches meeting at this vertex (two or more)
 
-		inline SeamVertex() {}
+		// Make it move friendly
+		SeamVertex() = default;
+
 		inline SeamVertex(uint32_t _idxVertex) : idxVertex(_idxVertex) {}
 		inline bool operator == (uint32_t _idxVertex) const {
 			return (idxVertex == _idxVertex);
@@ -577,6 +634,11 @@ float EdgeFunction2(const TPoint2<TYPE>& x0,
 	return dx1 * dy2 - dy1 * dx2;
 }
 
+inline int CeilPos(float y) {
+	int iy = (int)y;
+	return iy + (y > float(iy));
+}
+
 // extract array of faces viewed by each image
 bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThreshold, const IIndexArr& _views)
 {
@@ -592,42 +654,63 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	}
 	facesDatas.Resize(faces.size());
 	const size_t cap = std::min<size_t>(views.size(), 8);
-	for (FaceDataArr& fd : facesDatas)
-		fd.Reserve((uint32_t) cap);
+#pragma omp for schedule(static)
+	for (int_t idx = 0; idx < (int_t)facesDatas.size(); ++idx) {
+		facesDatas[idx].Reserve((uint32_t)cap);
+	}
 
 	Util::Progress progress(_T("Initialized views"), views.size());
 	typedef float real;
 	TImage<real> imageGradMag;
 	TImage<real>::EMat mGrad[2];
 
-	#ifdef TEXOPT_USE_OPENMP
+#ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
 	const int numThreads = omp_get_max_threads();
 
 	struct FaceAccum {
 		real quality;
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		Color color;
+		uint32_t c[3];
+		uint32_t cnt;
 #endif
+	};
+
+	struct PixelXY {
+		uint16_t x;
+		uint16_t y;
 	};
 
 	static thread_local std::vector<FaceAccum> gLocalAccum;
 	static thread_local std::vector<uint16_t> gLocalGen;
 	static thread_local uint16_t gLocalCurGen = 1;
 	static thread_local std::vector<FIndex> gLocalTouched;
-	static thread_local std::vector<uint16_t> gFaceGen;
-	static thread_local uint16_t gFaceCurGen = 1;
+	static thread_local std::vector<uint16_t> gPixelGen;
+	static thread_local uint16_t gPixelCurGen = 1;
+	static thread_local std::vector<PixelXY> gTouchedPixels;
 	static thread_local FaceMap faceMap;
 	static thread_local DepthMap depthMap;
 
+	struct FaceDataAndView {
+		FIndex idxFace;   // which face this belongs to
+		IIndex idxView;   // which camera/view
+		float quality;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+		float color[3];
+#endif
+	};
+	static thread_local std::vector<FaceDataAndView> publish;
+
 	// Since we are controlling the threading per-view, don't let cv thread
 	// when performing its work.
-	cv::setNumThreads(0);
+	cv::setNumThreads(1); // No threading.  0 is not "no threading".
 
 	// It is not faster to restrict the threading here.
-	#pragma omp parallel for private(imageGradMag, mGrad) schedule(dynamic)
-	for (int_t idx=0; idx<(int_t)views.size(); ++idx) {
-		#pragma omp flush (bAbort)
+#pragma omp parallel private(imageGradMag, mGrad)
+{
+#pragma omp for schedule(static)
+	for (int_t idx = 0; idx < (int_t)views.size(); ++idx) {
+#pragma omp flush (bAbort)
 		if (bAbort) {
 			++progress;
 			continue;
@@ -653,19 +736,17 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			gLocalGen.assign(numFaces, 0);
 			gLocalCurGen = 1;
 		}
-
-		gLocalCurGen++;
+		++gLocalCurGen;
 		if (gLocalCurGen == 0) {
 			std::fill(gLocalGen.begin(), gLocalGen.end(), 0);
 			gLocalCurGen = 1;
 		}
 		gLocalTouched.clear();
-		gLocalTouched.reserve(numFaces);
 
 		const IIndex idxView(views[(IIndex)idx]);
-	#else
-	for (IIndex idxView: views) {
-	#endif
+#else
+	for (IIndex idxView : views) {
+#endif
 		Image& imageData = images[idxView];
 		if (!imageData.IsValid()) {
 			++progress;
@@ -674,22 +755,26 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		// load image
 		unsigned level(nResolutionLevel);
 		const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
-		if ((imageData.image.empty() || MAXF(imageData.width,imageData.height) != imageSize) && !imageData.ReloadImage(imageSize)) {
-			#ifdef TEXOPT_USE_OPENMP
+		if ((imageData.image.empty() || MAXF(imageData.width, imageData.height) != imageSize) && !imageData.ReloadImage(imageSize)) {
+#ifdef TEXOPT_USE_OPENMP
 			bAbort = true;
-			#pragma omp flush (bAbort)
+#pragma omp flush (bAbort)
 			continue;
-			#else
+#else
 			return false;
-			#endif
+#endif
 		}
 
 		imageData.UpdateCamera(scene.platforms);
 		// compute gradient magnitude
 
-		// 1) BGR -> gray (8-bit)
+		// Libjpg is taking the image, decompressing it, and storing in R[0], G[1], B[2] order.
+		// This is expensive.
+		// The rest of the pipeline is expecting this and changing it isn't trivial.
+
+		// 1) RGB -> gray (8-bit)
 		cv::Mat gray8;
-		cv::cvtColor(imageData.image, gray8, cv::COLOR_BGR2GRAY);
+		cv::cvtColor(imageData.image, gray8, cv::COLOR_RGB2GRAY); // This is wrong in the original source.
 
 		// 2) Downsample in 8-bit (fast + correct)
 		cv::Mat graySmall8;
@@ -710,29 +795,28 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		grad[0] = cv::Mat(imageGradMag.rows, imageGradMag.cols, cv::DataType<real>::type, (void*)mGrad[0].data());
 		mGrad[1].resize(imageGradMag.rows, imageGradMag.cols);
 		grad[1] = cv::Mat(imageGradMag.rows, imageGradMag.cols, cv::DataType<real>::type, (void*)mGrad[1].data());
-		#if 1
-		cv::Sobel(imageGradMag, grad[0], cv::DataType<real>::type, 1, 0, 3, 1.0/8.0);
-		cv::Sobel(imageGradMag, grad[1], cv::DataType<real>::type, 0, 1, 3, 1.0/8.0);
-		#elif 1
-		const TMatrix<real,3,5> kernel(CreateDerivativeKernel3x5());
+#if 1
+		cv::Sobel(imageGradMag, grad[0], cv::DataType<real>::type, 1, 0, 3, 1.0 / 8.0);
+		cv::Sobel(imageGradMag, grad[1], cv::DataType<real>::type, 0, 1, 3, 1.0 / 8.0);
+#elif 1
+		const TMatrix<real, 3, 5> kernel(CreateDerivativeKernel3x5());
 		cv::filter2D(imageGradMag, grad[0], cv::DataType<real>::type, kernel);
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
-		#else
-		const TMatrix<real,5,7> kernel(CreateDerivativeKernel5x7());
+#else
+		const TMatrix<real, 5, 7> kernel(CreateDerivativeKernel5x7());
 		cv::filter2D(imageGradMag, grad[0], cv::DataType<real>::type, kernel);
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
-		#endif
+#endif
 		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2() + mGrad[1].cwiseAbs2()); // Drop the sqrt (won't affect results) .cwiseSqrt();
 		// apply some blur on the gradient to lower noise/glossiness effects onto face-quality score
 		cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(15, 15), 0, 0, cv::BORDER_DEFAULT);
 		// select faces inside view frustum
 		Mesh::FaceIdxArr cameraFaces;
 		Mesh::FacesInserter inserter(cameraFaces);
-		typedef TFrustum<float,5> Frustum;
+		typedef TFrustum<float, 5> Frustum;
 		const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
 		octree.Traverse(frustum, inserter);
 
-#if 1
 		PreprocessCameraFaces(
 			cameraFaces,
 			faces,
@@ -751,40 +835,31 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		const int height = imageData.height;
 		const size_t numPixels = size_t(width) * size_t(height);
 
-		static thread_local std::vector<uint16_t> depthGen;
-		static thread_local uint16_t depthCurGen = 1;
-		// Resize if needed
-		if (depthGen.size() != numPixels) {
-			depthGen.assign(numPixels, 0);
-			depthCurGen = 1;
+		// ensure pixel-gen buffer exists
+		if (gPixelGen.size() != numPixels) {
+			gPixelGen.assign(numPixels, 0);
+			gPixelCurGen = 1;
 		}
-		// Bump generation
-		depthCurGen++;
-		if (depthCurGen == 0) {
-			std::fill(depthGen.begin(), depthGen.end(), 0);
-			depthCurGen = 1;
+
+		// advance generation for THIS view
+		++gPixelCurGen;
+		if (gPixelCurGen == 0) {
+			std::fill(gPixelGen.begin(), gPixelGen.end(), 0);
+			gPixelCurGen = 1;
 		}
+		gTouchedPixels.clear();
 
 		// init view data
 		// Both maps must be completely filled or have a generator.
 
 		depthMap.create(height, width);
+		//std::fill(depthMap.begin(), depthMap.end(), -std::numeric_limits<float>::infinity());
+		__stosd((PDWORD)&*depthMap.begin(),
+			0xFF800000u,
+			numPixels);
+
 		faceMap.create(height, width);
-
-		//view.isValid.assign(numPixels, 0);
-
-		// ensure generator buffer exists
-		if (gFaceGen.size() != numPixels) {
-			gFaceGen.assign(numPixels, 0);
-			gFaceCurGen = 1;
-		}
-
-		// advance generation
-		++gFaceCurGen;
-		if (gFaceCurGen == 0) {
-			std::fill(gFaceGen.begin(), gFaceGen.end(), 0);
-			gFaceCurGen = 1;
-		}
+		faceMap.memset(0xFF); // Essentially NO_ID
 
 		struct Triangle {
 			Point2f pti[3];
@@ -804,6 +879,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			const CamVert& c0 = crd.verts[face[0]];
 			const CamVert& c1 = crd.verts[face[1]];
 			const CamVert& c2 = crd.verts[face[2]];
+
 			{
 				// ==== Perspective divide ====
 				float u0 = c0.x * c0.invZ;
@@ -829,6 +905,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 				t.pti[1] = { u1, v1i };
 				t.pti[2] = { u2, v2i };
 			}
+
 			// draw triangle
 			const auto& v1 = t.pti[0];
 			const auto& v2 = t.pti[1];
@@ -840,6 +917,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			if (area >= 0.f) {
 				continue;
 			}
+
 			// compute bounding-box fully containing the triangle
 			float boxMinX = v1.x;
 			float boxMinY = v1.y;
@@ -862,239 +940,330 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 				boxMaxY < 0.0f || boxMinY > heightMinus1)
 				continue;
 
-			// ---- Convert to integer bounding-box & clamp ----
-			int minXi = _cvt_ftoi_fast(boxMinX);
-			int minYi = _cvt_ftoi_fast(boxMinY);
-			int maxXi = _cvt_ftoi_fast(boxMaxX + 1);   // faster than ceil
-			int maxYi = _cvt_ftoi_fast(boxMaxY + 1);
+			// -----------------------------------------------
+			// Bounding box (float -> int, half-open)
+			// -----------------------------------------------
+			int minXi = (int)std::floor(boxMinX);
+			int minYi = (int)std::floor(boxMinY);
+			int maxXi = (int)std::ceil(boxMaxX);
+			int maxYi = (int)std::ceil(boxMaxY);
 
 			if (minXi < 0) minXi = 0;
 			if (minYi < 0) minYi = 0;
 			if (maxXi > width)  maxXi = width;
 			if (maxYi > height) maxYi = height;
 
-			ImageRef boxMinI(minXi, minYi);
-			ImageRef boxMaxI(maxXi - 1, maxYi - 1);   // convert from half-open to inclusive
+			const int x0 = minXi;
+			const int y0 = minYi;
+			const int x1 = maxXi - 1;
+			const int y1 = maxYi - 1;
 
-#ifdef INVARIANT2
-			constexpr int border = 0;
-			if (boxMinI.x < border)
-				boxMinI.x = border;
-			if (boxMinI.y < border)
-				boxMinI.y = border;
-			if (boxMaxI.x >= (size.width - border))
-				boxMaxI.x = (size.width - (border + 1));
-			if (boxMaxI.y >= (size.height - border))
-				boxMaxI.y = (size.height - (border + 1));
-#endif
+			if (x0 > x1 || y0 > y1)
+				continue;
 
-			const float invArea = 1.f / area;
+			// -----------------------------------------------
+			// Fixed-point setup
+			// -----------------------------------------------
+			constexpr int FP_BITS = 4;
+			constexpr int FP_SCALE = 1 << FP_BITS;
 
-			// edge deltas
-			const float w0_dx = (v2.y - v3.y) * invArea;
-			const float w0_dy = (v3.x - v2.x) * invArea;
-			const float w1_dx = (v3.y - v1.y) * invArea;
-			const float w1_dy = (v1.x - v3.x) * invArea;
-			const float w2_dx = (v1.y - v2.y) * invArea;
-			const float w2_dy = (v2.x - v1.x) * invArea;
+			// vertices in fixed-point
+			const int x0i = int(v1.x * FP_SCALE);
+			const int y0i = int(v1.y * FP_SCALE);
+			const int x1i = int(v2.x * FP_SCALE);
+			const int y1i = int(v2.y * FP_SCALE);
+			const int x2i = int(v3.x * FP_SCALE);
+			const int y2i = int(v3.y * FP_SCALE);
 
-			// Original work doesn't use pixel centers - premultiply by invArea
-			const float px0 = (float)boxMinI.x;
-			const float py0 = (float)boxMinI.y;
+			// -----------------------------------------------
+			// Integer edge deltas
+			// -----------------------------------------------
+			const int e0_dx = y1i - y2i;
+			const int e0_dy = x2i - x1i;
 
-			// initial barycentrics for first pixel center
-			float w0_row = EdgeFunction2(v2, v3, { px0, py0 }) * invArea;
-			float w1_row = EdgeFunction2(v3, v1, { px0, py0 }) * invArea;
-			float w2_row = EdgeFunction2(v1, v2, { px0, py0 }) * invArea;
+			const int e1_dx = y2i - y0i;
+			const int e1_dy = x0i - x2i;
 
-			// vertex depths
-			const float z0 = c0.z;
-			const float z1 = c1.z;
-			const float z2 = c2.z;
+			const int e2_dx = y0i - y1i;
+			const int e2_dy = x1i - x0i;
 
-			// reciprocal depths
+			// edge constants (64-bit!)
+			const int64_t e0_c = int64_t(x1i) * y2i - int64_t(x2i) * y1i;
+			const int64_t e1_c = int64_t(x2i) * y0i - int64_t(x0i) * y2i;
+			const int64_t e2_c = int64_t(x0i) * y1i - int64_t(x1i) * y0i;
+
+			// -----------------------------------------------
+			// Top-left rule bias (integer)
+			// -----------------------------------------------
+			auto TopLeftBias = [](int dx, int dy) -> int64_t {
+				return (dx > 0 || (dx == 0 && dy < 0)) ? 0 : -1;
+				};
+
+			const int64_t bias0 = TopLeftBias(e0_dx, e0_dy);
+			const int64_t bias1 = TopLeftBias(e1_dx, e1_dy);
+			const int64_t bias2 = TopLeftBias(e2_dx, e2_dy);
+
+			// -----------------------------------------------
+			// Pixel-center start (important)
+			// -----------------------------------------------
+			const int64_t x0p = (int64_t(x0) << FP_BITS) + (FP_SCALE >> 1);
+			const int64_t y0p = (int64_t(y0) << FP_BITS) + (FP_SCALE >> 1);
+
+			// row start edge values
+			int64_t e0_row = int64_t(e0_dx) * x0p + int64_t(e0_dy) * y0p + e0_c + bias0;
+			int64_t e1_row = int64_t(e1_dx) * x0p + int64_t(e1_dy) * y0p + e1_c + bias1;
+			int64_t e2_row = int64_t(e2_dx) * x0p + int64_t(e2_dy) * y0p + e2_c + bias2;
+
+			// -----------------------------------------------
+			// Fixed-point step amounts
+			// -----------------------------------------------
+			int64_t e0_stepX = int64_t(e0_dx) * FP_SCALE;
+			int64_t e1_stepX = int64_t(e1_dx) * FP_SCALE;
+			int64_t e2_stepX = int64_t(e2_dx) * FP_SCALE;
+
+			int64_t e0_stepY = int64_t(e0_dy) * FP_SCALE;
+			int64_t e1_stepY = int64_t(e1_dy) * FP_SCALE;
+			int64_t e2_stepY = int64_t(e2_dy) * FP_SCALE;
+
+			// -----------------------------------------------
+			// Area in same scale (FP_SCALE^2)
+			// -----------------------------------------------
+			const int64_t ax = int64_t(x1i) - int64_t(x0i);
+			const int64_t ay = int64_t(y1i) - int64_t(y0i);
+			const int64_t bx = int64_t(x2i) - int64_t(x0i);
+			const int64_t by = int64_t(y2i) - int64_t(y0i);
+
+			int64_t areaScaled = ax * by - ay * bx;
+			if (areaScaled == 0)
+				continue;
+
+			if (areaScaled < 0) {
+				areaScaled = -areaScaled;
+
+				e0_row = -e0_row;
+				e1_row = -e1_row;
+				e2_row = -e2_row;
+
+				e0_stepX = -e0_stepX;
+				e1_stepX = -e1_stepX;
+				e2_stepX = -e2_stepX;
+
+				e0_stepY = -e0_stepY;
+				e1_stepY = -e1_stepY;
+				e2_stepY = -e2_stepY;
+			}
+			const float invAreaScaled = 1.0f / float(areaScaled);
+
+			// -----------------------------------------------
+			// Depth plane (consistent with integer edges)
+			// -----------------------------------------------
 			const float iz0 = c0.invZ;
 			const float iz1 = c1.invZ;
 			const float iz2 = c2.invZ;
 
-			Depth* __restrict depthPtr = depthMap.ptr<float>(0);
-			uint16_t* __restrict depthGenPtr = depthGen.data();
-			cuint32_t* __restrict facePtr = faceMap.ptr<cuint32_t>(0);
-			//uint8_t* __restrict validPtr = view.isValid.data();
+			const float dz_dx =
+				(float(e0_stepX) * iz0 +
+					float(e1_stepX) * iz1 +
+					float(e2_stepX) * iz2) * invAreaScaled;
 
-			for (size_t y = boxMinI.y; y <= boxMaxI.y; ++y) {
-				size_t base = size_t(y) * width;
-				uint16_t* __restrict depthGenRow = depthGenPtr + base;
+			const float dz_dy =
+				(float(e0_stepY) * iz0 +
+					float(e1_stepY) * iz1 +
+					float(e2_stepY) * iz2) * invAreaScaled;
+
+			float invZ_row =
+				(float(e0_row) * iz0 +
+					float(e1_row) * iz1 +
+					float(e2_row) * iz2) * invAreaScaled;
+
+			// -----------------------------------------------
+			// Raster loop
+			// -----------------------------------------------
+			Depth* __restrict depthPtr = depthMap.ptr<float>(0);
+			cuint32_t* __restrict facePtr = faceMap.ptr<cuint32_t>(0);
+
+			constexpr int64_t EDGE_THRESH = 1 * FP_SCALE; // conservative
+
+			// Bias edges
+			e0_row -= EDGE_THRESH;
+			e1_row -= EDGE_THRESH;
+			e2_row -= EDGE_THRESH;
+
+			FaceAccum* __restrict accum = gLocalAccum.data();
+			uint16_t* __restrict faceGen = gLocalGen.data();
+
+			// Unrolled is not faster.
+			for (int y = y0; y <= y1; ++y) {
+				const size_t base = size_t(y) * width + x0;
+
 				Depth* __restrict depthRow = depthPtr + base;
 				cuint32_t* __restrict faceRow = facePtr + base;
-				//uint8_t* __restrict validRow = validPtr + base;
+				uint16_t* __restrict genRow = gPixelGen.data() + base;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+				uint8_t* __restrict  pImageBase = imageData.image.ptr<uint8_t>(y);
+#endif
 
-				float w0 = w0_row;
-				float w1 = w1_row;
-				float w2 = w2_row;
+				int64_t e0 = e0_row;
+				int64_t e1 = e1_row;
+				int64_t e2 = e2_row;
+				float   invZ = invZ_row;
 
-				// -------------------------------------------------------------------
-				// Phase 1: advance until entering triangle (cheap rejects only)
-				// -------------------------------------------------------------------
-				int x = minXi;
-				while (x <= maxXi) {
-					if (w0 >= 0.f && w1 >= 0.f && w0 + w1 <= 1.f) {
-						break; // found first inside pixel
+				uint32_t pix = (uint32_t)base;
+				for (int x = x0; x <= x1; ++x) {
+					if ((e0 | e1 | e2) < 0) {
+						if (invZ > *depthRow) {
+							*depthRow = invZ;
+							uint32_t faceId = (cuint32_t)crd.globalFace[fi];
+
+							// Determine which pixels correspond to which faces, and accumulate quality/color for each face.
+
+							FaceAccum& acc = accum[faceId];
+							uint16_t& gen = faceGen[faceId];
+
+							const real q = imageGradMag.ptr<real>(y >> 1)[x >> 1];
+
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+							const uint8_t* __restrict p = pImageBase + 3 * x;
+#endif
+
+							if (gen == gLocalCurGen) {
+								acc.quality += q;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+								acc.c[0] += p[0];
+								acc.c[1] += p[1];
+								acc.c[2] += p[2];
+								++acc.cnt;
+#endif
+							}
+							else {
+								gen = gLocalCurGen;
+								acc.quality = q;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+								acc.c[0] = p[0];
+								acc.c[1] = p[1];
+								acc.c[2] = p[2];
+								acc.cnt = 1;
+#endif
+								gLocalTouched.push_back(faceId);
+							}
+
+						}
 					}
 
-					w0 += w0_dx;
-					w1 += w1_dx;
-					w2 += w2_dx;
+					++pix;
 
-					++x;
+					e0 += e0_stepX;
+					e1 += e1_stepX;
+					e2 += e2_stepX;
+					invZ += dz_dx;
+
+					++depthRow;
+					++faceRow;
+					++genRow;
 				}
 
-				if (x > maxXi)
-					goto next_row; // entire row outside, skip
-
-				// -------------------------------------------------------------------
-				// Phase 2: inside span - no inside tests in main loop
-				// -------------------------------------------------------------------
-				size_t pix = base + x;
-				for (; x <= maxXi; ++x, ++pix) {
-					// Work with the reciprocal of Z to improve performance.
-					const float invZ = w0 * iz0 + w1 * iz1 + w2 * iz2;
-
-					const bool sameGen = (depthGenRow[x] == depthCurGen);
-					const float oldInvZ = sameGen ? depthRow[x] : -std::numeric_limits<float>::infinity();
-
-					if (invZ > oldInvZ) {
-						depthGenRow[x] = depthCurGen;
-						depthRow[x] = invZ;
-
-						gFaceGen[pix] = gFaceCurGen;
-						faceRow[x] = (cuint32_t)crd.globalFace[fi];
-
-						//validRow[x] = 1;
-					}
-
-					// advance
-					w0 += w0_dx;
-					w1 += w1_dx;
-					w2 += w2_dx;
-
-					// exit span
-					if (w0 < 0.f || w1 < 0.f || (w0 + w1) > 1.f)
-						break;
-				}
-
-			next_row:
-				w0_row += w0_dy;
-				w1_row += w1_dy;
-				w2_row += w2_dy;
-			}
-		}
-#else		
-static thread_local FaceMap faceMap;
-static thread_local DepthMap depthMap;
-
-		faceMap.create(imageData.height, imageData.width);
-		depthMap.create(imageData.height, imageData.width);
-		RasterMesh rasterer(vertices, imageData.camera, depthMap, faceMap);
-		rasterer.Clear();
-		for (auto idxFace : cameraFaces) {
-			const Face& facet = faces[idxFace];
-			rasterer.idxFace = idxFace;
-			rasterer.Project(facet);
-		}
-#endif
-
-		// compute the projection area of visible faces
-		#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		CLISTDEF0IDX(uint32_t,FIndex) areas(faces.GetSize());
-		areas.Memset(0);
-		#endif
-
-		for (int j = 0; j < faceMap.rows; ++j) {
-			const FIndex* __restrict faceRow = faceMap.ptr<FIndex>(j);
-			for (int i = 0; i < faceMap.cols; ++i) {
-				const size_t pix = size_t(j) * faceMap.cols + size_t(i);
-				if (gFaceGen[pix] != gFaceCurGen)
-					continue;
-
-				const FIndex idxFace = faceRow[i];
-
-				FaceAccum& acc = gLocalAccum[idxFace];
-				uint16_t& gen = gLocalGen[idxFace];
-
-				// Remember, imageGradMag now half-resolution.
-				const real q = (real)imageGradMag(j>>1, i>>1);
-
-				if (gen != gLocalCurGen) {
-					gen = gLocalCurGen;
-					acc.quality = q;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-					acc.color = Color(imageData.image(j, i));
-#endif
-					gLocalTouched.push_back(idxFace);
-				}
-				else {
-					acc.quality += q;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-					acc.color += Color(imageData.image(j, i));
-#endif
-				}
+				e0_row += e0_stepY;
+				e1_row += e1_stepY;
+				e2_row += e2_stepY;
+				invZ_row += dz_dy;
 			}
 		}
 
+		const int cols = faceMap.cols;
+		const int rows = faceMap.rows;
+
+		publish.clear();
+		publish.reserve(gLocalTouched.size());
+
+		for (FIndex idxFace : gLocalTouched) {
+			const FaceAccum& src = gLocalAccum[idxFace];
+
+			const Face& f = faces[idxFace];
+
+			const Vertex faceCenter =
+				(vertices[f[0]] + vertices[f[1]] + vertices[f[2]]) * (1.0f / 3.0f);
+
+			Point3f camDir =
+				Cast<Mesh::Type>(imageData.camera.C) - faceCenter;
+
+			const Normal& faceNormal = scene.mesh.faceNormals[idxFace];
+	
+			float invLen = 1.0f / FastSqrtS(camDir.dot(camDir));
+			camDir *= invLen;
+
+			float cosFaceCam = camDir.dot(faceNormal);
+			if (cosFaceCam <= 0.0f)
+				continue;
+
+			// clamp grazing angles
+			cosFaceCam = std::max(cosFaceCam, 0.2f);
+			float angleWeight = cosFaceCam * cosFaceCam; // cos^2
+			
+			FaceDataAndView& fd = publish.emplace_back();
+			fd.idxFace = idxFace;
+			fd.idxView = idxView;
+			fd.quality = src.quality * angleWeight;
+			fd.quality = fd.quality / (1.0f + 0.1f * fd.quality);
+
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+			const float invArea = 1.0f / float(src.cnt);
+
+			fd.color[0] =
+				(0.299f * src.c[0] +
+					0.587f * src.c[1] +
+					0.114f * src.c[2]) * invArea;
+
+			fd.color[1] =
+				(-0.168736f * src.c[0] -
+					0.331264f * src.c[1] +
+					0.5f * src.c[2]) * invArea + 128.0f;
+
+			fd.color[2] =
+				(0.5f * src.c[0] -
+					0.418688f * src.c[1] -
+					0.081312f * src.c[2]) * invArea + 128.0f;
+#endif
+		}
+
+		// Notice, we have minimized the work inside the critical.
 #ifdef TEXOPT_USE_OPENMP
 #pragma omp critical
 #endif
 		{
-			for (FIndex idxFace : gLocalTouched) {
-				FaceDataArr& faceDatas = facesDatas[idxFace];
-
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-				FaceData& fd = faceDatas.AddEmpty();
-				fd.idxView = idxView;
-				fd.quality = gLocalAccum[idxFace].quality;
-				fd.color = gLocalAccum[idxFace].color;
-#else
-				if (faceDatas.IsEmpty() || faceDatas.Last().idxView != idxView) {
-					FaceData& fd = faceDatas.AddEmpty();
-					fd.idxView = idxView;
-					fd.quality = gLocalAccum[idxFace].quality;
-				}
-				else {
-					// If your old logic relied on "Last()" existing for this view, you can keep this,
-					// but with touchedFaces it should normally not be needed.
-					FaceData& fd = faceDatas.Last();
-					fd.quality += gLocalAccum[idxFace].quality;
-				}
-#endif
+			for (const FaceDataAndView& e : publish) {
+				FaceDataArr& fd = facesDatas[e.idxFace];
+				FaceData& dst = fd.AddEmpty();
+				dst.color[0] = e.color[0];
+				dst.color[1] = e.color[1];
+				dst.color[2] = e.color[2];
+				dst.idxView = e.idxView;
+				dst.quality = e.quality;
 			}
 		}
 
 		++progress;
-	}
+	} // per view
+}
 
-	#ifdef TEXOPT_USE_OPENMP
-	if (bAbort)
-		return false;
-	#endif
+	progress.process();
 	progress.close();
 
 	// Restore cv's ability to thread.
 	cv::setNumThreads(-1);
 
-	#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	if (fOutlierThreshold > 0) {
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
 
 #pragma omp parallel for schedule(static)
-		for (int f = 0; f < (int) facesDatas.size(); ++f) {
+		for (int f = 0; f < (int)facesDatas.size(); ++f) {
 			FaceOutlierDetection(facesDatas[f], fOutlierThreshold);
 		}
 	}
-	#endif
+#endif
 	return true;
-}
+	}
 
 // order the camera view scores with highest score first and return the list of first <minCommonCameras> cameras
 // ratioAngleToQuality represents the ratio in witch we combine normal angle to quality for a face to obtain the selection score
@@ -1104,74 +1273,22 @@ static thread_local DepthMap depthMap;
 IIndexArr MeshTexture::SelectBestView(const FaceDataArr& faceDatas, FIndex fid, unsigned minCommonCameras, float ratioAngleToQuality) const
 {
 	ASSERT(!faceDatas.empty());
-	#if 1
-	
-	// compute scores based on the view quality and its angle to the face normal
-	float maxQuality = 0;
-	for (const FaceData& faceData: faceDatas)
-		maxQuality = MAXF(maxQuality, faceData.quality);
-	const Face& f = faces[fid];
-	const Vertex faceCenter((vertices[f[0]] + vertices[f[1]] + vertices[f[2]]) / 3.f);
-	CLISTDEF0IDX(float,IIndex) scores(faceDatas.size());
-	FOREACH(idxFaceData, faceDatas) {
-		const FaceData& faceData = faceDatas[idxFaceData];
-		const Image& imageData = images[faceData.idxView];
-		const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
-		const Normal& faceNormal = scene.mesh.faceNormals[fid];
-		const float cosFaceCam(ComputeAngle(camDir.ptr(), faceNormal.ptr()));
-		scores[idxFaceData] = ratioAngleToQuality*cosFaceCam + (1.f-ratioAngleToQuality)*faceData.quality/maxQuality;
-	}
-	// and sort the scores from to highest to smallest to get the best overall cameras
-	IIndexArr scorePodium(faceDatas.size());
-	std::iota(scorePodium.begin(), scorePodium.end(), 0);
-	scorePodium.Sort([&scores](IIndex i, IIndex j) {
-		return scores[i] > scores[j];
-	});
 
-	#else
-	
-	// sort qualityPodium in relation to faceDatas[index].quality decreasing
-	IIndexArr qualityPodium(faceDatas.size());
-	std::iota(qualityPodium.begin(), qualityPodium.end(), 0);
-	qualityPodium.Sort([&faceDatas](IIndex i, IIndex j) {
-		return faceDatas[i].quality > faceDatas[j].quality;
-	});
+	// Order views by descending absolute quality
+	IIndexArr order(faceDatas.size());
+	std::iota(order.begin(), order.end(), 0);
 
-	// sort anglePodium in relation to face angle to camera increasing
-	const Face& f = faces[fid];
-	const Vertex faceCenter((vertices[f[0]] + vertices[f[1]] + vertices[f[2]]) / 3.f);
-	CLISTDEF0IDX(float,IIndex) cameraAngles(0, faceDatas.size());
-	for (const FaceData& faceData: faceDatas) {
-		const Image& imageData = images[faceData.idxView];
-		const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
-		const Normal& faceNormal = scene.mesh.faceNormals[fid];
-		const float cosFaceCam(ComputeAngle(camDir.ptr(), faceNormal.ptr()));
-		cameraAngles.emplace_back(cosFaceCam);
-	}
-	IIndexArr anglePodium(faceDatas.size());
-	std::iota(anglePodium.begin(), anglePodium.end(), 0);
-	anglePodium.Sort([&cameraAngles](IIndex i, IIndex j) {
-		return cameraAngles[i] > cameraAngles[j];
-	});
+	order.Sort([&faceDatas](IIndex a, IIndex b) {
+		return faceDatas[a].quality > faceDatas[b].quality;
+		});
 
-	// combine podium scores to get overall podium
-	// and sort the scores in smallest to highest to get the best overall camera for current virtual face
-	CLISTDEF0IDX(float,IIndex) scores(faceDatas.size());
-	scores.Memset(0);
-	FOREACH(sIdx, faceDatas) {
-		scores[anglePodium[sIdx]] += ratioAngleToQuality * (sIdx+1);
-		scores[qualityPodium[sIdx]] += (1.f - ratioAngleToQuality) * (sIdx+1);
-	}
-	IIndexArr scorePodium(faceDatas.size());
-	std::iota(scorePodium.begin(), scorePodium.end(), 0);
-	scorePodium.Sort([&scores](IIndex i, IIndex j) {
-		return scores[i] < scores[j];
-	});
-	
-	#endif
-	IIndexArr cameras(MIN(minCommonCameras, faceDatas.size()));
-	FOREACH(i, cameras)
-		cameras[i] = faceDatas[scorePodium[i]].idxView;
+	unsigned n = MIN(minCommonCameras, (unsigned)faceDatas.size());
+	if (n > 1) n = std::max(1u, n - 1);
+
+	IIndexArr cameras(n);
+	for (unsigned i = 0; i < n; ++i)
+		cameras[i] = faceDatas[order[i]].idxView;
+
 	return cameras;
 }
 
@@ -1409,8 +1526,36 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 			colors(colorsAll.leftCols(numInliers));
 
 		mean = colors.rowwise().mean();
+#if 1
+		Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+
+		const Eigen::Index n = colors.cols();
+		const double inv = 1.0 / std::max(1.0, double(n - 1));
+
+		for (Eigen::Index i = 0; i < n; ++i) {
+			const auto x = colors.col(i);
+
+			const double dx0 = x[0] - mean[0];
+			const double dx1 = x[1] - mean[1];
+			const double dx2 = x[2] - mean[2];
+
+			cov(0, 0) += dx0 * dx0;
+			cov(0, 1) += dx0 * dx1;
+			cov(0, 2) += dx0 * dx2;
+			cov(1, 1) += dx1 * dx1;
+			cov(1, 2) += dx1 * dx2;
+			cov(2, 2) += dx2 * dx2;
+		}
+
+		cov(1, 0) = cov(0, 1);
+		cov(2, 0) = cov(0, 2);
+		cov(2, 1) = cov(1, 2);
+
+		covariance = cov * inv;
+#else
 		const Eigen::Matrix3Xd centered(colors.colwise() - mean);
 		covariance = (centered * centered.transpose()) / std::max(1.0, double(colors.cols() - 1));
+#endif
 
 		// stop if covariance nearly zero
 		if (covariance.array().abs().maxCoeff() < minCovariance)
@@ -1562,11 +1707,6 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 		if (!ListCameraFaces(facesDatas, fOutlierThreshold, views))
 			return false;
 
-		// create faces graph
-		typedef boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS> Graph;
-		typedef boost::graph_traits<Graph>::edge_iterator EdgeIter;
-		typedef boost::graph_traits<Graph>::out_edge_iterator EdgeOutIter;
-		Graph graph;
 		LabelArr labels;
 
 		size_t maxIdxView = 0;
@@ -1584,7 +1724,15 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 		// construct and use virtual faces for patch creation instead of actual mesh faces;
 		// the virtual faces are composed of coplanar triangles sharing same views
 		const bool bUseVirtualFaces(minCommonCameras > 0);
+
+		// JPB WIP Unused
 		if (bUseVirtualFaces) {
+			// create faces graph
+			typedef boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS> Graph;
+			typedef boost::graph_traits<Graph>::edge_iterator EdgeIter;
+			typedef boost::graph_traits<Graph>::out_edge_iterator EdgeOutIter;
+			Graph graph;
+
 			// 1) create FaceToVirtualFaceMap
 			FaceDataViewArr virtualFacesDatas;
 			VirtualFaceIdxsArr virtualFaces; // stores each virtual face as an array of mesh face ID
@@ -1643,7 +1791,8 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 			ASSERT((Mesh::FIndex)boost::num_vertices(graph) == virtualFaces.size());
 			// assign the best view to each face
 			labels.resize(faces.size());
-			components.resize(faces.size()); {
+			components.resize(faces.size());
+			{
 				// normalize quality values
 				float maxQuality(0);
 				for (const FaceDataArr& faceDatas: virtualFacesDatas) {
@@ -1711,37 +1860,15 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 
 			graph.clear();
 		}
-		
-		// create the graph of faces: each vertex is a face and the edges are the edges shared by the faces
-		FOREACH(idxFace, faces) {
-			MAYBEUNUSED const Mesh::FIndex idx((Mesh::FIndex)boost::add_vertex(graph));
-			ASSERT(idx == idxFace);
-		}
-		FOREACH(idxFace, faces) {
-			const Mesh::FaceFaces& afaces = faceFaces[idxFace];
-			for (int v=0; v<3; ++v) {
-				const FIndex idxFaceAdj = afaces[v];
-				if (idxFaceAdj == NO_ID || idxFace >= idxFaceAdj)
-					continue;
-				const bool bInvisibleFace(facesDatas[idxFace].IsEmpty());
-				const bool bInvisibleFaceAdj(facesDatas[idxFaceAdj].IsEmpty());
-				if (bInvisibleFace || bInvisibleFaceAdj) {
-					if (bInvisibleFace != bInvisibleFaceAdj)
-						seamEdges.emplace_back(idxFace, idxFaceAdj);
-					continue;
-				}
-				boost::add_edge(idxFace, idxFaceAdj, graph);
-			}
-		}
-
-		ASSERT((Mesh::FIndex)boost::num_vertices(graph) == faces.size());
-
+	
 		// start patch creation starting directly from individual faces
 		if (!bUseVirtualFaces) {
+			// No longer uses boost graph handling.
 			// assign the best view to each face
 			labels.resize(faces.size());
-			components.resize(faces.size());
 			{
+#undef USE_HISTOGRAM_APPROXIMATE_PERMILLE
+#ifdef USE_HISTOGRAM_APPROXIMATE_PERMILLE
 				// normalize quality values
 				float maxQuality(0);
 				for (const FaceDataArr& faceDatas: facesDatas) {
@@ -1755,22 +1882,56 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 						hist.Add(faceData.quality);
 				}
 				const float normQuality(hist.GetApproximatePermille(0.95f));
+#else
+				const float normQuality = 0.8f; // e.g. 0.7f or 0.8f
+#endif
 
-				#if TEXOPT_INFERENCE == TEXOPT_INFERENCE_LBP
+#if TEXOPT_INFERENCE == TEXOPT_INFERENCE_LBP
 				// initialize inference structures
+				labels.Memset(0xFF);
+				int64_t numFaces = (uint32_t)faces.size();
+				std::vector<uint8_t> active(numFaces, 1);
 
-				std::vector<uint32_t> degree(faces.size(), 0);
+				size_t numActive = 0;
+
+				FOREACH(f, faces) {
+					const FaceDataArr& fd = facesDatas[f];
+
+					if (fd.IsEmpty()) {
+						labels[f] = NO_ID;
+						active[f] = 0;
+						continue;
+					}
+
+					if (fd.GetSize() == 1) {
+						labels[f] = fd[0].idxView;
+						active[f] = 0;
+						continue;
+					}
+
+					active[f] = 1;
+					++numActive;
+				}
+
+				// ---------- degree + edge counting (ACTIVE ONLY) ----------
+				std::vector<uint32_t> degree(numFaces, 0);
 				uint64_t numDirectedEdges = 0;
 
 				FOREACH(f, faces) {
+					if (!active[f])
+						continue;
+
 					const Mesh::FaceFaces& afaces = faceFaces[f];
 					for (int k = 0; k < 3; ++k) {
 						const FIndex fAdj = afaces[k];
-						if (fAdj != NO_ID && f < fAdj) {
-							++degree[f];
-							++degree[fAdj];
-							numDirectedEdges += 2; // two directed edges
-						}
+						if (fAdj == NO_ID || f >= fAdj)
+							continue;
+						if (!active[fAdj])
+							continue;
+
+						++degree[f];
+						++degree[fAdj];
+						numDirectedEdges += 2;
 					}
 				}
 
@@ -1782,22 +1943,25 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 					inference.SetSmoothCost(SmoothnessPotts);
 
 					inference.edges.reserve(numDirectedEdges);
-					for (NodeID f = 0; f < faces.size(); ++f) {
-						auto& v = inference.nodes[f].incomingEdges;
-						if (v.capacity() < degree[f]) {
-							v.reserve(degree[f]);
-						}
-					}
 
 					FOREACH(f, faces) {
+						if (!active[f])
+							continue;
+
 						const Mesh::FaceFaces& afaces = faceFaces[f];
 						for (int k = 0; k < 3; ++k) {
 							const FIndex fAdj = afaces[k];
 							if (fAdj == NO_ID || f >= fAdj)
 								continue;
+							if (!active[fAdj])
+								continue;
 							inference.SetNeighbors(f, fAdj);
 						}
+					}
 
+#pragma omp parallel for schedule(static)
+					for (int64_t f = 0; f < (int64_t)numFaces; ++f) {
+						if (!active[f]) continue;
 						// set costs for label 0 (undefined)
 						inference.SetDataCost((Label)0, f, MaxEnergy);
 					}
@@ -1805,38 +1969,26 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 
 				// JPB WIP Why is this released? faceFaces.Release();
 
-				// --- reserve label and message capacity once ---
-#pragma omp parallel for schedule(static)
-				for (int f = 0; f < (int) facesDatas.size(); ++f) {
-					const size_t numLabels = facesDatas[f].GetSize() + 1;
-					
-					auto& node = inference.nodes[f];
-					node.labels.reserve(numLabels);
-					node.dataCosts.reserve(numLabels);
-				}
-
-				for (auto& edge : inference.edges) {
-					// max of the two endpoint label counts if they differ
-					const NodeID a = edge.nodeID1;
-					const NodeID b = edge.nodeID2;
-
-					const size_t labelsA = facesDatas[a].GetSize() + 1;
-					const size_t labelsB = facesDatas[b].GetSize() + 1;
-					const size_t maxLabels = (labelsA > labelsB) ? labelsA : labelsB;
-
-					edge.oldMsgs.reserve(maxLabels);
-					edge.newMsgs.reserve(maxLabels);
-				}
-
 				// set data costs for all labels (except label 0 - undefined)
 				const float invNormQuality = 1.f / normQuality;
 
-				FOREACH(f, facesDatas) {
+#pragma omp parallel for schedule(static)
+				for (int f = 0; f < (int)facesDatas.size(); ++f) {
+					if (!active[f])
+						continue;
+
 					const FaceDataArr& faceDatas = facesDatas[f];
 					if (faceDatas.IsEmpty())
 						continue;
 
 					LBPInference::Node& node = inference.nodes[f];
+					node.labels.clear();
+					node.dataCosts.clear();
+					const size_t numLabels = faceDatas.GetSize() + 1;
+					//node.labels.reserve(numLabels);
+					//node.dataCosts.reserve(numLabels);
+					node.dataCost = MaxEnergy;
+					node.label = 0;
 
 					for (const FaceData& faceData : faceDatas) {
 						const Label label = (Label)faceData.idxView + 1;
@@ -1854,37 +2006,66 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 						node.dataCosts.push_back(dataCost);
 
 						if (dataCost < node.dataCost) {
-							node.label = label;
+							node.label = (Label)(node.labels.size() - 1);
 							node.dataCost = dataCost;
 						}
 					}
 				}
 
-				// --- finalize message buffers once ---
-				FOREACH(f, facesDatas) {
-					LBPInference::Node& node = inference.nodes[f];
-					const size_t numLabels = node.labels.size();
+#if 0
+				// 2) Reserve message buffers per edge (parallel, edge-centric)
+#pragma omp parallel for schedule(static)
+				for (int i = 0; i < (int)inference.edges.size(); ++i) {
+					auto& e = inference.edges[i];
+					if (inference.nodes[e.nodeID2].labels.empty())
+						continue;
 
-					for (LBPInference::EdgeID edgeID : node.incomingEdges) {
-						LBPInference::DirectedEdge& e = inference.edges[edgeID];
-						e.oldMsgs.resize(numLabels, LBPInference::EnergyType(0));
-						e.newMsgs.resize(numLabels, LBPInference::EnergyType(0));
-					}
+					size_t maxLabels =
+						std::max(inference.nodes[e.nodeID1].labels.size(),
+							inference.nodes[e.nodeID2].labels.size());
+					e.oldMsgs.reserve(maxLabels);
+					e.newMsgs.reserve(maxLabels);
 				}
+
+				// 3) Resize message buffers per edge (parallel, edge-centric)
+#pragma omp parallel for schedule(static)
+				for (int i = 0; i < (int)inference.edges.size(); ++i) {
+					auto& e = inference.edges[i];
+					if (inference.nodes[e.nodeID2].labels.empty())
+						continue;
+
+					size_t numLabels = inference.nodes[e.nodeID2].labels.size();
+					e.oldMsgs.resize(numLabels);
+					e.newMsgs.resize(numLabels);
+				}
+#endif
 
 				// assign the optimal view (label) to each face
 				// (label 0 is reserved as undefined)
+#if 0 // JPB WIP BUG
+				FOREACH(f, faces) {
+					if (!active[f])
+						continue;
+
+					const auto& node = inference.nodes[f];
+					HARD_ASSERT(!node.labels.empty());
+					HARD_ASSERT(node.labels.size() == node.dataCosts.size());
+					HARD_ASSERT(node.label < node.labels.size());
+				}
+#endif
 				inference.Optimize();
 
 				// extract resulting labeling
-				labels.Memset(0xFF);
-				FOREACH(l, labels) {
-					const Label label(inference.GetLabel(l));
-					ASSERT(label < images.size()+1);
+				FOREACH(f, faces) {
+					if (!active[f])
+						continue;
+
+					const Label label = inference.GetLabel(f);
+					ASSERT(label < images.size() + 1);
 					if (label > 0)
-						labels[l] = label-1;
+						labels[f] = label - 1;
 				}
-				#endif
+#endif
 
 				#if TEXOPT_INFERENCE == TEXOPT_INFERENCE_TRWS
 				// find connected components
@@ -1973,186 +2154,119 @@ bool MeshTexture::FaceViewSelection(unsigned minCommonCameras, float fOutlierThr
 		}
 
 		// create texture patches
-#if 1 // Slightly faster
 		{
-			const FIndex numFaces = faces.GetSize();
-			components.Resize(numFaces);
-			components.MemsetValue(NO_ID);
+			// create texture patches (no Boost, unified CC + seam edges)
+			{
+				const FIndex numFaces = faces.GetSize();
 
-			seamEdges.clear();
-			seamEdges.Reserve(numFaces);
+				components.Resize(numFaces);
+				components.Memset(0xFF); // MemsetValue(NO_ID);
 
-			std::vector<FIndex> stack;
-			stack.reserve(64);
+				seamEdges.clear();
+				seamEdges.Reserve(numFaces);
 
-			FIndex curComponent = 0;
+				boost::container::small_vector<FIndex, 128> stack;
 
-			// Collect seam edges
-			for (FIndex f = 0; f < numFaces; ++f) {
-				for (int k = 0; k < 3; ++k) {
-					const FIndex g = faceFaces[f][k];
-					if (g == NO_ID || g < f)
+				FIndex curComponent = 0;
+
+				// ---- DFS components + seam edges in one pass ----
+				for (FIndex f = 0; f < numFaces; ++f) {
+					if (components[f] != NO_ID)
 						continue;
-					if (labels[f] != labels[g])
-						seamEdges.emplace_back(f, g);
+
+					components[f] = curComponent;
+					stack.clear();
+					stack.push_back(f);
+
+					while (!stack.empty()) {
+						const FIndex u = stack.back();
+						stack.pop_back();
+
+						const Mesh::FaceFaces& afaces = faceFaces[u];
+						for (int k = 0; k < 3; ++k) {
+							const FIndex v = afaces[k];
+							if (v == NO_ID)
+								continue;
+
+							if (labels[u] != labels[v]) {
+								if (u < v)
+									seamEdges.emplace_back(u, v);
+								continue;
+							}
+
+							if (components[v] == NO_ID) {
+								components[v] = curComponent;
+								stack.push_back(v);
+							}
+						}
+					}
+
+					++curComponent;
 				}
-			}
 
-			// DFS components by label
-			for (FIndex f = 0; f < numFaces; ++f) {
-				if (components[f] != NO_ID)
-					continue;
+				const FIndex nComponents = curComponent;
 
-				components[f] = curComponent;
-				stack.clear();
-				stack.push_back(f);
+				// ---- compute component sizes ----
+				LabelArr sizes(nComponents);
+				sizes.Memset(0);
+				FOREACH(i, components)
+					++sizes[components[i]];
 
-				while (!stack.empty()) {
-					const FIndex u = stack.back();
-					stack.pop_back();
+				// ---- build texture patches ----
+				texturePatches.Resize(nComponents + 1);
+				texturePatches.Last().label = NO_ID;
 
-					for (int k = 0; k < 3; ++k) {
-						const FIndex v = faceFaces[u][k];
-						if (v == NO_ID)
-							continue;
-						if (components[v] != NO_ID)
-							continue;
-						if (labels[u] != labels[v])
-							continue;
+				FOREACH(f, faces) {
+					const Label label = labels[f];
+					const FIndex c = components[f];
+					TexturePatch& texturePatch = texturePatches[c];
 
-						components[v] = curComponent;
-						stack.push_back(v);
+					ASSERT(texturePatch.label == label || texturePatch.faces.IsEmpty());
+
+					if (label == NO_ID) {
+						texturePatch.label = NO_ID;
+						texturePatches.Last().faces.Insert(f);
+					}
+					else {
+						if (texturePatch.faces.IsEmpty()) {
+							texturePatch.label = label;
+							texturePatch.faces.Reserve(sizes[c]);
+						}
+						texturePatch.faces.Insert(f);
 					}
 				}
 
-				++curComponent;
-			}
+				// ---- compact patches and build mapIdxPatch ----
+				mapIdxPatch.Resize(nComponents);
+				std::iota(mapIdxPatch.Begin(), mapIdxPatch.End(), 0);
 
-			const FIndex nComponents = curComponent;
-
-			LabelArr sizes(nComponents);
-			sizes.Memset(0);
-			FOREACH(i, components)
-				++sizes[components[i]];
-
-			texturePatches.Resize(nComponents + 1);
-			texturePatches.Last().label = NO_ID;
-
-			FOREACH(f, faces) {
-				const Label label = labels[f];
-				const FIndex c = components[f];
-				TexturePatch& texturePatch = texturePatches[c];
-
-				ASSERT(texturePatch.label == label || texturePatch.faces.IsEmpty());
-
-				if (label == NO_ID) {
-					texturePatch.label = NO_ID;
-					texturePatches.Last().faces.Insert(f);
-				}
-				else {
-					if (texturePatch.faces.IsEmpty()) {
-						texturePatch.label = label;
-						texturePatch.faces.Reserve(sizes[c]);
+				FIndex write = 0;
+				for (FIndex read = 0; read < nComponents; ++read) {
+					if (texturePatches[read].label != NO_ID) {
+						if (write != read) {
+							texturePatches[write] = std::move(texturePatches[read]);
+							mapIdxPatch[write] = mapIdxPatch[read];
+						}
+						++write;
 					}
-					texturePatch.faces.Insert(f);
 				}
-			}
 
-			mapIdxPatch.Resize(nComponents);
-			std::iota(mapIdxPatch.Begin(), mapIdxPatch.End(), 0);
+				texturePatches.Resize(write);
+				mapIdxPatch.Resize(write);
 
-			FIndex write = 0;
+				const unsigned numPatches = texturePatches.GetSize() - 1;
+				uint32_t idxPatch = 0;
 
-			for (FIndex read = 0; read < nComponents; ++read) {
-				if (texturePatches[read].label != NO_ID) {
-					if (write != read) {
-						texturePatches[write] = std::move(texturePatches[read]);
-						mapIdxPatch[write] = mapIdxPatch[read];
-					}
-					++write;
+				for (IndexArr::IDX i = 0; i < mapIdxPatch.GetSize(); ++i) {
+					while (i < mapIdxPatch[i])
+						mapIdxPatch.InsertAt(i++, numPatches);
+					mapIdxPatch[i] = idxPatch++;
 				}
+
+				while (mapIdxPatch.GetSize() <= nComponents)
+					mapIdxPatch.Insert(numPatches);
 			}
-
-			texturePatches.Resize(write);
-			mapIdxPatch.Resize(write);
-
-			const unsigned numPatches = texturePatches.GetSize() - 1;
-			uint32_t idxPatch = 0;
-
-			for (IndexArr::IDX i = 0; i < mapIdxPatch.GetSize(); ++i) {
-				while (i < mapIdxPatch[i])
-					mapIdxPatch.InsertAt(i++, numPatches);
-				mapIdxPatch[i] = idxPatch++;
-			}
-
-			while (mapIdxPatch.GetSize() <= nComponents)
-				mapIdxPatch.Insert(numPatches);
-}
-
-#else
-		{
-			// divide graph in sub-graphs of connected faces having the same label
-			EdgeIter ei, eie;
-			const PairIdxArr::IDX startLabelSeamEdges(seamEdges.size());
-			for (boost::tie(ei, eie) = boost::edges(graph); ei != eie; ++ei) {
-				const FIndex fSource((FIndex)ei->m_source);
-				const FIndex fTarget((FIndex)ei->m_target);
-				ASSERT(components[fSource] == components[fTarget]);
-				if (labels[fSource] != labels[fTarget])
-					seamEdges.emplace_back(fSource, fTarget);
-			}
-			for (const PairIdx *pEdge=seamEdges.Begin()+startLabelSeamEdges, *pEdgeEnd=seamEdges.End(); pEdge!=pEdgeEnd; ++pEdge)
-				boost::remove_edge(pEdge->i, pEdge->j, graph);
-
-			// find connected components: texture patches
-			ASSERT((FIndex)boost::num_vertices(graph) == components.GetSize());
-			const FIndex nComponents(boost::connected_components(graph, components.data()));
-
-			// create texture patches;
-			// last texture patch contains all faces with no texture
-			LabelArr sizes(nComponents);
-			sizes.Memset(0);
-			FOREACH(c, components)
-				++sizes[components[c]];
-			texturePatches.Resize(nComponents+1);
-			texturePatches.Last().label = NO_ID;
-			FOREACH(f, faces) {
-				const Label label(labels[f]);
-				const FIndex c(components[f]);
-				TexturePatch& texturePatch = texturePatches[c];
-				ASSERT(texturePatch.label == label || texturePatch.faces.IsEmpty());
-				if (label == NO_ID) {
-					texturePatch.label = NO_ID;
-					texturePatches.Last().faces.Insert(f);
-				} else {
-					if (texturePatch.faces.IsEmpty()) {
-						texturePatch.label = label;
-						texturePatch.faces.Reserve(sizes[c]);
-					}
-					texturePatch.faces.Insert(f);
-				}
-			}
-			// remove all patches with invalid label (except the last one)
-			// and create the map from the old index to the new one
-			mapIdxPatch.Resize(nComponents);
-			std::iota(mapIdxPatch.Begin(), mapIdxPatch.End(), 0);
-			for (FIndex t = nComponents; t-- > 0; ) {
-				if (texturePatches[t].label == NO_ID) {
-					texturePatches.RemoveAtMove(t);
-					mapIdxPatch.RemoveAtMove(t);
-				}
-			}
-			const unsigned numPatches(texturePatches.GetSize()-1);
-			uint32_t idxPatch(0);
-			for (IndexArr::IDX i=0; i<mapIdxPatch.GetSize(); ++i) {
-				while (i < mapIdxPatch[i])
-					mapIdxPatch.InsertAt(i++, numPatches);
-				mapIdxPatch[i] = idxPatch++;
-			}
-			while (mapIdxPatch.GetSize() <= nComponents)
-				mapIdxPatch.Insert(numPatches);
 		}
-#endif
 	}
 	return true;
 }
@@ -2218,6 +2332,15 @@ void MeshTexture::CreateSeamVertices()
 		}
 	}
 	seamEdges.Release();
+}
+
+static DWORD_PTR PinThreadToCoreAndSave(int coreIndex) {
+	DWORD_PTR newMask = (DWORD_PTR)1 << coreIndex;
+	return SetThreadAffinityMask(GetCurrentThread(), newMask);
+}
+
+static void RestoreThreadAffinity(DWORD_PTR oldMask) {
+	SetThreadAffinityMask(GetCurrentThread(), oldMask);
 }
 
 void MeshTexture::GlobalSeamLeveling()
@@ -2287,136 +2410,136 @@ void MeshTexture::GlobalSeamLeveling()
 	}
 
 #pragma omp parallel
-		{
-			const int tid = omp_get_thread_num();
+	{
+		const int tid = omp_get_thread_num();
 
-			CLISTDEF0(MatEntry)& localTriplets = tlsTriplets[tid];
-			Colors& localCoeffB = tlsCoeffB[tid];
+		CLISTDEF0(MatEntry)& localTriplets = tlsTriplets[tid];
+		Colors& localCoeffB = tlsCoeffB[tid];
 
-			IndexArr indices;
-			Colors vertexColors;
-			boost::container::small_vector<VIndex, 32> adjVerts;
+		IndexArr indices;
+		Colors vertexColors;
+		boost::container::small_vector<VIndex, 32> adjVerts;
 
-			// ----------------------------------------------------------
-			// 1) Gamma constraints (same as original, just parallel)
-			// ----------------------------------------------------------
+		// ----------------------------------------------------------
+		// 1) Gamma constraints (same as original, just parallel)
+		// ----------------------------------------------------------
 #pragma omp for schedule(static)
-			for (int vi = 0; vi < (int)vertices.GetSize(); ++vi) {
-				const VIndex v = (VIndex)vi;
+		for (int vi = 0; vi < (int)vertices.GetSize(); ++vi) {
+			const VIndex v = (VIndex)vi;
 
-				adjVerts.clear();
-				scene.mesh.GetAdjVertices(v, adjVerts);
+			adjVerts.clear();
+			scene.mesh.GetAdjVertices(v, adjVerts);
 
-				VertexPatchIterator itV(patchIndices[v], seamVertices);
-				while (true) {
-					if (!itV.Next())
-						break;
+			VertexPatchIterator itV(patchIndices[v], seamVertices);
+			while (true) {
+				if (!itV.Next())
+					break;
 
-					const uint32_t idxPatch = itV;
-					if (idxPatch == numPatches)
+				const uint32_t idxPatch = itV;
+				if (idxPatch == numPatches)
+					continue;
+
+				const MatIdx col = vertpatch2rows[v].at(idxPatch);
+
+				for (const VIndex vAdj : adjVerts) {
+					if (v >= vAdj)
 						continue;
 
-					const MatIdx col = vertpatch2rows[v].at(idxPatch);
+					VertexPatchIterator itVAdj(patchIndices[vAdj], seamVertices);
+					while (true) {
+						if (!itVAdj.Next())
+							break;
 
-					for (const VIndex vAdj : adjVerts) {
-						if (v >= vAdj)
-							continue;
+						const uint32_t idxPatchAdj = itVAdj;
+						if (idxPatchAdj == idxPatch) {
+							const MatIdx colAdj = vertpatch2rows[vAdj].at(idxPatchAdj);
 
-						VertexPatchIterator itVAdj(patchIndices[vAdj], seamVertices);
-						while (true) {
-							if (!itVAdj.Next())
-								break;
+							const MatIdx row = (MatIdx)localCoeffB.GetSize();
+							localCoeffB.Insert(Color(0.f, 0.f, 0.f));
 
-							const uint32_t idxPatchAdj = itVAdj;
-							if (idxPatchAdj == idxPatch) {
-								const MatIdx colAdj = vertpatch2rows[vAdj].at(idxPatchAdj);
-
-								const MatIdx row = (MatIdx)localCoeffB.GetSize();
-								localCoeffB.Insert(Color(0.f, 0.f, 0.f));
-
-								localTriplets.emplace_back(row, col, lambda);
-								localTriplets.emplace_back(row, colAdj, -lambda);
-							}
+							localTriplets.emplace_back(row, col, lambda);
+							localTriplets.emplace_back(row, colAdj, -lambda);
 						}
 					}
 				}
 			}
+		}
 
-			// ----------------------------------------------------------
-			// 2) Data constraints (same as original, just parallel)
-			// ----------------------------------------------------------
+		// ----------------------------------------------------------
+		// 2) Data constraints (same as original, just parallel)
+		// ----------------------------------------------------------
 #pragma omp for schedule(static)
-			for (int si = 0; si < (int)seamVertices.GetSize(); ++si) {
-				const SeamVertex& seamVertex = seamVertices[(IDX)si];
-				if (seamVertex.patches.GetSize() < 2)
-					continue;
+		for (int si = 0; si < (int)seamVertices.GetSize(); ++si) {
+			const SeamVertex& seamVertex = seamVertices[(IDX)si];
+			if (seamVertex.patches.GetSize() < 2)
+				continue;
 
-				seamVertex.SortByPatchIndex(indices);
-				vertexColors.Resize(indices.GetSize());
+			seamVertex.SortByPatchIndex(indices);
+			vertexColors.Resize(indices.GetSize());
 
-				FOREACH(i, indices) {
-					const SeamVertex::Patch& patch0 = seamVertex.patches[indices[i]];
-					SampleImage sampler(images[texturePatches[patch0.idxPatch].label].image);
+			FOREACH(i, indices) {
+				const SeamVertex::Patch& patch0 = seamVertex.patches[indices[i]];
+				SampleImage sampler(images[texturePatches[patch0.idxPatch].label].image);
 
-					for (const SeamVertex::Patch::Edge& edge : patch0.edges) {
-						const SeamVertex& sv1 = seamVertices[edge.idxSeamVertex];
-						const auto idxPatch1 = sv1.patches.Find(patch0.idxPatch);
-						sampler.AddEdge(patch0.proj, sv1.patches[idxPatch1].proj);
-					}
-					vertexColors[i] = sampler.GetColor();
+				for (const SeamVertex::Patch::Edge& edge : patch0.edges) {
+					const SeamVertex& sv1 = seamVertices[edge.idxSeamVertex];
+					const auto idxPatch1 = sv1.patches.Find(patch0.idxPatch);
+					sampler.AddEdge(patch0.proj, sv1.patches[idxPatch1].proj);
 				}
+				vertexColors[i] = sampler.GetColor();
+			}
 
-				const VertexPatch2RowMap& v2r = vertpatch2rows[seamVertex.idxVertex];
+			const VertexPatch2RowMap& v2r = vertpatch2rows[seamVertex.idxVertex];
 
-				for (IDX i = 0; i < indices.GetSize() - 1; ++i) {
-					const uint32_t p0 = seamVertex.patches[indices[i]].idxPatch;
-					const MatIdx c0 = v2r.at(p0);
-					const Color& col0 = vertexColors[i];
+			for (IDX i = 0; i < indices.GetSize() - 1; ++i) {
+				const uint32_t p0 = seamVertex.patches[indices[i]].idxPatch;
+				const MatIdx c0 = v2r.at(p0);
+				const Color& col0 = vertexColors[i];
 
-					for (IDX j = i + 1; j < indices.GetSize(); ++j) {
-						const uint32_t p1 = seamVertex.patches[indices[j]].idxPatch;
-						const MatIdx c1 = v2r.at(p1);
-						const Color& col1 = vertexColors[j];
+				for (IDX j = i + 1; j < indices.GetSize(); ++j) {
+					const uint32_t p1 = seamVertex.patches[indices[j]].idxPatch;
+					const MatIdx c1 = v2r.at(p1);
+					const Color& col1 = vertexColors[j];
 
-						const MatIdx row = (MatIdx)localCoeffB.GetSize();
-						localCoeffB.Insert(col1 - col0);
+					const MatIdx row = (MatIdx)localCoeffB.GetSize();
+					localCoeffB.Insert(col1 - col0);
 
-						localTriplets.emplace_back(row, c0, 1.f);
-						localTriplets.emplace_back(row, c1, -1.f);
-					}
+					localTriplets.emplace_back(row, c0, 1.f);
+					localTriplets.emplace_back(row, c1, -1.f);
 				}
 			}
 		}
+	}
 
-		// ------------------------------------------------------------
-		// Merge thread-local buffers (preserves per-thread row indexing)
-		// ------------------------------------------------------------
+	// ------------------------------------------------------------
+	// Merge thread-local buffers (preserves per-thread row indexing)
+	// ------------------------------------------------------------
 
-		Colors coeffB;
-		CLISTDEF0(MatEntry) aTriplets;
+	Colors coeffB;
+	CLISTDEF0(MatEntry) aTriplets;
 
-		std::vector<MatIdx> rowOffsets(numThreads, 0);
-		for (int t = 1; t < numThreads; ++t)
-			rowOffsets[t] = rowOffsets[t - 1] + tlsCoeffB[t - 1].GetSize();
+	std::vector<MatIdx> rowOffsets(numThreads, 0);
+	for (int t = 1; t < numThreads; ++t)
+		rowOffsets[t] = rowOffsets[t - 1] + tlsCoeffB[t - 1].GetSize();
 
-		for (int t = 0; t < numThreads; ++t) {
+	for (int t = 0; t < numThreads; ++t) {
 
-			for (const Color& c : tlsCoeffB[t])
-				coeffB.Insert(c);
+		for (const Color& c : tlsCoeffB[t])
+			coeffB.Insert(c);
 
-			for (auto& e : tlsTriplets[t]) {
-				aTriplets.emplace_back(
-					e.row() + rowOffsets[t],
-					e.col(),
-					e.value()
-				);
-			}
+		for (auto& e : tlsTriplets[t]) {
+			aTriplets.emplace_back(
+				e.row() + rowOffsets[t],
+				e.col(),
+				e.value()
+			);
 		}
-
+	}
 
 	// ------------------------------------------------------------
 	// 3) Build A from combined triplets
 	// ------------------------------------------------------------
+	// Eigen par not helping here.  Completely dominated by Solve.
 
 	const MatIdx rowsA = (MatIdx)coeffB.GetSize();
 
@@ -2437,10 +2560,11 @@ void MeshTexture::GlobalSeamLeveling()
 	Lhs = AT * A;
 	Lhs.makeCompressed();
 
-	// Ensure diagonal exists
-	for (int i = 0; i < (int)Lhs.rows(); ++i)
-		Lhs.coeffRef(i, i) += 0.0f;
-
+	// Ensure every diagonal entry exists
+	for (MatIdx i = 0; i < rowsX; ++i) {
+		if (Lhs.coeff(i, i) == 0.f)
+			Lhs.coeffRef(i, i) = 1e-6f;
+	}
 	// Keep only lower triangle (CG fast path)
 	Lhs.prune([](const int& r, const int& c, const float&) {
 		return c <= r;
@@ -2451,10 +2575,60 @@ void MeshTexture::GlobalSeamLeveling()
 	Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor>
 		colorAdjustments(rowsX, 3);
 
+	// JPB WIP BUG Crashes Lhs.diagonal().array() += 1e-6f;
+
 	// ------------------------------------------------------------
 	// 5) CG solve (fast, stable, same accuracy)
 	// ------------------------------------------------------------
 
+#if 1
+	Eigen::setNbThreads(1);
+
+	static Eigen::VectorXf xPrev[3];
+	static bool init = false;
+	if (!init) {
+		for (int i = 0; i < 3; ++i)
+			xPrev[i].setZero(rowsX);
+		init = true;
+	}
+
+#pragma omp parallel for num_threads(3) schedule(static)
+	for (int c = 0; c < 3; ++c) {
+
+		DWORD_PTR oldMask = PinThreadToCoreAndSave(c * 2);
+
+		Eigen::ConjugateGradient<
+			SparseMat,
+			Eigen::Lower,
+			Eigen::DiagonalPreconditioner<float>
+		> solverLocal;
+
+		solverLocal.setMaxIterations(1000);
+		solverLocal.setTolerance(3e-4f);
+		solverLocal.compute(Lhs);
+
+		Eigen::Map<const Eigen::VectorXf, Eigen::Unaligned,
+			Eigen::Stride<0, 3>> b(coeffB.front().ptr() + c, rowsA);
+
+		Eigen::VectorXf rhs(rowsX);
+		rhs.noalias() = AT * b;
+
+		Eigen::VectorXf x = solverLocal.solveWithGuess(rhs, xPrev[c]);
+		xPrev[c] = x;
+
+		const float invRowsX = 1.0f / rowsX;
+		float mean = x.sum() * invRowsX;
+		x.array() -= mean;
+
+		Eigen::Map<Eigen::VectorXf, Eigen::Unaligned,
+			Eigen::Stride<0, 3>> out(colorAdjustments.data() + c, rowsX);
+		out.noalias() = x;
+
+		RestoreThreadAffinity(oldMask);
+	}
+
+	Eigen::setNbThreads(0); // restore
+#else
 	Eigen::ConjugateGradient<
 		SparseMat,
 		Eigen::Lower,
@@ -2487,12 +2661,9 @@ void MeshTexture::GlobalSeamLeveling()
 			Eigen::Stride<0, 3>> out(colorAdjustments.data() + c, rowsX);
 		out.noalias() = x;
 	}
-
+#endif
 
 	////
-	std::atomic<int> totalColorsAssigned = 0;
-	std::atomic<int> badColors = 0;
-
 	// adjust texture patches using the correction colors
 	#ifdef TEXOPT_USE_OPENMP
 	#pragma omp parallel for schedule(static, 1)
@@ -2521,18 +2692,19 @@ void MeshTexture::GlobalSeamLeveling()
 			const Face& face = faces[idxFace];
 			data.tri = faceTexcoords.Begin() + idxFace * 3;
 #if 1 // JPB WIP BUG
+			bool valid = true;
 			for (int v = 0; v < 3; ++v) {
 				auto& tmp = vertpatch2rows[face[v]];
 				auto it = tmp.find(idxPatch);
-				if (it != tmp.end()) {
-					auto el = *it;
-					data.colors[v] = colorAdjustments.row(el.second);
+				if (it == tmp.end()) {
+					valid = false;
+					break;
 				}
-				else
-				{
-					data.colors[v] = Color(1, 0, 1);
-					++badColors;
-				}
+				data.colors[v] = colorAdjustments.row(it->second);
+			}
+
+			if (!valid) {
+				data.colors[0] = data.colors[1] = data.colors[2] = Color::ZERO;
 			}
 #else
 			for (int v = 0; v < 3; ++v)
@@ -2543,10 +2715,81 @@ void MeshTexture::GlobalSeamLeveling()
 			ColorMap::RasterizeTriangleBary(data.tri[0], data.tri[1], data.tri[2], data);
 		}
 
-		totalColorsAssigned += texturePatch.faces.size() * 3;
+#if 1 // Retry, to remove splotches.  Make dilation 0 and fuse it with application:
+		cv::Mat image(images[texturePatch.label].image(texturePatch.rect));
 
+		for (int r = 1; r < image.rows - 1; ++r) {
+			const Color* __restrict prev = (Color*)imageAdj.ptr(r - 1);
+			const Color* __restrict curr = (Color*)imageAdj.ptr(r);
+			const Color* __restrict next = (Color*)imageAdj.ptr(r + 1);
+
+			Pixel8U* __restrict out = image.ptr<Pixel8U>(r);
+
+			for (int c = 1; c < image.cols - 1; ++c) {
+
+				Color a = curr[c];
+
+				// If no correction here, try to dilate from neighbors
+				if (a == Color::ZERO) {
+
+					Color sum(0);
+					int n = 0;
+
+					const Color v0 = prev[c - 1];
+					const Color v1 = prev[c];
+					const Color v2 = prev[c + 1];
+					const Color v3 = curr[c - 1];
+					const Color v4 = curr[c + 1];
+					const Color v5 = next[c - 1];
+					const Color v6 = next[c];
+					const Color v7 = next[c + 1];
+
+					if (v0 != Color::ZERO) { sum += v0; ++n; }
+					if (v1 != Color::ZERO) { sum += v1; ++n; }
+					if (v2 != Color::ZERO) { sum += v2; ++n; }
+					if (v3 != Color::ZERO) { sum += v3; ++n; }
+					if (v4 != Color::ZERO) { sum += v4; ++n; }
+					if (v5 != Color::ZERO) { sum += v5; ++n; }
+					if (v6 != Color::ZERO) { sum += v6; ++n; }
+					if (v7 != Color::ZERO) { sum += v7; ++n; }
+
+					if (!n)
+						continue;
+
+					a = (n > 1 ? sum / n : sum);
+				}
+
+				// Apply correction immediately
+				Pixel8U& v = out[c];
+
+				// scalar color space math (unchanged, correct)
+				const Color col = RGB2YCBCR(Color(v));
+				const Color acol = YCBCR2RGB(Color(col + a));
+
+				// SIMD round + clamp (this is the only optimized part)
+				__m128 rgbf = _mm_set_ps(0.0f, acol[2], acol[1], acol[0]);
+				__m128i rgbi = _mm_cvtps_epi32(rgbf);
+
+				const __m128i zero = _mm_setzero_si128();
+				const __m128i max255 = _mm_set1_epi32(255);
+
+				rgbi = _mm_max_epi32(rgbi, zero);
+				rgbi = _mm_min_epi32(rgbi, max255);
+
+				// pack to bytes
+				__m128i pack16 = _mm_packus_epi32(rgbi, rgbi);
+				__m128i pack8 = _mm_packus_epi16(pack16, pack16);
+
+				uint32_t rgb8 = (uint32_t)_mm_cvtsi128_si32(pack8);
+				v[0] = (uint8_t)(rgb8 & 0xFF);
+				v[1] = (uint8_t)((rgb8 >> 8) & 0xFF);
+				v[2] = (uint8_t)((rgb8 >> 16) & 0xFF);
+			}
+		}
+#else
 		// dilate with one pixel width, in order to make sure patch border smooths out a little
-		imageAdj.DilateMean<1>(imageAdj, Color::ZERO);
+		// JPB WIP BUG Try imageAdj.DilateMean<1>(imageAdj, Color::ZERO);
+		imageAdj.DilateMean<0>(imageAdj, Color::ZERO);
 		// apply color correction to the patch image
 		cv::Mat image(images[texturePatch.label].image(texturePatch.rect));
 		for (int r=0; r<image.rows; ++r) {
@@ -2561,14 +2804,195 @@ void MeshTexture::GlobalSeamLeveling()
 					v[p] = (uint8_t)CLAMP(ROUND2INT(acol[p]), 0, 255);
 			}
 		}
+#endif
 	}
-
-	DEBUG("%d bad colors assigned in %d colors", badColors.load(), totalColorsAssigned.load());
 }
 
 // set to one in order to dilate also on the diagonal of the border
 // (normally not needed)
 #define DILATE_EXTRA 0
+#if 1 // too aggressive?
+void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
+{
+	typedef Image8U::Type Type;
+
+	const int width = mask.width();
+	const int height = mask.height();
+	const int stride = width;
+
+	Type* data = (Type*) mask.data;
+
+	auto Idx = [&](int x, int y) {
+		return y * stride + x;
+		};
+
+	// ------------------------------------------------------------
+	// 1) DILATE border -> interior (4-neighborhood)
+	// ------------------------------------------------------------
+	for (int y = 1; y < height - 1; ++y) {
+		Type* row = data + y * stride;
+		for (int x = 1; x < width - 1; ++x) {
+			if (row[x] != border)
+				continue;
+
+			Type& up = data[(y - 1) * stride + x];
+			Type& down = data[(y + 1) * stride + x];
+			Type& left = row[x - 1];
+			Type& right = row[x + 1];
+
+			if (up != border) up = interior;
+			if (down != border) down = interior;
+			if (left != border) left = interior;
+			if (right != border) right = interior;
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 2) ERODE interior -> empty (edge consistency)
+	// ------------------------------------------------------------
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			Type& v = data[y * stride + x];
+			if (v != interior)
+				continue;
+
+			auto Sample = [&](int xx, int yy) -> Type {
+				if ((unsigned)xx >= (unsigned)width ||
+					(unsigned)yy >= (unsigned)height)
+					return empty;
+				return data[yy * stride + xx];
+				};
+
+			// horizontal
+			if ((Sample(x - 1, y) == border && Sample(x + 1, y) == empty) ||
+				(Sample(x + 1, y) == border && Sample(x - 1, y) == empty)) {
+				v = empty;
+				continue;
+			}
+
+			// vertical
+			if ((Sample(x, y - 1) == border && Sample(x, y + 1) == empty) ||
+				(Sample(x, y + 1) == border && Sample(x, y - 1) == empty)) {
+				v = empty;
+				continue;
+			}
+
+			// diagonals
+			if ((Sample(x - 1, y - 1) == border && Sample(x + 1, y + 1) == empty) ||
+				(Sample(x + 1, y + 1) == border && Sample(x - 1, y - 1) == empty) ||
+				(Sample(x - 1, y + 1) == border && Sample(x + 1, y - 1) == empty) ||
+				(Sample(x + 1, y - 1) == border && Sample(x - 1, y + 1) == empty)) {
+				v = empty;
+				continue;
+			}
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 3) Mark interior pixels touching empty as border
+	// ------------------------------------------------------------
+	for (int y = 1; y < height - 1; ++y) {
+		for (int x = 1; x < width - 1; ++x) {
+			Type& v = data[y * stride + x];
+			if (v != interior)
+				continue;
+
+			if (data[(y - 1) * stride + x] == empty ||
+				data[(y + 1) * stride + x] == empty ||
+				data[y * stride + x - 1] == empty ||
+				data[y * stride + x + 1] == empty) {
+				v = border;
+			}
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 4) Compute initial border frontier
+	// ------------------------------------------------------------
+	std::vector<int> frontier;
+	frontier.reserve(width * 2 + height * 2);
+
+	std::vector<uint8_t> visited(width * height, 0);
+
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const int idx = Idx(x, y);
+			if (data[idx] == empty)
+				continue;
+
+			bool touchesEmpty = false;
+			for (int dy = -1; dy <= 1 && !touchesEmpty; ++dy) {
+				for (int dx = -1; dx <= 1; ++dx) {
+					int xn = x + dx;
+					int yn = y + dy;
+					if ((unsigned)xn >= (unsigned)width ||
+						(unsigned)yn >= (unsigned)height)
+						continue;
+					if (data[Idx(xn, yn)] == empty) {
+						touchesEmpty = true;
+						break;
+					}
+				}
+			}
+
+			if (touchesEmpty) {
+				frontier.push_back(idx);
+				visited[idx] = 1;
+			}
+		}
+	}
+
+	// ------------------------------------------------------------
+	// 5) Iterative strip erosion (frontier-based)
+	// ------------------------------------------------------------
+	std::vector<int> nextFrontier;
+	nextFrontier.reserve(frontier.size());
+
+	for (int s = 0; s < stripWidth; ++s) {
+		nextFrontier.clear();
+
+		// Remove current frontier
+		for (int idx : frontier)
+			data[idx] = empty;
+
+		// Grow new frontier
+		for (int idx : frontier) {
+			int x = idx % stride;
+			int y = idx / stride;
+
+			for (int dy = -1; dy <= 1; ++dy) {
+				for (int dx = -1; dx <= 1; ++dx) {
+					int xn = x + dx;
+					int yn = y + dy;
+					if ((unsigned)xn >= (unsigned)width ||
+						(unsigned)yn >= (unsigned)height)
+						continue;
+
+					int nidx = Idx(xn, yn);
+					if (data[nidx] != empty && !visited[nidx]) {
+						visited[nidx] = 1;
+						nextFrontier.push_back(nidx);
+					}
+				}
+			}
+		}
+
+		frontier.swap(nextFrontier);
+		if (frontier.empty())
+			break;
+	}
+
+	// ------------------------------------------------------------
+	// 6) Final cleanup: keep only remaining frontier as border
+	// ------------------------------------------------------------
+	for (int i = 0; i < width * height; ++i)
+		if (data[i] != empty)
+			data[i] = empty;
+
+	for (int idx : frontier)
+		data[idx] = border;
+}
+#else
 void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
 {
 	typedef Image8U::Type Type;
@@ -2634,7 +3058,6 @@ void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
 	#undef ERODEDIR
 
 	// mark all interior pixels with empty neighbors as border
-#pragma omp parallel for schedule(static)
 	for (int r=0; r<mask.rows; ++r) {
 		for (int c=0; c<mask.cols; ++c) {
 			Type& v = mask(r,c);
@@ -2727,7 +3150,6 @@ void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
 	#undef ISEMPTY
 
 	// mark all remaining pixels empty in the mask
-#pragma omp parallel for schedule(static)
 	for (int y=0; y<height; ++y) {
 		for (int x=0; x<width; ++x) {
 			if (orgMask(y,x) != empty)
@@ -2739,7 +3161,6 @@ void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
 	// mark all border pixels
 	std::vector<ImageRef> borderVec(borderPixels.begin(), borderPixels.end());
 
-#pragma omp parallel for schedule(static)
 	for (int i = 0; i < (int)borderVec.size(); ++i) {
 		mask(borderVec[i]) = border;
 	}
@@ -2768,6 +3189,7 @@ void MeshTexture::ProcessMask(Image8U& mask, int stripWidth)
 	}
 	#endif
 }
+#endif
 
 inline MeshTexture::Color ColorLaplacian(const Image32F3& img, int i) {
 	const int width(img.width());
@@ -2863,7 +3285,7 @@ static void SolvePoissonSOR_Compact(
 #endif
 
 	float initialResidual = -1.0f;
-
+	
 	for (int iter = 0; iter < maxIters; ++iter) {
 #ifdef COUNT_ITERATIONS
 		++lIters;
@@ -2874,14 +3296,18 @@ static void SolvePoissonSOR_Compact(
 
 			const PoissonStencil& s = stencil[i];
 
-			int u = s.up;
-			int l = s.left;
-			int r = s.right;
-			int d = s.down;
+			const int u = s.up;
+			const int l = s.left;
+			const int r = s.right;
+			const int d = s.down;
 
-			float newR = (xR[u] + xR[l] + xR[r] + xR[d] - bR[i]) * 0.25f;
-			float newG = (xG[u] + xG[l] + xG[r] + xG[d] - bG[i]) * 0.25f;
-			float newB = (xB[u] + xB[l] + xB[r] + xB[d] - bB[i]) * 0.25f;
+			const float sumR = xR[u] + xR[l] + xR[r] + xR[d] - bR[i];
+			const float sumG = xG[u] + xG[l] + xG[r] + xG[d] - bG[i];
+			const float sumB = xB[u] + xB[l] + xB[r] + xB[d] - bB[i];
+
+			const float newR = sumR * 0.25f;
+			const float newG = sumG * 0.25f;
+			const float newB = sumB * 0.25f;
 
 			xR[i] += omega * (newR - xR[i]);
 			xG[i] += omega * (newG - xG[i]);
@@ -2894,14 +3320,18 @@ static void SolvePoissonSOR_Compact(
 
 			const PoissonStencil& s = stencil[i];
 
-			int u = s.up;
-			int l = s.left;
-			int r = s.right;
-			int d = s.down;
+			const int u = s.up;
+			const int l = s.left;
+			const int r = s.right;
+			const int d = s.down;
 
-			float newR = (xR[u] + xR[l] + xR[r] + xR[d] - bR[i]) * 0.25f;
-			float newG = (xG[u] + xG[l] + xG[r] + xG[d] - bG[i]) * 0.25f;
-			float newB = (xB[u] + xB[l] + xB[r] + xB[d] - bB[i]) * 0.25f;
+			const float sumR = xR[u] + xR[l] + xR[r] + xR[d] - bR[i];
+			const float sumG = xG[u] + xG[l] + xG[r] + xG[d] - bG[i];
+			const float sumB = xB[u] + xB[l] + xB[r] + xB[d] - bB[i];
+
+			const float newR = sumR * 0.25f;
+			const float newG = sumG * 0.25f;
+			const float newB = sumB * 0.25f;
 
 			xR[i] += omega * (newR - xR[i]);
 			xG[i] += omega * (newG - xG[i]);
@@ -2916,6 +3346,7 @@ static void SolvePoissonSOR_Compact(
 				int i = redInterior[k];
 
 				const PoissonStencil& s = stencil[i];
+
 				int u = s.up;
 				int l = s.left;
 				int r = s.right;
@@ -2947,6 +3378,7 @@ static void SolvePoissonSOR_Compact(
 				int i = blackInterior[k];
 
 				const PoissonStencil& s = stencil[i];
+
 				int u = s.up;
 				int l = s.left;
 				int r = s.right;
@@ -3016,17 +3448,30 @@ void MeshTexture::PoissonBlending(
 	const int height = dst.height();
 	const int n = width * height;
 
-	// Compact indexing
+	// Compact indexing (now using tiles)
 	TImage<MatIdx> indices(dst.size());
 	indices.memset(0xff);
 
 	MatIdx nnz = 0;
-	for (int i = 0; i < n; ++i)
-		if (mask(i) != empty)
-			indices(i) = nnz++;
 
-	if (nnz == 0)
-		return;
+	// Pass 1: interior pixels first (solver hot set)
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const int i = y * width + x;
+			if (mask(i) == interior) {
+				indices(i) = nnz++;
+			}
+		}
+	}
+
+	// Pass 2: border pixels (cold, mostly fixed)
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			const int i = y * width + x;
+			if (mask(i) == border)
+				indices(i) = nnz++;
+		}
+	}
 
 	std::vector<PoissonStencil> stencil(nnz);
 	std::vector<float> xR(nnz);
@@ -3041,7 +3486,7 @@ void MeshTexture::PoissonBlending(
 	redInterior.reserve(nnz);
 	blackInterior.reserve(nnz);
 
-	// Build compact system (EXACT match to original)
+	// Build compact system
 	const bool useSrcOnly = (bias == 1.0f);
 	const float invBias = 1.0f - bias;
 
@@ -3070,6 +3515,7 @@ void MeshTexture::PoissonBlending(
 				xR[idx] = c.x;
 				xG[idx] = c.y;
 				xB[idx] = c.z;
+
 				continue;
 			}
 
@@ -3121,6 +3567,8 @@ void MeshTexture::PoissonBlending(
 		}
 	}
 
+	// Can't sort this. std::sort(redInterior.begin(), redInterior.end());
+	// Can't sort this. std::sort(blackInterior.begin(), blackInterior.end());
 
 	// FAST SOLVE (this replaces Eigen)
 	SolvePoissonSOR_Compact(
@@ -3255,9 +3703,11 @@ void MeshTexture::LocalSeamLeveling()
 		const uint32_t totalPatches = (uint32_t)texturePatches.size();
 		for (SeamVertex& v : seamVertices) {
 			v.patchIndexLookup.clear();
-			v.patchIndexLookup.reserve(v.patches.size());
-			for (uint32_t j = 0; j < v.patches.size(); ++j)
-				v.patchIndexLookup[v.patches[j].idxPatch] = (uint16_t)j;
+			uint32_t cnt = v.patches.size();
+			v.patchIndexLookup.reserve(cnt);
+			for (uint32_t j = 0; j < cnt; ++j) {
+				v.patchIndexLookup.Insert(v.patches[j].idxPatch, (uint16_t)j); // JPB WIP BUG Is this always unique?
+			}
 		}
 	}
 
@@ -3268,8 +3718,6 @@ void MeshTexture::LocalSeamLeveling()
 		for (const auto& patch : vertex.patches)
 			patchToSeamVertices[patch.idxPatch].push_back(v);
 	}
-
-	_mm_mfence();
 
 #ifdef TEXOPT_USE_OPENMP
 #pragma omp parallel for schedule(static, 1)
@@ -3313,7 +3761,7 @@ void MeshTexture::LocalSeamLeveling()
 			const SeamVertex& seamVertex0 = seamVertices[vIdx];
 			if (seamVertex0.patches.size() < 2)
 				continue;
-			const uint32_t idxVertPatch0 = seamVertex0.patchIndexLookup.at(idxPatch);
+			const uint32_t idxVertPatch0 = seamVertex0.patchIndexLookup.At(idxPatch);
 
 			const SeamVertex::Patch& patch0 = seamVertex0.patches[idxVertPatch0];
 			const TexCoord p0(patch0.proj - offset);
@@ -3322,11 +3770,13 @@ void MeshTexture::LocalSeamLeveling()
 			for (const SeamVertex::Patch::Edge& edge0 : patch0.edges) {
 				const SeamVertex& seamVertex1 = seamVertices[edge0.idxSeamVertex];
 
-				// === INLINE FIND via hash lookup
-				auto itAdj = seamVertex1.patchIndexLookup.find(idxPatch);
-				if (itAdj == seamVertex1.patchIndexLookup.end())
+				const uint16_t* itAdj =
+					seamVertex1.patchIndexLookup.Find(idxPatch);
+
+				if (itAdj == nullptr)
 					continue;
-				const uint32_t idxVertPatch0Adj = itAdj->second;
+
+				const uint32_t idxVertPatch0Adj = *itAdj;
 
 				const SeamVertex::Patch& patch0Adj = seamVertex1.patches[idxVertPatch0Adj];
 				const TexCoord p0Adj(patch0Adj.proj - offset);
@@ -3353,10 +3803,13 @@ void MeshTexture::LocalSeamLeveling()
 					const TexCoord& p1(patch1.proj);
 
 					// === INLINE FIND: seamVertex1.patches.Find(patch1.idxPatch)
-					auto itAdj1 = seamVertex1.patchIndexLookup.find(patch1.idxPatch);
-					if (itAdj1 == seamVertex1.patchIndexLookup.end())
+					const uint16_t* itAdj1 =
+						seamVertex1.patchIndexLookup.Find(patch1.idxPatch);
+
+					if (itAdj1 == nullptr)
 						continue;
-					const uint32_t idxVertPatch1Adj = itAdj1->second;
+
+					const uint32_t idxVertPatch1Adj = *itAdj1;
 
 					const SeamVertex::Patch& patch1Adj = seamVertex1.patches[idxVertPatch1Adj];
 					const TexCoord& p1Adj(patch1Adj.proj);
@@ -3412,7 +3865,7 @@ void MeshTexture::LocalSeamLeveling()
 		}
 
 		ProcessMask(mask, 20);
-		PoissonBlending(imageOrg, image, mask);
+		PoissonBlending(imageOrg, image, mask); // , 0.8f /* JPB WIP BUG Experiment with bias */);
 
 		// apply color correction to patch image
 		cv::Mat imagePatch(image0(texturePatch.rect));
@@ -3423,9 +3876,34 @@ void MeshTexture::LocalSeamLeveling()
 					continue;
 				const Color& a = image(r, c);
 				Pixel8U& v = row[c];
+#if 1
+				// scale once
+				__m128 af = _mm_set_ps(0.0f, a[2] * 255.f, a[1] * 255.f, a[0] * 255.f);
+
+				// round all 3 channels at once
+				__m128i ai = _mm_cvtps_epi32(af);
+
+				// clamp to [0,255]
+				const __m128i zero = _mm_setzero_si128();
+				const __m128i max255 = _mm_set1_epi32(255);
+
+				ai = _mm_max_epi32(ai, zero);
+				ai = _mm_min_epi32(ai, max255);
+
+				// pack to bytes
+				__m128i pack16 = _mm_packus_epi32(ai, ai);
+				__m128i pack8 = _mm_packus_epi16(pack16, pack16);
+
+				// store RGB
+				uint32_t rgb8 = (uint32_t)_mm_cvtsi128_si32(pack8);
+				v[0] = (uint8_t)(rgb8 & 0xFF);
+				v[1] = (uint8_t)((rgb8 >> 8) & 0xFF);
+				v[2] = (uint8_t)((rgb8 >> 16) & 0xFF);
+#else
 				v[0] = (uint8_t)CLAMP(ROUND2INT(a[0] * 255.f), 0, 255);
 				v[1] = (uint8_t)CLAMP(ROUND2INT(a[1] * 255.f), 0, 255);
 				v[2] = (uint8_t)CLAMP(ROUND2INT(a[2] * 255.f), 0, 255);
+#endif
 			}
 		}
 	}
@@ -3968,12 +4446,45 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		}
 
 		// apply some sharpening
+#if 1
+		if (fSharpnessWeight > 0.0f) {
+			cv::Mat small;
+			cv::resize(
+				textureDiffuse,
+				small,
+				cv::Size(),
+				0.25, 0.25,
+				cv::INTER_AREA
+			);
+
+			cv::Mat blurredSmall;
+			cv::GaussianBlur(small, blurredSmall, cv::Size(), 1.5);
+
+			cv::addWeighted(
+				small,
+				1.0 + fSharpnessWeight,
+				blurredSmall,
+				-fSharpnessWeight,
+				0.0,
+				small
+			);
+
+			cv::resize(
+				small,
+				textureDiffuse,
+				textureDiffuse.size(),
+				0, 0,
+				cv::INTER_LINEAR
+			);
+		}
+#else
 		if (fSharpnessWeight > 0) {
 			constexpr double sigma = 1.5;
 			Image8U3 blurryTextureDiffuse;
 			cv::GaussianBlur(textureDiffuse, blurryTextureDiffuse, cv::Size(), sigma);
 			cv::addWeighted(textureDiffuse, 1 + fSharpnessWeight, blurryTextureDiffuse, -fSharpnessWeight, 0, textureDiffuse);
 		}
+#endif
 
 		const int nMaxTextureSize = 60000;
 		// only downscale if needed

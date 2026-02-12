@@ -393,36 +393,16 @@ bool CImage::FilterFormat(void* pDst, PIXELFORMAT formatDst, Size strideDst, con
 		case PF_B8G8R8A8:
 			// from PF_B8G8R8A8 to PF_R8G8B8 (flip)
 			ASSERT(pDst != pSrc);
-#if 0 // JPB WIP BUG
+#if 1 // JPB WIP BUG
 			{
-				const uint8_t* src = static_cast<const uint8_t*>(pSrc);
 				uint8_t* dst = static_cast<uint8_t*>(pDst);
+				const uint8_t* src = static_cast<const uint8_t*>(pSrc);
 
-				__m128i mask = _mm_set1_epi32(0x00FFFFFF);
-
-				Size i = 0;
-				for (; i + 4 <= nSzize; i += 4) {
-					// load 4 BGRA pixels (16 bytes)
-					__m128i bgra = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
-					__m128i bgrx = _mm_and_si128(bgra, mask); // clear alpha
-
-					// store 2 RGB pixels (8 bytes)
-					_mm_storel_epi64(reinterpret_cast<__m128i*>(dst), bgrx);
-
-					// store 1 more RGB pixel (4 bytes)
-					__m128i shifted = _mm_srli_si128(bgrx, 8); // shift pixel 2 into low dword
-					*reinterpret_cast<uint32_t*>(dst + 8) = _mm_cvtsi128_si32(shifted);
-
-					// advance
-					src += strideSrc * 4;  // 4 input pixels
-					dst += strideDst * 4 - strideDst; // 12 output bytes (4 pixels*3)
-				}
-
-				// tail pixels
-				for (; i < nSzize; ++i) {
+				for (Size i = 0; i < nSzize; ++i) {
 					dst[0] = src[2];
 					dst[1] = src[1];
 					dst[2] = src[0];
+
 					src += strideSrc;
 					dst += strideDst;
 				}

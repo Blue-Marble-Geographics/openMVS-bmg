@@ -46,7 +46,41 @@ ObjModel::MaterialLib::MaterialLib()
 {
 }
 
-bool ObjModel::MaterialLib::Save(const String& prefix, bool texLossless) const
+bool ObjModel::MaterialLib::SaveSingleMaterial(const String& prefix, bool texLossless) const
+{
+	const Material& mat = materials[0];
+
+	std::ofstream out(prefix + ".mtl");
+	if (!out.good())
+		return false;
+
+	const String pathName(Util::getFilePath(prefix));
+	const String name(Util::getFileNameExt(prefix));
+
+	String diffuseName = mat.diffuse_name;
+	if (diffuseName.IsEmpty())
+		diffuseName = name + "_" + mat.name + "_map_Kd." + (texLossless ? "png" : "jpg");
+
+	// Write MTL once
+	out
+		<< "newmtl " << mat.name << "\n"
+		<< "Ka 1.000000 1.000000 1.000000\n"
+		<< "Kd " << mat.Kd.r << " " << mat.Kd.g << " " << mat.Kd.b << "\n"
+		<< "Ks 0.000000 0.000000 0.000000\n"
+		<< "Tr 1.000000\n"
+		<< "illum 1\n"
+		<< "Ns 1.000000\n";
+
+	if (!mat.diffuse_map.empty()) {
+		out << "map_Kd " << diffuseName << "\n";
+		if (!mat.diffuse_map.Save(pathName + diffuseName))
+			return false;
+	}
+
+	return true;
+}
+
+bool ObjModel::MaterialLib::SaveMultipleMaterials(const String& prefix, bool texLossless) const
 {
 	std::ofstream out((prefix+".mtl").c_str());
 	if (!out.good())
@@ -99,6 +133,14 @@ bool ObjModel::MaterialLib::Save(const String& prefix, bool texLossless) const
 	#else
 	return true;
 	#endif
+}
+
+bool ObjModel::MaterialLib::Save(const String& prefix, bool texLossless) const
+{
+	if (materials.size() == 1) {
+		return SaveSingleMaterial(prefix, texLossless);
+	}
+	return SaveMultipleMaterials(prefix, texLossless);
 }
 
 bool ObjModel::MaterialLib::Load(const String& fileName)

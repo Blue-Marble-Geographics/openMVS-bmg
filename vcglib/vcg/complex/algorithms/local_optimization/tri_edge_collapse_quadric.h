@@ -482,9 +482,39 @@ public:
   */
   ScalarType ComputePriority()
   {
+#if 1
+
+    VertexType* __restrict v0 = this->pos.V(0);
+    VertexType* __restrict v1 = this->pos.V(1);
+
+    CoordType oldPos0 = v0->P();
+    CoordType oldPos1 = v1->P();
+
+    const double optimalError = ComputePosition();
+
+    QuadricType qq = QH::Qd(v0);
+    qq += QH::Qd(v1);
+
+    extern double g_ScaleFactor;
+    double quadErr = g_ScaleFactor *
+      qq.Apply(Point3d::Construct(this->optimalPos));
+
+    if (quadErr <= 1e-15) {
+      const float dx = oldPos0[0] - oldPos1[0];
+      const float dy = oldPos0[1] - oldPos1[1];
+      const float dz = oldPos0[2] - oldPos1[2];
+      quadErr = 1e-15 * FastSqrtS(dx * dx + dy * dy + dz * dz);
+    }
+
+    return (ScalarType)quadErr;
+#else
+    // In P2P, the geometry has been run through both DPC and the first part of ReconstructMesh,
+    // so we can expect the points of the mesh to be relatively uniform.  Therefore, checking for
+    // long edges or other similar metrics to cull on isn't effective.
     VertexType* __restrict v[2];
     v[0] = this->pos.V(0);
     v[1] = this->pos.V(1);
+
 #if 0 //original work
 
 
@@ -655,6 +685,7 @@ return ScalarType(QuadErr * (1.0f - newQual));
     
     // Square again since this expression squared is monotonic and preserves ordering: return (ScalarType)(QuadErr / FastSqrtS(newQual));
     return (ScalarType)(QuadErr * QuadErr / newQual);
+#endif
 #endif
 #endif
   }
@@ -858,7 +889,12 @@ inline  void UpdateHeap(HeapType& h_ret)
 
 #else
 
-  __forceinline void UpdateHeap(void*h, void* hBuffer, std::vector<void*>& pairsScratch, std::vector<void*>& toAddScratch)
+  __forceinline void UpdateHeap(
+    void* __restrict h,
+    void* __restrict hBuffer,
+    std::vector<void*>& __restrict pairsScratch,
+    std::vector<void*>& __restrict toAddScratch
+  )
   {
     const int mark = ++this->GlobalMark();
 
@@ -891,20 +927,21 @@ inline  void UpdateHeap(HeapType& h_ret)
     
     toAddScratch.clear();
 
-    int toAddCnt = 0;
-
     for (VFIterator vfi(v1); !vfi.End(); ++vfi) {
       VertexType* __restrict a = (VertexType*) *itPairs++;
       VertexType* __restrict b = (VertexType*)*itPairs++;
       VertexType* __restrict c = vfi.V0(); // anchor vertex
 
-      if (!a->IsV()) { // Always rw && a->IsRW()) {
+      bool aVisited = a->IsV();
+      bool bVisited = b->IsV();
+
+      if (!aVisited) { // Always rw && a->IsRW()) {
         a->SetV();
         toAddScratch.push_back(c);
         toAddScratch.push_back(a);
       }
 
-      if (!b->IsV()) { // Always rw && b->IsRW()) {
+      if (!bVisited) { // Always rw && b->IsRW()) {
         b->SetV();
         toAddScratch.push_back(b);
         toAddScratch.push_back(c);
@@ -915,24 +952,25 @@ inline  void UpdateHeap(HeapType& h_ret)
       toAddScratch.push_back(b);
     }
 
-    VertexType* cache[4] = {}; // track last 4 seen vertices
-    auto notInCache = [&](VertexType* v) {
-      return v != cache[0] && v != cache[1] && v != cache[2] && v != cache[3];
-      };
+    int toAddCnt = (int) toAddScratch.size();
+    VertexType* c0 = nullptr;
+    VertexType* c1 = nullptr;
+    VertexType* c2 = nullptr;
+    VertexType* c3 = nullptr;
 
     auto pvToAdd = toAddScratch.begin();
-    for (int i = 0, cnt = (int) toAddScratch.size(); i < cnt; i += 2) {
+    for (int i = 0; i < toAddCnt; i += 2) {
 #if 1 // Provably better 33.630
-      if (i + 2 < toAddCnt) {
+      if (i + 3 < toAddCnt) {
         auto* nextV0 = (VertexType*) pvToAdd[i + 2];
         auto* nextV1 = (VertexType*) pvToAdd[i + 3];
 
-        if (notInCache(nextV0)) {
+        if (nextV0 != c0 && nextV0 != c1 && nextV0 != c2 && nextV0 != c3) {
           const QuadricType& q0 = QH::Qd(nextV0);
           _mm_prefetch((char*)q0.array, _MM_HINT_T1);
           _mm_prefetch(((char*)q0.array) + 64, _MM_HINT_T1);
         }
-        if (notInCache(nextV1)) {
+        if (nextV1 != c0 && nextV1 != c1 && nextV1 != c2 && nextV1 != c3) {
           const QuadricType& q1 = QH::Qd(nextV1);
           _mm_prefetch((char*)q1.array, _MM_HINT_T1);
           _mm_prefetch(((char*)q1.array) + 64, _MM_HINT_T1);
@@ -947,10 +985,10 @@ inline  void UpdateHeap(HeapType& h_ret)
       // Notice, currV0 and currV1 on the first iteration
       // are not prefetched, but they are cached because
       // we have incurred the penalty of accessing them.
-      cache[3] = cache[1];
-      cache[2] = cache[0];
-      cache[1] = currV0;
-      cache[0] = currV1;
+      c3 = c1;
+      c2 = c0;
+      c1 = currV0;
+      c0 = currV1;
     }
   }
 #endif
@@ -1003,7 +1041,15 @@ inline  void UpdateHeap(HeapType& h_ret)
     {
       vcg::tri::UpdateBounding<TriMeshType>::Box(m);
       //Make all quadric independent from mesh size
-      g_ScaleFactor = 1e8*pow(1.0/m.bbox.Diag(),6); // scaling factor
+
+      const double diag = m.bbox.Diag();
+      if (diag <= 0.0) {
+        // pathological mesh, disable early reject safely
+        g_ScaleFactor = 1.0;
+      }
+      else {
+        g_ScaleFactor = 1e8 * std::pow(1.0 / diag, 6);
+      }
     }
     if(pp->QualityWeight) // we map quality range into a squared 01 and than this into the 1..QualityWeightFactor range
     {

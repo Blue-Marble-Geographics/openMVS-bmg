@@ -333,6 +333,12 @@ void Mesh::ListIncidenteFaces()
 
 		++i;
 	}
+
+	// JPB WIP BUG Too slow?
+	for (size_t v = 0; v < vertexFaces.size(); ++v)
+	{
+		std::sort(vertexFaces[v].begin(), vertexFaces[v].end());
+	}
 }
 
 // extract array face adjacencies for each face in the mesh (3 * number of faces);
@@ -346,41 +352,50 @@ void Mesh::ListIncidenteFaceFaces()
 
 	faceFaces.resize(faces.size());
 
-	FOREACH(f, faces) {
+	FOREACH(f, faces)
+	{
 		const Face& face = faces[f];
+		FaceFaces& out = faceFaces[f];
 
-		for (int e = 0; e < 3; ++e) {
+		for (int e = 0; e < 3; ++e)
+		{
 			const FaceIdxArr& A = vertexFaces[face[e]];
 			const FaceIdxArr& B = vertexFaces[face[(e + 1) % 3]];
 
 			FIndex adj = NO_ID;
 
-			// two-pointer scan (lists are sorted)
-			size_t i = 0, j = 0;
+			size_t i = 0;
+			size_t j = 0;
 			const size_t na = A.size();
 			const size_t nb = B.size();
 
-			while (i < na && j < nb) {
+			// Full two-pointer intersection scan (like std::set_intersection)
+			while (i < na && j < nb)
+			{
 				const FIndex fa = A[i];
 				const FIndex fb = B[j];
 
-				if (fa == fb) {
-					if (fa != f) {
+				if (fa == fb)
+				{
+					if (fa != f)
+					{
 						adj = fa;
-						break;
+						break;          // manifold case: first valid match
 					}
 					++i;
 					++j;
 				}
-				else if (fa < fb) {
+				else if (fa < fb)
+				{
 					++i;
 				}
-				else {
+				else
+				{
 					++j;
 				}
 			}
 
-			faceFaces[f][e] = adj;
+			out[e] = adj;
 		}
 	}
 }
@@ -1007,6 +1022,22 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices,
 	return numIssues;
 }
 #else
+
+#if defined(_MSC_VER)
+#define DEBUG_BREAK() __debugbreak()
+#else
+#define DEBUG_BREAK() __builtin_trap()
+#endif
+
+#define HARD_ASSERT(cond) \
+  do { \
+    if (!(cond)) { \
+      (void)__FILE__; \
+      (void)__LINE__; \
+      DEBUG_BREAK(); \
+    } \
+  } while (0)
+
 unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxArr* duplicatedVertices)
 {
 	vertices.reserve(vertices.size() * 2); // JPB WIP OPT
@@ -1014,6 +1045,7 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 	ASSERT(!vertices.empty() && !faces.empty());
 	if (vertexFaces.size() != vertices.size())
 		ListIncidenteFaces();
+
 	// iterate over all vertices and separates the components
 	// incident to the same vertex by duplicating the vertex
 	unsigned numNonManifoldIssues(0);
@@ -1122,10 +1154,32 @@ unsigned Mesh::FixNonManifold(float magDisplacementDuplicateVertices, VertexIdxA
 		}
 	}
 
+#if 0 // Validate non-manifold
+	for (FIndex f = 0; f < faces.size(); ++f)
+	{
+		const Face& face = faces[f];
+
+		for (int i = 0; i < 3; ++i)
+		{
+			HARD_ASSERT(face[i] < vertices.size());
+		}
+
+		// detect degenerate triangle
+		HARD_ASSERT(face[0] != face[1]);
+		HARD_ASSERT(face[1] != face[2]);
+		HARD_ASSERT(face[2] != face[0]);
+	}
+
+	ListIncidenteFaceFaces(); // JPB WIP BUG
+	ValidateVertexFacesSorted();
+	ValidateFaceFaces();
+#endif
+
 	if (numNonManifoldIssues > 0) {
 		vertexFaces.Release();
 		DEBUG_ULTIMATE("Removed %u non-manifold issues", numNonManifoldIssues);
 	}
+
 	return numNonManifoldIssues;
 }
 #endif
@@ -2050,6 +2104,56 @@ void Mesh::Clean(
 
 	DEBUG("Cleaned mesh: %u vertices, %u faces (%s)",
 		vertices.GetSize(), faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+
+	// -------------------------------------------------------------
+	// Remove degenerate + duplicate faces
+	// -------------------------------------------------------------
+
+	std::unordered_set<uint64_t> faceSet;
+	FaceArr cleanedFaces;
+	cleanedFaces.Reserve(faces.GetSize());
+
+	for (FIndex f = 0; f < faces.GetSize(); ++f)
+	{
+		const Face& face = faces[f];
+
+		// Skip degenerate
+		if (face[0] == face[1] ||
+			face[1] == face[2] ||
+			face[2] == face[0])
+			continue;
+
+		uint32_t a = face[0];
+		uint32_t b = face[1];
+		uint32_t c = face[2];
+
+		// Canonical sort
+		if (b < a) std::swap(a, b);
+		if (c < a) std::swap(a, c);
+		if (c < b) std::swap(b, c);
+
+		uint64_t key =
+			((uint64_t)a << 42) |
+			((uint64_t)b << 21) |
+			(uint64_t)c;
+
+		if (faceSet.insert(key).second)
+		{
+			cleanedFaces.Insert(face);
+		}
+	}
+
+	faces = std::move(cleanedFaces);
+
+	// Mesh is reimported, must rebuild adjacency for future passes and for saving.
+	ListIncidenteFaces();
+	ListIncidenteFaceFaces();
+
+	if (bLastClean) {
+		ValidateVertexFacesSorted();
+		ValidateFaceFaces();
+		ValidateEdgeConsistency();
+	}
 }
 
 
@@ -2833,9 +2937,104 @@ bool Mesh::LoadGLTF(const String& fileName, bool bBinary)
 } // Load
 /*----------------------------------------------------------------*/
 
+
+void Mesh::ValidateFaceFaces() const
+{
+	HARD_ASSERT(!faceFaces.empty());
+	const size_t n = faces.size();
+
+	for (FIndex f = 0; f < n; ++f)
+	{
+		for (int e = 0; e < 3; ++e)
+		{
+			const FIndex g = faceFaces[f][e];
+			if (g == NO_ID)
+				continue;
+
+			HARD_ASSERT(g < n);
+
+			bool foundBack = false;
+			for (int k = 0; k < 3; ++k)
+			{
+				if (faceFaces[g][k] == f)
+				{
+					foundBack = true;
+					break;
+				}
+			}
+
+			if (!foundBack)
+			{
+				std::cout << "Asymmetry: face " << f
+					<< " thinks neighbor is " << g
+					<< " but reverse not found\n";
+				DEBUG_BREAK();
+			}
+		}
+	}
+}
+
+void Mesh::ValidateEdgeConsistency() const
+{
+	HARD_ASSERT(!faces.empty());
+	HARD_ASSERT(!faceFaces.empty());
+	const size_t n = faces.size();
+
+	for (FIndex f = 0; f < n; ++f)
+	{
+		const Face& F = faces[f];
+
+		for (int e = 0; e < 3; ++e)
+		{
+			const FIndex g = faceFaces[f][e];
+			if (g == NO_ID)
+				continue;
+
+			const Face& G = faces[g];
+
+			int shared = 0;
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					if (F[i] == G[j])
+						++shared;
+
+			if (shared != 2)
+			{
+				std::cout << "Invalid adjacency:\n";
+				std::cout << "Face " << f << " : "
+					<< F[0] << "," << F[1] << "," << F[2] << "\n";
+				std::cout << "Face " << g << " : "
+					<< G[0] << "," << G[1] << "," << G[2] << "\n";
+				std::cout << "Shared = " << shared << "\n";
+				DEBUG_BREAK();
+			}
+		}
+	}
+}
+
+void Mesh::ValidateVertexFacesSorted() const
+{
+	HARD_ASSERT(!vertexFaces.empty());
+	for (size_t v = 0; v < vertexFaces.size(); ++v)
+	{
+		const auto& vf = vertexFaces[v];
+		for (size_t i = 1; i < vf.size(); ++i)
+		{
+			if (vf[i - 1] > vf[i])
+			{
+				std::cout << "vertexFaces not sorted at vertex " << v << "\n";
+				DEBUG_BREAK();
+			}
+		}
+	}
+}
+
 // export the mesh to the given file
 bool Mesh::Save(const String& fileName, const cList<String>& comments, bool bBinary) const
 {
+	// Meshes are not guaranteed to be in a consistent state.  This is the responsibility
+	// of the caller.
+
 	TD_TIMER_STARTD();
 	const String ext(Util::getFileExt(fileName).ToLower());
 	bool ret;

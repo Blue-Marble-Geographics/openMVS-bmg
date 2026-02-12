@@ -645,8 +645,8 @@ private:
         actualV = int(incident.size());//tp.NumberOfIncidentVertices();
         oldDist += abs(idealV - actualV); newDist += abs(idealV - (actualV + 1));
 
-        const ScalarType qOld = std::min(Quality(v0->P(),v2->P(),v3->P()),Quality(v0->P(),v1->P(),v2->P()));
-        const ScalarType qNew = std::min(Quality(v0->P(),v1->P(),v3->P()),Quality(v2->P(),v3->P(),v1->P()));
+        const ScalarType qOld = std::min(Quality((float*) &v0->P(), (float*)&v2->P(), (float*)&v3->P()), Quality((float*)&v0->P(), (float*)&v1->P(), (float*)&v2->P()));
+        const ScalarType qNew = std::min(Quality((float*)&v0->P(), (float*)&v1->P(), (float*)&v3->P()),Quality((float*)&v2->P(), (float*)&v3->P(), (float*)&v1->P()));
 
         return (newDist < oldDist && qNew >= qOld * 0.50f) ||
                 (newDist == oldDist && qNew > qOld * 1.f) || qNew > 1.5f * qOld;
@@ -849,8 +849,8 @@ private:
 
                 //check on new face quality
                 {
-                    const auto newQ = Quality(mp,      v1->P(), v2->P());
-                    const auto oldQ = Quality(v0->P(), v1->P(), v2->P());
+                    const auto newQ = Quality((float*)&mp, (float*)&v1->P(), (float*)&v2->P());
+                    const auto oldQ = Quality((float*)&v0->P(), (float*)&v1->P(), (float*)&v2->P());
 
                     if(newQ <= 0.5*oldQ)
                         return false;

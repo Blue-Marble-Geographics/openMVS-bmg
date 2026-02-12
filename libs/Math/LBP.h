@@ -45,22 +45,23 @@ public:
 	typedef EnergyType (STCALL *FncSmoothCost)(NodeID, NodeID, LabelID, LabelID);
 
 	enum { MaxEnergy = 1000 };
+  enum { kApproxMaxNumSharedViews = 8 }; // Too low and we reallocate; too high and we waste memory and slow down too.
 
 public:
 	struct DirectedEdge {
 		NodeID nodeID1;
 		NodeID nodeID2;
-		std::vector<EnergyType> newMsgs;
-		std::vector<EnergyType> oldMsgs;
+		boost::container::small_vector<EnergyType, kApproxMaxNumSharedViews> newMsgs;
+		boost::container::small_vector<EnergyType, kApproxMaxNumSharedViews> oldMsgs;
 		inline DirectedEdge(NodeID _nodeID1, NodeID _nodeID2) : nodeID1(_nodeID1), nodeID2(_nodeID2) {}
 	};
 
 	struct Node {
 		LabelID label;
 		EnergyType dataCost;
-		std::vector<LabelID> labels;
-		std::vector<EnergyType> dataCosts;
-		std::vector<EdgeID> incomingEdges;
+		boost::container::small_vector<LabelID, kApproxMaxNumSharedViews> labels;
+		boost::container::small_vector<EnergyType, kApproxMaxNumSharedViews> dataCosts;
+		boost::container::small_vector<EdgeID, 3> incomingEdges; // Frequently 3 in length.
 		inline Node() : label(0), dataCost(MaxEnergy) {}
 	};
 
@@ -68,9 +69,38 @@ public:
 	std::vector<Node> nodes;
 	FncSmoothCost fncSmoothCost;
 
+	// Cached topology
+	std::vector<boost::container::small_vector<EdgeID, 3>> outEdges;
+	LabelID globalMaxLabel = 0;
+	size_t maxLabelsPerNode = 0;
+	bool topologyPrepared = false;
+
 public:
 	LBPInference() {}
 	LBPInference(NodeID nNodes) : nodes(nNodes) {}
+
+	void PrepareTopology()
+	{
+		if (topologyPrepared)
+			return;
+
+		// Build outEdges ONCE
+		outEdges.assign(nodes.size(), {});
+		for (EdgeID e = 0; e < edges.size(); ++e)
+			outEdges[edges[e].nodeID1].push_back(e);
+
+		// Compute label bounds ONCE
+		globalMaxLabel = 0;
+		maxLabelsPerNode = 0;
+
+		for (const Node& n : nodes) {
+			maxLabelsPerNode = std::max(maxLabelsPerNode, n.labels.size());
+			for (LabelID l : n.labels)
+				globalMaxLabel = std::max(globalMaxLabel, l);
+		}
+
+		topologyPrepared = true;
+	}
 
 	inline void SetNumNodes(NodeID nNodes) {
 		nodes.resize(nNodes);
@@ -362,162 +392,206 @@ void PrepareMessageBuffers()
 }
 
 // -----------------------------------------------------------------
-int Optimize(unsigned numIterations) {
-	if (!buffersInitialized)
-		PrepareMessageBuffers();
-
+int Optimize(unsigned numIterations /* always 1 */)
+{
 	const size_t* __restrict offs = msgOffset.data();
 	const EnergyType maxE = (EnergyType)LBPInference::MaxEnergy;
 
 	// ------------------------------------------------------------
-	// Build outgoing edge lists ONCE
+	// Thread-local scratch (persistent across calls)
 	// ------------------------------------------------------------
-	static std::vector<std::vector<EdgeID>> outEdges;
-	if (outEdges.size() != nodes.size()) {
-		outEdges.assign(nodes.size(), {});
-		for (EdgeID e = 0; e < edges.size(); ++e)
-			outEdges[edges[e].nodeID1].push_back(e);
-	}
-
-	LabelID globalMaxLabel = 0;
-	for (const Node& n : nodes) {
-		for (LabelID l : n.labels)
-			if (l > globalMaxLabel)
-				globalMaxLabel = l;
-	}
-
+	static thread_local std::vector<EnergyType> sumAll;
+	static thread_local std::vector<EnergyType> energyBuf;
 	static thread_local std::vector<EnergyType> perLabelMin;
 	static thread_local std::vector<uint32_t> perLabelGen;
 	static thread_local uint32_t curGen = 1;
 
-	for (unsigned iter = 0; iter < numIterations; ++iter) {
-		EnergyType* __restrict readMsgs = msgBuf[msgParity].data();
-		EnergyType* __restrict writeMsgs = msgBuf[msgParity ^ 1].data();
+	int changed = 0;
+
+	// ------------------------------------------------------------
+	// Message passing iterations
+	// ------------------------------------------------------------
+	EnergyType* __restrict readMsgs = msgBuf[msgParity].data();
+	EnergyType* __restrict writeMsgs = msgBuf[msgParity ^ 1].data();
 
 #ifdef LBP_USE_OPENMP
 #pragma omp parallel
 #endif
-		{
-			perLabelMin.resize(globalMaxLabel + 1);
-			perLabelGen.resize(globalMaxLabel + 1, 0);
+	{
+		const size_t need = (size_t)globalMaxLabel + 1;
 
-			/* thread-local scratch */
-			std::vector<EnergyType> sumAll;
-			std::vector<EnergyType> energyBuf;
+		// Step 1: ensure capacity (no reallocation later)
+		if (perLabelMin.capacity() < need) {
+			perLabelMin.reserve(need);
+			perLabelGen.reserve(need);
+		}
+
+		// Step 2: ensure size (no reallocation now)
+		if (perLabelMin.size() < need) {
+			const size_t oldSize = perLabelMin.size();
+			perLabelMin.resize(need);
+			perLabelGen.resize(need);
+
+			// Zero only the newly-added range
+			memset(perLabelGen.data() + oldSize, 0,
+				(need - oldSize) * sizeof(uint32_t));
+		}
+
+		// per-node scratch
+		if (sumAll.size() < maxLabelsPerNode)
+			sumAll.resize(maxLabelsPerNode);
+
+		if (energyBuf.size() < maxLabelsPerNode)
+			energyBuf.resize(maxLabelsPerNode);
 
 #ifdef LBP_USE_OPENMP
-#pragma omp for schedule(static, 32)
+#pragma omp for schedule(static, 1024) nowait
 #endif
-			for (int_t u = 0; u < (int_t)nodes.size(); ++u) {
-				const Node& n1 = nodes[u];
-				const auto& labels1 = n1.labels;
-				const auto& inEdges1 = n1.incomingEdges;
-				const auto& outE = outEdges[u];
+		for (int_t u = 0; u < (int_t)nodes.size(); ++u) {
+			const Node& n1 = nodes[u];
+			const auto& labels1 = n1.labels;
+			const auto& inEdges1 = n1.incomingEdges;
+			const auto& outE = outEdges[u];
 
-				const size_t L1 = labels1.size();
-				if (L1 == 0 || outE.empty())
-					continue;
+			const size_t L1 = labels1.size();
+			if (L1 == 0 || outE.empty())
+				continue;
 
-				/* resize scratch */
-				if (sumAll.size() < L1) {
-					sumAll.resize(L1);
-					energyBuf.resize(L1);
+			// add all incoming ONCE
+			// We fuse as we can.
+			EnergyType* __restrict sum = sumAll.data();
+			const size_t deg = inEdges1.size();
+
+			// Fast path: deg == 3 (almost always)
+			if (deg == 3) {
+				const EnergyType* __restrict u = n1.dataCosts.data();
+
+				const EnergyType* __restrict p0 = readMsgs + offs[inEdges1[0]];
+				const EnergyType* __restrict p1 = readMsgs + offs[inEdges1[1]];
+				const EnergyType* __restrict p2 = readMsgs + offs[inEdges1[2]];
+				EnergyType* __restrict out = sum;
+
+				size_t k = 0;
+				for (; k + 3 < L1; k += 4) {
+					out[0] = u[0] + p0[0] + p1[0] + p2[0];
+					out[1] = u[1] + p0[1] + p1[1] + p2[1];
+					out[2] = u[2] + p0[2] + p1[2] + p2[2];
+					out[3] = u[3] + p0[3] + p1[3] + p2[3];
+
+					u += 4;
+					p0 += 4;
+					p1 += 4;
+					p2 += 4;
+					out += 4;
 				}
 
-				/* sumAll = unary */
-				memcpy(sumAll.data(), n1.dataCosts.data(), L1 * sizeof(EnergyType));
+				for (; k < L1; ++k) {
+					*out++ = *u++ + *p0++ + *p1++ + *p2++;
+				}
+			}
+			else {
+				// Generic fallback: start from unary
+				memcpy(sum, n1.dataCosts.data(), L1 * sizeof(EnergyType));
 
-				/* add all incoming ONCE */
+				// Accumulate all incoming messages
 				for (EdgeID eid : inEdges1) {
 					const EnergyType* __restrict msg = readMsgs + offs[eid];
 					for (size_t k = 0; k < L1; ++k)
-						sumAll[k] += msg[k];
+						sum[k] += msg[k];
+				}
+			}
+
+			// --------------------------------------------------------
+			// Emit message for each outgoing edge
+			// --------------------------------------------------------
+			for (EdgeID eid : outE) {
+				const DirectedEdge& edge = edges[eid];
+				const Node& n2 = nodes[edge.nodeID2];
+				const auto& labels2 = n2.labels;
+				const size_t L2 = edgeMsgLen[eid];
+
+				// find message from v -> u (subtraction term)
+				const EnergyType* __restrict sub = nullptr;
+				for (EdgeID pe : inEdges1) {
+					if (edges[pe].nodeID1 == edge.nodeID2) {
+						sub = readMsgs + offs[pe];
+						break;
+					}
 				}
 
-				/* --------------------------------------------------------
-					 Emit message for each outgoing edge
-					 -------------------------------------------------------- */
-				for (EdgeID eid : outE) {
-					const DirectedEdge& edge = edges[eid];
-					const Node& n2 = nodes[edge.nodeID2];
-					const auto& labels2 = n2.labels;
-					const size_t L2 = edgeMsgLen[eid];
+				// energyBuf = sumAll - sub
+				if (sub) {
+					for (size_t k = 0; k < L1; ++k)
+						energyBuf[k] = sumAll[k] - sub[k];
+				}
+				else {
+					memcpy(energyBuf.data(), sumAll.data(), L1 * sizeof(EnergyType));
+				}
 
-					/* find message from v -> u */
-					const EnergyType* __restrict sub = nullptr;
-					for (EdgeID pe : inEdges1) {
-						if (edges[pe].nodeID1 == edge.nodeID2) {
-							sub = readMsgs + offs[pe];
-							break;
+				// generation bump
+				if (++curGen == 0) {
+					memset(perLabelGen.data(), 0, perLabelGen.size() * sizeof(uint32_t));
+					curGen = 1;
+				}
+
+				EnergyType globalMin = std::numeric_limits<EnergyType>::max();
+
+				// compute minima
+				for (size_t k = 0; k < L1; ++k) {
+					EnergyType e = energyBuf[k];
+					if (e < globalMin)
+						globalMin = e;
+
+					LabelID l = labels1[k];
+					if (l != 0) {
+						if (perLabelGen[l] != curGen) {
+							perLabelGen[l] = curGen;
+							perLabelMin[l] = e;
+						}
+						else if (e < perLabelMin[l]) {
+							perLabelMin[l] = e;
 						}
 					}
+				}
 
-					/* build energyBuf = sumAll - sub */
-					if (sub) {
-						for (size_t k = 0; k < L1; ++k)
-							energyBuf[k] = sumAll[k] - sub[k];
-					}
-					else {
-						for (size_t k = 0; k < L1; ++k)
-							energyBuf[k] = sumAll[k];
-					}
+				const EnergyType base = globalMin + maxE;
+				EnergyType* __restrict msgOut = writeMsgs + offs[eid];
+				const uint32_t* __restrict gen = perLabelGen.data();
+				const EnergyType* __restrict minv = perLabelMin.data();
+				for (size_t j = 0; j < L2; ++j) {
+					LabelID l2 = labels2[j];
+					EnergyType best = base;
 
-					/* compute minima AFTER subtraction (CRITICAL) */
-					if (++curGen == 0) {
-						std::fill(perLabelGen.begin(), perLabelGen.end(), 0);
-						curGen = 1;
+					if (l2 != 0 && gen[l2] == curGen) {
+						best = std::min(best, minv[l2]);
 					}
 
-					EnergyType globalMin = std::numeric_limits<EnergyType>::max();
-
-					for (size_t k = 0; k < L1; ++k) {
-						EnergyType e = energyBuf[k];
-						if (e < globalMin)
-							globalMin = e;
-
-						LabelID l = labels1[k];
-						if (l != 0) {
-							if (perLabelGen[l] != curGen) {
-								perLabelGen[l] = curGen;
-								perLabelMin[l] = e;
-							}
-							else if (e < perLabelMin[l]) {
-								perLabelMin[l] = e;
-							}
-						}
-					}
-
-					const EnergyType base = globalMin + maxE;
-
-					EnergyType* __restrict msgOut = writeMsgs + offs[eid];
-					for (size_t j = 0; j < L2; ++j) {
-						LabelID l2 = labels2[j];
-						EnergyType best = base;
-
-						if (l2 != 0 && perLabelGen[l2] == curGen) {
-							EnergyType m = perLabelMin[l2];
-							if (m < best)
-								best = m;
-						}
-
-						msgOut[j] = best;
-					}
+					msgOut[j] = best;
 				}
 			}
 		}
 
-		/* ------------------------------------------------------------
-			 flip buffers
-			 ------------------------------------------------------------ */
-		msgParity ^= 1;
+		// ------------------------------------------------------------
+		// Flip buffers
+		// ------------------------------------------------------------
+#ifdef LBP_USE_OPENMP
+#pragma omp single
+#endif
+		{
+			msgParity ^= 1;
+		}
 
-		/* ------------------------------------------------------------
-			 normalize new read buffer
-			 ------------------------------------------------------------ */
+#ifdef LBP_USE_OPENMP
+#pragma omp barrier   // REQUIRED
+#endif
+
+		// ------------------------------------------------------------
+		// Normalize messages
+		// ------------------------------------------------------------
 		EnergyType* __restrict normMsgs = msgBuf[msgParity].data();
 
 #ifdef LBP_USE_OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp for schedule(static) nowait
 #endif
 		for (int_t edgeID = 0; edgeID < (int_t)edges.size(); ++edgeID) {
 			EnergyType* __restrict m = normMsgs + offs[edgeID];
@@ -546,51 +620,77 @@ int Optimize(unsigned numIterations) {
 				m[k] = v;
 			}
 		}
-	}
 
-	/* ------------------------------------------------------------
-		 Final labeling
-		 ------------------------------------------------------------ */
-	EnergyType* __restrict msgs = msgBuf[msgParity].data();
-	int changed = 0;
+		// ------------------------------------------------------------
+		// Final labeling
+		// ------------------------------------------------------------
+		EnergyType* __restrict msgs = msgBuf[msgParity].data();
 
 #ifdef LBP_USE_OPENMP
-#pragma omp parallel for schedule(static) reduction(+:changed)
+#pragma omp for schedule(static) reduction(+:changed)
 #endif
-	for (int_t nodeID = 0; nodeID < (int_t)nodes.size(); ++nodeID) {
-		Node& node = nodes[nodeID];
-		const LabelID oldLabel = node.label;
-		const auto& inEdges = node.incomingEdges;
-		const size_t L = node.labels.size();
+		for (int_t nodeID = 0; nodeID < (int_t)nodes.size(); ++nodeID) {
+			Node& node = nodes[nodeID];
+			const LabelID oldLabel = node.label;
+			const auto& inEdges = node.incomingEdges;
+			const EnergyType* __restrict data = node.dataCosts.data();
+			const LabelID* __restrict labels = node.labels.data();
+			const size_t L = node.labels.size();
+			if (L == 0)
+				continue; // inactive
+			const size_t deg = inEdges.size();
 
-		EnergyType bestE = std::numeric_limits<EnergyType>::max();
-		LabelID bestL = node.labels.front();
-		size_t bestIdx = 0;
+			// Unrolling this like the one above is not currently effective.
+			EnergyType bestE = std::numeric_limits<EnergyType>::max();
+			size_t bestIdx = 0;
+			LabelID bestL = labels[0];
+			const EnergyType invQ = (EnergyType)(1.0f / 1024.0f);
 
-		for (size_t j = 0; j < L; ++j) {
-			EnergyType e = node.dataCosts[j];
-			for (EdgeID eid : inEdges)
-				e += msgs[offs[eid] + j];
+			if (deg == 3) {
+				const EnergyType* __restrict m0 = msgs + offs[inEdges[0]];
+				const EnergyType* __restrict m1 = msgs + offs[inEdges[1]];
+				const EnergyType* __restrict m2 = msgs + offs[inEdges[2]];
 
-			e = floor(e * (EnergyType)1024) * (EnergyType)(1.0f / 1024.0f);
+				for (size_t j = 0; j < L; ++j) {
+					EnergyType e = data[j] + m0[j] + m1[j] + m2[j];
 
-			if (e < bestE || (e == bestE && j < bestIdx)) {
-				bestE = e;
-				bestIdx = j;
-				bestL = node.labels[j];
+					// quantize (safe because e >= 0)
+					int q = (int)(e * 1024.0f);
+					e = (EnergyType)q * invQ;
+
+					if (e < bestE) {
+						bestE = e;
+						bestIdx = j;
+						bestL = labels[j];
+					}
+				}
 			}
+			else {
+				for (size_t j = 0; j < L; ++j) {
+					EnergyType e = data[j];
+					for (EdgeID eid : inEdges)
+						e += msgs[offs[eid] + j];
+
+					int q = (int)(e * 1024.0f);
+					e = (EnergyType)q * invQ;
+
+					if (e < bestE) {
+						bestE = e;
+						bestIdx = j;
+						bestL = labels[j];
+					}
+				}
+			}
+
+			node.label = bestL;
+			node.dataCost = data[bestIdx];
+			if (bestL != oldLabel)
+				++changed;
 		}
-
-		node.label = bestL;
-		if (bestL != oldLabel)
-			++changed;
-
-		node.dataCost = node.dataCosts[bestIdx];
-	}
+	} // omp parallel
 
 	return changed;
 }
-
 #endif
 
 
@@ -659,6 +759,11 @@ int Optimize(unsigned numIterations) {
 #endif
 	EnergyType Optimize() 
 	{
+		if (!buffersInitialized)
+			PrepareMessageBuffers();
+
+		PrepareTopology();
+
 		unsigned maxIters = 50;
 		int lastChanged = INT_MAX;
 		unsigned stall = 0;

@@ -58,6 +58,10 @@ public:
 		bool Save(const String& prefix, bool texLossless=false) const;
 		// Loads the material lib from a .mtl file and all textures of its materials with the given file name
 		bool Load(const String& fileName);
+
+	private:
+		bool SaveSingleMaterial(const String& prefix, bool texLossless) const;
+    bool SaveMultipleMaterials(const String& prefix, bool texLossless) const;
 	};
 
 	typedef Point3f Vertex;

@@ -72,6 +72,15 @@ IMAGEPTR Image::ReadImage(const String& fileName, Image8U3& image)
 } // ReadImage
 /*----------------------------------------------------------------*/
 
+IMAGEPTR Image::ReadImageRaw(const String& fileName, Image8U3& image)
+{
+	IMAGEPTR pImage(OpenImage(fileName));
+	if (pImage != NULL && !ReadImageRaw(pImage, image))
+		pImage.Release();
+	return pImage;
+} // ReadImageRaw
+/*----------------------------------------------------------------*/
+
 bool Image::ReadImage(IMAGEPTR pImage, Image8U3& image)
 {
 	if (FAILED(pImage->ReadHeader())) {
@@ -87,6 +96,20 @@ bool Image::ReadImage(IMAGEPTR pImage, Image8U3& image)
 } // ReadImage
 /*----------------------------------------------------------------*/
 
+bool Image::ReadImageRaw(IMAGEPTR pImage, Image8U3& image)
+{
+	if (FAILED(pImage->ReadHeader())) {
+		LOG("error: failed loading image header");
+		return false;
+	}
+	image.create(pImage->GetHeight(), pImage->GetWidth());
+	if (FAILED(pImage->ReadData(image.data, PF_B8G8R8, 3, (CImage::Size)image.step))) {
+		LOG("error: failed loading image data");
+		return false;
+	}
+	return true;
+} // ReadImage
+/*----------------------------------------------------------------*/
 
 bool Image::LoadImage(const String& fileName, unsigned nMaxResolution)
 {
@@ -126,6 +149,19 @@ bool Image::ReloadImage(unsigned nMaxResolution, bool bLoadPixels)
 	return true;
 } // ReloadImage
 /*----------------------------------------------------------------*/
+
+// open the stored image file name and read again the image data
+bool Image::ReloadImageRaw(unsigned nMaxResolution)
+{
+	IMAGEPTR pImage(ReadImageRaw(name, image));
+	if (pImage == NULL) {
+		LOG("error: failed reloading image '%s'", name.c_str());
+		return false;
+	}
+	// resize image if needed
+	scale = ResizeImage(nMaxResolution);
+	return true;
+} // ReloadImage
 
 // free the image data
 void Image::ReleaseImage()

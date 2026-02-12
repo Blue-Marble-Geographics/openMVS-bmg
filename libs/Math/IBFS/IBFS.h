@@ -206,32 +206,35 @@ public:
 #if 1
 	int CollapseDegree1Nodes()
 	{
-		const float maxCap = 1e8f;
-
 		std::vector<uint8_t> removed(numNodes, 0);
 		std::vector<int> q;
 		q.reserve(numNodes);
 
-		// 1) Seed queue with all removable degree-1 nodes
+		// ------------------------------------------------------------------
+		// 1) Seed queue with structurally removable degree-1 nodes
+		//    Only nodes with ZERO terminal capacity are safe.
+		// ------------------------------------------------------------------
 		for (int u = 0; u < numNodes; ++u) {
 			Node& nu = nodes[u];
-			if (nu.arcCount == 1 && nu.excess < maxCap) {
+			if (nu.arcCount == 1 && nu.excess == 0) {
 				q.push_back(u);
 			}
 		}
 
 		int numRemoved = 0;
 
+		// ------------------------------------------------------------------
 		// 2) Process queue
+		// ------------------------------------------------------------------
 		for (size_t qi = 0; qi < q.size(); ++qi) {
 			const int u = q[qi];
 			if (removed[u]) continue;
 
 			Node& nu = nodes[u];
 
-			// Conditions may have changed since enqueue
+			// Conditions may have changed
 			if (nu.arcCount != 1) continue;
-			if (nu.excess >= maxCap) continue;
+			if (nu.excess != 0) continue;   // must still be structurally neutral
 
 			Arc& a = nu.arcs[0];
 			const int v = int(a.head - nodes);
@@ -239,40 +242,42 @@ public:
 
 			Node& nv = nodes[v];
 
-			// ---- Flow-safe contraction ----
+			// --------------------------------------------------------------
+			// Safe contraction (pre-maxflow):
+			// Since nu.excess == 0 and no flow exists yet,
+			// removing u does NOT change cut energy.
+			// --------------------------------------------------------------
 
-			// Absorb excess
-			nv.excess += nu.excess;
-
-			// Remove reverse arc v -> u by saturating and compacting
 			const int ridx = a.revIdx;
-			Arc& rv = nv.arcs[ridx];
-			rv.rCap += a.rCap;
 
-			// Compact v's arcs
+			// Remove reverse arc v -> u by compacting
 			nv.arcCount--;
 			if (ridx != nv.arcCount) {
 				nv.arcs[ridx] = nv.arcs[nv.arcCount];
 
-				// Fix reverse index of the moved arc
+				// Fix reverse index of moved arc
 				Arc& moved = nv.arcs[ridx];
 				Node* other = moved.head;
 				other->arcs[moved.revIdx].revIdx = ridx;
 			}
 
-			// Remove u
+			// Remove u completely
 			nu.arcCount = 0;
 			removed[u] = 1;
 			++numRemoved;
 
-			// 3) If v becomes degree-1 and is removable, enqueue it
-			if (nv.arcCount == 1 && nv.excess < maxCap && !removed[v]) {
+			// --------------------------------------------------------------
+			// 3) If v becomes degree-1 and remains structurally neutral,
+			//    enqueue it
+			// --------------------------------------------------------------
+			if (!removed[v] && nv.arcCount == 1 && nv.excess == 0) {
 				q.push_back(v);
 			}
 		}
 
 		return numRemoved;
 	}
+
 #else
 	int CollapseDegree1Nodes()
 	{
