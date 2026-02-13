@@ -7,6 +7,7 @@
     "boost-iostreams",
     "boost-program-options",
     "boost-serialization",
+    "boost-sort",
     "boost-system",
     "boost-throw-exception",
     {
@@ -16,6 +17,7 @@
     "eigen3",
     "glew",
     "glfw3",
+    "libjpeg-turbo",
     "libpng",
     "opencv",
 	"opengl",
