@@ -2653,6 +2653,56 @@ void TImage<TYPE>::RasterizeTriangleBary(const TPoint2<T>& v1, const TPoint2<T>&
 	}
 }
 
+template <typename TYPE>
+template <typename T, typename PARSER, bool CULL>
+void TImage<TYPE>::RasterizeTriangleBaryMasked(const TPoint2<T>& v1, const TPoint2<T>& v2, const TPoint2<T>& v3, PARSER& parser, uint8_t* __restrict mask)
+{
+	// compute bounding-box fully containing the triangle
+	const TPoint2<T> boxMin(MINF3(v1.x, v2.x, v3.x), MINF3(v1.y, v2.y, v3.y));
+	const TPoint2<T> boxMax(MAXF3(v1.x, v2.x, v3.x), MAXF3(v1.y, v2.y, v3.y));
+	// check the bounding-box intersects the image
+	const cv::Size size(parser.Size());
+	if (boxMax.x < T(0) || boxMin.x > T(size.width - 1) ||
+		boxMax.y < T(0) || boxMin.y > T(size.height - 1))
+		return;
+	// clip bounding-box to be fully contained by the image
+	ImageRef boxMinI(FLOOR2INT(boxMin));
+	ImageRef boxMaxI(CEIL2INT(boxMax));
+	Base::clip(boxMinI, boxMaxI, size);
+	// ignore back oriented triangles (negative area)
+	const T area(EdgeFunction(v1, v2, v3));
+	if (CULL && area <= 0)
+		return;
+	// parse all pixels inside the bounding-box
+	const T invArea(T(1) / area);
+	for (int y = boxMinI.y; y <= boxMaxI.y; ++y) {
+		const int rowOffset = y * size.width;
+		uint8_t* __restrict maskRow = mask + rowOffset;
+
+		for (int x = boxMinI.x; x <= boxMaxI.x; ++x) {
+			const ImageRef pt(x, y);
+			const TPoint2<T> p(Cast<T>(pt));
+			// discard point if not in triangle;
+			// testing only for negative barycentric coordinates
+			// guarantees all will be in [0,1] at the end of all checks
+			const T b1(EdgeFunction(v2, v3, p) * invArea);
+			if (b1 < 0)
+				continue;
+			const T b2(EdgeFunction(v3, v1, p) * invArea);
+			if (b2 < 0)
+				continue;
+			const T b3(EdgeFunction(v1, v2, p) * invArea);
+			if (b3 < 0)
+				continue;
+
+			maskRow[x] = 1;
+
+			// output pixel
+			parser(pt, TPoint3<T>(b1, b2, b3));
+		}
+	}
+}
+
 // drawing line between 2 points from left to right
 // papb -> pcpd
 // pa, pb, pc, pd must then be sorted before
@@ -3085,6 +3135,7 @@ static bool SaveJpegTurbo(
 		return false;
 	}
 
+	setvbuf(f, nullptr, _IOFBF, 1 << 20);  // 1MB buffer
 	fwrite(jpegBuf, 1, jpegSize, f);
 	fclose(f);
 

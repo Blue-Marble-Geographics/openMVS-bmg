@@ -82,6 +82,10 @@ String strConfigFileName;
 boost::program_options::variables_map vm;
 } // namespace OPT
 
+#ifndef _USE_CUDA
+int unused;
+#endif
+
 // initialize and parse the command line parameters
 bool Initialize(size_t argc, LPCTSTR* argv)
 {
@@ -110,6 +114,8 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		#endif
 		#ifdef _USE_CUDA
 		("cuda-device", boost::program_options::value(&SEACAVE::CUDA::desiredDeviceID)->default_value(-1), "CUDA device number to be used to reconstruct the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
+		#else
+		("cuda-device", boost::program_options::value(&unused)->default_value(-1), "CUDA device number to be used to reconstruct the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
 		#endif
 		;
 

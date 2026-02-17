@@ -77,6 +77,10 @@ String strConfigFileName;
 boost::program_options::variables_map vm;
 } // namespace OPT
 
+#ifndef _USE_CUDA
+int unused;
+#endif
+
 // JPB WIP BUG -patch-packing-heuristic 150 --export-type obj --empty-color 0 --archive-type 1
 // This forces "Skyline with waste map" and outputs the result to uncompressed binary.  This is much faster than the alternatives for big data.
 
@@ -108,6 +112,8 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		#endif
 		#ifdef _USE_CUDA
 		("cuda-device", boost::program_options::value(&SEACAVE::CUDA::desiredDeviceID)->default_value(-1), "CUDA device number to be used to texture the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
+		#else
+		("cuda-device", boost::program_options::value(&unused)->default_value(-1), "CUDA device number to be used to texture the mesh (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
 		#endif
 		;
 
