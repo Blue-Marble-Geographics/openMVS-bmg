@@ -12,7 +12,7 @@ IF(CMAKE_VERSION VERSION_GREATER_EQUAL 3.16.0)
 endif()
 
 # Link its dependencies
-TARGET_LINK_LIBRARIES(Common ${Boost_LIBRARIES} ${OpenCV_LIBS} turbojpeg)
+TARGET_LINK_LIBRARIES(Common ${Boost_LIBRARIES} ${OpenCV_LIBS} libjpeg-turbo::turbojpeg)
 
 # Install
 SET_TARGET_PROPERTIES(Common PROPERTIES
