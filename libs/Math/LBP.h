@@ -43,7 +43,7 @@ public:
 	typedef EnergyType (STCALL *FncSmoothCost)(NodeID, NodeID, LabelID, LabelID);
 
 	enum { MaxEnergy = 1000 };
-  enum { kApproxMaxNumSharedViews = 8 }; // Too low and we reallocate; too high and we waste memory and slow down too.
+  enum { kApproxMaxNumSharedViews = 32 }; // Too low and we reallocate; too high and we waste memory and slow down too.
 
 public:
 	struct DirectedEdge {
@@ -109,10 +109,13 @@ public:
 	}
 
 	inline void SetNeighbors(NodeID nodeID1, NodeID nodeID2) {
-		nodes[nodeID2].incomingEdges.push_back((EdgeID)edges.size());
-		edges.push_back(DirectedEdge(nodeID1, nodeID2));
-		nodes[nodeID1].incomingEdges.push_back((EdgeID)edges.size());
-		edges.push_back(DirectedEdge(nodeID2, nodeID1));
+		EdgeID e0 = (EdgeID)edges.size();
+
+		edges.emplace_back(nodeID1, nodeID2);
+		edges.emplace_back(nodeID2, nodeID1);
+
+		nodes[nodeID2].incomingEdges.push_back(e0);
+		nodes[nodeID1].incomingEdges.push_back(e0 + 1);
 	}
 
 	inline void SetDataCost(LabelID label, NodeID nodeID, EnergyType cost) {
@@ -247,7 +250,7 @@ public:
 				energyBuf.resize(maxLabelsPerNode);
 
 	#ifdef LBP_USE_OPENMP
-	#pragma omp for schedule(static, 1024) nowait
+	#pragma omp for schedule(dynamic, 256) nowait // Better than static
 	#endif
 			for (int_t u = 0; u < (int_t)nodes.size(); ++u) {
 				const Node& n1 = nodes[u];

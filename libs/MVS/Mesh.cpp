@@ -1923,12 +1923,14 @@ void Mesh::Clean(
 
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 
-		if (!decimationRan) {
+		// This needs to run even if we don't decimate.  Redy, in particular, will
+		// have many small holes otherwise.  These are actually micro-islands.
+		//if (!decimationRan) {
 			const int fnBefore = mesh.fn;
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(
 				mesh, longSize);
 			stats.removedComponents += (fnBefore - mesh.fn);
-		}
+		//}
 
 		CompactAndRefresh();
 
@@ -1946,6 +1948,10 @@ void Mesh::Clean(
 
 		ValidateMesh(mesh, "after spike removal", true); // JPB WIP BUG
 	}
+
+	// JPB WIP BUG
+	//int cc = vcg::tri::Clean<CLEAN::Mesh>::CountConnectedComponents(mesh);
+	//DEBUG("Connected components: %d", cc);
 
 	// -------------------------------------------------------------
 	// Phase 4: Hole closing
