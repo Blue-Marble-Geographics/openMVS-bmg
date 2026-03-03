@@ -35,6 +35,8 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/filtered_graph.hpp>
 #include <boost/graph/connected_components.hpp>
+#include "robin_set.h"
+
 #ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable: 4244 4267 4305)
@@ -2115,7 +2117,33 @@ void Mesh::Clean(
 	// Remove degenerate + duplicate faces
 	// -------------------------------------------------------------
 
-	std::unordered_set<uint64_t> faceSet;
+	struct FaceKey
+	{
+		uint32_t a;
+		uint32_t b;
+		uint32_t c;
+
+		bool operator==(const FaceKey& o) const noexcept
+		{
+			return a == o.a && b == o.b && c == o.c;
+		}
+	};
+
+	struct FaceKeyHash
+	{
+		size_t operator()(const FaceKey& k) const noexcept
+		{
+			uint64_t h = 1469598103934665603ull;
+			h ^= k.a; h *= 1099511628211ull;
+			h ^= k.b; h *= 1099511628211ull;
+			h ^= k.c; h *= 1099511628211ull;
+			return (size_t)h;
+		}
+	};
+
+	tsl::robin_set<FaceKey, FaceKeyHash> faceSet;
+	faceSet.reserve(faces.GetSize());
+
 	FaceArr cleanedFaces;
 	cleanedFaces.Reserve(faces.GetSize());
 
@@ -2123,30 +2151,27 @@ void Mesh::Clean(
 	{
 		const Face& face = faces[f];
 
-		// Skip degenerate
-		if (face[0] == face[1] ||
-			face[1] == face[2] ||
-			face[2] == face[0])
-			continue;
-
 		uint32_t a = face[0];
 		uint32_t b = face[1];
 		uint32_t c = face[2];
+
+		// Skip degenerate
+		if (a == b || b == c || c == a)
+			continue;
 
 		// Canonical sort
 		if (b < a) std::swap(a, b);
 		if (c < a) std::swap(a, c);
 		if (c < b) std::swap(b, c);
 
-		uint64_t key =
-			((uint64_t)a << 42) |
-			((uint64_t)b << 21) |
-			(uint64_t)c;
+		FaceKey key;
+		key.a = a;
+		key.b = b;
+		key.c = c;
 
+		// robin_set insert returns pair<iterator,bool>
 		if (faceSet.insert(key).second)
-		{
 			cleanedFaces.Insert(face);
-		}
 	}
 
 	faces = std::move(cleanedFaces);
@@ -2161,7 +2186,6 @@ void Mesh::Clean(
 		ValidateEdgeConsistency();
 	}
 }
-
 
 #else
 

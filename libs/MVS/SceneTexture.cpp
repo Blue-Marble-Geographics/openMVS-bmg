@@ -32,6 +32,7 @@
 #include "Common.h"
 #include "Scene.h"
 #include "RectsBinPack.h"
+#include "robin_map.h" // assumes robin_map.h is in include path
 
 #include <boost/graph/filtered_graph.hpp>
 // connected components
@@ -69,6 +70,7 @@ using namespace MVS;
 #define TEXOPT_INFERENCE_LBP 1
 #define TEXOPT_INFERENCE_TRWS 2
 #define TEXOPT_INFERENCE TEXOPT_INFERENCE_LBP
+#define INCREASE_PATCHES
 
 static const Scene* gSceneForSmoothness = nullptr;
 
@@ -84,6 +86,47 @@ LBPInference::EnergyType STCALL SmoothnessPotts(LBPInference::NodeID, LBPInferen
 
 static LBPInference::EnergyType gSmoothnessWeight = 1000;
 
+#ifdef INCREASE_PATCHES
+static LBPInference::EnergyType SmoothnessPottsStrong(
+	LBPInference::NodeID n1,
+	LBPInference::NodeID n2,
+	LBPInference::LabelID l1,
+	LBPInference::LabelID l2)
+{
+	if (l1 == l2) {
+		return 0;
+	}
+
+	const Normal& N1 = gSceneForSmoothness->mesh.faceNormals[n1];
+	const Normal& N2 = gSceneForSmoothness->mesh.faceNormals[n2];
+
+	float cosAngle = N1.dot(N2);
+	if (cosAngle < 0.0f) {
+		cosAngle = 0.0f;
+	}
+
+	// Gate: below this, do not encourage sameness at all
+	// Raising this reduces merging (more patches); lowering increases merging (fewer patches).
+	const float cosGate = 0.8f;
+
+	if (cosAngle < cosGate) {
+		cosAngle = 0.0f;
+	}
+	else {
+		cosAngle = (cosAngle - cosGate) / (1.0f - cosGate);
+	}
+
+	// Baseline penalty for switching labels (prevents checkerboard fragmentation)
+	// Increase -> fewer patches; decrease -> more patches.
+	const float switchPenalty = 2.0f;
+
+	// Angle-weighted additional penalty
+	const float w = switchPenalty + (float)gSmoothnessWeight * cosAngle;
+
+	// If EnergyType is integer, rounding is better than truncation
+	return (LBPInference::EnergyType)(w + 0.5f);
+}
+#else
 static LBPInference::EnergyType SmoothnessPottsStrong(
 	LBPInference::NodeID n1,
 	LBPInference::NodeID n2,
@@ -103,6 +146,7 @@ static LBPInference::EnergyType SmoothnessPottsStrong(
 
 	return (LBPInference::EnergyType)w;
 }
+#endif
 
 }
 #endif
@@ -768,97 +812,59 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		std::iota(views.begin(), views.end(), IIndex(0));
 	}
 	facesDatas.Resize(faces.size());
-	const size_t cap = std::min<size_t>(views.size(), 8);
-#pragma omp for schedule(static)
-	for (int_t idx = 0; idx < (int_t)facesDatas.size(); ++idx) {
-		facesDatas[idx].Reserve((uint32_t)cap);
-	}
-
 	Util::Progress progress(_T("Initialized views"), views.size());
 	typedef float real;
 	TImage<real> imageGradMag;
 	TImage<real>::EMat mGrad[2];
+	FaceMap faceMap;
+	DepthMap depthMap;
+
+	struct FaceAccum {
+		float quality;
+		uint32_t area;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+		Color color;
+#endif
+	};
+
+	struct FaceOut {
+		FIndex idxFace;
+		FaceData data; // includes idxView, quality, and optional color
+	};
+	std::vector<std::vector<FaceOut>> perViewOut;
+	perViewOut.resize(views.size());
+
+	// Since we are controlling the threading per-view, don't let cv thread
+// when performing its work.
+	const int prevCvThreads = cv::getNumThreads();
+	cv::setNumThreads(1);
+
+	static std::vector<Point3f> gFaceCenter;
+	gFaceCenter.resize(faces.size());
+
+#pragma omp parallel for schedule(static)
+	for (int64_t f = 0; f < (int64_t)faces.size(); ++f) {
+		const Face& fc = faces[(size_t)f];
+		const Vertex& a = vertices[fc[0]];
+		const Vertex& b = vertices[fc[1]];
+		const Vertex& c = vertices[fc[2]];
+		gFaceCenter[(size_t)f] = Point3f(
+			(a.x + b.x + c.x) * (1.0f / 3.0f),
+			(a.y + b.y + c.y) * (1.0f / 3.0f),
+			(a.z + b.z + c.z) * (1.0f / 3.0f)
+		);
+	}
 
 #ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
-	const int numThreads = omp_get_max_threads();
-
-	struct FaceAccum {
-		real quality;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		uint32_t c[3];
-		uint32_t cnt;
-#endif
-	};
-
-	struct PixelXY {
-		uint16_t x;
-		uint16_t y;
-	};
-
-	static thread_local std::vector<FaceAccum> gLocalAccum;
-	static thread_local std::vector<uint16_t> gLocalGen;
-	static thread_local uint16_t gLocalCurGen = 1;
-	static thread_local std::vector<FIndex> gLocalTouched;
-	static thread_local std::vector<uint16_t> gPixelGen;
-	static thread_local uint16_t gPixelCurGen = 1;
-	static thread_local std::vector<PixelXY> gTouchedPixels;
-	static thread_local FaceMap faceMap;
-	static thread_local DepthMap depthMap;
-
-	struct FaceDataAndView {
-		FIndex idxFace;   // which face this belongs to
-		IIndex idxView;   // which camera/view
-		float quality;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		float color[3];
-#endif
-	};
-	static thread_local std::vector<FaceDataAndView> publish;
-
-	// Since we are controlling the threading per-view, don't let cv thread
-	// when performing its work.
-	cv::setNumThreads(1); // No threading.  0 is not "no threading".
-
-	// It is not faster to restrict the threading here.
-#pragma omp parallel private(imageGradMag, mGrad)
-	{
-#pragma omp for schedule(dynamic, 1) // Modest increase over static.
-		for (int_t idx = 0; idx < (int_t)views.size(); ++idx) {
+#pragma omp parallel for private(imageGradMag, mGrad, faceMap, depthMap)
+	for (int_t idx = 0; idx < (int_t)views.size(); ++idx) {
 #pragma omp flush (bAbort)
-			if (bAbort) {
-				++progress;
-				continue;
-			}
-
-			const size_t numFaces = faces.GetSize();
-			const size_t expectedVerts = numFaces * 2;
-
-			static thread_local	CameraRenderData crd;
-
-			crd.globalVert.clear();
-			crd.faces.clear();
-			crd.globalFace.clear();
-			crd.verts.clear();
-
-			crd.globalVert.reserve(expectedVerts);
-			crd.verts.reserve(expectedVerts);
-			crd.faces.reserve(numFaces);
-			crd.globalFace.reserve(numFaces);
-
-			if (gLocalAccum.size() != numFaces) {
-				gLocalAccum.resize(numFaces);
-				gLocalGen.assign(numFaces, 0);
-				gLocalCurGen = 1;
-			}
-			++gLocalCurGen;
-			if (gLocalCurGen == 0) {
-				std::fill(gLocalGen.begin(), gLocalGen.end(), 0);
-				gLocalCurGen = 1;
-			}
-			gLocalTouched.clear();
-
-			const IIndex idxView(views[(IIndex)idx]);
+		if (bAbort) {
+			++progress;
+			continue;
+		}
+		const IIndex idxView(views[(IIndex)idx]);
 #else
 	for (IIndex idxView : views) {
 #endif
@@ -879,21 +885,9 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			return false;
 #endif
 		}
-
 		imageData.UpdateCamera(scene.platforms);
 		// compute gradient magnitude
-
-		// Libjpg is taking the image, decompressing it, and storing in R[0], G[1], B[2] order.
-		// This is expensive.
-		// The rest of the pipeline is expecting this and changing it isn't trivial.
-
-		// 1) RGB -> gray (8-bit)
-		cv::Mat gray8;
-		cv::cvtColor(imageData.image, gray8, cv::COLOR_RGB2GRAY); // This is wrong in the original source.
-
-		// 2) Downsample in 8-bit (fast + correct)
-		gray8.convertTo(imageGradMag, CV_32F, 1.0f / 255.0f);
-
+		imageData.image.toGray(imageGradMag, cv::COLOR_BGR2GRAY, true);
 		cv::Mat grad[2];
 		mGrad[0].resize(imageGradMag.rows, imageGradMag.cols);
 		grad[0] = cv::Mat(imageGradMag.rows, imageGradMag.cols, cv::DataType<real>::type, (void*)mGrad[0].data());
@@ -911,13 +905,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		cv::filter2D(imageGradMag, grad[0], cv::DataType<real>::type, kernel);
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
 #endif
-
-#if 1 // JPB WIP BUG
-		(TImage<real>::EMatMap)imageGradMag =
-			(mGrad[0].cwiseAbs2() + mGrad[1].cwiseAbs2()).cwiseSqrt();
-#else
-		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2() + mGrad[1].cwiseAbs2()); // Drop the sqrt (won't affect results) .cwiseSqrt();
-#endif
+		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2() + mGrad[1].cwiseAbs2()).cwiseSqrt();
 		// apply some blur on the gradient to lower noise/glossiness effects onto face-quality score
 		cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(15, 15), 0, 0, cv::BORDER_DEFAULT);
 		// select faces inside view frustum
@@ -926,509 +914,140 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		typedef TFrustum<float, 5> Frustum;
 		const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
 		octree.Traverse(frustum, inserter);
-
-		PreprocessCameraFaces(
-			cameraFaces,
-			faces,
-			scene.mesh.vertices,
-			crd
-		);
-
-		UpdateCameraVertsAndNormals(
-			scene.mesh.vertices,
-			imageData.camera,
-			crd
-		);
-
 		// project all triangles in this view and keep the closest ones
-		const int width = imageData.width;
-		const int height = imageData.height;
-		const size_t numPixels = size_t(width) * size_t(height);
-
-		// ensure pixel-gen buffer exists
-		if (gPixelGen.size() != numPixels) {
-			gPixelGen.assign(numPixels, 0);
-			gPixelCurGen = 1;
+		faceMap.create(imageData.height, imageData.width);
+		depthMap.create(imageData.height, imageData.width);
+		RasterMesh rasterer(vertices, imageData.camera, depthMap, faceMap);
+		rasterer.Clear();
+		for (auto idxFace : cameraFaces) {
+			const Face& facet = faces[idxFace];
+			rasterer.idxFace = idxFace;
+			rasterer.Project(facet);
 		}
+		// compute the projection area of visible faces
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+		CLISTDEF0IDX(uint32_t, FIndex) areas(faces.GetSize());
+		areas.Memset(0);
+#endif
 
-		// advance generation for THIS view
-		++gPixelCurGen;
-		if (gPixelCurGen == 0) {
-			std::fill(gPixelGen.begin(), gPixelGen.end(), 0);
-			gPixelCurGen = 1;
-		}
-		gTouchedPixels.clear();
+		tsl::robin_map<uint32_t, FaceAccum> acc;
+		acc.reserve(cameraFaces.size()); // decent heuristic
 
-		// init view data
-		// Both maps must be completely filled or have a generator.
+		for (int j = 0; j < faceMap.rows; ++j) {
+			const FIndex* __restrict fm = faceMap.ptr<FIndex>(j);
+			const real* __restrict gm = imageGradMag.ptr<real>(j);
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+			const auto* __restrict im = imageData.image.ptr<decltype(imageData.image)::value_type>(j);
+#endif
 
-		depthMap.create(height, width);
-		//std::fill(depthMap.begin(), depthMap.end(), -std::numeric_limits<float>::infinity());
-		__stosd((PDWORD) & *depthMap.begin(),
-			0xFF800000u,
-			numPixels);
-
-		faceMap.create(height, width);
-		faceMap.memset(0xFF); // Essentially NO_ID
-
-		struct Triangle {
-			Point2f pti[3];
-		} t;
-
-		const float minX = 3.f;
-		const float minY = 3.f;
-		const float maxX = (float)(width - 4);
-		const float maxY = (float)(height - 4);
-
-		const float widthMinus1 = (float)(width - 1);
-		const float heightMinus1 = (float)(height - 1);
-
-		for (size_t fi = 0, cnt = crd.faces.size(); fi < cnt; ++fi) {
-			const Face& face = crd.faces[fi];
-			// ==== Camera-space vertices (pre-transformed) ====
-			const CamVert& c0 = crd.verts[face[0]];
-			const CamVert& c1 = crd.verts[face[1]];
-			const CamVert& c2 = crd.verts[face[2]];
-
-			{
-				// ==== Perspective divide ====
-				float u0 = c0.x * c0.invZ;
-				float v0i = c0.y * c0.invZ;
-
-				float u1 = c1.x * c1.invZ;
-				float v1i = c1.y * c1.invZ;
-
-				float u2 = c2.x * c2.invZ;
-				float v2i = c2.y * c2.invZ;
-
-				// ==== Scalar bounds check (simd not needed anymore) ====
-				if (u0 < minX || u0 > maxX ||
-					u1 < minX || u1 > maxX ||
-					u2 < minX || u2 > maxX ||
-					v0i < minY || v0i > maxY ||
-					v1i < minY || v1i > maxY ||
-					v2i < minY || v2i > maxY)
+			for (int i = 0; i < faceMap.cols; ++i) {
+				const uint32_t f = (uint32_t)fm[i];
+				if (f == (uint32_t)NO_ID) {
 					continue;
-
-				// ==== Store results (same as your SSE path) ====
-				t.pti[0] = { u0, v0i };
-				t.pti[1] = { u1, v1i };
-				t.pti[2] = { u2, v2i };
-			}
-
-			// draw triangle
-			const auto& v1 = t.pti[0];
-			const auto& v2 = t.pti[1];
-			const auto& v3 = t.pti[2];
-
-			// ignore back oriented triangles (negative area)
-			// flip winding to match OpenMVS screen-space convention
-			const float area = EdgeFunction2(v1, v2, v3);
-			if (area >= 0.f) {
-				continue;
-			}
-
-			// compute bounding-box fully containing the triangle
-			float boxMinX = v1.x;
-			float boxMinY = v1.y;
-			float boxMaxX = v1.x;
-			float boxMaxY = v1.y;
-
-			if (v2.x < boxMinX) boxMinX = v2.x;
-			if (v3.x < boxMinX) boxMinX = v3.x;
-			if (v2.y < boxMinY) boxMinY = v2.y;
-			if (v3.y < boxMinY) boxMinY = v3.y;
-
-			if (v2.x > boxMaxX) boxMaxX = v2.x;
-			if (v3.x > boxMaxX) boxMaxX = v3.x;
-			if (v2.y > boxMaxY) boxMaxY = v2.y;
-			if (v3.y > boxMaxY) boxMaxY = v3.y;
-
-			// ---- Quick reject: fully outside screen ----
-			// This is the minimal correct check
-			if (boxMaxX < 0.0f || boxMinX > widthMinus1 ||
-				boxMaxY < 0.0f || boxMinY > heightMinus1)
-				continue;
-
-			// -----------------------------------------------
-			// Bounding box (float -> int, half-open)
-			// -----------------------------------------------
-			int minXi = (int)std::floor(boxMinX);
-			int minYi = (int)std::floor(boxMinY);
-			int maxXi = (int)std::ceil(boxMaxX);
-			int maxYi = (int)std::ceil(boxMaxY);
-
-			if (minXi < 0) minXi = 0;
-			if (minYi < 0) minYi = 0;
-			if (maxXi > width)  maxXi = width;
-			if (maxYi > height) maxYi = height;
-
-			const int x0 = minXi;
-			const int y0 = minYi;
-			const int x1 = maxXi - 1;
-			const int y1 = maxYi - 1;
-
-			if (x0 > x1 || y0 > y1)
-				continue;
-
-			// -----------------------------------------------
-			// Fixed-point setup
-			// -----------------------------------------------
-			constexpr int FP_BITS = 4;
-			constexpr int FP_SCALE = 1 << FP_BITS;
-
-			// vertices in fixed-point
-			const int x0i = int(v1.x * FP_SCALE);
-			const int y0i = int(v1.y * FP_SCALE);
-			const int x1i = int(v2.x * FP_SCALE);
-			const int y1i = int(v2.y * FP_SCALE);
-			const int x2i = int(v3.x * FP_SCALE);
-			const int y2i = int(v3.y * FP_SCALE);
-
-			// -----------------------------------------------
-			// Integer edge deltas
-			// -----------------------------------------------
-			const int e0_dx = y1i - y2i;
-			const int e0_dy = x2i - x1i;
-
-			const int e1_dx = y2i - y0i;
-			const int e1_dy = x0i - x2i;
-
-			const int e2_dx = y0i - y1i;
-			const int e2_dy = x1i - x0i;
-
-			// edge constants (64-bit!)
-			const int64_t e0_c = int64_t(x1i) * y2i - int64_t(x2i) * y1i;
-			const int64_t e1_c = int64_t(x2i) * y0i - int64_t(x0i) * y2i;
-			const int64_t e2_c = int64_t(x0i) * y1i - int64_t(x1i) * y0i;
-
-			// -----------------------------------------------
-			// Top-left rule bias (integer)
-			// -----------------------------------------------
-			auto TopLeftBias = [](int dx, int dy) -> int64_t {
-				return (dx > 0 || (dx == 0 && dy < 0)) ? 0 : -1;
-				};
-
-			const int64_t bias0 = TopLeftBias(e0_dx, e0_dy);
-			const int64_t bias1 = TopLeftBias(e1_dx, e1_dy);
-			const int64_t bias2 = TopLeftBias(e2_dx, e2_dy);
-
-			// -----------------------------------------------
-			// Pixel-center start (important)
-			// -----------------------------------------------
-			const int64_t x0p = (int64_t(x0) << FP_BITS) + (FP_SCALE >> 1);
-			const int64_t y0p = (int64_t(y0) << FP_BITS) + (FP_SCALE >> 1);
-
-			// row start edge values
-			int64_t e0_row = int64_t(e0_dx) * x0p + int64_t(e0_dy) * y0p + e0_c + bias0;
-			int64_t e1_row = int64_t(e1_dx) * x0p + int64_t(e1_dy) * y0p + e1_c + bias1;
-			int64_t e2_row = int64_t(e2_dx) * x0p + int64_t(e2_dy) * y0p + e2_c + bias2;
-
-			// -----------------------------------------------
-			// Fixed-point step amounts
-			// -----------------------------------------------
-			int64_t e0_stepX = int64_t(e0_dx) * FP_SCALE;
-			int64_t e1_stepX = int64_t(e1_dx) * FP_SCALE;
-			int64_t e2_stepX = int64_t(e2_dx) * FP_SCALE;
-
-			int64_t e0_stepY = int64_t(e0_dy) * FP_SCALE;
-			int64_t e1_stepY = int64_t(e1_dy) * FP_SCALE;
-			int64_t e2_stepY = int64_t(e2_dy) * FP_SCALE;
-
-			// -----------------------------------------------
-			// Area in same scale (FP_SCALE^2)
-			// -----------------------------------------------
-			const int64_t ax = int64_t(x1i) - int64_t(x0i);
-			const int64_t ay = int64_t(y1i) - int64_t(y0i);
-			const int64_t bx = int64_t(x2i) - int64_t(x0i);
-			const int64_t by = int64_t(y2i) - int64_t(y0i);
-
-			int64_t areaScaled = ax * by - ay * bx;
-			if (areaScaled == 0)
-				continue;
-
-			if (areaScaled < 0) {
-				areaScaled = -areaScaled;
-
-				e0_row = -e0_row;
-				e1_row = -e1_row;
-				e2_row = -e2_row;
-
-				e0_stepX = -e0_stepX;
-				e1_stepX = -e1_stepX;
-				e2_stepX = -e2_stepX;
-
-				e0_stepY = -e0_stepY;
-				e1_stepY = -e1_stepY;
-				e2_stepY = -e2_stepY;
-			}
-			const float invAreaScaled = 1.0f / float(areaScaled);
-
-			// -----------------------------------------------
-			// Depth plane (consistent with integer edges)
-			// -----------------------------------------------
-			const float iz0 = c0.invZ;
-			const float iz1 = c1.invZ;
-			const float iz2 = c2.invZ;
-
-			const float dz_dx =
-				(float(e0_stepX) * iz0 +
-					float(e1_stepX) * iz1 +
-					float(e2_stepX) * iz2) * invAreaScaled;
-
-			const float dz_dy =
-				(float(e0_stepY) * iz0 +
-					float(e1_stepY) * iz1 +
-					float(e2_stepY) * iz2) * invAreaScaled;
-
-			float invZ_row =
-				(float(e0_row) * iz0 +
-					float(e1_row) * iz1 +
-					float(e2_row) * iz2) * invAreaScaled;
-
-			// -----------------------------------------------
-			// Raster loop
-			// -----------------------------------------------
-			Depth* __restrict depthPtr = depthMap.ptr<float>(0);
-			cuint32_t* __restrict facePtr = faceMap.ptr<cuint32_t>(0);
-
-			constexpr int64_t EDGE_THRESH = 1 * FP_SCALE; // conservative
-
-			// Bias edges
-			e0_row -= EDGE_THRESH;
-			e1_row -= EDGE_THRESH;
-			e2_row -= EDGE_THRESH;
-
-			FaceAccum* __restrict accum = gLocalAccum.data();
-			uint16_t* __restrict faceGen = gLocalGen.data();
-
-			// Unrolled is not faster.
-			for (int y = y0; y <= y1; ++y) {
-				const size_t base = size_t(y) * width + x0;
-
-				Depth* __restrict depthRow = depthPtr + base;
-				cuint32_t* __restrict faceRow = facePtr + base;
-				uint16_t* __restrict genRow = gPixelGen.data() + base;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-				uint8_t* __restrict  pImageBase = imageData.image.ptr<uint8_t>(y);
-#endif
-
-				int64_t e0 = e0_row;
-				int64_t e1 = e1_row;
-				int64_t e2 = e2_row;
-				float   invZ = invZ_row;
-
-				uint32_t pix = (uint32_t)base;
-				for (int x = x0; x <= x1; ++x) {
-					if ((e0 | e1 | e2) < 0) {
-						if (invZ > *depthRow) {
-							*depthRow = invZ;
-							uint32_t faceId = (cuint32_t)crd.globalFace[fi];
-
-							// Determine which pixels correspond to which faces, and accumulate quality/color for each face.
-
-							FaceAccum& acc = accum[faceId];
-							uint16_t& gen = faceGen[faceId];
-
-							const real q = imageGradMag.ptr<real>(y)[x];
-
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-							const uint8_t* __restrict p = pImageBase + 3 * x;
-#endif
-
-							if (gen == gLocalCurGen) {
-								acc.quality += q;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-								acc.c[0] += p[0];
-								acc.c[1] += p[1];
-								acc.c[2] += p[2];
-								++acc.cnt;
-#endif
-							}
-							else {
-								gen = gLocalCurGen;
-								acc.quality = q;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-								acc.c[0] = p[0];
-								acc.c[1] = p[1];
-								acc.c[2] = p[2];
-								acc.cnt = 1;
-#endif
-								gLocalTouched.push_back(faceId);
-							}
-						}
-					}
-
-					++pix;
-
-					e0 += e0_stepX;
-					e1 += e1_stepX;
-					e2 += e2_stepX;
-					invZ += dz_dx;
-
-					++depthRow;
-					++faceRow;
-					++genRow;
 				}
 
-				e0_row += e0_stepY;
-				e1_row += e1_stepY;
-				e2_row += e2_stepY;
-				invZ_row += dz_dy;
-			}
-		}
+				auto ins = acc.emplace(f, FaceAccum{});
+				FaceAccum& a = ins.first.value();
 
-#ifdef STATS
-		double avgCnt = 0.0;
-		double minCnt = 1e9;
-		double maxCnt = 0.0;
-		int cntFaces = 0;
-
-		for (FIndex idxFace : gLocalTouched) {
-			const FaceAccum& src = gLocalAccum[idxFace];
-			avgCnt += src.cnt;
-			if (src.cnt < minCnt) minCnt = src.cnt;
-			if (src.cnt > maxCnt) maxCnt = src.cnt;
-			cntFaces++;
-		}
-
-		if (cntFaces > 0) {
-			double avg = avgCnt / cntFaces;
-
-#pragma omp critical
-			{
-				printf("View %u footprint: avg=%.2f  min=%.0f  max=%.0f\n",
-					idxView,
-					avg,
-					minCnt,
-					maxCnt);
-			}
-		}
-#endif
-
-		const int cols = faceMap.cols;
-		const int rows = faceMap.rows;
-
-		publish.clear();
-		publish.reserve(gLocalTouched.size());
-
-		const Point3f camPos = Cast<Mesh::Type>(imageData.camera.C);
-		const float inv3 = 1.0f / 3.0f;
-		const float k = 5e-4f;
-
-		for (FIndex idxFace : gLocalTouched) {
-
-			const FaceAccum& src = gLocalAccum[idxFace];
-			const Face& f = faces[idxFace];
-
-			// --- inline centroid (no temp objects) ---
-			const Vertex& v0 = vertices[f[0]];
-			const Vertex& v1 = vertices[f[1]];
-			const Vertex& v2 = vertices[f[2]];
-
-			const float cx = (v0.x + v1.x + v2.x) * inv3;
-			const float cy = (v0.y + v1.y + v2.y) * inv3;
-			const float cz = (v0.z + v1.z + v2.z) * inv3;
-
-			// camVec = camPos - center
-			const float dx = camPos.x - cx;
-			const float dy = camPos.y - cy;
-			const float dz = camPos.z - cz;
-
-			const float dist2 = dx * dx + dy * dy + dz * dz;
-			if (dist2 <= 1e-12f)
-				continue;
-
-			const Normal& n = scene.mesh.faceNormals[idxFace];
-
-			// normalize and dot in one step
-			const float invDist = 1.0f / FastSqrtS(dist2);
-
-			const float cosFaceCam =
-				(dx * n.x + dy * n.y + dz * n.z) * invDist;
-
-			if (cosFaceCam <= 0.0f)
-				continue;
-
-			const float angleWeight = (cosFaceCam < 0.2f) ? 0.2f : cosFaceCam;
-
-			const float distWeight = 1.0f / (1.0f + k * dist2);
-			const float finalWeight = angleWeight * distWeight;
-
-			FaceDataAndView& fd = publish.emplace_back();
-			fd.idxFace = idxFace;
-			fd.idxView = idxView;
-
-			const float footprintWeight = FastSqrtS((float)src.cnt);
-
-			float q = src.quality * finalWeight * footprintWeight;
-			fd.quality = FastLog1pAccurate(q);;
-
+				if (ins.second) {
+					a.quality = (float)gm[i];
+					a.area = 1;
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-			const float invArea = 1.0f / float(src.cnt);
-
-			const float r = src.c[0] * invArea;
-			const float g = src.c[1] * invArea;
-			const float b = src.c[2] * invArea;
-
-			fd.color[0] = 0.299f * r + 0.587f * g + 0.114f * b;
-			fd.color[1] = -0.168736f * r - 0.331264f * g + 0.5f * b + 128.0f;
-			fd.color[2] = 0.5f * r - 0.418688f * g - 0.081312f * b + 128.0f;
+					a.color = Color(im[i]);
 #endif
-		}
-
-		// Notice, we have minimized the work inside the critical.
-#ifdef TEXOPT_USE_OPENMP
-#pragma omp critical
+				}
+				else {
+					a.quality += (float)gm[i];
+					a.area++;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+					a.color += Color(im[i]);
 #endif
-		{
-			for (const FaceDataAndView& e : publish) {
-				FaceDataArr& fd = facesDatas[e.idxFace];
-				FaceData& dst = fd.AddEmpty();
-				dst.color[0] = e.color[0];
-				dst.color[1] = e.color[1];
-				dst.color[2] = e.color[2];
-				dst.idxView = e.idxView;
-				dst.quality = e.quality;
+				}
 			}
 		}
+
+		// ---- angle adjustment per face (same as your logic) ----
+		// Build output list for this view:
+		std::vector<FaceOut> out;
+		out.reserve(acc.size());
+		for (auto it = acc.begin(); it != acc.end(); ++it) {
+			const FIndex idxFace = it.key();
+			FaceAccum& a = it.value();
+
+			const Face& f = faces[idxFace];
+			const auto& faceCenter = gFaceCenter[idxFace];
+			const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
+			const Normal& faceNormal = scene.mesh.faceNormals[idxFace];
+			const float cosFaceCam(MAXF(0.001f, ComputeAngle(camDir.ptr(), faceNormal.ptr())));
+			a.quality *= SQUARE(cosFaceCam);
+
+			FaceOut fo;
+			fo.idxFace = idxFace;
+			fo.data.idxView = idxView;
+			fo.data.quality = a.quality;
+#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
+			Color c = a.color * (1.f / (float)a.area);
+			fo.data.color = RGB2YCBCR(Color(c));
+#endif
+			out.push_back(fo);
+		}
+
+		perViewOut[(size_t)idx].swap(out);
 
 		++progress;
-		} // per view
 	}
 
-	progress.process();
+#ifdef TEXOPT_USE_OPENMP
+	if (bAbort)
+		return false;
+#endif
+	// Pass 1: count how many FaceOut entries per face
+	std::vector<uint32_t> addCount(facesDatas.GetSize(), 0);
+
+	for (size_t idx = 0; idx < perViewOut.size(); ++idx) {
+		const auto& out = perViewOut[idx];
+		for (const FaceOut& fo : out) {
+			++addCount[(size_t)fo.idxFace];
+		}
+	}
+
+	// Pass 2: reserve capacity in each FaceDataArr once
+	for (size_t f = 0; f < (size_t)facesDatas.GetSize(); ++f) {
+		const uint32_t nAdd = addCount[f];
+		if (nAdd == 0) {
+			continue;
+		}
+		FaceDataArr& arr = facesDatas[(FIndex)f];
+		// Reserve exactly current size + new adds.
+		// Use whatever your container's reserve is called (Reserve / reserve / EnsureCapacity).
+		arr.Reserve(arr.GetSize() + nAdd);
+	}
+
+	// Pass 3: your original merge (unchanged)
+	for (size_t idx = 0; idx < perViewOut.size(); ++idx) {
+		const auto& out = perViewOut[idx];
+		for (const FaceOut& fo : out) {
+			FaceDataArr& arr = facesDatas[fo.idxFace];
+			FaceData& fd = arr.AddEmpty();
+			fd = fo.data;
+		}
+	}
+
 	progress.close();
 
 	// Restore cv's ability to thread.
-	cv::setNumThreads(-1);
-
-#ifdef STATS
-	float minQ = FLT_MAX;
-	float maxQ = -FLT_MAX;
-
-	for (const FaceDataArr& arr : facesDatas)
-		for (const FaceData& fd : arr) {
-			minQ = std::min(minQ, fd.quality);
-			maxQ = std::max(maxQ, fd.quality);
-		}
-
-	printf("Quality range: %f to %f\n", minQ, maxQ);
-#endif
+	cv::setNumThreads(prevCvThreads);
 
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	if (fOutlierThreshold > 0) {
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
-
-#pragma omp parallel for schedule(static)
-		for (int f = 0; f < (int)facesDatas.size(); ++f) {
-			FaceOutlierDetection(facesDatas[f], fOutlierThreshold);
-		}
+		for (FaceDataArr& faceDatas : facesDatas)
+			FaceOutlierDetection(faceDatas, fOutlierThreshold);
 	}
 #endif
 	return true;
-}
+	}
 
 // order the camera view scores with highest score first and return the list of first <minCommonCameras> cameras
 // ratioAngleToQuality represents the ratio in witch we combine normal angle to quality for a face to obtain the selection score
@@ -1649,213 +1268,414 @@ inline T MultiGaussUnnormalized(const Eigen::Matrix<T,N,1>& X, const Eigen::Matr
 // has a much different color than in the majority of views
 bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) const
 {
-	// reject all views whose gauss value is below this threshold
-	if (thOutlier <= 0)
+	if (thOutlier <= 0) {
 		thOutlier = 6e-2f;
-
-	const float minCovariance(1e-3f); // if all covariances drop below this the outlier detection aborted
-
-	const unsigned maxIterations(10);
-	const unsigned minInliers(4);
-
-	// init colors array
-	if (faceDatas.GetSize() <= minInliers)
-		return false;
-	Eigen::Matrix3Xd colorsAll(3, faceDatas.GetSize());
-	BoolArr inliers(faceDatas.GetSize());
-	FOREACH(i, faceDatas) {
-		colorsAll.col(i) = ((const Color::EVec)faceDatas[i].color).cast<double>();
-		inliers[i] = true;
 	}
 
-	// perform outlier removal; abort if something goes wrong
-	// (number of inliers below threshold or can not invert the covariance)
-#ifdef FASTER_OUTLIER_DETECTION
-	size_t numInliers = faceDatas.GetSize();
-	Eigen::Vector3d mean;
-	Eigen::Matrix3d covariance;
-	Eigen::Matrix3d covarianceInv;
+	const double minCovariance = 1e-3;
+	const unsigned maxIterations = 10;
+	const unsigned minInliers = 4;
 
-	// Precompute squared Mahalanobis threshold once.
-	// exp(-0.5 * d2) > thOutlier  <=>  d2 < -2*log(thOutlier)
+	const uint32_t nAll = (uint32_t)faceDatas.GetSize();
+	if (nAll <= minInliers) {
+		return false;
+	}
 
 	if (thOutlier <= 0 || thOutlier >= 1.0f) {
 		thOutlier = 0.06f;
 	}
 	const double thMahalanobisSq = -2.0 * std::log((double)thOutlier);
 
-	for (unsigned iter = 0; iter < maxIterations; ++iter)
-	{
-		// === compute mean & covariance for inliers ===
-		const Eigen::Block<Eigen::Matrix3Xd, 3, Eigen::Dynamic, !Eigen::Matrix3Xd::IsRowMajor>
-			colors(colorsAll.leftCols(numInliers));
-
-		mean = colors.rowwise().mean();
-#if 1
-		Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-
-		const Eigen::Index n = colors.cols();
-		const double inv = 1.0 / std::max(1.0, double(n - 1));
-
-		for (Eigen::Index i = 0; i < n; ++i) {
-			const auto x = colors.col(i);
-
-			const double dx0 = x[0] - mean[0];
-			const double dx1 = x[1] - mean[1];
-			const double dx2 = x[2] - mean[2];
-
-			cov(0, 0) += dx0 * dx0;
-			cov(0, 1) += dx0 * dx1;
-			cov(0, 2) += dx0 * dx2;
-			cov(1, 1) += dx1 * dx1;
-			cov(1, 2) += dx1 * dx2;
-			cov(2, 2) += dx2 * dx2;
-		}
-
-		cov(1, 0) = cov(0, 1);
-		cov(2, 0) = cov(0, 2);
-		cov(2, 1) = cov(1, 2);
-
-		covariance = cov * inv;
-#else
-		const Eigen::Matrix3Xd centered(colors.colwise() - mean);
-		covariance = (centered * centered.transpose()) / std::max(1.0, double(colors.cols() - 1));
-#endif
-
-		// stop if covariance nearly zero
-		if (covariance.array().abs().maxCoeff() < minCovariance)
-		{
-			RFOREACH(i, faceDatas)
-				if (!inliers[i])
-					faceDatas.RemoveAt(i);
-			return true;
-		}
-
-		// === fast stable inverse (LLT for SPD 3×3) ===
-		Eigen::LLT<Eigen::Matrix3d> llt(covariance);
-		if (llt.info() != Eigen::Success)
-			return false;
-		covarianceInv = llt.solve(Eigen::Matrix3d::Identity());
-
-		// === classify ===
-		size_t newCount = 0;
-		bool bChanged = false;
-
-		for (uint32_t i = 0, cnt = (uint32_t)faceDatas.GetSize(); i < cnt; ++i)
-		{
-			const Eigen::Vector3d color(((const Color::EVec)faceDatas[i].color).cast<double>());
-			const double dx0 = color[0] - mean[0];
-			const double dx1 = color[1] - mean[1];
-			const double dx2 = color[2] - mean[2];
-
-			const double t0 = covarianceInv(0, 0) * dx0 + covarianceInv(0, 1) * dx1 + covarianceInv(0, 2) * dx2;
-			const double t1 = covarianceInv(1, 0) * dx0 + covarianceInv(1, 1) * dx1 + covarianceInv(1, 2) * dx2;
-			const double t2 = covarianceInv(2, 0) * dx0 + covarianceInv(2, 1) * dx1 + covarianceInv(2, 2) * dx2;
-
-			const double dist2 = dx0 * t0 + dx1 * t1 + dx2 * t2; // Mahalanobis distance squared
-
-			const bool isInlier = (dist2 < thMahalanobisSq);
-			bool& inlier = inliers[i];
-
-			if (isInlier)
-			{
-				colorsAll.col(newCount++) = color;
-				if (!inlier) { inlier = true; bChanged = true; }
-			}
-			else
-			{
-				if (inlier) { inlier = false; bChanged = true; }
-			}
-		}
-
-		numInliers = newCount;
-		if (numInliers == faceDatas.GetSize())
-			return true;
-		if (numInliers < minInliers)
-			return false;
-		if (!bChanged)
-			break;
+	// Preconvert colors once (SoA for cache + no Eigen temporaries).
+	std::vector<double> c0(nAll), c1(nAll), c2(nAll);
+	for (uint32_t i = 0; i < nAll; ++i) {
+		const Color::EVec v = (const Color::EVec)faceDatas[i].color;
+		c0[i] = (double)v[0];
+		c1[i] = (double)v[1];
+		c2[i] = (double)v[2];
 	}
-#else
-	size_t numInliers(faceDatas.GetSize());
+
+	// Inlier mask and active index list.
+	std::vector<uint8_t> inlierMask(nAll, 1);
+	std::vector<uint32_t> inlierIdx(nAll);
+	for (uint32_t i = 0; i < nAll; ++i) {
+		inlierIdx[i] = i;
+	}
+	uint32_t nIn = nAll;
+
 	Eigen::Vector3d mean;
 	Eigen::Matrix3d covariance;
 	Eigen::Matrix3d covarianceInv;
-	for (unsigned iter = 0; iter < maxIterations; ++iter) {
-		// compute the mean color and color covariance only for inliers
-		const Eigen::Block<Eigen::Matrix3Xd,3,Eigen::Dynamic,!Eigen::Matrix3Xd::IsRowMajor> colors(colorsAll.leftCols(numInliers));
-		mean = colors.rowwise().mean();
-		const Eigen::Matrix3Xd centered(colors.colwise() - mean);
-		covariance = (centered * centered.transpose()) / double(colors.cols() - 1);
 
-		// stop if all covariances gets very small
-		if (covariance.array().abs().maxCoeff() < minCovariance) {
-			// remove the outliers
-			RFOREACH(i, faceDatas)
-				if (!inliers[i])
-					faceDatas.RemoveAt(i);
-			return true;
+	for (unsigned iter = 0; iter < maxIterations; ++iter) {
+		// Mean over current inliers.
+		double m0 = 0.0, m1 = 0.0, m2 = 0.0;
+		for (uint32_t k = 0; k < nIn; ++k) {
+			const uint32_t i = inlierIdx[k];
+			m0 += c0[i];
+			m1 += c1[i];
+			m2 += c2[i];
+		}
+		const double invN = 1.0 / (double)nIn;
+		m0 *= invN;
+		m1 *= invN;
+		m2 *= invN;
+		mean[0] = m0;
+		mean[1] = m1;
+		mean[2] = m2;
+
+		// Covariance (symmetric, sample covariance with 1/(n-1)).
+		double c00 = 0.0, c01 = 0.0, c02 = 0.0;
+		double c11 = 0.0, c12 = 0.0;
+		double c22 = 0.0;
+
+		for (uint32_t k = 0; k < nIn; ++k) {
+			const uint32_t i = inlierIdx[k];
+			const double dx0 = c0[i] - m0;
+			const double dx1 = c1[i] - m1;
+			const double dx2 = c2[i] - m2;
+
+			c00 += dx0 * dx0;
+			c01 += dx0 * dx1;
+			c02 += dx0 * dx2;
+			c11 += dx1 * dx1;
+			c12 += dx1 * dx2;
+			c22 += dx2 * dx2;
 		}
 
-		// invert the covariance matrix
-		// (FullPivLU not the fastest, but gives feedback about numerical stability during inversion)
-		const Eigen::FullPivLU<Eigen::Matrix3d> lu(covariance);
-		if (!lu.isInvertible())
-			return false;
-		covarianceInv = lu.inverse();
+		const double inv = 1.0 / std::max(1.0, (double)(nIn - 1));
+		covariance(0, 0) = c00 * inv;
+		covariance(0, 1) = c01 * inv;
+		covariance(0, 2) = c02 * inv;
+		covariance(1, 0) = c01 * inv;
+		covariance(1, 1) = c11 * inv;
+		covariance(1, 2) = c12 * inv;
+		covariance(2, 0) = c02 * inv;
+		covariance(2, 1) = c12 * inv;
+		covariance(2, 2) = c22 * inv;
 
-		// filter inliers
-		// (all views with a gauss value above the threshold)
-		numInliers = 0;
-		bool bChanged(false);
-		FOREACH(i, faceDatas) {
-			const Eigen::Vector3d color(((const Color::EVec)faceDatas[i].color).cast<double>());
-			const double gaussValue(MultiGaussUnnormalized<double,3>(color, mean, covarianceInv));
-			bool& inlier = inliers[i];
-			if (gaussValue > thOutlier) {
-				// set as inlier
-				colorsAll.col(numInliers++) = color;
-				if (inlier != true) {
-					inlier = true;
-					bChanged = true;
-				}
-			} else {
-				// set as outlier
-				if (inlier != false) {
-					inlier = false;
-					bChanged = true;
+		if (covariance.array().abs().maxCoeff() < minCovariance) {
+			// Same behavior: remove non-inliers and return true.
+			// Do stable compaction once (preserves original order).
+			uint32_t w = 0;
+			for (uint32_t i = 0; i < nAll; ++i) {
+				if (inlierMask[i]) {
+					if (w != i) {
+						faceDatas[w] = faceDatas[i];
+					}
+					++w;
 				}
 			}
-		}
-		if (numInliers == faceDatas.GetSize())
+			while (faceDatas.GetSize() > w) {
+				faceDatas.RemoveLast();
+			}
 			return true;
-		if (numInliers < minInliers)
+		}
+
+		Eigen::LLT<Eigen::Matrix3d> llt(covariance);
+		if (llt.info() != Eigen::Success) {
 			return false;
-		if (!bChanged)
+		}
+		covarianceInv = llt.solve(Eigen::Matrix3d::Identity());
+
+		// Classify all points (same rule as your code).
+		// Build next inlier list without touching faceDatas yet.
+		uint32_t newNIn = 0;
+		bool changed = false;
+
+		const double i00 = covarianceInv(0, 0), i01 = covarianceInv(0, 1), i02 = covarianceInv(0, 2);
+		const double i10 = covarianceInv(1, 0), i11 = covarianceInv(1, 1), i12 = covarianceInv(1, 2);
+		const double i20 = covarianceInv(2, 0), i21 = covarianceInv(2, 1), i22 = covarianceInv(2, 2);
+
+		for (uint32_t i = 0; i < nAll; ++i) {
+			const double dx0 = c0[i] - m0;
+			const double dx1 = c1[i] - m1;
+			const double dx2 = c2[i] - m2;
+
+			const double t0 = i00 * dx0 + i01 * dx1 + i02 * dx2;
+			const double t1 = i10 * dx0 + i11 * dx1 + i12 * dx2;
+			const double t2 = i20 * dx0 + i21 * dx1 + i22 * dx2;
+
+			const double dist2 = dx0 * t0 + dx1 * t1 + dx2 * t2;
+
+			const uint8_t isIn = (dist2 < thMahalanobisSq) ? 1 : 0;
+			if (isIn) {
+				inlierIdx[newNIn++] = i;
+			}
+
+			if (inlierMask[i] != isIn) {
+				inlierMask[i] = isIn;
+				changed = true;
+			}
+		}
+
+		nIn = newNIn;
+		if (nIn == nAll) {
+			return true;
+		}
+		if (nIn < minInliers) {
+			return false;
+		}
+		if (!changed) {
 			break;
+		}
+	}
+
+#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_DAMPING
+	{
+		const float factorOutlierRemoval = 0.2f;
+		covarianceInv *= (double)factorOutlierRemoval;
+
+		for (uint32_t i = 0; i < nAll; ++i) {
+			if (!inlierMask[i]) {
+				continue;
+			}
+			Eigen::Vector3d color;
+			color[0] = c0[i];
+			color[1] = c1[i];
+			color[2] = c2[i];
+
+			const double gaussValue = MultiGaussUnnormalized<double, 3>(color, mean, covarianceInv);
+			faceDatas[i].quality *= (float)gaussValue;
+		}
 	}
 #endif
 
-	#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_DAMPING
-	// select the final inliers
-	const float factorOutlierRemoval(0.2f);
-	covarianceInv *= factorOutlierRemoval;
-	RFOREACH(i, faceDatas) {
-		const Eigen::Vector3d color(((const Color::EVec)faceDatas[i].color).cast<double>());
-		const double gaussValue(MultiGaussUnnormalized<double,3>(color, mean, covarianceInv));
-		ASSERT(gaussValue >= 0 && gaussValue <= 1);
-		faceDatas[i].quality *= gaussValue;
+#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
+	{
+		// Stable in-place compaction (preserve order).
+		uint32_t w = 0;
+		for (uint32_t i = 0; i < nAll; ++i) {
+			if (inlierMask[i]) {
+				if (w != i) {
+					faceDatas[w] = faceDatas[i];
+				}
+				++w;
+			}
+		}
+		while (faceDatas.GetSize() > w) {
+			faceDatas.RemoveLast();
+		}
 	}
-	#endif
-	#if TEXOPT_FACEOUTLIER == TEXOPT_FACEOUTLIER_GAUSS_CLAMPING
-	// remove outliers
-	RFOREACH(i, faceDatas)
-		if (!inliers[i])
-			faceDatas.RemoveAt(i);
-	#endif
+#endif
+
 	return true;
 }
 #endif
+
+static void
+CollapseSmallLabelIslands(
+	const Mesh::FaceFacesArr& faceFaces,
+	const MeshTexture::FaceDataViewArr& facesDatas,
+	MeshTexture::LabelArr& labels,
+	uint32_t maxIslandFaces,
+	uint32_t maxPasses)
+{
+	return;
+	const uint32_t faceCount = (uint32_t)labels.size();
+	if (faceCount == 0) {
+		return;
+	}
+
+	auto FaceHasLabelCandidate = [&](uint32_t f, MeshTexture::Label lbl) -> bool {
+		const MeshTexture::FaceDataArr& arr = facesDatas[(FIndex)f];
+		for (const MeshTexture::FaceData& fd : arr) {
+			if ((MeshTexture::Label)fd.idxView == lbl) {
+				return true;
+			}
+		}
+		return false;
+		};
+
+	// Union-find helper
+	std::vector<uint32_t> parent(faceCount);
+	std::vector<uint8_t> rank(faceCount);
+
+	auto FindRoot = [&](uint32_t x) -> uint32_t {
+		while (parent[x] != x) {
+			parent[x] = parent[parent[x]];
+			x = parent[x];
+		}
+		return x;
+		};
+
+	auto Union = [&](uint32_t a, uint32_t b) {
+		a = FindRoot(a);
+		b = FindRoot(b);
+		if (a == b) {
+			return;
+		}
+		const uint8_t ra = rank[a];
+		const uint8_t rb = rank[b];
+		if (ra < rb) {
+			parent[a] = b;
+		}
+		else if (ra > rb) {
+			parent[b] = a;
+		}
+		else {
+			parent[b] = a;
+			rank[a] = (uint8_t)(ra + 1);
+		}
+		};
+
+	for (uint32_t pass = 0; pass < maxPasses; ++pass) {
+		// Build components of same-label adjacency
+		for (uint32_t i = 0; i < faceCount; ++i) {
+			parent[i] = i;
+			rank[i] = 0;
+		}
+
+		for (uint32_t f = 0; f < faceCount; ++f) {
+			const MeshTexture::Label lf = labels[(FIndex)f];
+			if (lf == NO_ID) {
+				continue;
+			}
+
+			const Mesh::FaceFaces& adj = faceFaces[(FIndex)f];
+			for (int k = 0; k < 3; ++k) {
+				const FIndex fn = adj[k];
+				if (fn == NO_ID) {
+					continue;
+				}
+				const uint32_t g = (uint32_t)fn;
+				if (labels[(FIndex)g] != lf) {
+					continue;
+				}
+				Union(f, g);
+			}
+		}
+
+		// Component size + representative label
+		std::vector<uint32_t> compSize(faceCount, 0);
+		std::vector<MeshTexture::Label> compLabel(faceCount, NO_ID);
+
+		for (uint32_t f = 0; f < faceCount; ++f) {
+			const MeshTexture::Label lf = labels[(FIndex)f];
+			if (lf == NO_ID) {
+				continue;
+			}
+			const uint32_t r = FindRoot(f);
+			++compSize[r];
+			if (compLabel[r] == NO_ID) {
+				compLabel[r] = lf;
+			}
+		}
+
+		// For each small component, pick a neighbor label by boundary vote
+		// Use a small fixed top list per component to avoid hash maps.
+		struct Top2 {
+			MeshTexture::Label lbl[2];
+			uint32_t cnt[2];
+		};
+
+		std::vector<Top2> top(faceCount);
+		for (uint32_t r = 0; r < faceCount; ++r) {
+			top[r].lbl[0] = NO_ID; top[r].cnt[0] = 0;
+			top[r].lbl[1] = NO_ID; top[r].cnt[1] = 0;
+		}
+
+		auto AddVote = [&](Top2& t, MeshTexture::Label lbl) {
+			if (lbl == NO_ID) {
+				return;
+			}
+			if (t.lbl[0] == lbl) {
+				++t.cnt[0];
+				return;
+			}
+			if (t.lbl[1] == lbl) {
+				++t.cnt[1];
+				return;
+			}
+			if (t.lbl[0] == NO_ID) {
+				t.lbl[0] = lbl;
+				t.cnt[0] = 1;
+				return;
+			}
+			if (t.lbl[1] == NO_ID) {
+				t.lbl[1] = lbl;
+				t.cnt[1] = 1;
+				return;
+			}
+			// replace weaker
+			if (t.cnt[0] < t.cnt[1]) {
+				t.lbl[0] = lbl;
+				t.cnt[0] = 1;
+			}
+			else {
+				t.lbl[1] = lbl;
+				t.cnt[1] = 1;
+			}
+			};
+
+		for (uint32_t f = 0; f < faceCount; ++f) {
+			const MeshTexture::Label lf = labels[(FIndex)f];
+			if (lf == NO_ID) {
+				continue;
+			}
+
+			const uint32_t rf = FindRoot(f);
+			if (compSize[rf] == 0 || compSize[rf] > maxIslandFaces) {
+				continue;
+			}
+
+			const Mesh::FaceFaces& adj = faceFaces[(FIndex)f];
+			for (int k = 0; k < 3; ++k) {
+				const FIndex fn = adj[k];
+				if (fn == NO_ID) {
+					continue;
+				}
+				const uint32_t g = (uint32_t)fn;
+				const MeshTexture::Label lg = labels[(FIndex)g];
+				if (lg == NO_ID || lg == lf) {
+					continue;
+				}
+				AddVote(top[rf], lg);
+			}
+		}
+
+		// Relabel faces in small components if the winning neighbor label is a valid candidate
+		uint32_t changed = 0;
+
+		for (uint32_t f = 0; f < faceCount; ++f) {
+			const MeshTexture::Label lf = labels[(FIndex)f];
+			if (lf == NO_ID) {
+				continue;
+			}
+
+			const uint32_t rf = FindRoot(f);
+			if (compSize[rf] == 0 || compSize[rf] > maxIslandFaces) {
+				continue;
+			}
+
+			Top2& t = top[rf];
+			MeshTexture::Label best = t.lbl[0];
+			uint32_t bestCnt = t.cnt[0];
+			if (t.cnt[1] > bestCnt) {
+				best = t.lbl[1];
+				bestCnt = t.cnt[1];
+			}
+
+			if (best == NO_ID) {
+				continue;
+			}
+
+			// Critical safety: only relabel if that camera is actually a candidate for this face
+			if (!FaceHasLabelCandidate(f, best)) {
+				continue;
+			}
+
+			if (labels[(FIndex)f] != best) {
+				labels[(FIndex)f] = best;
+				++changed;
+			}
+		}
+
+		if (changed == 0) {
+			break;
+		}
+	}
+}
 
 bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras, float fOutlierThreshold, float fRatioDataSmoothness, const IIndexArr& views)
 {
@@ -2122,12 +1942,12 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 
 				const Mesh::FaceFaces& adj = faceFaces[cur];
 
-				for (int k = 0; k < 3; ++k)	{
+				for (int k = 0; k < 3; ++k) {
 					FIndex fn = adj[k];
 					if (fn == NO_ID)
 						continue;
 
-					if (compGeom[fn] == -1)	{
+					if (compGeom[fn] == -1) {
 						compGeom[fn] = nGeomComponents;
 						stack.push_back(fn);
 					}
@@ -2457,6 +2277,303 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 			}
 		}
 
+#if 0 // JPB WIP BUG Until i can get this to work. def INCREASE_PATCHES
+		// create texture patches (connected components of same-label adjacency)
+		{
+			seamEdges.clear();
+
+			const uint32_t faceCount = (uint32_t)numFaces;
+
+			// Build seam edges (optional)
+			for (FIndex f = 0; f < (FIndex)faceCount; ++f) {
+				const Mesh::FaceFaces& adj = faceFaces[f];
+
+				for (int k = 0; k < 3; ++k) {
+					const FIndex fn = adj[k];
+					if (fn == NO_ID) {
+						continue;
+					}
+					if (f >= fn) {
+						continue;
+					}
+					if (labels[f] == NO_ID || labels[fn] == NO_ID || labels[f] != labels[fn]) {
+						seamEdges.emplace_back(f, fn);
+					}
+				}
+			}
+
+			// Union-find on faces
+			std::vector<uint32_t> parent(faceCount);
+			std::vector<uint8_t> rank(faceCount, 0);
+
+			auto ResetUF = [&]() {
+				for (uint32_t i = 0; i < faceCount; ++i) {
+					parent[i] = i;
+					rank[i] = 0;
+				}
+				};
+
+			auto FindRoot = [&](uint32_t x) -> uint32_t {
+				while (parent[x] != x) {
+					parent[x] = parent[parent[x]];
+					x = parent[x];
+				}
+				return x;
+				};
+
+			auto Union = [&](uint32_t a, uint32_t b) {
+				a = FindRoot(a);
+				b = FindRoot(b);
+				if (a == b) {
+					return;
+				}
+				const uint8_t ra = rank[a];
+				const uint8_t rb = rank[b];
+				if (ra < rb) {
+					parent[a] = b;
+				}
+				else if (ra > rb) {
+					parent[b] = a;
+				}
+				else {
+					parent[b] = a;
+					rank[a] = (uint8_t)(ra + 1);
+				}
+				};
+
+			auto BuildUFForCurrentLabels = [&]() {
+				ResetUF();
+
+				for (uint32_t f = 0; f < faceCount; ++f) {
+					if (labels[(FIndex)f] == NO_ID) {
+						continue;
+					}
+
+					const Mesh::FaceFaces& adj = faceFaces[(FIndex)f];
+
+					for (int k = 0; k < 3; ++k) {
+						const FIndex fn = adj[k];
+						if (fn == NO_ID) {
+							continue;
+						}
+
+						const uint32_t g = (uint32_t)fn;
+						if (g == f) {
+							continue;
+						}
+
+						if (labels[(FIndex)g] == NO_ID) {
+							continue;
+						}
+
+						if (labels[(FIndex)f] != labels[(FIndex)g]) {
+							continue;
+						}
+
+						if (compGeom[(FIndex)f] != compGeom[(FIndex)g]) {
+							continue;
+						}
+
+						if (labels[f] == labels[g]) {
+							float dot = scene.mesh.faceNormals[f].dot(scene.mesh.faceNormals[g]);
+							// Be more relaxed here (e.g., 0.9 instead of 0.98)
+							// This allows the road to "curve" or have "bumps" without shattering into patches
+							if (dot > 0.9f) {
+								Union(f, g);
+								continue;
+							}
+						}
+					}
+				}
+				};
+
+			// Build UF for initial labels
+			{
+				const uint32_t targetPatches = 3000;
+				const uint32_t minFaces = 256;
+				const uint32_t maxIters = 6;
+				const uint32_t faceCount = (uint32_t)numFaces;
+
+				for (uint32_t iter = 0; iter < maxIters; ++iter) {
+					BuildUFForCurrentLabels();
+
+					// 1. Storage for this iteration
+					std::vector<uint32_t> root(faceCount);
+					std::vector<uint32_t> compSize(faceCount, 0);
+					std::vector<uint32_t> rootToList(faceCount, 0xFFFFFFFFu);
+					uint32_t listCount = 0;
+
+					for (uint32_t f = 0; f < faceCount; ++f) {
+						if (labels[(FIndex)f] == NO_ID) {
+							root[f] = 0xFFFFFFFFu;
+							continue;
+						}
+						uint32_t r = FindRoot(f);
+						root[f] = r;
+						if (compSize[r] == 0) {
+							rootToList[r] = listCount++;
+						}
+						compSize[r]++;
+					}
+
+					if (listCount <= targetPatches) break;
+
+					// 2. Build Offset Array (Standard CSR)
+					std::vector<uint32_t> offsets(listCount + 1, 0);
+					for (uint32_t r = 0; r < faceCount; ++r) {
+						uint32_t id = rootToList[r];
+						if (id != 0xFFFFFFFFu) {
+							offsets[id + 1] = compSize[r];
+						}
+					}
+					for (uint32_t i = 1; i <= listCount; ++i) {
+						offsets[i] += offsets[i - 1];
+					}
+
+					// 3. Populate Faces By Component
+					std::vector<uint32_t> facesByComp(offsets.back());
+					std::vector<uint32_t> cursor = offsets;
+					for (uint32_t f = 0; f < faceCount; ++f) {
+						uint32_t r = root[f];
+						if (r != 0xFFFFFFFFu) {
+							facesByComp[cursor[rootToList[r]]++] = f;
+						}
+					}
+
+					uint32_t changedComps = 0;
+					struct LabelChange { uint32_t rootId; Label newLabel; };
+					std::vector<LabelChange> pendingChanges;
+
+					// 4. Voting Logic
+					std::vector<float> scores((size_t)numLabels);
+					std::vector<uint8_t> used((size_t)numLabels);
+
+					for (uint32_t r = 0; r < faceCount; ++r) {
+						uint32_t id = rootToList[r];
+						if (id == 0xFFFFFFFFu || compSize[r] >= minFaces) continue;
+
+						const uint32_t beg = offsets[id];
+						const uint32_t end = offsets[id + 1];
+
+						std::fill(scores.begin(), scores.end(), 0.0f);
+						std::fill(used.begin(), used.end(), 0);
+
+						// Track if a label is actually "reachable" (meets the UF criteria)
+						std::vector<uint8_t> reachable((size_t)numLabels, 0);
+
+						for (uint32_t it = beg; it < end; ++it) {
+							uint32_t f = facesByComp[it];
+							const Mesh::FaceFaces& adj = faceFaces[(FIndex)f];
+
+							for (int k = 0; k < 3; ++k) {
+								FIndex fn = adj[k];
+								if (fn == NO_ID) continue;
+								uint32_t g = (uint32_t)fn;
+								if (root[g] == r) continue; // Same component
+
+								// CRITICAL: If the UF wouldn't merge these based on Geometry/Normals,
+								// we MUST NOT let this neighbor influence the label.
+								if (compGeom[(FIndex)f] != compGeom[(FIndex)g]) continue;
+
+								float dot = scene.mesh.faceNormals[f].dot(scene.mesh.faceNormals[g]);
+								if (dot <= 0.9f) continue; // Must match BuildUFForCurrentLabels threshold
+
+								Label lg = labels[fn];
+								if (lg == NO_ID) continue;
+
+								// If we're here, this neighbor is a valid merge candidate
+								float weight = (dot > 0.98f) ? 15.0f : 1.0f;
+								if (compSize[root[g]] < minFaces) weight *= 2.0f;
+
+								scores[(size_t)lg] += weight;
+								used[(size_t)lg] = 1;
+								reachable[(size_t)lg] = 1;
+							}
+						}
+
+						int bestLabel = -1;
+						float bestScore = -1.0f;
+						for (int l = 0; l < (int)numLabels; ++l) {
+							if (!used[l] || !reachable[l]) continue;
+
+							float s = scores[l];
+							// Only apply stickiness if the current label is actually a valid neighbor
+							if ((Label)l == labels[(FIndex)facesByComp[beg]]) s *= 1.2f;
+
+							if (s > bestScore) {
+								bestScore = s;
+								bestLabel = l;
+							}
+						}
+
+						if (bestLabel >= 0 && (Label)bestLabel != labels[(FIndex)facesByComp[beg]]) {
+							pendingChanges.push_back({ r, (Label)bestLabel });
+							changedComps++;
+						}
+					}
+					for (const auto& change : pendingChanges) {
+						uint32_t id = rootToList[change.rootId];
+						for (uint32_t it = offsets[id]; it < offsets[id + 1]; ++it) {
+							labels[(FIndex)facesByComp[it]] = change.newLabel;
+						}
+					}
+					if (changedComps == 0) break;
+				}
+
+				CollapseSmallLabelIslands(faceFaces, facesDatas, labels, 512, 3);
+				BuildUFForCurrentLabels();
+			}
+
+			// Assign compact component ids
+			std::vector<uint32_t> rootToComp(faceCount, 0xFFFFFFFFu);
+			uint32_t nextComp = 0;
+
+			components.resize(faceCount);
+
+			for (uint32_t f = 0; f < faceCount; ++f) {
+				if (labels[(FIndex)f] == NO_ID) {
+					components[(FIndex)f] = -1;
+					continue;
+				}
+
+				const uint32_t r = FindRoot(f);
+				uint32_t& cid = rootToComp[r];
+				if (cid == 0xFFFFFFFFu) {
+					cid = nextComp++;
+				}
+				components[(FIndex)f] = (int)cid;
+			}
+
+			// Build patches from components
+			texturePatches.clear();
+			texturePatches.resize(nextComp);
+
+			for (uint32_t p = 0; p < nextComp; ++p) {
+				texturePatches[p].label = NO_ID;
+				texturePatches[p].faces.clear();
+			}
+
+			for (uint32_t f = 0; f < faceCount; ++f) {
+				const int cid = components[(FIndex)f];
+				if (cid < 0) {
+					continue;
+				}
+
+				TexturePatch& tp = texturePatches[(size_t)cid];
+				const Label lbl = labels[(FIndex)f];
+
+				if (tp.label == NO_ID) {
+					tp.label = lbl;
+				}
+				else {
+					ASSERT(tp.label == lbl);
+				}
+
+				tp.faces.Insert((FIndex)f);
+			}
+		}
+	}
+#else
 		// create texture patches
 		{
 			seamEdges.clear();
@@ -2529,6 +2646,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 			}
 		}
 	}
+#endif
 
 	return true;
 }
@@ -3112,8 +3230,38 @@ void MeshTexture::GlobalSeamLeveling()
 
 		// dilate with one pixel width, in order to make sure patch border smooths out a little
 		// Fused and optimized for DilateMean<1> case
-		cv::Mat image(images[texturePatch.label].image(texturePatch.rect));
+		const Image& img = images[texturePatch.label];
 
+		cv::Rect roi = texturePatch.rect;
+
+		const int imgW = img.image.cols;
+		const int imgH = img.image.rows;
+
+		// Clamp left/top by shrinking
+		if (roi.x < 0) {
+			roi.width += roi.x;
+			roi.x = 0;
+		}
+		if (roi.y < 0) {
+			roi.height += roi.y;
+			roi.y = 0;
+		}
+
+		// Clamp right/bottom
+		if (roi.x + roi.width > imgW) {
+			roi.width = imgW - roi.x;
+		}
+		if (roi.y + roi.height > imgH) {
+			roi.height = imgH - roi.y;
+		}
+
+		// If it collapsed, skip
+		if (roi.width <= 0 || roi.height <= 0) {
+			continue;
+		}
+
+		// Use roi (NOT texturePatch.rect)
+		cv::Mat image(img.image(roi));
 		uint8_t* maskData = mask.data();
 
 		w = image.cols;
@@ -3998,6 +4146,16 @@ void MeshTexture::LocalSeamLeveling()
 			if (invLen2 == 0.0f)
 				return;
 
+			const int outW = image.width();
+			const int outH = image.height();
+
+			const int px = (int)pt.x;
+			const int py = (int)pt.y;
+
+			if ((unsigned)px >= (unsigned)outW || (unsigned)py >= (unsigned)outH) {
+				return;
+			}
+
 			float dx = float(pt.x) - p0.x;
 			float dy = float(pt.y) - p0.y;
 
@@ -4027,33 +4185,45 @@ void MeshTexture::LocalSeamLeveling()
 
 	// Better to fully thread
   // Notice, we must use dynamic scheduling here as patch size can vary a lot and cause load imbalance.
-#ifdef TEXOPT_USE_OPENMP
+	const int T = omp_get_max_threads();
+
+	std::vector<Image32F3> tlsImage((size_t)T);
+	std::vector<Image32F3> tlsImageOrg((size_t)T);
+	std::vector<Image8U> tlsMask((size_t)T);
+
 #pragma omp parallel for schedule(dynamic, 4)
 	for (int i = 0; i < (int)numPatches; ++i) {
-#else
-	for (uint32_t i = 0; i < numPatches; ++i) {
-#endif
+		const int tid = omp_get_thread_num();
+
+		Image32F3& image = tlsImage[(size_t)tid];
+		Image32F3& imageOrg = tlsImageOrg[(size_t)tid];
+		Image8U& mask = tlsMask[(size_t)tid];
+
 		const uint32_t idxPatch = (uint32_t)i;
 		const TexturePatch& texturePatch = texturePatches[idxPatch];
+
+		// Skip invalid patches defensively
+		if (texturePatch.label == NO_ID) {
+			continue;
+		}
+		if (texturePatch.rect.width <= 0 || texturePatch.rect.height <= 0) {
+			continue;
+		}
+
 		const Image8U3& image0 = images[texturePatch.label].image;
+		const cv::Size sz = texturePatch.rect.size();
 
-		// Extract image region and create coverage mask.
-		static thread_local Image32F3 image;
-		static thread_local Image32F3 imageOrg;
-		static thread_local Image8U mask;
-
-		const auto& sz = texturePatch.rect.size();
-
-		if (image.size() != sz)
+		if (image.size() != sz) {
 			image.create(sz);
-
-		if (imageOrg.size() != sz)
+		}
+		if (imageOrg.size() != sz) {
 			imageOrg.create(sz);
-
-		if (mask.width() < sz.width || mask.height() < sz.height)
+		}
+		if (mask.size() != sz) {
 			mask.create(sz);
+		}
 
-		mask(cv::Rect(0, 0, sz.width, sz.height)).setTo(0);
+		mask.setTo(0);
 
 		image0(texturePatch.rect).convertTo(image, CV_32FC3, 1.0f / 255.0f);
 		image.copyTo(imageOrg);
@@ -4431,69 +4601,214 @@ struct PackedRect {
 	int index;
 };
 
-bool PackShelf(
+static inline int RoundUpToMultiple(int x, int m) {
+  if (m <= 0) return x;
+  return ((x + m - 1) / m) * m;
+}
+
+static bool PackShelfFast(
 	int atlasW,
 	int atlasH,
-	const RectsBinPack::RectArr& rects,
-	RectsBinPack::RectArr& outRects) {
-
+	const RectsBinPack::RectArr& inRects,
+	RectsBinPack::RectArr& outRects)
+{
 	struct Item {
-		cv::Rect r;
+		int w, h;
 		int index;
 	};
 
+	const int n = (int)inRects.size();
 	std::vector<Item> items;
-	items.reserve(rects.size());
+	items.resize((size_t)n);
 
-	for (int i = 0; i < (int)rects.size(); ++i)
-		items.push_back({ rects[i], i });
+	for (int i = 0; i < n; ++i) {
+		items[(size_t)i].w = inRects[(size_t)i].width;
+		items[(size_t)i].h = inRects[(size_t)i].height;
+		items[(size_t)i].index = i;
+	}
 
-	// sort: tallest first, then widest, stable
 	std::sort(items.begin(), items.end(),
 		[](const Item& a, const Item& b) {
-			if (a.r.height != b.r.height)
-				return a.r.height > b.r.height;
-			if (a.r.width != b.r.width)
-				return a.r.width > b.r.width;
+			if (a.h != b.h) return a.h > b.h;
+			if (a.w != b.w) return a.w > b.w;
 			return a.index < b.index;
 		});
 
-	outRects.resize(rects.size());
+	outRects.resize((size_t)n);
 
+	int shelfX = 0;
 	int shelfY = 0;
 	int shelfH = 0;
-	int shelfX = 0;
 
-	for (const Item& it : items) {
-		int w = it.r.width;
-		int h = it.r.height;
+	for (int k = 0; k < n; ++k) {
+		int w = items[(size_t)k].w;
+		int h = items[(size_t)k].h;
 
-		// too large to ever fit
-		if (w > atlasW || h > atlasH)
+		// too large ever
+		if ((w > atlasW || h > atlasH) && (h > atlasW || w > atlasH)) {
 			return false;
+		}
 
-		// new shelf if needed
+		// If it doesn't fit on this shelf, start a new shelf
 		if (shelfX + w > atlasW) {
 			shelfY += shelfH;
 			shelfX = 0;
 			shelfH = 0;
 		}
 
-		// no vertical space left
-		if (shelfY + h > atlasH)
-			return false;
+		// If still doesn't fit horizontally, try rotating (fresh shelf or not)
+		if (shelfX + w > atlasW) {
+			// must be because w > atlasW; try rotate
+			int tw = h;
+			int th = w;
+			w = tw;
+			h = th;
+			if (w > atlasW) {
+				return false;
+			}
+		}
 
-		// place
-		outRects[it.index] = cv::Rect(shelfX, shelfY, w, h);
+		// Optional: if it fits rotated but not unrotated (common), rotate
+		if (shelfX + w <= atlasW) {
+			// ok as-is
+		}
+		else {
+			int tw = h;
+			int th = w;
+			if (shelfX + tw <= atlasW) {
+				w = tw;
+				h = th;
+			}
+			else {
+				// new shelf and retry could be done, but keep it simple
+				return false;
+			}
+		}
+
+		if (shelfY + h > atlasH) {
+			return false;
+		}
+
+		RectsBinPack::Rect placed;
+		placed.x = shelfX;
+		placed.y = shelfY;
+		placed.width = w;
+		placed.height = h;
+		outRects[(size_t)items[(size_t)k].index] = placed;
 
 		shelfX += w;
-		if (h > shelfH)
-			shelfH = h;
+		if (h > shelfH) shelfH = h;
 	}
 
 	return true;
 }
 
+static void ComputeUsedBounds(
+  const RectsBinPack::RectArr& placed,
+  int& usedW,
+  int& usedH)
+{
+  usedW = 0;
+  usedH = 0;
+  for (const auto& r : placed) {
+    usedW = std::max(usedW, r.x + r.width);
+    usedH = std::max(usedH, r.y + r.height);
+  }
+}
+
+static bool PackShelfReasonablySquare(
+  const RectsBinPack::RectArr& rects,
+  int multiple,
+  int maxDim,
+  RectsBinPack::RectArr& outPlaced,
+  int& outAtlasW,
+  int& outAtlasH)
+{
+  uint64_t area = 0;
+  int maxW = 0;
+  int maxH = 0;
+
+  for (const auto& r : rects) {
+    area += (uint64_t)r.width * (uint64_t)r.height;
+    maxW = std::max(maxW, r.width);
+    maxH = std::max(maxH, r.height);
+  }
+
+  if (rects.empty()) {
+    outPlaced.clear();
+    outAtlasW = 0;
+    outAtlasH = 0;
+    return true;
+  }
+
+  // Target square width near sqrt(area)
+  int baseW = (int)std::sqrt((double)area);
+  baseW = std::max(baseW, maxW);
+  baseW = RoundUpToMultiple(baseW, multiple);
+  baseW = std::min(baseW, maxDim);
+
+  // Try widths around baseW (geometric sweep)
+  // This keeps it fast for 80k (few dozen pack attempts).
+  const int kTries = 18;
+  int bestScore = INT_MAX;
+  int bestW = 0;
+  int bestH = 0;
+  RectsBinPack::RectArr bestPlaced;
+
+  RectsBinPack::RectArr placed;
+
+  for (int t = -kTries / 2; t <= kTries / 2; ++t) {
+    double scale = std::pow(2.0, (double)t / 3.0); // steps of ~1.26x
+    int candW = (int)(baseW * scale);
+
+    candW = std::max(candW, maxW);
+    candW = RoundUpToMultiple(candW, multiple);
+    candW = std::min(candW, maxDim);
+
+    // Skip duplicate widths
+    if (candW == bestW) {
+      continue;
+    }
+
+    // Allow full height up to maxDim; packing determines usedH
+    if (!PackShelfFast(candW, maxDim, rects, placed)) {
+      continue;
+    }
+
+    int usedW = 0;
+    int usedH = 0;
+    ComputeUsedBounds(placed, usedW, usedH);
+
+    if (usedH > maxDim || usedW > maxDim) {
+      continue;
+    }
+
+    // Score: prefer square and small max dimension.
+    // aspectPenalty is 0 when square, grows as it stretches.
+    int maxSide = std::max(usedW, usedH);
+    int minSide = std::max(1, std::min(usedW, usedH));
+    int aspectPenalty = (maxSide * 1000) / minSide; // 1000 == perfect square
+
+    // Weight aspect heavily, but also prefer smaller atlases.
+    int score = aspectPenalty * 100 + maxSide;
+
+    if (score < bestScore) {
+      bestScore = score;
+      bestW = usedW;
+      bestH = usedH;
+      bestPlaced = placed;
+    }
+  }
+
+  if (bestScore == INT_MAX) {
+    return false; // cannot fit within maxDim; you need multi-atlas paging
+  }
+
+  outPlaced.swap(bestPlaced);
+  outAtlasW = bestW;
+  outAtlasH = bestH;
+  return true;
+}
 
 void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
 {
@@ -4577,11 +4892,10 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 	}
 
 	// merge texture patches with overlapping rectangles
-	for (unsigned i=0; i<texturePatches.size(); ++i) {
+	for (unsigned i = 0; i < texturePatches.size(); ++i) {
 		TexturePatch& texturePatchBig = texturePatches[i];
-		for (unsigned j = i + 1; j < texturePatches.size(); ++j) {
 
-			TexturePatch& texturePatchBig = texturePatches[i];
+		for (unsigned j = i + 1; j < texturePatches.size(); /* no ++j here */) {
 			TexturePatch& texturePatchSmall = texturePatches[j];
 
 			if (texturePatchBig.label != texturePatchSmall.label ||
@@ -4594,48 +4908,61 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 
 			for (const FIndex idxFace : texturePatchSmall.faces) {
 				TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
-				for (int v = 0; v < 3; ++v)
+				for (int v = 0; v < 3; ++v) {
 					texcoords[v] += offset;
+				}
 			}
-			// join faces lists
+
 			texturePatchBig.faces.JoinRemove(texturePatchSmall.faces);
-			// remove the small patch
-			texturePatches.RemoveAtMove(j);
+			texturePatches.RemoveAtMove(j); // j stays the same (new element moved into j)
 		}
 	}
 
 	// create texture
 	{
-		// 1) Prepare rects
+		// Prepare rects
 		RectsBinPack::RectArr rects(texturePatches.GetSize());
-		FOREACH(i, texturePatches)
-			rects[i] = texturePatches[i].rect;
-
-		int textureSize = RectsBinPack::ComputeTextureSize(rects, nTextureSizeMultiple);
-
-		// 2) Pack (square attempt, but we won't force square allocation)
-		while (true) {
-			bool bPacked = false;
-
-			MaxRectsBinPack pack(textureSize, textureSize);
-			bPacked = pack.Insert(rects, MaxRectsBinPack::RectBestAreaFit);
-
-			if (bPacked)
-				break;
-
-			textureSize *= 2;
+		for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i) {
+			rects[i] = texturePatches[(uint32_t)i].rect;
 		}
 
-		// 3) Compute actual atlas bounds (NON-SQUARE)
+		RectsBinPack::RectArr placed;
 		int atlasW = 0;
 		int atlasH = 0;
 
-		for (const auto& r : rects) {
-			atlasW = std::max(atlasW, r.x + r.width);
-			atlasH = std::max(atlasH, r.y + r.height);
+		int maxDim = std::max(64, nMaxTextureSize); // starting point
+
+		// Optional: hard safety cap so you don't allocate something insane
+		const int hardCap = 262144; // pick something you can tolerate
+
+		bool ok = false;
+
+		while (!ok) {
+			ok = PackShelfReasonablySquare(
+				rects,
+				(int)nTextureSizeMultiple,
+				maxDim,
+				placed,
+				atlasW,
+				atlasH);
+
+			if (ok) {
+				break;
+			}
+
+			// Grow and retry
+			if (maxDim >= hardCap) {
+				// At this point you either need paging or you accept very large atlases.
+				// Since you said "don't fail", last resort: just keep going (or set higher cap).
+				maxDim = maxDim * 2;
+			}
+			else {
+				maxDim = std::min(hardCap, maxDim * 2);
+			}
 		}
 
-		// 5) Allocate final atlas (non-square)
+		rects.swap(placed);
+
 		textureDiffuse.create(atlasH, atlasW);
 		textureDiffuse.setTo(cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
 
@@ -4647,15 +4974,49 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			const TexturePatch& texturePatch = texturePatches[i];
 			const RectsBinPack::Rect& rect = rects[i];
 
-			int x(0), y(1);
-				const Image& imageData = images[texturePatch.label];
-				cv::Mat patch(imageData.image(texturePatch.rect));
-				if (rect.width != texturePatch.rect.width) {
-					// flip patch and texture-coordinates
-					patch = patch.t();
-					x = 1; y = 0;
-				}
-				patch.copyTo(textureDiffuse(rect));
+			int x = 0;
+			int y = 1;
+
+			const Image& imageData = images[texturePatch.label];
+
+			// Clamp ROI to image bounds BEFORE making cv::Mat(roi)
+			cv::Rect roi = texturePatch.rect;
+
+			const int imgW = imageData.image.cols;
+			const int imgH = imageData.image.rows;
+
+			// Clamp left/top by shrinking width/height
+			if (roi.x < 0) {
+				roi.width += roi.x;
+				roi.x = 0;
+			}
+			if (roi.y < 0) {
+				roi.height += roi.y;
+				roi.y = 0;
+			}
+
+			// Clamp right/bottom
+			if (roi.x + roi.width > imgW) {
+				roi.width = imgW - roi.x;
+			}
+			if (roi.y + roi.height > imgH) {
+				roi.height = imgH - roi.y;
+			}
+
+			// Skip if invalid
+			if (roi.width <= 0 || roi.height <= 0) {
+				continue;
+			}
+
+			cv::Mat patch(imageData.image(roi));
+
+			if (rect.width != roi.width) {
+				patch = patch.t();
+				x = 1;
+				y = 0;
+			}
+
+			patch.copyTo(textureDiffuse(rect));
 
 #if 0
 			// --- DEBUG: color atlas by camera index instead of copying image ---

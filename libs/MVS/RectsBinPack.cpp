@@ -65,7 +65,7 @@ void MaxRectsBinPack::Init(int width, int height)
 	usedRectangles.Empty();
 
 	freeRectangles.Empty();
-	freeRectangles.Insert(Rect(0,0, width,height));
+	freeRectangles.Insert(Rect(0, 0, width, height));
 }
 
 MaxRectsBinPack::Rect MaxRectsBinPack::Insert(int width, int height, FreeRectChoiceHeuristic method)
@@ -100,15 +100,15 @@ bool MaxRectsBinPack::Insert(RectArr& rects, FreeRectChoiceHeuristic method)
 		Rect bestNode;
 
 		// find the best place to store this rectangle
-		#ifdef RECTPACK_USE_OPENMP
-		#pragma omp parallel
+#ifdef RECTPACK_USE_OPENMP
+#pragma omp parallel
 		{
 			int privBestScore1 = std::numeric_limits<int>::max();
 			int privBestScore2 = std::numeric_limits<int>::max();
 			IDX privBestRectIndex = NO_IDX;
 			Rect privBestNode;
-			#pragma omp for nowait
-			for (int_t i=0; i<(int_t)rects.GetSize(); ++i) {
+#pragma omp for nowait
+			for (int_t i = 0; i < (int_t)rects.GetSize(); ++i) {
 				int score1, score2;
 				Rect newNode(ScoreRect(rects[i].width, rects[i].height, method, score1, score2));
 				if (score1 < privBestScore1 || (score1 == privBestScore1 && score2 < privBestScore2)) {
@@ -118,7 +118,7 @@ bool MaxRectsBinPack::Insert(RectArr& rects, FreeRectChoiceHeuristic method)
 					privBestRectIndex = i;
 				}
 			}
-			#pragma omp critical
+#pragma omp critical
 			{
 				if (privBestScore1 < bestScore1 || (privBestScore1 == bestScore1 && privBestScore2 < bestScore2)) {
 					bestScore1 = privBestScore1;
@@ -128,7 +128,7 @@ bool MaxRectsBinPack::Insert(RectArr& rects, FreeRectChoiceHeuristic method)
 				}
 			}
 		}
-		#else
+#else
 		FOREACH(i, rects) {
 			int score1, score2;
 			Rect newNode(ScoreRect(rects[i].width, rects[i].height, method, score1, score2));
@@ -139,7 +139,7 @@ bool MaxRectsBinPack::Insert(RectArr& rects, FreeRectChoiceHeuristic method)
 				bestRectIndex = i;
 			}
 		}
-		#endif
+#endif
 
 		// if no place found...
 		if (bestRectIndex == NO_IDX) {
@@ -161,7 +161,7 @@ bool MaxRectsBinPack::Insert(RectArr& rects, FreeRectChoiceHeuristic method)
 	return true;
 }
 
-void MaxRectsBinPack::PlaceRect(const Rect &node)
+void MaxRectsBinPack::PlaceRect(const Rect& node)
 {
 	for (size_t i = 0; i < freeRectangles.GetSize(); ++i) {
 		if (SplitFreeNode(freeRectangles[i], node))
@@ -173,16 +173,18 @@ void MaxRectsBinPack::PlaceRect(const Rect &node)
 	usedRectangles.Insert(node);
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::ScoreRect(int width, int height, FreeRectChoiceHeuristic method, int &score1, int &score2) const
+MaxRectsBinPack::Rect MaxRectsBinPack::ScoreRect(int width, int height, FreeRectChoiceHeuristic method, int& score1, int& score2) const
 {
 	switch (method) {
 	case RectBestShortSideFit: return FindPositionForNewNodeBestShortSideFit(width, height, score1, score2);
 	case RectBestLongSideFit: return FindPositionForNewNodeBestLongSideFit(width, height, score2, score1);
 	case RectBestAreaFit: return FindPositionForNewNodeBestAreaFit(width, height, score1, score2);
 	case RectBottomLeftRule: return FindPositionForNewNodeBottomLeft(width, height, score1, score2);
-	case RectContactPointRule: { Rect newNode = FindPositionForNewNodeContactPoint(width, height, score1);
+	case RectContactPointRule: {
+		Rect newNode = FindPositionForNewNodeContactPoint(width, height, score1);
 		score1 = -score1; // Reverse since we are minimizing, but for contact point score bigger is better.
-		return newNode; }
+		return newNode;
+	}
 	default: ASSERT("unknown method" == NULL); return Rect();
 	}
 }
@@ -197,7 +199,7 @@ float MaxRectsBinPack::Occupancy() const
 	return (float)usedSurfaceArea / (binWidth * binHeight);
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBottomLeft(int width, int height, int &bestY, int &bestX) const
+MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBottomLeft(int width, int height, int& bestY, int& bestX) const
 {
 	Rect bestNode;
 
@@ -232,7 +234,7 @@ MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBottomLeft(int widt
 	return bestNode;
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestShortSideFit(int width, int height, int &bestShortSideFit, int &bestLongSideFit) const
+MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestShortSideFit(int width, int height, int& bestShortSideFit, int& bestLongSideFit) const
 {
 	Rect bestNode;
 
@@ -276,7 +278,7 @@ MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestShortSideFit(in
 	return bestNode;
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestLongSideFit(int width, int height, int &bestShortSideFit, int &bestLongSideFit) const
+MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestLongSideFit(int width, int height, int& bestShortSideFit, int& bestLongSideFit) const
 {
 	Rect bestNode;
 
@@ -320,7 +322,7 @@ MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestLongSideFit(int
 	return bestNode;
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestAreaFit(int width, int height, int &bestAreaFit, int &bestShortSideFit) const
+MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeBestAreaFit(int width, int height, int& bestAreaFit, int& bestShortSideFit) const
 {
 	Rect bestNode;
 
@@ -390,7 +392,7 @@ int MaxRectsBinPack::ContactPointScoreNode(int x, int y, int width, int height) 
 	return score;
 }
 
-MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeContactPoint(int width, int height, int &bestContactScore) const
+MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeContactPoint(int width, int height, int& bestContactScore) const
 {
 	Rect bestNode;
 
@@ -422,7 +424,7 @@ MaxRectsBinPack::Rect MaxRectsBinPack::FindPositionForNewNodeContactPoint(int wi
 	return bestNode;
 }
 
-bool MaxRectsBinPack::SplitFreeNode(Rect freeNode, const Rect &usedNode)
+bool MaxRectsBinPack::SplitFreeNode(Rect freeNode, const Rect& usedNode)
 {
 	// Test with SAT if the rectangles even intersect.
 	if (usedNode.x >= freeNode.x + freeNode.width || usedNode.x + usedNode.width <= freeNode.x ||
@@ -487,7 +489,7 @@ void MaxRectsBinPack::PruneFreeList()
 
 	/// Go through each pair and remove any rectangle that is redundant.
 	for (size_t i = 0; i < freeRectangles.GetSize(); ++i)
-		for (size_t j = i+1; j < freeRectangles.GetSize(); ++j) {
+		for (size_t j = i + 1; j < freeRectangles.GetSize(); ++j) {
 			if (IsContainedIn(freeRectangles[i], freeRectangles[j])) {
 				freeRectangles.RemoveAtMove(i--);
 				break;
@@ -514,12 +516,12 @@ int MaxRectsBinPack::ComputeTextureSize(const RectArr& rects, int mult)
 	}
 	// compute the approximate area
 	// considering the best case scenario for the packing algorithm: 0.9 fill
-	area = CEIL2INT((1.f/0.9f)*(float)area);
+	area = CEIL2INT((1.f / 0.9f) * (float)area);
 	// compute texture size...
 	const int sizeTex(MAXF(CEIL2INT(SQRT((float)area)), maxSizePatch));
 	if (mult > 0) {
 		// ... as multiple of mult
-		return ((sizeTex+mult-1)/mult)*mult;
+		return ((sizeTex + mult - 1) / mult) * mult;
 	}
 	// ... as power of two
 	return POWI(2, CEIL2INT<unsigned>(LOGN((float)sizeTex) / LOGN(2.f)));
@@ -545,9 +547,9 @@ void GuillotineBinPack::Init(int width, int height)
 	binWidth = width;
 	binHeight = height;
 
-	#ifndef _RELEASE
+#ifndef _RELEASE
 	disjointRects.Clear();
-	#endif
+#endif
 
 	// Clear any memory of previously packed rectangles.
 	usedRectangles.clear();
@@ -564,7 +566,7 @@ void GuillotineBinPack::Init(int width, int height)
 }
 
 bool GuillotineBinPack::Insert(RectArr& rects, bool merge,
-							   FreeRectChoiceHeuristic rectChoice, GuillotineSplitHeuristic splitMethod)
+	FreeRectChoiceHeuristic rectChoice, GuillotineSplitHeuristic splitMethod)
 {
 	// Remember variables about the best packing choice we have made so far during the iteration process.
 	size_t bestFreeRect = 0;
@@ -704,7 +706,7 @@ float GuillotineBinPack::Occupancy() const
 }
 
 /// Returns the heuristic score value for placing a rectangle of size width*height into freeRect. Does not try to rotate.
-int GuillotineBinPack::ScoreByHeuristic(int width, int height, const Rect &freeRect, FreeRectChoiceHeuristic rectChoice)
+int GuillotineBinPack::ScoreByHeuristic(int width, int height, const Rect& freeRect, FreeRectChoiceHeuristic rectChoice)
 {
 	switch (rectChoice) {
 	case RectBestAreaFit: return ScoreBestAreaFit(width, height, freeRect);
@@ -717,12 +719,12 @@ int GuillotineBinPack::ScoreByHeuristic(int width, int height, const Rect &freeR
 	}
 }
 
-int GuillotineBinPack::ScoreBestAreaFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreBestAreaFit(int width, int height, const Rect& freeRect)
 {
 	return freeRect.width * freeRect.height - width * height;
 }
 
-int GuillotineBinPack::ScoreBestShortSideFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreBestShortSideFit(int width, int height, const Rect& freeRect)
 {
 	int leftoverHoriz = abs(freeRect.width - width);
 	int leftoverVert = abs(freeRect.height - height);
@@ -730,7 +732,7 @@ int GuillotineBinPack::ScoreBestShortSideFit(int width, int height, const Rect &
 	return leftover;
 }
 
-int GuillotineBinPack::ScoreBestLongSideFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreBestLongSideFit(int width, int height, const Rect& freeRect)
 {
 	int leftoverHoriz = abs(freeRect.width - width);
 	int leftoverVert = abs(freeRect.height - height);
@@ -738,17 +740,17 @@ int GuillotineBinPack::ScoreBestLongSideFit(int width, int height, const Rect &f
 	return leftover;
 }
 
-int GuillotineBinPack::ScoreWorstAreaFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreWorstAreaFit(int width, int height, const Rect& freeRect)
 {
 	return -ScoreBestAreaFit(width, height, freeRect);
 }
 
-int GuillotineBinPack::ScoreWorstShortSideFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreWorstShortSideFit(int width, int height, const Rect& freeRect)
 {
 	return -ScoreBestShortSideFit(width, height, freeRect);
 }
 
-int GuillotineBinPack::ScoreWorstLongSideFit(int width, int height, const Rect &freeRect)
+int GuillotineBinPack::ScoreWorstLongSideFit(int width, int height, const Rect& freeRect)
 {
 	return -ScoreBestLongSideFit(width, height, freeRect);
 }
@@ -815,7 +817,7 @@ GuillotineBinPack::Rect GuillotineBinPack::FindPositionForNewNode(int width, int
 	return bestNode;
 }
 
-void GuillotineBinPack::SplitFreeRectByHeuristic(const Rect &freeRect, const Rect &placedRect, GuillotineSplitHeuristic method)
+void GuillotineBinPack::SplitFreeRectByHeuristic(const Rect& freeRect, const Rect& placedRect, GuillotineSplitHeuristic method)
 {
 	// Compute the lengths of the leftover area.
 	const int w = freeRect.width - placedRect.width;
@@ -866,7 +868,7 @@ void GuillotineBinPack::SplitFreeRectByHeuristic(const Rect &freeRect, const Rec
 
 /// This function will add the two generated rectangles into the freeRectangles array. The caller is expected to
 /// remove the original rectangle from the freeRectangles array after that.
-void GuillotineBinPack::SplitFreeRectAlongAxis(const Rect &freeRect, const Rect &placedRect, bool splitHorizontal)
+void GuillotineBinPack::SplitFreeRectAlongAxis(const Rect& freeRect, const Rect& placedRect, bool splitHorizontal)
 {
 	// Form the two new rectangles.
 	Rect bottom;
@@ -882,7 +884,8 @@ void GuillotineBinPack::SplitFreeRectAlongAxis(const Rect &freeRect, const Rect 
 	if (splitHorizontal) {
 		bottom.width = freeRect.width;
 		right.height = placedRect.height;
-	} else // Split vertically
+	}
+	else // Split vertically
 	{
 		bottom.width = placedRect.width;
 		right.height = freeRect.height;
@@ -900,34 +903,37 @@ void GuillotineBinPack::SplitFreeRectAlongAxis(const Rect &freeRect, const Rect 
 
 void GuillotineBinPack::MergeFreeList()
 {
-	#ifndef _RELEASE
+#ifndef _RELEASE
 	DisjointRectCollection test;
 	for (size_t i = 0; i < freeRectangles.size(); ++i)
 		ASSERT(test.Add(freeRectangles[i]) == true);
-	#endif
+#endif
 
 	// Do a Theta(n^2) loop to see if any pair of free rectangles could me merged into one.
 	// Note that we miss any opportunities to merge three rectangles into one. (should call this function again to detect that)
 	for (size_t i = 0; i < freeRectangles.size(); ++i)
-		for (size_t j = i+1; j < freeRectangles.size(); ++j) {
+		for (size_t j = i + 1; j < freeRectangles.size(); ++j) {
 			if (freeRectangles[i].width == freeRectangles[j].width && freeRectangles[i].x == freeRectangles[j].x) {
 				if (freeRectangles[i].y == freeRectangles[j].y + freeRectangles[j].height) {
 					freeRectangles[i].y -= freeRectangles[j].height;
 					freeRectangles[i].height += freeRectangles[j].height;
 					freeRectangles.erase(freeRectangles.begin() + j);
 					--j;
-				} else if (freeRectangles[i].y + freeRectangles[i].height == freeRectangles[j].y) {
+				}
+				else if (freeRectangles[i].y + freeRectangles[i].height == freeRectangles[j].y) {
 					freeRectangles[i].height += freeRectangles[j].height;
 					freeRectangles.erase(freeRectangles.begin() + j);
 					--j;
 				}
-			} else if (freeRectangles[i].height == freeRectangles[j].height && freeRectangles[i].y == freeRectangles[j].y) {
+			}
+			else if (freeRectangles[i].height == freeRectangles[j].height && freeRectangles[i].y == freeRectangles[j].y) {
 				if (freeRectangles[i].x == freeRectangles[j].x + freeRectangles[j].width) {
 					freeRectangles[i].x -= freeRectangles[j].width;
 					freeRectangles[i].width += freeRectangles[j].width;
 					freeRectangles.erase(freeRectangles.begin() + j);
 					--j;
-				} else if (freeRectangles[i].x + freeRectangles[i].width == freeRectangles[j].x) {
+				}
+				else if (freeRectangles[i].x + freeRectangles[i].width == freeRectangles[j].x) {
 					freeRectangles[i].width += freeRectangles[j].width;
 					freeRectangles.erase(freeRectangles.begin() + j);
 					--j;
@@ -935,11 +941,11 @@ void GuillotineBinPack::MergeFreeList()
 			}
 		}
 
-	#ifndef _RELEASE
+#ifndef _RELEASE
 	test.Clear();
 	for (size_t i = 0; i < freeRectangles.size(); ++i)
 		ASSERT(test.Add(freeRectangles[i]) == true);
-	#endif
+#endif
 }
 /*----------------------------------------------------------------*/
 
@@ -966,9 +972,9 @@ void SkylineBinPack::Init(int width, int height, bool useWasteMap_)
 
 	useWasteMap = useWasteMap_;
 
-	#ifndef _RELEASE
+#ifndef _RELEASE
 	disjointRects.Clear();
-	#endif
+#endif
 
 	usedSurfaceArea = 0;
 	skyLine.clear();
@@ -996,16 +1002,16 @@ bool SkylineBinPack::Insert(RectArr& rects, LevelChoiceHeuristic method)
 		IDX bestRectIndex = NO_IDX;
 		Rect bestNode;
 
-		#ifdef RECTPACK_USE_OPENMP
-		#pragma omp parallel
+#ifdef RECTPACK_USE_OPENMP
+#pragma omp parallel
 		{
 			int privBestScore1 = std::numeric_limits<int>::max();
 			int privBestScore2 = std::numeric_limits<int>::max();
 			int privBestSkylineIndex = -1;
 			IDX privBestRectIndex = NO_IDX;
 			Rect privBestNode;
-			#pragma omp for nowait
-			for (int_t i=0; i<(int_t)rects.GetSize(); ++i) {
+#pragma omp for nowait
+			for (int_t i = 0; i < (int_t)rects.GetSize(); ++i) {
 				int score1, score2, index;
 				Rect newNode(ScoreRect(rects[i].width, rects[i].height, method, score1, score2, index));
 				if (score1 < privBestScore1 || (score1 == privBestScore1 && score2 < privBestScore2)) {
@@ -1016,7 +1022,7 @@ bool SkylineBinPack::Insert(RectArr& rects, LevelChoiceHeuristic method)
 					privBestRectIndex = i;
 				}
 			}
-			#pragma omp critical
+#pragma omp critical
 			{
 				if (privBestScore1 < bestScore1 || (privBestScore1 == bestScore1 && privBestScore2 < bestScore2)) {
 					bestScore1 = privBestScore1;
@@ -1027,7 +1033,7 @@ bool SkylineBinPack::Insert(RectArr& rects, LevelChoiceHeuristic method)
 				}
 			}
 		}
-		#else
+#else
 		FOREACH(i, rects) {
 			int score1, score2, index;
 			Rect newNode(ScoreRect(rects[i].width, rects[i].height, method, score1, score2, index));
@@ -1039,7 +1045,7 @@ bool SkylineBinPack::Insert(RectArr& rects, LevelChoiceHeuristic method)
 				bestRectIndex = i;
 			}
 		}
-		#endif
+#endif
 
 		// if no place found...
 		if (bestRectIndex == NO_IDX) {
@@ -1051,10 +1057,10 @@ bool SkylineBinPack::Insert(RectArr& rects, LevelChoiceHeuristic method)
 		}
 
 		// Perform the actual packing.
-		#ifndef _RELEASE
+#ifndef _RELEASE
 		ASSERT(disjointRects.Disjoint(bestNode));
 		disjointRects.Add(bestNode);
-		#endif
+#endif
 		AddSkylineLevel(bestSkylineIndex, bestNode);
 		usedSurfaceArea += rects[bestRectIndex].area();
 
@@ -1071,7 +1077,7 @@ SkylineBinPack::Rect SkylineBinPack::Insert(int width, int height, LevelChoiceHe
 	if (useWasteMap) {
 		// First try to pack this rectangle into the waste map, if it fits.
 		Rect node = wasteMap.Insert(width, height, true, GuillotineBinPack::RectBestShortSideFit,
-									GuillotineBinPack::SplitMaximizeArea);
+			GuillotineBinPack::SplitMaximizeArea);
 		ASSERT(disjointRects.Disjoint(node));
 		if (node.height != 0) {
 			Rect newNode;
@@ -1080,10 +1086,10 @@ SkylineBinPack::Rect SkylineBinPack::Insert(int width, int height, LevelChoiceHe
 			newNode.width = node.width;
 			newNode.height = node.height;
 			usedSurfaceArea += width * height;
-			#ifndef _RELEASE
+#ifndef _RELEASE
 			ASSERT(disjointRects.Disjoint(newNode));
 			disjointRects.Add(newNode);
-			#endif
+#endif
 			return newNode;
 		}
 	}
@@ -1094,7 +1100,7 @@ SkylineBinPack::Rect SkylineBinPack::Insert(int width, int height, LevelChoiceHe
 	}
 }
 
-SkylineBinPack::Rect SkylineBinPack::ScoreRect(int width, int height, LevelChoiceHeuristic method, int &score1, int &score2, int &index) const
+SkylineBinPack::Rect SkylineBinPack::ScoreRect(int width, int height, LevelChoiceHeuristic method, int& score1, int& score2, int& index) const
 {
 	Rect newNode;
 	switch (method) {
@@ -1108,28 +1114,19 @@ SkylineBinPack::Rect SkylineBinPack::ScoreRect(int width, int height, LevelChoic
 
 bool SkylineBinPack::RectangleFits(int skylineNodeIndex, int width, int height, int& y) const
 {
-	const int binW = binWidth;
-	const int binH = binHeight;
-	const auto* __restrict sl = skyLine.data();
-
-	int x = sl[skylineNodeIndex].x;
-	if (x + width > binW)
+	int x = skyLine[skylineNodeIndex].x;
+	if (x + width > binWidth)
 		return false;
-
 	int widthLeft = width;
 	int i = skylineNodeIndex;
-	y = sl[i].y;
-
+	y = skyLine[skylineNodeIndex].y;
 	while (widthLeft > 0) {
-		const int yi = sl[i].y;
-		if (yi > y)
-			y = yi;
-
-		if (y + height > binH)
+		y = MAXF(y, skyLine[i].y);
+		if (y + height > binHeight)
 			return false;
-
-		widthLeft -= sl[i].width;
+		widthLeft -= skyLine[i].width;
 		++i;
+		ASSERT(i < (int)skyLine.size() || widthLeft <= 0);
 	}
 	return true;
 }
@@ -1151,7 +1148,7 @@ int SkylineBinPack::ComputeWastedArea(int skylineNodeIndex, int width, int heigh
 	return wastedArea;
 }
 
-bool SkylineBinPack::RectangleFits(int skylineNodeIndex, int width, int height, int &y, int &wastedArea) const
+bool SkylineBinPack::RectangleFits(int skylineNodeIndex, int width, int height, int& y, int& wastedArea) const
 {
 	bool fits = RectangleFits(skylineNodeIndex, width, height, y);
 	if (fits)
@@ -1184,7 +1181,7 @@ void SkylineBinPack::AddWasteMapArea(int skylineNodeIndex, int width, int height
 	}
 }
 
-void SkylineBinPack::AddSkylineLevel(int skylineNodeIndex, const Rect &rect)
+void SkylineBinPack::AddSkylineLevel(int skylineNodeIndex, const Rect& rect)
 {
 	// First track all wasted areas and mark them into the waste map if we're using one.
 	if (useWasteMap)
@@ -1199,11 +1196,11 @@ void SkylineBinPack::AddSkylineLevel(int skylineNodeIndex, const Rect &rect)
 	ASSERT(newNode.x + newNode.width <= binWidth);
 	ASSERT(newNode.y <= binHeight);
 
-	for (size_t i = skylineNodeIndex+1; i < skyLine.size(); ++i) {
-		ASSERT(skyLine[i-1].x <= skyLine[i].x);
+	for (size_t i = skylineNodeIndex + 1; i < skyLine.size(); ++i) {
+		ASSERT(skyLine[i - 1].x <= skyLine[i].x);
 
-		if (skyLine[i].x < skyLine[i-1].x + skyLine[i-1].width) {
-			int shrink = skyLine[i-1].x + skyLine[i-1].width - skyLine[i].x;
+		if (skyLine[i].x < skyLine[i - 1].x + skyLine[i - 1].width) {
+			int shrink = skyLine[i - 1].x + skyLine[i - 1].width - skyLine[i].x;
 
 			skyLine[i].x += shrink;
 			skyLine[i].width -= shrink;
@@ -1211,9 +1208,11 @@ void SkylineBinPack::AddSkylineLevel(int skylineNodeIndex, const Rect &rect)
 			if (skyLine[i].width <= 0) {
 				skyLine.erase(skyLine.begin() + i);
 				--i;
-			} else
+			}
+			else
 				break;
-		} else
+		}
+		else
 			break;
 	}
 	MergeSkylines();
@@ -1221,10 +1220,10 @@ void SkylineBinPack::AddSkylineLevel(int skylineNodeIndex, const Rect &rect)
 
 void SkylineBinPack::MergeSkylines()
 {
-	for (size_t i = 0; i < skyLine.size()-1; ++i)
-		if (skyLine[i].y == skyLine[i+1].y) {
-			skyLine[i].width += skyLine[i+1].width;
-			skyLine.erase(skyLine.begin() + (i+1));
+	for (size_t i = 0; i < skyLine.size() - 1; ++i)
+		if (skyLine[i].y == skyLine[i + 1].y) {
+			skyLine[i].width += skyLine[i + 1].width;
+			skyLine.erase(skyLine.begin() + (i + 1));
 			--i;
 		}
 }
@@ -1243,15 +1242,15 @@ SkylineBinPack::Rect SkylineBinPack::InsertBottomLeft(int width, int height)
 		AddSkylineLevel(bestIndex, newNode);
 
 		usedSurfaceArea += width * height;
-		#ifndef _RELEASE
+#ifndef _RELEASE
 		disjointRects.Add(newNode);
-		#endif
+#endif
 	}
 
 	return newNode;
 }
 
-SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeBottomLeft(int width, int height, int &bestHeight, int &bestWidth, int &bestIndex) const
+SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeBottomLeft(int width, int height, int& bestHeight, int& bestWidth, int& bestIndex) const
 {
 	bestHeight = std::numeric_limits<int>::max();
 	bestIndex = -1;
@@ -1275,16 +1274,16 @@ SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeBottomLeft(int width,
 		if (RectangleFits(i, height, width, y)) {
 			if (y + width < bestHeight || (y + width == bestHeight && skyLine[i].width < bestWidth)) {
 				bestHeight = y + width;
-						bestIndex = i;
-						bestWidth = skyLine[i].width;
-						newNode.x = skyLine[i].x;
-						newNode.y = y;
-						newNode.width = height;
-						newNode.height = width;
-						ASSERT(disjointRects.Disjoint(newNode));
-					}
-				}
+				bestIndex = i;
+				bestWidth = skyLine[i].width;
+				newNode.x = skyLine[i].x;
+				newNode.y = y;
+				newNode.width = height;
+				newNode.height = width;
+				ASSERT(disjointRects.Disjoint(newNode));
 			}
+		}
+	}
 
 	return newNode;
 }
@@ -1303,15 +1302,15 @@ SkylineBinPack::Rect SkylineBinPack::InsertMinWaste(int width, int height)
 		AddSkylineLevel(bestIndex, newNode);
 
 		usedSurfaceArea += width * height;
-		#ifndef _RELEASE
+#ifndef _RELEASE
 		disjointRects.Add(newNode);
-		#endif
+#endif
 	}
 
 	return newNode;
 }
 
-SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeMinWaste(int width, int height, int &bestHeight, int &bestWastedArea, int &bestIndex) const
+SkylineBinPack::Rect SkylineBinPack::FindPositionForNewNodeMinWaste(int width, int height, int& bestHeight, int& bestWastedArea, int& bestIndex) const
 {
 	bestHeight = std::numeric_limits<int>::max();
 	bestWastedArea = std::numeric_limits<int>::max();

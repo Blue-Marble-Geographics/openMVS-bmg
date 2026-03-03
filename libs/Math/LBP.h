@@ -194,7 +194,7 @@ public:
 		msgBuf[0].assign(total, EnergyType(0));
 		msgBuf[1].assign(total, EnergyType(0));
 		buffersInitialized = true;
-	}
+	} 
 
 // -----------------------------------------------------------------
 	int Optimize(unsigned numIterations /* always 1 */)
@@ -210,7 +210,7 @@ public:
 		static thread_local std::vector<EnergyType> perLabelMin;
 		static thread_local std::vector<uint32_t> perLabelGen;
 		static thread_local uint32_t curGen = 1;
-
+		 
 		int changed = 0;
 
 		// ------------------------------------------------------------
@@ -312,10 +312,10 @@ public:
 				for (EdgeID eid : outE) {
 					const DirectedEdge& edge = edges[eid];
 					const Node& n2 = nodes[edge.nodeID2];
-					const auto& labels2 = n2.labels;
-					const size_t L2 = edgeMsgLen[eid];
+					const LabelID* __restrict labels2 = n2.labels.data();
+					const size_t L2 = (size_t)edgeMsgLen[eid];
 
-					// find message from v -> u (subtraction term)
+					// Find message from v -> u (subtraction term)
 					const EnergyType* __restrict sub = nullptr;
 					for (EdgeID pe : inEdges1) {
 						if (edges[pe].nodeID1 == edge.nodeID2) {
@@ -326,49 +326,29 @@ public:
 
 					// energyBuf = sumAll - sub
 					if (sub) {
-						for (size_t k = 0; k < L1; ++k)
+						for (size_t k = 0; k < L1; ++k) {
 							energyBuf[k] = sumAll[k] - sub[k];
+						}
 					}
 					else {
 						memcpy(energyBuf.data(), sumAll.data(), L1 * sizeof(EnergyType));
 					}
 
-					// generation bump
-					if (++curGen == 0) {
-						memset(perLabelGen.data(), 0, perLabelGen.size() * sizeof(uint32_t));
-						curGen = 1;
-					}
-
-					EnergyType globalMin = std::numeric_limits<EnergyType>::max();
-
-					// compute minima
-					for (size_t k = 0; k < L1; ++k) {
-						EnergyType e = energyBuf[k];
-						if (e < globalMin)
-							globalMin = e;
-
-						LabelID l = labels1[k];
-						if (l != 0) {
-							if (perLabelGen[l] != curGen) {
-								perLabelGen[l] = curGen;
-								perLabelMin[l] = e;
-							}
-							else if (e < perLabelMin[l]) {
-								perLabelMin[l] = e;
-							}
-						}
-					}
-
-					const EnergyType base = globalMin + maxE;
 					EnergyType* __restrict msgOut = writeMsgs + offs[eid];
-					const uint32_t* __restrict gen = perLabelGen.data();
-					const EnergyType* __restrict minv = perLabelMin.data();
-					for (size_t j = 0; j < L2; ++j) {
-						LabelID l2 = labels2[j];
-						EnergyType best = base;
 
-						if (l2 != 0 && gen[l2] == curGen) {
-							best = std::min(best, minv[l2]);
+					// General pairwise cost: O(L1*L2)
+					// This is correct for any fncSmoothCost, including your SmoothnessPottsStrong.
+					for (size_t j = 0; j < L2; ++j) {
+						const LabelID l2 = labels2[j];
+						EnergyType best = std::numeric_limits<EnergyType>::max();
+
+						for (size_t k = 0; k < L1; ++k) {
+							const LabelID l1 = labels1[k];
+							const EnergyType v = fncSmoothCost(edge.nodeID1, edge.nodeID2, l1, l2);
+							const EnergyType e = energyBuf[k] + v;
+							if (e < best) {
+								best = e;
+							}
 						}
 
 						msgOut[j] = best;
@@ -390,43 +370,34 @@ public:
 	#pragma omp barrier   // REQUIRED
 	#endif
 
-	#if 0 // Optional?
+			// Restore for stability
 			// ------------------------------------------------------------
 			// Normalize messages
 			// ------------------------------------------------------------
 			EnergyType* __restrict normMsgs = msgBuf[msgParity].data();
 
-	#ifdef LBP_USE_OPENMP
-	#pragma omp for schedule(static) nowait
-	#endif
+#ifdef LBP_USE_OPENMP
+#pragma omp for schedule(static)
+#endif
 			for (int_t edgeID = 0; edgeID < (int_t)edges.size(); ++edgeID) {
 				EnergyType* __restrict m = normMsgs + offs[edgeID];
 				const size_t L = edgeMsgLen[edgeID];
 
 				EnergyType minMsg = std::numeric_limits<EnergyType>::max();
-				for (size_t k = 0; k < L; ++k)
-					if (m[k] < minMsg)
+				for (size_t k = 0; k < L; ++k) {
+					if (m[k] < minMsg) {
 						minMsg = m[k];
-
-				const size_t L4 = L & ~size_t(3);
-				__m128 vmin = _mm_set1_ps(minMsg);
-				__m128 vzero = _mm_setzero_ps();
-
-				size_t k = 0;
-				for (; k < L4; k += 4) {
-					__m128 v = _mm_loadu_ps(m + k);
-					v = _mm_sub_ps(v, vmin);
-					v = _mm_max_ps(v, vzero);
-					_mm_storeu_ps(m + k, v);
+					}
 				}
-				for (; k < L; ++k) {
-					EnergyType v = m[k] - minMsg;
-					if (v < (EnergyType)0)
-						v = (EnergyType)0;
-					m[k] = v;
+				for (size_t k = 0; k < L; ++k) {
+					m[k] -= minMsg;
 				}
 			}
-	#endif
+
+
+#ifdef LBP_USE_OPENMP
+#pragma omp barrier
+#endif
 
 			// ------------------------------------------------------------
 			// Final labeling

@@ -2685,14 +2685,15 @@ void TImage<TYPE>::RasterizeTriangleBaryMasked(const TPoint2<T>& v1, const TPoin
 			// discard point if not in triangle;
 			// testing only for negative barycentric coordinates
 			// guarantees all will be in [0,1] at the end of all checks
+			const T eps = T(1e-6);
 			const T b1(EdgeFunction(v2, v3, p) * invArea);
-			if (b1 < 0)
+			if (b1 < -eps)
 				continue;
 			const T b2(EdgeFunction(v3, v1, p) * invArea);
-			if (b2 < 0)
+			if (b2 < -eps)
 				continue;
 			const T b3(EdgeFunction(v1, v2, p) * invArea);
-			if (b3 < 0)
+			if (b3 < -eps)
 				continue;
 
 			maskRow[x] = 1;

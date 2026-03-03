@@ -470,7 +470,7 @@ public:
  * It also update a vector of face pointers                     
  * It uses a priority queue to choose the best ear to be closed          
  */
-        
+
 template <typename T, typename Compare = std::less<T>>
 using small_vector_priority_queue = std::priority_queue<T, boost::container::small_vector<T, 64>, Compare>;
 
@@ -483,7 +483,11 @@ template<class EAR>
       assert(tri::IsValidPointer(m,p.f));
       assert(p.IsBorder());
       int holeSize = EAR::InitNonManifoldBitOnHoleBoundary(p);
-      FaceIterator f = tri::Allocator<MESH>::AddFaces(m, holeSize-2, facePointersToBeUpdated);
+      const int numFacesToAdd = holeSize - 2;
+      FaceIterator f = tri::Allocator<MESH>::AddFaces(m, numFacesToAdd, facePointersToBeUpdated);
+      // Remember the end of OUR allocated range (not m.face.end(),
+      // which may include faces allocated by other hole fills).
+      FaceIterator fEnd = f + numFacesToAdd;
 
       small_vector_priority_queue<EAR> EarHeap;
       PosType fp = p;
@@ -522,9 +526,11 @@ template<class EAR>
         }//is update()
       } 
       
-      // If the hole had k non manifold vertexes it requires less than n-2 face ( it should be n - 2*(k+1) ), 
-      // so we delete the remaining ones. 
-      while(f!=m.face.end()){
+      // If the hole had k non manifold vertexes it requires less than n-2 faces,
+      // so we delete only the REMAINING UNUSED faces in our allocated range.
+      // IMPORTANT: do NOT delete to m.face.end() -- that would destroy faces
+      // created by previous hole fills or other operations.
+      while(f != fEnd){
         tri::Allocator<MESH>::DeleteFace(m,*f);
         f++;
       }
@@ -639,10 +645,14 @@ template<class EAR>
 
         // Fill only local adjacency
         facePtrToBeUpdated.clear();
-        facePtrToBeUpdated.reserve(EAR::AdjacencyRing().size());
+        facePtrToBeUpdated.reserve(vinfo.size() + EAR::AdjacencyRing().size());
 
-        for (auto fptr : EAR::AdjacencyRing())
-          facePtrToBeUpdated.push_back(&fptr);
+        // Keep vinfo hole positions updated across AddFaces reallocations
+        for (auto& info2 : vinfo)
+          facePtrToBeUpdated.push_back(&info2.p.f);
+
+        for (size_t ai = 0; ai < EAR::AdjacencyRing().size(); ++ai)
+          facePtrToBeUpdated.push_back(&EAR::AdjacencyRing()[ai]);
 
         tri::Hole<MESH>::FillHoleEar<EAR>(m, info.p, facePtrToBeUpdated);
 
