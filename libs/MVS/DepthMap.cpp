@@ -90,6 +90,7 @@ MDEFVAR_OPTDENSE_bool(bFilterAdjust, "Filter Adjust", "adjust depth estimates du
 MDEFVAR_OPTDENSE_bool(bAddCorners, "Add Corners", "add support points at image corners with nearest neighbor disparities", "0")
 MDEFVAR_OPTDENSE_bool(bInitSparse, "Init Sparse", "init depth-map only with the sparse points (no interpolation)", "1")
 MDEFVAR_OPTDENSE_bool(bRemoveDmaps, "Remove Dmaps", "remove depth-maps after fusion", "0")
+MDEFVAR_OPTDENSE_bool(bDenseFuse, "Dense Fuse", "use Merrell-style recursive dense fusion (median-based, more outlier-resistant; slower than fast fuse)", "1" /* JPB WIP BUG "0" */)
 MDEFVAR_OPTDENSE_float(fViewMinScore, "View Min Score", "Min score to consider a neighbor images (0 - disabled)", "2.0")
 MDEFVAR_OPTDENSE_float(fViewMinScoreRatio, "View Min Score Ratio", "Min score ratio to consider a neighbor images", "0.03")
 MDEFVAR_OPTDENSE_float(fMinArea, "Min Area", "Min shared area for accepting the depth triangulation", "0.05")
@@ -135,6 +136,7 @@ DepthData::DepthData(const DepthData& srcDepthData) :
 	confMap(srcDepthData.confMap),
 	dMin(srcDepthData.dMin),
 	dMax(srcDepthData.dMax),
+	size(srcDepthData.size),
 	references(srcDepthData.references)
 {}
 
@@ -239,17 +241,6 @@ void DepthData::ApplyIgnoreMask(const BitMatrix& mask)
 
 bool DepthData::Save(const String& fileName) const
 {
-#if 1 // Remove extra copy
-	ASSERT(IsValid() && !depthMap.empty() && !confMap.empty());
-		// serialize out the current state
-		IIndexArr IDs(0, images.size());
-		for (const ViewData& image: images)
-			IDs.push_back(image.GetID());
-		const ViewData& image0 = GetView();
-		if (!ExportDepthDataRaw(fileName, image0.pImageData->name, IDs, depthMap.size(), image0.camera.K, image0.camera.R, image0.camera.C, dMin, dMax, depthMap, normalMap, confMap, viewsMap))
-			return false;
-
-#else
 	ASSERT(IsValid() && !depthMap.empty() && !confMap.empty());
 	const String fileNameTmp(fileName+".tmp"); {
 		// serialize out the current state
@@ -265,9 +256,9 @@ bool DepthData::Save(const String& fileName) const
 		File::deleteFile(fileNameTmp);
 		return false;
 	}
-#endif
 	return true;
 }
+
 bool DepthData::Load(const String& fileName, unsigned flags)
 {
 	// serialize in the saved state
@@ -304,6 +295,20 @@ unsigned DepthData::DecRef()
 	if (--references == 0)
 		Release();
 	return references;
+}
+// Compute the memory size occupied by the depth-data images (in bytes)
+size_t MVS::DepthData::GetMemorySize() const
+{
+	if (IsEmpty())
+		return 0;
+	size_t nBytes = depthMap.memory_size();
+	if (!normalMap.empty())
+		nBytes += normalMap.memory_size();
+	if (!confMap.empty())
+		nBytes += confMap.memory_size();
+	if (!viewsMap.empty())
+		nBytes += viewsMap.memory_size();
+	return nBytes;
 }
 /*----------------------------------------------------------------*/
 
@@ -714,9 +719,6 @@ _PS_CONST(cephes_FOPI, (float)1.27323954473516); // 4 / M_PI
 	 take into account the special handling they have for greater values
 	 -- it does not return garbage for arguments over 8192, though, but
 	 the extra precision is missing).
-
-	 Note that it is such that sinf((float)M_PI) = 8.74e-8, which is the
-	 surprising but correct result.
 
 	 Performance is also surprisingly good, 1.33 times faster than the
 	 macos vsinf SSE2 function, and 1.5 times faster than the
@@ -1173,7 +1175,7 @@ void __declspec(safebuffers) DepthEstimator::GatherSampleInfo(
 	// 1) Using SSE2.
 	// 2) Reordering the weights and tempWeights to retrieve them in scanning order.
 	// 3) Pre-computing the address arithmetic for x (vPtxAsIntx16).
-	// 4) Using 4x the memory per image to store the samples in a form more friendly to the bilinear-sampling algorithm processing.
+	// 4) Using 4x the memory to store the samples in a form more friendly to the bilinear-sampling algorithm processing.
 	// 5) Using _mm_cvttps_epi32 to truncate towards zero on values that are guaranteed here to be positive.
 	// 6) Working on sets of 4 sums, nums, and sums2 and horizontally adding these at the end.
 	// 7) Removing all unpredictable branching.
@@ -1608,42 +1610,32 @@ float DepthEstimator::ScorePixelImageOrig(
 
 	ASSERT(n == nTexels);
 	// score similarity of the reference and target texture patches
-#if DENSE_NCC == DENSE_NCC_FAST
+	#if DENSE_NCC == DENSE_NCC_FAST
 	const float normSq1(sumSq-SQUARE(sum/nSizeWindow));
-#elif DENSE_NCC == DENSE_NCC_WEIGHTED
+	#elif DENSE_NCC == DENSE_NCC_WEIGHTED
 	const float normSq1(sumSq-SQUARE(sum)/pWeightMap0Info.sumWeights);
-#else
+	#else
 	const float normSq1(normSqDelta<float,float,nTexels>(texels1.data(), sum/(float)nTexels));
-#endif
+	#endif
 	const float nrmSq(normSq0*normSq1);
 	if (nrmSq <=1e-16f)
 		return thRobust;
-#if DENSE_NCC == DENSE_NCC_DEFAULT
+	#if DENSE_NCC == DENSE_NCC_DEFAULT
 	const float num(texels0.dot(texels1));
 #endif
 	const float ncc(CLAMP(num/SQRT(nrmSq), -1.f, 1.f));
 	float score(1.f-ncc);
-#if 1
+	#if 1
 	score *= _vFirst(sh.mVScoreFactor);
-#else
+	#else
 #if DENSE_SMOOTHNESS != DENSE_SMOOTHNESS_NA
-	// encourage smoothness
-	for (const NeighborEstimate& neighbor: neighborsClose) {
-		ASSERT(neighbor.depth > 0);
-#if DENSE_SMOOTHNESS == DENSE_SMOOTHNESS_PLANE
-		const float factorDepth(DENSE_EXP(SQUARE(plane.Distance(neighbor.X)/depth) * smoothSigmaDepth));
-#else
-		const float factorDepth(DENSE_EXP(SQUARE((depth-neighbor.depth)/depth) * smoothSigmaDepth));
+		score *= sh.mVScoreFactor;
 #endif
-		const float factorNormal(DENSE_EXP(SQUARE(ACOS(ComputeAngle(normal.ptr(), neighbor.normal.ptr()))) * smoothSigmaNormal));
-		score *= (1.f - smoothBonusDepth * factorDepth) * (1.f - smoothBonusNormal * factorNormal);
-	}
-#endif
-#endif
+	#endif
 	if (!image1.depthMap.empty()) {
 		ASSERT(OPTDENSE::fEstimationGeometricWeight > 0);
 		float consistency(4.f);
-		const Point3f X1(image1.Tl*Point3f(float(X0.x)*depth,float(X0.y)*depth,depth)+image1.Tm); // Kj * Rj * (Ri.t() * X + Ci - Cj)
+		const Point3f X1(image1.Tl*Point3f(float(_AsArray(vX0,0))*depth,float(_AsArray(vX0,1))*depth,depth)+image1.Tm); // Kj * Rj * (Ri.t() * X + Ci - Cj)
 		if (X1.z > 0) {
 			const Point2f x1(X1);
 			if (image1.depthMap.isInsideWithBorder<float,1>(x1)) {
@@ -2212,10 +2204,17 @@ void DepthEstimator::ProcessPixel(IDX idx)
 
 #if DENSE_SMOOTHNESS == DENSE_SMOOTHNESS_PLANE
 	_Data neighborsCloseNormalsSOA[4];
+	// JPB WIP BUG Remove for debugging
+	neighborsCloseNormalsSOA[0] = _SetZero();
+	neighborsCloseNormalsSOA[1] = _SetZero();
+	neighborsCloseNormalsSOA[2] = _SetZero();
+	neighborsCloseNormalsSOA[3] = _SetZero();
 	for (int i = 0; i < numNeighbors; ++i) {
 		neighborsCloseNormalsSOA[i] = neighborsCloseNormals[i];
 	}
 	_MM_TRANSPOSE4_PS(neighborsCloseNormalsSOA[0], neighborsCloseNormalsSOA[1], neighborsCloseNormalsSOA[2], neighborsCloseNormalsSOA[3]);
+
+	neighborsCloseNormalsSOA[3] = _SetZero(); // JPB WIP BUG Remove for debugging
 #endif
 
 	float& conf = confMap0.pix(x0);
@@ -2246,13 +2245,18 @@ void DepthEstimator::ProcessPixel(IDX idx)
 		//ASSERT(neighbor.depth > 0 && neighbor.normal.dot(viewDir) <= 0);
 		#if DENSE_SMOOTHNESS == DENSE_SMOOTHNESS_PLANE
 		InitPlane(neighborDepth, nn);
-		sh.mVScoreFactor = CalculateScoreFactor(
-			neighborNormal,
-			neighborDepth,
-			numNeighbors,
-			&neighborsCloseCoord[0],
-			&neighborsCloseNormalsSOA[0]
-		);
+		if (numNeighbors > 0) { // JPB WIP BUG Debugging on this check and else.
+			sh.mVScoreFactor = CalculateScoreFactor(
+				neighborNormal,
+				neighborDepth,
+				numNeighbors,
+				&neighborsCloseCoord[0],
+				&neighborsCloseNormalsSOA[0]
+			);
+		}
+		else {
+			sh.mVScoreFactor = _Set(1.f);
+		}
 		#endif
 		// Any ScorePixel needs sh.mVScoreFactor set accurately.
 		const float nconf(ScorePixel(neighborDepth, Normal4(nn)));
@@ -2425,7 +2429,7 @@ void DepthEstimator::ProcessPixel(IDX idx)
 
 		// ScorePixel needs sh.mVScoreFactor set accurately.
 		// mVScoreFactor changes with a depth, normal, or neighbor change.
-		if (ignoreNeighbors) {
+		if (ignoreNeighbors || (numNeighbors == 0) /* JPB WIP BUG Debugging */) {
 			// sh.mVScoreFactor set previously to 1.f
 		} else {
 			sh.mVScoreFactor = CalculateScoreFactor(

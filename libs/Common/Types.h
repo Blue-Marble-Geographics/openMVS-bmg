@@ -962,17 +962,26 @@ FORCEINLINE INTTYPE Ceil2Int(double x) {
 	return static_cast<INTTYPE>(ceil(x));
 	#endif
 }
+
 template <typename IntType = int>
-__forceinline IntType Round2Int(float x) {
-	return static_cast<IntType>(
-		_mm_cvtss_si32(_mm_set_ss(x))
-		);
+__forceinline typename std::enable_if<(sizeof(IntType) > 4), IntType>::type
+Round2Int(float x) {
+	return static_cast<IntType>(_mm_cvtss_si64(_mm_set_ss(x)));
 }
 template <typename IntType = int>
-__forceinline IntType Round2Int(double x) {
-	return static_cast<IntType>(
-		_mm_cvtsd_si32(_mm_set_sd(x))
-		);
+__forceinline typename std::enable_if<(sizeof(IntType) <= 4), IntType>::type
+Round2Int(float x) {
+	return static_cast<IntType>(_mm_cvtss_si32(_mm_set_ss(x)));
+}
+template <typename IntType = int>
+__forceinline typename std::enable_if<(sizeof(IntType) > 4), IntType>::type
+Round2Int(double x) {
+	return static_cast<IntType>(_mm_cvtsd_si64(_mm_set_sd(x)));
+}
+template <typename IntType = int>
+__forceinline typename std::enable_if<(sizeof(IntType) <= 4), IntType>::type
+Round2Int(double x) {
+	return static_cast<IntType>(_mm_cvtsd_si32(_mm_set_sd(x)));
 }
 /*----------------------------------------------------------------*/
 

@@ -394,6 +394,15 @@ static  __forceinline _Data FastExpAlwaysNegative(_Data vX)
   return _Div(_CastFI(s), _CastFI(t));
 }
 
+static __forceinline _Data FastExpNoClampNegativeRcp(_Data vX)
+{
+  /* Caller guarantees vLow <= vX <= 0. No clamp at all. */
+  const _DataI r = _ConvertIF(_Mul(vExpFactor, vX));
+  const _Data  s = _CastFI(_AddI(_CastIF(vExpC), r));
+  const _Data  t = _CastFI(_SubI(_CastIF(vExpC), r));
+  return _Mul(s, recip_float4_single(t));   // ~24-bit precision
+}
+
 // Paired to reduce load store delays.
 static  __forceinline void FastExpAlwaysNegativePair(_Data& vExp, _Data& vExp2, _Data vX, _Data vX2)
 {

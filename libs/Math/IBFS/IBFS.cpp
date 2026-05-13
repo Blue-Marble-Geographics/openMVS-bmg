@@ -36,37 +36,39 @@ If you require another license, please contact the above.
 #include "IBFS.h"
 #include "boost/container/small_vector.hpp"
 
+// Toggle perf optimizations for A/B test:
+//   IBFS_OPT_PREFETCH : software prefetch in growth / adoption / augment / augmentTree
+// Set to 0 to disable.
+#ifndef IBFS_OPT_PREFETCH
+#define IBFS_OPT_PREFETCH 1
+#endif
+
 using namespace IBFS;
 
 //
-// Orphan handling
+// Orphan handling (index-based)
 //
-#define ADD_ORPHAN_BACK(n)							\
-if (orphanFirst != IB_ORPHANS_END)					\
-{													\
-	orphanLast = (orphanLast->nextPtr = (n));		\
-}													\
-else												\
-{													\
-	orphanLast = (orphanFirst = (n));				\
-}													\
-(n)->nextPtr = IB_ORPHANS_END
+#define ADD_ORPHAN_BACK(n) do {                              \
+	NodeIdx _ni = static_cast<NodeIdx>((n) - nodes);         \
+	if (orphanFirstIdx != kOrphansEndIdx) {                  \
+		nodes[orphanLastIdx].nextPtrIdx = _ni;               \
+		orphanLastIdx = _ni;                                 \
+	} else {                                                 \
+		orphanFirstIdx = orphanLastIdx = _ni;                \
+	}                                                        \
+	(n)->nextPtrIdx = kOrphansEndIdx;                        \
+} while (0)
 
-
-
-
-
-#define ADD_ORPHAN_FRONT(n)							\
-if (orphanFirst == IB_ORPHANS_END)					\
-{													\
-	(n)->nextPtr = IB_ORPHANS_END;					\
-	orphanLast = (orphanFirst = (n));				\
-}													\
-else												\
-{													\
-	(n)->nextPtr = orphanFirst;						\
-	orphanFirst = (n);								\
-}
+#define ADD_ORPHAN_FRONT(n) do {                             \
+	NodeIdx _ni = static_cast<NodeIdx>((n) - nodes);         \
+	if (orphanFirstIdx == kOrphansEndIdx) {                  \
+		(n)->nextPtrIdx = kOrphansEndIdx;                    \
+		orphanFirstIdx = orphanLastIdx = _ni;                \
+	} else {                                                 \
+		(n)->nextPtrIdx = orphanFirstIdx;                    \
+		orphanFirstIdx = _ni;                                \
+	}                                                        \
+} while (0)
 
 
 
@@ -77,16 +79,19 @@ IBFSGraph::IBFSGraph() {
 	augTimestamp = 0;
 	verbose = IBTEST;
 	flow = 0;
-  orphanFirst = orphanLast = nullptr;
+  orphanFirstIdx = orphanLastIdx = kOrphansEndIdx;
   nodes = nodeEnd = nullptr;
+  arcCountBuild = nullptr;
 }
 
 IBFSGraph::~IBFSGraph() {
+	delete[] arcCountBuild;
 	active0.release();
 	activeS1.release();
 	activeT1.release();
 	orphanBuckets.release();
 	_aligned_free(nodes);
+	nodes = nullptr;
 }
 
 
@@ -111,19 +116,23 @@ void IBFSGraph::initGraph() {
 
 void IBFSGraph::initSize(int n, int)
 {
+	assert(n >= 0 && static_cast<uint32_t>(n) <= kMaxNodes);
 	numNodes = n;
-	nodes = static_cast<Node*>(_aligned_malloc(sizeof(Node) * n, 64));
+	nodes = static_cast<Node*>(_aligned_malloc(sizeof(Node) * static_cast<size_t>(n), 64));
+	arcCountBuild = new std::atomic<int>[n];
 
 #pragma omp parallel for schedule(static)
 	for (int i = 0; i < n; ++i) {
+		arcCountBuild[i].store(0, std::memory_order_relaxed);
 		Node& node = nodes[i];
-		node.arcCountBuild.store(0, std::memory_order_relaxed);
 		node.excess = 0;
-		node.parent = nullptr;
-		node.firstSon = nullptr;
-		node.nextPtr = nullptr;
+		node.parentRef = kNullParent;
+		node.firstSonIdx = kNullIdx;
+		node.nextPtrIdx = kNullIdx;
 		node.lastAugTimestamp = 0;
 		node.isParentCurr = 0;
+		node.arcCount = 0;
+		node.residBits = 0;
 		node.label = 0;
 	}
 
@@ -146,40 +155,49 @@ __forceinline void IBFSGraph::augmentTree(
 
 	for (int i = 0; i < nodeCount - 1; ++i) {
 		Arc* a = arcPath[i];
-		Arc& rev = a->head->arcs[a->revIdx];
+#if IBFS_OPT_PREFETCH
+		// Prefetch the next iteration's node and arc while we mutate this one.
+		if (i + 1 < nodeCount - 1) {
+			_mm_prefetch((const char*)nodePath[i + 1], _MM_HINT_T0);
+			_mm_prefetch((const char*)arcPath[i + 1], _MM_HINT_T0);
+		}
+#endif
+		Node* parentNode = nodes + a->headIdx();
+		Arc& rev = parentNode->arcs[a->revIdx()];
 
 		if (sTree) {
 			// used reverse residual
 			a->rCap += bottleneck;
-			rev.isRevResidual = 1;
+			parentNode->residBits |= (1u << a->revIdx());
 			rev.rCap -= bottleneck;
 		}
 		else {
 			// used forward residual
 			rev.rCap += bottleneck;
-			a->isRevResidual = 1;
+			x->residBits |= (1u << (int)(a - x->arcs));
 			a->rCap -= bottleneck;
 		}
 
 		if ((sTree ? rev.rCap : a->rCap) == 0) {
-			if (sTree) a->isRevResidual = 0;
-			else rev.isRevResidual = 0;		
-	
-			Node* y = a->head->firstSon;
-			if (y == x) {
-				a->head->firstSon = x->nextPtr;
+			if (sTree) x->residBits &= ~(1u << (int)(a - x->arcs));
+			else parentNode->residBits &= ~(1u << a->revIdx());
+
+			NodeIdx xi = static_cast<NodeIdx>(x - nodes);
+			NodeIdx yi = parentNode->firstSonIdx;
+			if (yi == xi) {
+				parentNode->firstSonIdx = x->nextPtrIdx;
 			}
 			else {
-				for (; y && y->nextPtr != x; y = y->nextPtr);
-				if (y) y->nextPtr = x->nextPtr;
+				while (yi != kNullIdx && yi != kOrphansEndIdx
+					&& nodes[yi].nextPtrIdx != xi) {
+					yi = nodes[yi].nextPtrIdx;
+				}
+				if (yi != kNullIdx && yi != kOrphansEndIdx)
+					nodes[yi].nextPtrIdx = x->nextPtrIdx;
 			}
 
 			// orphan creation
-			x->nextPtr = IB_ORPHANS_END;
-			if (orphanFirst != IB_ORPHANS_END)
-				orphanLast = orphanLast->nextPtr = x;
-			else
-				orphanFirst = orphanLast = x;
+			ADD_ORPHAN_BACK(x);
 		}
 		x = nodePath[i + 1];
 	}
@@ -187,15 +205,11 @@ __forceinline void IBFSGraph::augmentTree(
 	// terminal
 	x->excess += (sTree ? -bottleneck : bottleneck);
 	if (x->excess == 0) {
-		x->nextPtr = IB_ORPHANS_END;
-		if (orphanFirst != IB_ORPHANS_END)
-			orphanLast = orphanLast->nextPtr = x;
-		else
-			orphanFirst = orphanLast = x;
+		ADD_ORPHAN_BACK(x);
 	}
 }
 
-enum { kSmallSize = 128 };
+enum { kSmallSize = 1024 };
 
 struct Scratch
 {
@@ -206,18 +220,18 @@ struct Scratch
 	IBFSGraph::Arc* smallTArc[kSmallSize];
 };
 
-thread_local std::vector<IBFSGraph::Node*> bigSNode;
-thread_local std::vector<IBFSGraph::Arc*> bigSArc;
+static std::vector<IBFSGraph::Node*> bigSNode;
+static std::vector<IBFSGraph::Arc*> bigSArc;
 
-thread_local std::vector<IBFSGraph::Node*> bigTNode;
-thread_local std::vector<IBFSGraph::Arc*> bigTArc;
+static std::vector<IBFSGraph::Node*> bigTNode;
+static std::vector<IBFSGraph::Arc*> bigTArc;
 
-__declspec(thread) Scratch scratch; // Must be POD
+static Scratch scratch;
 
 void IBFSGraph::augment(Arc * __restrict bridge)
 {
-	Node* __restrict x;
-	Arc* __restrict a;
+	Node* x;
+	Arc* a;
 	EdgeCap bottleneck;
 	Real pushesBefore;
 
@@ -234,7 +248,11 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	int lenS = 0;
 	bool overflow = false;
 
-	for (x = bridge->head->arcs[bridge->revIdx].head;;) {
+	{
+		Node* bridgeHead = nodes + bridge->headIdx();
+		x = nodes + bridgeHead->arcs[bridge->revIdx()].headIdx();
+	}
+	for (;;) {
 		// ---- overflow check once per full iteration ----
 		if (lenS + 1 >= kSmallSize) {
 			overflow = true;
@@ -249,13 +267,17 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 			break;
 		}
 
-		a = x->parent;
+		a = unpackParent(x->parentRef);
 		sArc[lenS] = a;
 
-    Node* aHead0 = a->head;
+		Node* aHead0 = nodes + a->headIdx();
+#if IBFS_OPT_PREFETCH
+		// Prefetch the rev-arc cache line on parent (if arcs[3], it's a 2nd line).
+		_mm_prefetch((const char*)aHead0, _MM_HINT_T0);
+#endif
 
 		{
-			const Arc& rev0 = aHead0->arcs[a->revIdx];
+			const Arc& rev0 = aHead0->arcs[a->revIdx()];
 			if (bottleneck > rev0.rCap)
 				bottleneck = rev0.rCap;
 		}
@@ -271,13 +293,16 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 			break;
 		}
 
-		a = x->parent;
+		a = unpackParent(x->parentRef);
 		sArc[lenS] = a;
 
-		Node* aHead1 = a->head;
+		Node* aHead1 = nodes + a->headIdx();
+#if IBFS_OPT_PREFETCH
+		_mm_prefetch((const char*)aHead1, _MM_HINT_T0);
+#endif
 
 		{
-			const Arc& rev1 = aHead1->arcs[a->revIdx];
+			const Arc& rev1 = aHead1->arcs[a->revIdx()];
 			if (bottleneck > rev1.rCap)
 				bottleneck = rev1.rCap;
 		}
@@ -295,7 +320,7 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 
 	int lenT = 0;
 
-	for (x = bridge->head;;) {
+	for (x = nodes + bridge->headIdx();;) {
 		// ---- overflow check once per full iteration ----
 		if (lenT + 1 >= kSmallSize) {
 			overflow = true;
@@ -310,14 +335,18 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 			break;
 		}
 
-		a = x->parent;
+		a = unpackParent(x->parentRef);
 		tArc[lenT] = a;
 
 		if (bottleneck > a->rCap)
 			bottleneck = a->rCap;
 
 		++lenT;
-		x = a->head;
+#if IBFS_OPT_PREFETCH
+		// Prefetch the next parent node before we land on it.
+		_mm_prefetch((const char*)(nodes + a->headIdx()), _MM_HINT_T0);
+#endif
+		x = nodes + a->headIdx();
 
 		// ================== step 1 ==================
 		tNode[lenT] = x;
@@ -327,14 +356,17 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 			break;
 		}
 
-		a = x->parent;
+		a = unpackParent(x->parentRef);
 		tArc[lenT] = a;
 
 		if (bottleneck > a->rCap)
 			bottleneck = a->rCap;
 
 		++lenT;
-		x = a->head;
+#if IBFS_OPT_PREFETCH
+		_mm_prefetch((const char*)(nodes + a->headIdx()), _MM_HINT_T0);
+#endif
+		x = nodes + a->headIdx();
 	}
 
 	if (!overflow && bottleneck > (-x->excess))
@@ -348,16 +380,20 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 		bigSArc.clear();
 		bigSArc.reserve(1024);
 
-		for (x = bridge->head->arcs[bridge->revIdx].head; ; x = a->head) {
+		{
+			Node* bridgeHead = nodes + bridge->headIdx();
+			x = nodes + bridgeHead->arcs[bridge->revIdx()].headIdx();
+		}
+		for (;; x = nodes + a->headIdx()) {
 			bigSNode.push_back(x);
 
 			if (x->excess)
 				break;
 
-			a = x->parent;
+			a = unpackParent(x->parentRef);
 			bigSArc.push_back(a);
 
-			Arc& rev = a->head->arcs[a->revIdx];
+			Arc& rev = nodes[a->headIdx()].arcs[a->revIdx()];
 			if (bottleneck > rev.rCap)
 				bottleneck = rev.rCap;
 		}
@@ -370,10 +406,10 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 		bigTArc.clear();
 		bigTArc.reserve(1024);
 
-		for (x = bridge->head; ; x = a->head) {
+		for (x = nodes + bridge->headIdx(); ; x = nodes + a->headIdx()) {
 			bigTNode.push_back(x);
 			if (x->excess) break;
-			a = x->parent;
+			a = unpackParent(x->parentRef);
 			bigTArc.push_back(a);
 			if (bottleneck > a->rCap)
 				bottleneck = a->rCap;
@@ -421,12 +457,13 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	}
 
 	// augment connecting arc
-	Arc& rev = bridge->head->arcs[bridge->revIdx];
+	Node& bridgeTgt = nodes[bridge->headIdx()];
+	Arc& rev = bridgeTgt.arcs[bridge->revIdx()];
 	rev.rCap += bottleneck;
-	bridge->isRevResidual = 1;
+	nodes[rev.headIdx()].residBits |= (1u << rev.revIdx());
 	bridge->rCap -= bottleneck;
 	if (bridge->rCap == 0) {
-		rev.isRevResidual = 0;
+		bridgeTgt.residBits &= ~(1u << bridge->revIdx());
 	}
 
 
@@ -457,14 +494,14 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 template <bool sTree>
 void IBFSGraph::adoption()
 {
-	Node * __restrict x, * __restrict  y, * __restrict z;
-  Arc * __restrict  a;
-  bool threePass = false;
-  int minLabel, numOrphans = 0, numOrphansUniq = 0;
+	Node* x, * y;
+	Arc*  a;
+	bool threePass = false;
+	int minLabel, numOrphans = 0, numOrphansUniq = 0;
 
-  while (orphanFirst != IB_ORPHANS_END) {
-		x = orphanFirst;
-		orphanFirst = x->nextPtr;
+	while (orphanFirstIdx != kOrphansEndIdx) {
+		x = nodes + orphanFirstIdx;
+		orphanFirstIdx = x->nextPtrIdx;
 		testNode(x);
 		stats.incOrphans();
 		numOrphans++;
@@ -475,81 +512,108 @@ void IBFSGraph::adoption()
 			else uniqOrphansT++;
 			numOrphansUniq++;
 		}
-		if (numOrphans >= 3*numOrphansUniq) {
+		if (numOrphans >= 3 * numOrphansUniq) {
 			threePass = true;
 		}
 
-    // check for same-level parent
+		// check for same-level parent
 		if (x->isParentCurr) {
-			a = x->parent;
-		} else {
-			x->isParentCurr = 1;
-      a = nullptr;
+			a = unpackParent(x->parentRef);
 		}
-    x->parent = nullptr;
+		else {
+			x->isParentCurr = 1;
+			a = nullptr;
+		}
+		x->parentRef = kNullParent;
 
-    if (x->label != (sTree ? 1 : -1)) {
-      minLabel = x->label - (sTree ? 1 : -1);
-			for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+		if (x->label != (sTree ? 1 : -1)) {
+			minLabel = x->label - (sTree ? 1 : -1);
+			const int cnt = x->arcCount;
+			__assume(cnt <= 4);
+			const uint8_t resBits = x->residBits;
+			for (int i = 0; i < cnt; ++i) {
 				a = &x->arcs[i];
 				stats.incOrphanArcs1();
-				y = a->head;
+				y = nodes + a->headIdx();
 
-				if ((sTree ? a->isRevResidual : a->rCap) && y->label == minLabel) {
+#if IBFS_OPT_PREFETCH
+				// prefetch next arc's target node
+				if (i + 1 < cnt)
+					_mm_prefetch((const char*)(nodes + x->arcs[i + 1].headIdx()), _MM_HINT_T0);
+#endif
 
-					x->parent = a;
-					x->nextPtr = y->firstSon;
-					y->firstSon = x;
+				if ((sTree ? ((resBits >> i) & 1u) : a->rCap) && y->label == minLabel) {
+					x->parentRef = packParent(a, x);
+					x->nextPtrIdx = y->firstSonIdx;
+					y->firstSonIdx = idxOf(x);
 					break;
 				}
 			}
 		}
-    if (x->parent != nullptr) continue;
+		if (x->parentRef != kNullParent) continue;
 
-    // orphan children
-    for (y = x->firstSon; y != nullptr; y = z) {
-			stats.incOrphanArcs3();
-			z=y->nextPtr;
-			ADD_ORPHAN_BACK(y);
+		// orphan children
+		{
+			NodeIdx yi = x->firstSonIdx;
+			while (yi != kNullIdx && yi != kOrphansEndIdx) {
+				y = nodes + yi;
+				stats.incOrphanArcs3();
+				NodeIdx zi = y->nextPtrIdx;
+				ADD_ORPHAN_BACK(y);
+				yi = zi;
+			}
 		}
-    x->firstSon = nullptr;
+		x->firstSonIdx = kNullIdx;
 
-    if (x->label == (sTree ? topLevelS : -topLevelT)) {
-      x->label = numNodes;
+		if (x->label == (sTree ? topLevelS : -topLevelT)) {
+			x->label = numNodes;
 			continue;
 		}
 
 		if (threePass) {
-      x->label += (sTree ? 1 : -1);
+			x->label += (sTree ? 1 : -1);
 			orphanBuckets.add<sTree>(x);
 			continue;
 		}
 
-    // relabel
+		// relabel
 		minLabel = (sTree ? topLevelS : -topLevelT);
-    if (x->label != minLabel) {
-			for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+		if (x->label != minLabel) {
+			const int cnt = x->arcCount;
+			__assume(cnt <= 4);
+			const uint8_t resBits = x->residBits;
+			for (int i = 0; i < cnt; ++i) {
 				a = &x->arcs[i];
 				stats.incOrphanArcs2();
-				y = a->head;
-			if ((sTree ? a->isRevResidual : a->rCap) &&
+				y = nodes + a->headIdx();
+
+
+#if IBFS_OPT_PREFETCH
+				// prefetch next arc's target node
+				if (i + 1 < cnt)
+					_mm_prefetch((const char*)(nodes + x->arcs[i + 1].headIdx()), _MM_HINT_T0);
+#endif
+
+				if ((sTree ? ((resBits >> i) & 1u) : a->rCap) &&
 					(sTree ? y->label > 0 : y->label < 0) &&
 					(sTree ? y->label < minLabel : y->label > minLabel)) {
 					minLabel = y->label;
-					x->parent = a;
+					x->parentRef = packParent(a, x);
 					if (minLabel == x->label) break;
 				}
 			}
 		}
 
-    if (x->parent != nullptr) {
-      x->label = minLabel + (sTree ? 1 : -1);
-			x->nextPtr = x->parent->head->firstSon;
-			x->parent->head->firstSon = x;
-      if (sTree && x->label == topLevelS) activeS1.add(x);
-      else if (!sTree && x->label == -topLevelT) activeT1.add(x);
-			} else {
-      x->label = numNodes;
+		if (x->parentRef != kNullParent) {
+			x->label = minLabel + (sTree ? 1 : -1);
+			Node* po = nodes + unpackParent(x->parentRef)->headIdx();
+			x->nextPtrIdx = po->firstSonIdx;
+			po->firstSonIdx = idxOf(x);
+			if (sTree && x->label == topLevelS) activeS1.add(x);
+			else if (!sTree && x->label == -topLevelT) activeT1.add(x);
+		}
+		else {
+			x->label = numNodes;
 		}
 	}
 
@@ -570,25 +634,28 @@ void IBFSGraph::adoption3Pass()
 			testNode(x);
 
 			// pass 2: find lowest level parent
-			if (x->parent == nullptr) {
+			if (x->parentRef == kNullParent) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
 				destLabel = x->label - (sTree ? 1 : -1);
 
-				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+				const int cnt = x->arcCount;
+				__assume(cnt <= 4);
+				const uint8_t resBits = x->residBits;
+				for (int i = 0; i < cnt; ++i) {
 					a = &x->arcs[i];
-					y = a->head;
-					if ((sTree ? a->isRevResidual : a->rCap) &&
-						(y->excess || y->parent != NULL) &&
+					y = nodes + a->headIdx();
+					if ((sTree ? ((resBits >> i) & 1u) : a->rCap) &&
+						(y->excess || y->parentRef != kNullParent) &&
 						//!y->isOrphan() &&
 						(sTree ? (y->label > 0) : (y->label < 0)) &&
 						(sTree ? (y->label < minLabel) : (y->label > minLabel)))
 					{
-						x->parent = a;
+						x->parentRef = packParent(a, x);
 						if ((minLabel = y->label) == destLabel) break;
 					}
 				}
 
-				if (x->parent == nullptr) {
+				if (x->parentRef == kNullParent) {
 					x->label = numNodes;
 					continue;
 				}
@@ -604,12 +671,15 @@ void IBFSGraph::adoption3Pass()
 			if (x->label != (sTree ? topLevelS : -topLevelT)) {
 				minLabel = x->label + (sTree ? 1 : -1);
 
-				for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
+				const int cnt = x->arcCount;
+				__assume(cnt <= 4);
+				const uint8_t resBits = x->residBits;
+				for (int i = 0; i < cnt; ++i) {
 					a = &x->arcs[i];
-					y = a->head;
+					y = nodes + a->headIdx();
 
-					Arc& rev = a->head->arcs[a->revIdx];
-					if ((sTree ? a->rCap : a->isRevResidual) &&
+					Arc& rev = y->arcs[a->revIdx()];
+					if ((sTree ? a->rCap : ((resBits >> i) & 1u)) &&
 							((!sTree && y->label == numNodes) ||
 								// the above implicitly holds by condition below when sTree=true
 								(sTree ? (minLabel < y->label) : (minLabel > y->label))))
@@ -618,15 +688,18 @@ void IBFSGraph::adoption3Pass()
 							orphanBuckets.remove<sTree>(y);
 
 						y->label = minLabel;
-						y->parent = &rev;
+						y->parentRef = packParent(&rev, y);
 						orphanBuckets.add<sTree>(y);
 					}
 				}
 			}
 
 			// relabel onto new parent
-			x->nextPtr = x->parent->head->firstSon;
-			x->parent->head->firstSon = x;
+			{
+				Node* po = nodes + unpackParent(x->parentRef)->headIdx();
+				x->nextPtrIdx = po->firstSonIdx;
+				po->firstSonIdx = idxOf(x);
+			}
 			x->isParentCurr = 0;
 
 			// add to active list of the next growth phase
@@ -651,11 +724,17 @@ void IBFSGraph::growth()
 {
 	Node* x, * y;
 
-	for (Node** active = active0.list;
-		active != active0.list + active0.len;
+	for (Node** active = active0.list_vec.data();
+		active != active0.list_vec.data() + active0.len;
 		++active) {
 
 		x = *active;
+
+#if IBFS_OPT_PREFETCH
+		// At the start of each outer iteration in growth(), prefetch the next active node
+		if (active + 1 < active0.list_vec.data() + active0.len)
+			_mm_prefetch((const char*)*(active + 1), _MM_HINT_T0);
+#endif
 
 		if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
 			continue;
@@ -666,20 +745,27 @@ void IBFSGraph::growth()
 		for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 			Arc* a = &x->arcs[i];
 
-			if ((dirS ? a->rCap : a->isRevResidual) == 0) continue;
+			if ((dirS ? a->rCap : (EdgeCap)((x->residBits >> i) & 1u)) == 0) continue;
 
-			y = a->head;
+			y = nodes + a->headIdx();
 
-			Arc& rev = a->head->arcs[a->revIdx];
+#if IBFS_OPT_PREFETCH
+			// prefetch next arc's head node while we process this one
+			if (i + 1 < cnt) {
+				_mm_prefetch((const char*)(nodes + x->arcs[i + 1].headIdx()), _MM_HINT_T0);
+			}
+#endif
+
+			Arc& rev = y->arcs[a->revIdx()];
 			if (y->label == numNodes) {
 				y->isParentCurr = 0;
 				y->label = x->label + (dirS ? 1 : -1);
 
 				// parent assignment
-				y->parent = &rev;
+				y->parentRef = packParent(&rev, y);
 
-				y->nextPtr = x->firstSon;
-				x->firstSon = y;
+				y->nextPtrIdx = x->firstSonIdx;
+				x->firstSonIdx = idxOf(y);
 
 				if (dirS) activeS1.add(y);
 				else activeT1.add(y);
@@ -694,7 +780,7 @@ void IBFSGraph::growth()
 					break;
 
 				// recheck same arc if it still has residual
-				if (dirS ? a->rCap : a->isRevResidual)
+				if (dirS ? a->rCap : (EdgeCap)((x->residBits >> i) & 1u))
 					--i;
 			}
 		}
@@ -705,7 +791,8 @@ void IBFSGraph::growth()
 
 
 EdgeCap IBFSGraph::computeMaxFlow() {
-	orphanFirst = IB_ORPHANS_END;
+	orphanFirstIdx = kOrphansEndIdx;
+	orphanLastIdx  = kOrphansEndIdx;
 	bool dirS = true;
 	ActiveList::swapLists(&active0, &activeS1);
 
@@ -898,7 +985,7 @@ bool IBFSGraph::readCompiled(FILE *pFile)
 		} else if (buffer[0] == 'a') {
 			if (nodeId1 < 0 ||
 				nodeId1 >= declaredNumOfNodes ||
-				nodeId2 < 0 ||
+			nodeId2 < 0 ||
 				nodeId2 >= declaredNumOfNodes)
 			{
 				fprintf(stdout, "inconsistent node index in compiled file %d,%d line %d\n", nodeId1, nodeId2, line);

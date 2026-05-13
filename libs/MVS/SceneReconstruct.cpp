@@ -32,7 +32,138 @@
 #define FIX_MANIFOLD // No manifold repair at all
 #define MANIFOLD_FIXUP
 #undef PRE_OPENMVS21
-#define APPROXIMATE_GRAPHCUT
+#define EARLY_OUT_WEIGHTING
+#define PARALLEL_GRAPH_CUT_EXTRACTION
+
+// --- Optional point-cloud pre-filter (applied AFTER StatisticalOutlierRemoval,
+// BEFORE Delaunay insertion). Defaults to OFF.
+//
+// Confidence-weighted filter: uses the per-point pointWeights data
+//    (per-view confidence). For each point we take the MAX weight across
+//    its views (the strongest single-view evidence). Weight distributions
+//    are typically right-skewed (lognormal-ish), so a symmetric mean-kσ
+//    threshold goes negative and drops nothing. Instead we drop the bottom
+//    KPCT percent by quantile -- robust to distribution shape.
+//    KPCT=10 means drop bottom 10% (lowest-confidence). Set to 0 to disable.
+#ifndef RECONSTRUCT_CONFIDENCE_FILTER
+#define RECONSTRUCT_CONFIDENCE_FILTER 0
+#endif
+
+// =====================================================================
+// SCRREC_OPT_PREFETCH: latency-hiding optimizations (semantics-preserving).
+//   A) Software prefetch in the deferred-apply scatter loop
+//      (per-vertex weighting). Warms `cell_info_t.f[]` lines ~8 atomics
+//      ahead so the CAS-loop pipelines instead of stalling on DRAM.
+//   B) Software prefetch in BuildGraphNodesAndEdges Phase 3. Warms
+//      neighbor `infoCells[]` and `qualAngles[]` cachelines for the
+//      next iteration before the random gather happens.
+//   C) _mm_pause() in AtomicAddFloat's CAS retry loop. Yields the µop
+//      port under contention; helps the long-tail of histogram cells
+//      that get hit by many threads at once.
+// All three are pure latency hiding -- no math changes, no data structure
+// changes, identical results. Set to 0 to A/B test.
+// =====================================================================
+#ifndef SCRREC_OPT_PREFETCH
+#define SCRREC_OPT_PREFETCH 1
+#endif
+#ifndef RECONSTRUCT_CONFIDENCE_FILTER_KPCT
+#define RECONSTRUCT_CONFIDENCE_FILTER_KPCT 3
+#endif
+
+// RECONSTRUCT_EARLY_CONFIDENCE_FILTER: Run the confidence filter BEFORE
+// spatial_sort / SOR / permuteScatter2 instead of after.  Same drop logic
+// (bottom KPCT% by max-per-point view weight), same KPCT setting.
+// When this is 1, the late confidence filter is automatically suppressed
+// to prevent double-dropping.  Effect: every later O(N) and O(N log N)
+// stage sees a smaller N (kd-tree build, KNN search, sort, DT insertion,
+// per-point cell walks).  Constraints:
+//   - Skipped if pointWeights are not available (no-op, falls through).
+//   - Skipped in ROI mode -- ProcessPoints<true> compacts indices[] to
+//     post-filter indices, breaking original-cloud-index lookups into
+//     pointWeightsOffsets/Sizes.  (The late filter has the same constraint
+//     implicitly; it just isn't usually enabled together with ROI.)
+// NOTE: Found to drop quality-bearing boundary/feature points on aerial
+// scenes (low-confidence !=  noise here -- it correlates with low view
+// count which marks boundaries and thin features). Reverted to 0.
+// Set to 0 to revert to the original ordering.
+#ifndef RECONSTRUCT_EARLY_CONFIDENCE_FILTER
+#define RECONSTRUCT_EARLY_CONFIDENCE_FILTER 0
+#endif
+
+// RECONSTRUCT_VOXEL_PREFILTER: Density-based pre-decimation. For each input
+// point compute a voxel-grid cell index; collapse all points in the same
+// cell to a single representative (highest-confidence wins; first-arrival
+// if no pointWeights). Effect: removes redundant near-duplicates from
+// over-sampled flat regions WITHOUT removing isolated boundary/feature
+// points (sparse cells keep their single point unconditionally). Unlike
+// the confidence filter this is data-density driven, so it should preserve
+// silhouette / thin-feature detail.
+//
+// AUTO-TUNED VOXEL SIZE: Voxel size is derived from the data's *densest*
+// region rather than hardcoded. We probe a coarse 64^3 occupancy grid
+// over the active bbox, find the peak bin, and estimate dense-region
+// inter-point spacing assuming a 2D surface within that bin:
+//      bin_side = max_span / 64
+//      dense_spacing ~= bin_side / sqrt(K_peak)
+//      voxel = dense_spacing * VOXEL_SAFETY
+// VOXEL_SAFETY < 1.0 = strictly more conservative than the dense
+// spacing (only true duplicates merge). VOXEL_SAFETY = 1.0 = match
+// dense spacing (some mild merging where over-sampled). VOXEL_SAFETY > 1.0
+// = aggressive (collapses real geometry; not recommended).
+//
+// Resulting kGrid is clamped to [256, 65535] so the voxel can never grow
+// larger than max_span/256 (a hard upper bound that prevents catastrophic
+// merge on degenerate / sparse data) nor smaller than max_span/65535
+// (16-bit-per-axis grid limit).
+//
+// Cost: one bbox pass + one density probe (~50ms) + one voxel-key build +
+// tbb::parallel_sort on (key, idx).
+// Side benefit: post-sort indices[] are in approximately z-order, which
+// often warms up the subsequent CGAL spatial_sort.
+//
+// Constraints:
+//   - Skipped in ROI mode (same indices[] semantics issue as above).
+//   - Skipped if numVertices == 0.
+//   - Skipped if dense-region probe yields uninformative result (K_peak
+//     < some threshold) -- means the cloud is uniformly sparse, no
+//     redundancy to remove.
+// Set to 0 to disable.
+#ifndef RECONSTRUCT_VOXEL_PREFILTER
+#define RECONSTRUCT_VOXEL_PREFILTER 1
+#endif
+
+// RECONSTRUCT_VOXEL_SAFETY: Multiplier applied to estimated dense-region
+// inter-point spacing to derive voxel size.
+//   < 1.0  : voxel smaller than dense spacing -> only exact duplicates merge
+//   1.0    : voxel matches dense spacing -> light merging in dense regions,
+//            none in sparse regions (RECOMMENDED starting point)
+//   > 1.0  : voxel larger than dense spacing -> real geometry can be lost
+// Stored as int * 0.01 so it's preprocessor-friendly. 100 = 1.00.
+#ifndef RECONSTRUCT_VOXEL_SAFETY_X100
+#define RECONSTRUCT_VOXEL_SAFETY_X100 100
+#endif
+
+// DIRECT_VIEW_EXPANSION: Instead of storing point indices in per-vertex
+// allViews[] during insertion (random small_vector pushes), store vertex
+// index per point (sequential writes), then expand views in a single
+// cache-friendly sequential pass after insertion is complete.
+// Set to 1 to enable the new path, 0 for the original path.
+#ifndef DIRECT_VIEW_EXPANSION
+#define DIRECT_VIEW_EXPANSION 1
+#endif
+
+// INSERTION_BFS_MAX_CELLS: Cap on the per-restart BFS cell-visit count
+// during nearest-vertex search inside the distInsert>0 insertion path.
+// 0 = unbounded (semantically exact: BFS terminates only when proven
+//     no closer vertex exists).
+// >0 = approximate: if BFS hits this cap, accept current best as nearest.
+//     Worst case: pick a vertex slightly further than true nearest →
+//     downstream "insert vs skip" check errs toward inserting (NOT
+//     toward dropping legitimate points). Mesh quality preserved;
+//     DT may grow slightly. Recommended: 32-64. Lower = faster + larger DT.
+#ifndef INSERTION_BFS_MAX_CELLS
+#define INSERTION_BFS_MAX_CELLS 64
+#endif
 
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
@@ -280,15 +411,13 @@ public:
     graph.finalizeGraph();
 	}
 
-	int CollapseDegree1Nodes()
+	// Variant for callers that wrote arcs[] directly and set arcCount.
+	// Skips the atomic counter copy; only runs arc sort.
+	void FinalizeGraphPrebuilt()
 	{
-		return graph.CollapseDegree1Nodes();
+		graph.finalizeGraphPrebuilt();
 	}
 
-	void PrelabelDominantNodes()
-	{
-		graph.PrelabelDominantNodes();
-	}
 	graph_type graph;
 };
 #else
@@ -437,6 +566,7 @@ struct view_t {
 };
 
 // Use 2 cache lines per entry to start.
+#if !DIRECT_VIEW_EXPANSION
 typedef boost::container::small_vector<uint32_t, 26> view_vec_t;
 view_vec_t* allViews; // faces' weight from the cell outwards
 
@@ -445,6 +575,19 @@ __forceinline void InsertViews(size_t vertexId, const PointCloudStreaming& pc, u
 	// Note we silently enforce indices no larger than a uint32_t
 	allViews[vertexId].push_back(idxPoint);
 }
+#else
+// New path: store vertex index per point during insertion.
+// Expansion into per-vertex view lists happens as a separate pass.
+uint32_t* pointToVertex; // sized numVertices, maps sorted-point-index -> DT vertex idx
+// Per-vertex expanded view data (built after insertion)
+struct ExpandedViewCount {
+	uint32_t id;
+	uint16_t count;
+};
+ExpandedViewCount* vcData;   // flat array of all view counts
+uint32_t* vcOffsets;          // vcData offset per vertex idx
+uint16_t* vcSizes;            // number of ViewCounts per vertex idx
+#endif
 
 #ifdef VALIDATE
 struct vert_info_t2 {
@@ -1161,7 +1304,7 @@ __forceinline int intersect(
 	const double pax = ih.pv0Diff[0], pay = ih.pv0Diff[1], paz = ih.pv0Diff[2];
 	const double qax = ih.qv0Diff[0], qay = ih.qv0Diff[1], qaz = ih.qv0Diff[2];
 
-	// signed distances to plane (no 'd' needed): dp = n�(p-a), dq = n�(q-a)
+	// signed distances to plane (no 'd' needed): dp = n�(p-a), dq = n�(q-a)
 	const double dp = nx * pax + ny * pay + nz * paz;
 	const double dq = nx * qax + ny * qay + nz * qaz;
 
@@ -1347,8 +1490,8 @@ __forceinline bool IntersectsPrecheckFast(
 #if 1 // JPB WIP BUG Alternative version which drops the "1" case and improves performance
 template<bool UseP>
 __forceinline int CheckEdges2FastCore(
-	double sx, double sy, double sz,   // ray direction from endpoint
-	double ax, double ay, double az,   // endpoint - v0
+	double sx, double sy, double sz,
+	double ax, double ay, double az,   // a - endpoint (v0 - p or v0 - q)
 	double bx, double by, double bz,   // v1 - endpoint
 	double cx, double cy, double cz,   // v2 - endpoint
 	int* __restrict coplanar)
@@ -1356,37 +1499,28 @@ __forceinline int CheckEdges2FastCore(
 	constexpr double eps = 1e-12;
 	int nCop = 0;
 
-	// Mixed reusable terms
-	const double sxaY = ax * sy - sx * ay;
-	const double sxbY = sx * by - bx * sy;
-	const double sxcY = cx * sy - sx * cy;
+	const double sxa_y = sx * ay - ax * sy;
+	const double sxb_y = sx * by - bx * sy;
+	const double sxc_y = sx * cy - cx * sy;
 
-	// Reused 2D cross products
-	const double abXY = ax * by - ay * bx;
-	const double bcXY = bx * cy - by * cx; // == bx*cy - cx*by
-	const double caXY = cx * ay - cy * ax; // == -(ax*cy - cx*ay)
-
-	// (a, b): original t3 = bx*ay - ax*by = -(ax*by - ay*bx) = -abXY
-	{
-		const double det = sxaY * bz + sxbY * az - abXY * sz;
+	{ // (s, a, b)
+		const double t3 = ax * by - bx * ay;
+		const double det = sxa_y * bz - sxb_y * az + t3 * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 0;
 	}
-
-	// (b, c): original t3 = bx*cy - cx*by = bcXY  (PLUS term!)
-	{
-		const double det = sxbY * cz + sxcY * bz + bcXY * sz;
+	{ // (s, b, c)
+		const double t3 = bx * cy - cx * by;
+		const double det = sxb_y * cz - sxc_y * bz + t3 * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 1;
 	}
-
-	// (c, a): original t3 = ax*cy - cx*ay = -caXY
-	{
-		const double det = sxcY * az - sxaY * cz - caXY * sz;
+	{ // (s, c, a)
+		const double t3 = cx * ay - ax * cy;
+		const double det = sxc_y * az - sxa_y * cz + t3 * sz;
 		if (det > eps) return -1;
 		if (det >= -eps && det <= eps) coplanar[nCop++] = 2;
 	}
-
 	return nCop;
 }
 
@@ -1427,16 +1561,16 @@ __forceinline int IntersectPlaneAndEdges(
 	if (!(pPos | pNeg | qPos | qNeg)) return 3;
 
 	if (!pNeg && !qPos) {
-		// P-side endpoint = p: a = -(p-v0), b = v1-p, c = v2-p
+		// P-side: a = v0-p = -pax, b = v1-p, c = v2-p
 		const double bxP = v1x - px, byP = v1y - py, bzP = v1z - pz;
 		const double cxP = v2x - px, cyP = v2y - py, czP = v2z - pz;
-		return CheckEdges2FastCore<true>(sPx, sPy, sPz, pax, pay, paz, bxP, byP, bzP, cxP, cyP, czP, coplanar);
+		return CheckEdges2FastCore<true>(sPx, sPy, sPz, -pax, -pay, -paz, bxP, byP, bzP, cxP, cyP, czP, coplanar);
 	}
 	else {
-		// Q-side endpoint = q: a = -(q-v0), b = v1-q, c = v2-q
+		// Q-side: a = v0-q = -qax, b = v1-q, c = v2-q
 		const double bxQ = v1x - qx, byQ = v1y - qy, bzQ = v1z - qz;
 		const double cxQ = v2x - qx, cyQ = v2y - qy, czQ = v2z - qz;
-		return CheckEdges2FastCore<false>(sQx, sQy, sQz, qax, qay, qaz, bxQ, byQ, bzQ, cxQ, cyQ, czQ, coplanar);
+		return CheckEdges2FastCore<false>(sQx, sQy, sQz, -qax, -qay, -qaz, bxQ, byQ, bzQ, cxQ, cyQ, czQ, coplanar);
 	}
 }
 
@@ -1446,7 +1580,9 @@ bool intersect(const delaunay_t& Tr,
 	const segment_t& seg,
 	const std::vector<facet_t>& in_facets,
 	std::vector<facet_t>& out_facets,
-	intersection_t& inter) {
+	intersection_t& inter,
+	const uint32_t*       __restrict cellNbrID,
+	const cell_handle_t*  __restrict allCellsArr) {
 
 	ASSERT(!in_facets.empty());
 
@@ -1515,23 +1651,65 @@ bool intersect(const delaunay_t& Tr,
 
 		inter.facet = inFacet;
 		const cell_handle_t back = inter.facet.first;
+		// Cache the back cell's ID once. The cell record was just touched by
+		// the vertex/point loads above, so this read is free (same line).
+		const cell_size_t backID = back->info();
 
 		// ------------------------------------------------------------
-		// FAST FACET PATH (dominant, unchanged)
+		// FAST FACET PATH (dominant)
 		// ------------------------------------------------------------
-		if (nbCoplanar <= 1) {
+		if (nbCoplanar == 0) {
 			inter.type = intersection_t::FACET;
 
 			out_facets.clear();
 
-			const cell_handle_t nc(inter.facet.first->neighbor(inter.facet.second));
+			// Flat-array hop: backID -> ncID via cellNbrID, then handle via allCellsArr.
+			// Replaces back->neighbor(facet.second) random cell-pool deref.
+			const cell_size_t   ncID = cellNbrID[(size_t)backID * 4 + inter.facet.second];
+			const cell_handle_t nc   = allCellsArr[ncID];
 			ASSERT(!Tr.is_infinite(nc));
 
+			// Back-check via 4 sequential u32 reads (one 16 B chunk) instead of
+			// 4 random nc->neighbor(i) derefs.
+			const uint32_t* __restrict ncNbrs = cellNbrID + (size_t)ncID * 4;
 			for (int i = 0; i < 4; ++i) {
-				if (nc->neighbor(i) == back)
+				if (ncNbrs[i] == backID)
 					continue;
 				out_facets.emplace_back(nc, i);
 			}
+
+			inter.dist = (float)(vo / vd);
+			return true;
+		}
+
+		// ------------------------------------------------------------
+		// nbCoplanar == 1  (edge intersection)
+		// ------------------------------------------------------------
+		if (nbCoplanar == 1) {
+			const int j = 4 * inter.facet.second;
+			const int i1 = j + coplanar[0];
+
+			inter.type = intersection_t::EDGE;
+			inter.v1 = inter.facet.first->vertex(facet_vertex_order[i1 + 0]);
+			inter.v2 = inter.facet.first->vertex(facet_vertex_order[i1 + 1]);
+
+			out_facets.clear();
+			const edge_t out_edge(inter.facet.first,
+				facet_vertex_order[i1 + 0],
+				facet_vertex_order[i1 + 1]);
+
+			typename delaunay_t::Cell_circulator efc(Tr.incident_cells(out_edge));
+			typename delaunay_t::Cell_circulator ifc = efc;
+			do {
+				const cell_handle_t c(ifc);
+				if (c == inter.facet.first) continue;
+
+				const facet_t f1(c, c->index(inter.v1));
+				if (!Tr.is_infinite(f1)) out_facets.push_back(f1);
+
+				const facet_t f2(c, c->index(inter.v2));
+				if (!Tr.is_infinite(f2)) out_facets.push_back(f2);
+			} while (++ifc != efc);
 
 			inter.dist = (float)(vo / vd);
 			return true;
@@ -1552,18 +1730,21 @@ bool intersect(const delaunay_t& Tr,
 
 			out_facets.clear();
 
-			const cell_handle_t nc(inter.facet.first->neighbor(inter.facet.second));
+			// Flat-array hop, same as the dominant FACET path.
+			const cell_size_t   ncID = cellNbrID[(size_t)backID * 4 + inter.facet.second];
+			const cell_handle_t nc   = allCellsArr[ncID];
 			ASSERT(!Tr.is_infinite(nc));
 
-			const cell_handle_t n0 = nc->neighbor(0);
-			const cell_handle_t n1 = nc->neighbor(1);
-			const cell_handle_t n2 = nc->neighbor(2);
-			const cell_handle_t n3 = nc->neighbor(3);
+			const uint32_t* __restrict ncNbrs = cellNbrID + (size_t)ncID * 4;
+			const uint32_t n0 = ncNbrs[0];
+			const uint32_t n1 = ncNbrs[1];
+			const uint32_t n2 = ncNbrs[2];
+			const uint32_t n3 = ncNbrs[3];
 
-			if (n0 != back) out_facets.emplace_back(nc, 0);
-			if (n1 != back) out_facets.emplace_back(nc, 1);
-			if (n2 != back) out_facets.emplace_back(nc, 2);
-			if (n3 != back) out_facets.emplace_back(nc, 3);
+			if (n0 != backID) out_facets.emplace_back(nc, 0);
+			if (n1 != backID) out_facets.emplace_back(nc, 1);
+			if (n2 != backID) out_facets.emplace_back(nc, 2);
+			if (n3 != backID) out_facets.emplace_back(nc, 3);
 
 			inter.dist = (float)(vo / vd);
 			return true;
@@ -2022,159 +2203,82 @@ __forceinline void facetOrderIndices(const cell_handle_t& cell, int k, int idx[3
 // computes result = dot / sqrt(|N|^2 * |C|^2), clamps to [-1,1],
 // and returns 0.5f for degenerates (same as your scalar).
 // 2-space indent, braces same line, camelCase variables.
-__forceinline void computeOneMinusPlaneSphereAngle4(const delaunay_t& Tr,
-	const cell_handle_t& cell,
-	_Data vQual,
-	float* __restrict out) {
+__forceinline void computeOneMinusPlaneSphereAngle4(
+	const delaunay_t& Tr, const cell_handle_t& cell,
+	_Data vQual, float* __restrict out)
+{
 	if (Tr.is_infinite(cell)) {
-		out[0] = out[1] = out[2] = out[3] = 0.0f;
+		_mm_store_ps(out, _mm_setzero_ps());
 		return;
 	}
 
-	// Load the four cell vertices once (SoA source)
-	const auto& p0 = cell->vertex(0)->point();
-	const auto& p1 = cell->vertex(1)->point();
-	const auto& p2 = cell->vertex(2)->point();
-	const auto& p3 = cell->vertex(3)->point();
-
-	const float px[4] = { (float)p0.x(), (float)p1.x(), (float)p2.x(), (float)p3.x() };
-	const float py[4] = { (float)p0.y(), (float)p1.y(), (float)p2.y(), (float)p3.y() };
-	const float pz[4] = { (float)p0.z(), (float)p1.z(), (float)p2.z(), (float)p3.z() };
+	// Load once.
+	const auto& pp0 = cell->vertex(0)->point();
+	const auto& pp1 = cell->vertex(1)->point();
+	const auto& pp2 = cell->vertex(2)->point();
+	const auto& pp3 = cell->vertex(3)->point();
 
 #if CGAL_VERSION_NR < 1041101000
 	const auto cc = cell->circumcenter(Tr.geom_traits());
 #else
-	const auto cc = Tr.geom_traits().construct_circumcenter_3_object()(
-		cell->vertex(0)->point(),
-		cell->vertex(1)->point(),
-		cell->vertex(2)->point(),
-		cell->vertex(3)->point());
+	const auto cc = Tr.geom_traits().construct_circumcenter_3_object()(pp0, pp1, pp2, pp3);
 #endif
-	const float ccx = (float)cc.x();
-	const float ccy = (float)cc.y();
-	const float ccz = (float)cc.z();
 
-#if defined(__SSE2__)
-	// Gather Pa/Pb/Pc from your exact facet triangles (matches scalar order).
-	// facet k: tri = getTriangle(cell, k); Pa=tri[0], Pb=tri[1], Pc=tri[2]
+	// float SoA in registers (no stack arrays).
+	const __m128 vx = _mm_setr_ps((float)pp0.x(), (float)pp1.x(),
+		(float)pp2.x(), (float)pp3.x());
+	const __m128 vy = _mm_setr_ps((float)pp0.y(), (float)pp1.y(),
+		(float)pp2.y(), (float)pp3.y());
+	const __m128 vz = _mm_setr_ps((float)pp0.z(), (float)pp1.z(),
+		(float)pp2.z(), (float)pp3.z());
 
-  // Per-facet lane index mapping that matches getTriangle(cell,k)
-	int i0[3], i1[3], i2[3], i3[3];
-	facetOrderIndices(cell, 0, i0);
-	facetOrderIndices(cell, 1, i1);
-	facetOrderIndices(cell, 2, i2);
-	facetOrderIndices(cell, 3, i3);
+	// Pa,Pb,Pc per lane via shuffles (no memory):
+	//   k=0:[2,1,3]  k=1:[2,3,0]  k=2:[0,3,1]  k=3:[0,1,2]
+	const __m128 ax = _mm_shuffle_ps(vx, vx, _MM_SHUFFLE(0, 0, 2, 2));
+	const __m128 ay = _mm_shuffle_ps(vy, vy, _MM_SHUFFLE(0, 0, 2, 2));
+	const __m128 az = _mm_shuffle_ps(vz, vz, _MM_SHUFFLE(0, 0, 2, 2));
+	const __m128 bx = _mm_shuffle_ps(vx, vx, _MM_SHUFFLE(1, 3, 3, 1));
+	const __m128 by = _mm_shuffle_ps(vy, vy, _MM_SHUFFLE(1, 3, 3, 1));
+	const __m128 bz = _mm_shuffle_ps(vz, vz, _MM_SHUFFLE(1, 3, 3, 1));
+	const __m128 cx = _mm_shuffle_ps(vx, vx, _MM_SHUFFLE(2, 1, 0, 3));
+	const __m128 cy = _mm_shuffle_ps(vy, vy, _MM_SHUFFLE(2, 1, 0, 3));
+	const __m128 cz = _mm_shuffle_ps(vz, vz, _MM_SHUFFLE(2, 1, 0, 3));
 
-	__m128 ax = _mm_setr_ps(px[i0[0]], px[i1[0]], px[i2[0]], px[i3[0]]);
-	__m128 ay = _mm_setr_ps(py[i0[0]], py[i1[0]], py[i2[0]], py[i3[0]]);
-	__m128 az = _mm_setr_ps(pz[i0[0]], pz[i1[0]], pz[i2[0]], pz[i3[0]]);
+	const __m128 Ax = _mm_sub_ps(bx, ax), Ay = _mm_sub_ps(by, ay), Az = _mm_sub_ps(bz, az);
+	const __m128 Bx = _mm_sub_ps(cx, ax), By = _mm_sub_ps(cy, ay), Bz = _mm_sub_ps(cz, az);
 
-	__m128 bx = _mm_setr_ps(px[i0[1]], px[i1[1]], px[i2[1]], px[i3[1]]);
-	__m128 by = _mm_setr_ps(py[i0[1]], py[i1[1]], py[i2[1]], py[i3[1]]);
-	__m128 bz = _mm_setr_ps(pz[i0[1]], pz[i1[1]], pz[i2[1]], pz[i3[1]]);
+	const __m128 Nx = _mm_sub_ps(_mm_mul_ps(Ay, Bz), _mm_mul_ps(Az, By));
+	const __m128 Ny = _mm_sub_ps(_mm_mul_ps(Az, Bx), _mm_mul_ps(Ax, Bz));
+	const __m128 Nz = _mm_sub_ps(_mm_mul_ps(Ax, By), _mm_mul_ps(Ay, Bx));
 
-	__m128 cx = _mm_setr_ps(px[i0[2]], px[i1[2]], px[i2[2]], px[i3[2]]);
-	__m128 cy = _mm_setr_ps(py[i0[2]], py[i1[2]], py[i2[2]], py[i3[2]]);
-	__m128 cz = _mm_setr_ps(pz[i0[2]], pz[i1[2]], pz[i2[2]], pz[i3[2]]);
+	const __m128 Cx = _mm_sub_ps(_mm_set1_ps((float)cc.x()), ax);
+	const __m128 Cy = _mm_sub_ps(_mm_set1_ps((float)cc.y()), ay);
+	const __m128 Cz = _mm_sub_ps(_mm_set1_ps((float)cc.z()), az);
 
-	// A = Pb - Pa; B = Pc - Pa
-	__m128 Ax = _mm_sub_ps(bx, ax);
-	__m128 Ay = _mm_sub_ps(by, ay);
-	__m128 Az = _mm_sub_ps(bz, az);
+	const __m128 fnLenSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(Nx, Nx), _mm_mul_ps(Ny, Ny)), _mm_mul_ps(Nz, Nz));
+	const __m128 ctLenSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(Cx, Cx), _mm_mul_ps(Cy, Cy)), _mm_mul_ps(Cz, Cz));
+	const __m128 dot = _mm_add_ps(_mm_add_ps(_mm_mul_ps(Nx, Cx), _mm_mul_ps(Ny, Cy)), _mm_mul_ps(Nz, Cz));
 
-	__m128 Bx = _mm_sub_ps(cx, ax);
-	__m128 By = _mm_sub_ps(cy, ay);
-	__m128 Bz = _mm_sub_ps(cz, az);
+	const __m128 denom = _mm_mul_ps(fnLenSq, ctLenSq);
+	// rsqrt + 1 NR step
+	__m128 r = _mm_rsqrt_ps(denom);
+	const __m128 half = _mm_set1_ps(0.5f), three = _mm_set1_ps(3.0f);
+	r = _mm_mul_ps(_mm_mul_ps(half, r),
+		_mm_sub_ps(three, _mm_mul_ps(denom, _mm_mul_ps(r, r))));
 
-	// N = A x B
-	__m128 Nx = _mm_sub_ps(_mm_mul_ps(Ay, Bz), _mm_mul_ps(Az, By));
-	__m128 Ny = _mm_sub_ps(_mm_mul_ps(Az, Bx), _mm_mul_ps(Ax, Bz));
-	__m128 Nz = _mm_sub_ps(_mm_mul_ps(Ax, By), _mm_mul_ps(Ay, Bx));
+	__m128 res = _mm_mul_ps(dot, r);
+	const __m128 one = _mm_set1_ps(1.0f);
+	res = _mm_min_ps(_mm_max_ps(res, _mm_set1_ps(-1.0f)), one);
 
-	// |N|^2
-	__m128 Nx2 = _mm_mul_ps(Nx, Nx);
-	__m128 Ny2 = _mm_mul_ps(Ny, Ny);
-	__m128 Nz2 = _mm_mul_ps(Nz, Nz);
-	__m128 n12 = _mm_add_ps(Nx2, Ny2);
-	__m128 fnLenSq = _mm_add_ps(n12, Nz2);
-
-	// C = CC - Pa
-	__m128 CCx = _mm_set1_ps(ccx);
-	__m128 CCy = _mm_set1_ps(ccy);
-	__m128 CCz = _mm_set1_ps(ccz);
-	__m128 Cx = _mm_sub_ps(CCx, ax);
-	__m128 Cy = _mm_sub_ps(CCy, ay);
-	__m128 Cz = _mm_sub_ps(CCz, az);
-
-	// |C|^2
-	__m128 Cx2 = _mm_mul_ps(Cx, Cx);
-	__m128 Cy2 = _mm_mul_ps(Cy, Cy);
-	__m128 Cz2 = _mm_mul_ps(Cz, Cz);
-	__m128 c12 = _mm_add_ps(Cx2, Cy2);
-	__m128 ctLenSq = _mm_add_ps(c12, Cz2);
-
-	// dot(N, C)
-	__m128 d0 = _mm_mul_ps(Nx, Cx);
-	__m128 d1 = _mm_mul_ps(Ny, Cy);
-	__m128 d2 = _mm_mul_ps(Nz, Cz);
-	__m128 d01 = _mm_add_ps(d0, d1);
-	__m128 dot = _mm_add_ps(d01, d2);
-
-	// denom and real sqrt
-	__m128 denom = _mm_mul_ps(fnLenSq, ctLenSq);
-	__m128 sqrtDen = _mm_sqrt_ps(denom);
-	__m128 res = _mm_div_ps(dot, sqrtDen);
-
-	// clamp [-1,1]
-	__m128 one = _mm_set1_ps(1.0f);
-	__m128 negOne = _mm_set1_ps(-1.0f);
-	res = _mm_min_ps(_mm_max_ps(res, negOne), one);
-
-	// degenerates -> 0.5f
-	__m128 zero = _mm_set1_ps(0.0f);
-	__m128 halfVal = _mm_set1_ps(0.5f);
-	// Compute mask for invalid facets
-	__m128 mBad = _mm_or_ps(_mm_or_ps(_mm_cmple_ps(fnLenSq, zero),
-		_mm_cmple_ps(ctLenSq, zero)),
-		_mm_cmple_ps(denom, zero));
-
-	// Select res or 0.5 for degenerates
-	__m128 outv = _mm_or_ps(_mm_and_ps(mBad, halfVal),
-		_mm_andnot_ps(mBad, res));
-
-	// outv = vQual * (1 - outv)
-	outv = _mm_mul_ps(vQual, _mm_sub_ps(one, outv));
-
-	_mm_store_ps(out, outv); // Aligned malloc guarantees this.
-
-#else
-	// Scalar fallback identical to your math (kept for portability)
-	for (int k = 0; k < 4; ++k) {
-		const auto tri = getTriangle(cell, k);
-		const auto& pa = tri.verts[0]->point();
-		const auto& pb = tri.verts[1]->point();
-		const auto& pc = tri.verts[2]->point();
-		const float x0 = (float)pa.x(), y0 = (float)pa.y(), z0 = (float)pa.z();
-		const float x1 = (float)pb.x(), y1 = (float)pb.y(), z1 = (float)pb.z();
-		const float x2 = (float)pc.x(), y2 = (float)pc.y(), z2 = (float)pc.z();
-		const float ax = x1 - x0, ay = y1 - y0, az = z1 - z0;
-		const float bx = x2 - x0, by = y2 - y0, bz = z2 - z0;
-		const float nx = ay * bz - az * by;
-		const float ny = az * bx - ax * bz;
-		const float nz = ax * by - ay * bx;
-		const float fn = nx * nx + ny * ny + nz * nz;
-		if (fn == 0.0f) { out[k] = 0.5f; continue; }
-		const float cx = ccx - x0, cy = ccy - y0, cz = ccz - z0;
-		const float ct = cx * cx + cy * cy + cz * cz;
-		const float d = fn * ct;
-		if (d <= 0.0f) { out[k] = 0.5f; continue; }
-		float r = (nx * cx + ny * cy + nz * cz) / std::sqrt(d);
-		out[k] = r < -1.0f ? -1.0f : (r > 1.0f ? 1.0f : r);
+	// Degenerate fallback (cold).
+	const __m128 mBad = _mm_cmple_ps(denom, _mm_setzero_ps());
+	if (_mm_movemask_ps(mBad)) {
+		res = _mm_or_ps(_mm_and_ps(mBad, _mm_set1_ps(0.5f)),
+			_mm_andnot_ps(mBad, res));
 	}
-#endif
+
+	_mm_store_ps(out, _mm_mul_ps(vQual, _mm_sub_ps(one, res)));
 }
-
-
 
 #if 0
 inline float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
@@ -2279,6 +2383,331 @@ float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
 }
 #endif
 
+// Compute the angle between the plane containing the given facet and the cell's circumscribed sphere
+// return cosines of the angle
+float computePlaneSphereAngle(const delaunay_t& Tr, const facet_t& facet)
+{
+	// compute facet normal
+	if (Tr.is_infinite(facet.first))
+		return 1.f;
+	const triangle_vhandles_t tri(getTriangle(facet.first, facet.second));
+	const Point3f v0(CGAL2MVS<float>(tri.verts[0]->point()));
+	const Point3f v1(CGAL2MVS<float>(tri.verts[1]->point()));
+	const Point3f v2(CGAL2MVS<float>(tri.verts[2]->point()));
+	const Point3f fn((v1-v0).cross(v2-v0));
+		const float fnLenSq(normSq(fn));
+		if (fnLenSq == 0.f)
+			return 0.5f;
+
+	// compute the co-tangent to the circumscribed sphere in one of the vertices
+	#if CGAL_VERSION_NR < 1041101000
+	const Point3f cc(CGAL2MVS<float>(facet.first->circumcenter(Tr.geom_traits())));
+	#else
+	struct Tools {
+		static point_t circumcenter(const delaunay_t& Tr, const facet_t& facet) {
+			return Tr.geom_traits().construct_circumcenter_3_object()(
+				facet.first->vertex(0)->point(),
+				facet.first->vertex(1)->point(),
+				facet.first->vertex(2)->point(),
+				facet.first->vertex(3)->point()
+			);
+		}
+	};
+	const Point3f cc(CGAL2MVS<float>(Tools::circumcenter(Tr, facet)));
+	#endif
+	const Point3f ct(cc-v0);
+	const float ctLenSq(normSq(ct));
+	if (ctLenSq == 0.f)
+		return 0.5f;
+
+	// compute the angle between the two vectors
+	return CLAMP((fn.dot(ct))/SQRT(fnLenSq*ctLenSq), -1.f, 1.f);
+}
+
+static void BuildGraphNodesAndEdges(
+	MaxFlow<cell_size_t, edge_cap_t>& graph,
+	cell_handle_t* __restrict allCellHandles,
+	const delaunay_t& delaunay,
+	const cell_info_t* __restrict infoCells,
+	const uint32_t*   __restrict cellNbrID,
+	const uint8_t*    __restrict cellNbrSlot,
+	size_t totalCells,
+	float kQual,
+	float maxCap,
+	double cpuHz = 0.0)
+{
+	const bool diag = (cpuHz > 0.0);
+	const auto tStart = rdtscEnd();
+
+	// Phase 1: nodes � parallel reduction for flow, direct excess write
+	{
+		edge_cap_t totalFlow = 0;
+#pragma omp parallel for schedule(static) reduction(+:totalFlow)
+		for (ptrdiff_t ciID = 0; ciID < (ptrdiff_t)totalCells; ++ciID) {
+			const cell_info_t& ciInfo = infoCells[ciID];
+			const edge_cap_t s = ciInfo.s;
+			const edge_cap_t t = MINF(ciInfo.t, maxCap);
+			totalFlow += (s < t ? s : t);
+			graph.graph.nodes[ciID].excess = s - t;
+		}
+		graph.graph.flow = totalFlow;
+	}
+	const auto tP1 = rdtscEnd();
+
+	// Phase 2: compute quality angles only. Per-cell neighbor IDs +
+	// reverse-slot indices (cellNbrID, cellNbrSlot) are now built once at
+	// cell-enumeration time and passed in — no cell-pool derefs needed here.
+	// qualAngles still local: only this function uses it.
+	float* __restrict qualAngles = (float*)_aligned_malloc(sizeof(float) * totalCells * 4, 64);
+
+	{
+		const _Data vQual = _mm_set1_ps(kQual);
+
+		// P2: angle math only — vertex pool derefs (4× ci->vertex(k)->point()
+		// per cell + circumcenter). No cell-pool derefs.
+#pragma omp parallel for schedule(static)
+		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			float*              __restrict dstQ = qualAngles + idx * 4;
+			const cell_handle_t            ci   = allCellHandles[idx];
+
+			if (delaunay.is_infinite(ci)) {
+				dstQ[0] = dstQ[1] = dstQ[2] = dstQ[3] = 0.0f;
+			} else {
+				computeOneMinusPlaneSphereAngle4(delaunay, ci, vQual, dstQ);
+			}
+		}
+
+		if (diag) {
+			std::cout << "     [P2 angle math   ] "
+			          << rdtscToSeconds(rdtscEnd() - tP1, cpuHz) << "\n";
+		}
+	}
+	const auto tP2 = rdtscEnd();
+
+	// Phase 3: direct arc build. Each cell writes its own 4 outgoing arcs
+	// to nodes[idx].arcs[0..3] using neighbor index `i` as the slot. No
+	// atomics, no edges[] materialization, no cross-thread aliasing.
+	//
+	// Slot determinism: arc slot on cell ci = neighbor index i. The reverse
+	// slot on cj is cellNbrSlot[ci][i] = j (cj->index(ci)). Each peer pair
+	// independently agrees on its slots without coordination.
+	//
+	// Cap symmetry: q = MINF(qi[i], qj[j]) and q' = MINF(qj[j], qi[i]) — same.
+	// Both peers compute identical q. ci writes rCap = ciInfo.f[i]+q;
+	// cj writes rCap = cjInfo.f[j]+q. Identical to legacy AddEdge output.
+	//
+	// Manual load scheduling: gather all 4 neighbor IDs and slot indices
+	// first, then issue all 8 random loads back-to-back so the LSU can
+	// dispatch them in parallel up to its LFB count. Bounded MSHR/LFB
+	// occupancy per iteration; no inter-iteration speculation, no risk of
+	// TLB thrash.
+	{
+		auto* __restrict ibNodes = graph.graph.nodes;
+
+#pragma omp parallel for schedule(static)
+		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			// Stage 1: linear loads — own cell's caches.
+			const float*       __restrict ciQ    = qualAngles + idx * 4;
+			const uint32_t*    __restrict nbrIds = cellNbrID  + idx * 4;
+			const cell_info_t&            ciInfo = infoCells[idx];
+			const uint8_t                 slotPk = cellNbrSlot[idx];
+
+#if SCRREC_OPT_PREFETCH
+			// (B) Warm next iteration's neighbor lines (~6 random gathers).
+			// nbrIds for idx+1 is itself a sequential read, so it's free.
+			if (idx + 1 < (ptrdiff_t)totalCells) {
+				const uint32_t* __restrict nNbr = cellNbrID + (idx + 1) * 4;
+				const uint32_t n0 = nNbr[0], n1 = nNbr[1], n2 = nNbr[2], n3 = nNbr[3];
+				_mm_prefetch((const char*)&infoCells[n0],            _MM_HINT_T0);
+				_mm_prefetch((const char*)&infoCells[n1],            _MM_HINT_T0);
+				_mm_prefetch((const char*)&infoCells[n2],            _MM_HINT_T0);
+				_mm_prefetch((const char*)&infoCells[n3],            _MM_HINT_T0);
+				_mm_prefetch((const char*)(qualAngles + (size_t)n0 * 4), _MM_HINT_T0);
+				_mm_prefetch((const char*)(qualAngles + (size_t)n2 * 4), _MM_HINT_T0);
+			}
+#endif
+
+			// Stage 2: resolve all 4 neighbor IDs and slot indices up front.
+			const uint32_t cj0 = nbrIds[0], cj1 = nbrIds[1];
+			const uint32_t cj2 = nbrIds[2], cj3 = nbrIds[3];
+			const int j0 = (slotPk     ) & 3;
+			const int j1 = (slotPk >> 2) & 3;
+			const int j2 = (slotPk >> 4) & 3;
+			const int j3 = (slotPk >> 6) & 3;
+
+			// Stage 3: issue all 8 random loads back-to-back.
+			const float qN0 = qualAngles[(size_t)cj0 * 4 + j0];
+			const float qN1 = qualAngles[(size_t)cj1 * 4 + j1];
+			const float qN2 = qualAngles[(size_t)cj2 * 4 + j2];
+			const float qN3 = qualAngles[(size_t)cj3 * 4 + j3];
+			const float fN0 = infoCells[cj0].f[j0];
+			const float fN1 = infoCells[cj1].f[j1];
+			const float fN2 = infoCells[cj2].f[j2];
+			const float fN3 = infoCells[cj3].f[j3];
+
+			// Stage 4: own-cell f[i] (linear) + arithmetic.
+			const float fi0 = ciInfo.f[0], fi1 = ciInfo.f[1];
+			const float fi2 = ciInfo.f[2], fi3 = ciInfo.f[3];
+			const float qi0 = ciQ[0], qi1 = ciQ[1], qi2 = ciQ[2], qi3 = ciQ[3];
+
+			const float q0 = MINF(qi0, qN0);
+			const float q1 = MINF(qi1, qN1);
+			const float q2 = MINF(qi2, qN2);
+			const float q3 = MINF(qi3, qN3);
+
+			const float fwd0 = fi0 + q0, rev0 = fN0 + q0;
+			const float fwd1 = fi1 + q1, rev1 = fN1 + q1;
+			const float fwd2 = fi2 + q2, rev2 = fN2 + q2;
+			const float fwd3 = fi3 + q3, rev3 = fN3 + q3;
+
+			// Stage 5: write the 4 arcs (linear, same cacheline as node).
+			auto& u = ibNodes[idx];
+			auto& a0 = u.arcs[0];
+			a0.initFields((uint32_t)cj0, (uint8_t)j0);
+			a0.rCap = fwd0;
+			auto& a1 = u.arcs[1];
+			a1.initFields((uint32_t)cj1, (uint8_t)j1);
+			a1.rCap = fwd1;
+			auto& a2 = u.arcs[2];
+			a2.initFields((uint32_t)cj2, (uint8_t)j2);
+			a2.rCap = fwd2;
+			auto& a3 = u.arcs[3];
+			a3.initFields((uint32_t)cj3, (uint8_t)j3);
+			a3.rCap = fwd3;
+			u.residBits = (uint8_t)(
+				((rev0 > 0) << 0) |
+				((rev1 > 0) << 1) |
+				((rev2 > 0) << 2) |
+				((rev3 > 0) << 3));
+			u.arcCount = 4;
+		}
+	}
+	_aligned_free(qualAngles);
+	const auto tP3 = rdtscEnd();
+
+	if (diag) {
+		std::cout << "     [P1 excess     ] " << rdtscToSeconds(tP1 - tStart, cpuHz) << "\n";
+		std::cout << "     [P2 quals+nbrs ] " << rdtscToSeconds(tP2 - tP1, cpuHz) << "\n";
+		std::cout << "     [P3 arc build  ] " << rdtscToSeconds(tP3 - tP2, cpuHz) << "\n";
+	}
+}
+
+#ifdef PARALLEL_GRAPH_CUT_EXTRACTION
+// Extract the surface mesh from the graph-cut result.
+// Parallel pass 1: find boundary facets across all cells.
+// Sequential pass 2: deduplicate vertices and build mesh arrays.
+static void ExtractGraphCutSurface(
+	const delaunay_t& delaunay,
+	cell_handle_t* __restrict allCellHandles,
+	const MaxFlow<cell_size_t, edge_cap_t>& graph,
+	size_t totalCells,
+	const Point3f* __restrict idToPoint,
+	Mesh& mesh,
+	double cpuHz = 0.0)
+{
+	// Per-face record collected in parallel
+	struct RawFace {
+		uint32_t vidx[3]; // vert_info_t::idx for each corner
+		bool     flip;
+	};
+
+	const auto tStart = rdtscEnd();
+
+	// Precompute src-side flag for every cell ID. graph.IsNodeOnSrcSide(id)
+	// indirects into the IBFS node array; doing it twice per cell from
+	// inside the inner loop misses that array randomly. A single linear
+	// pass populates a flat byte array, then Pass 1 reads it sequentially.
+	// Memory: ~286 MB for 286M cells; freed before Pass 2.
+	uint8_t* __restrict srcSide = (uint8_t*)_aligned_malloc(totalCells, 64);
+#pragma omp parallel for schedule(static)
+	for (ptrdiff_t i = 0; i < (ptrdiff_t)totalCells; ++i) {
+		srcSide[i] = graph.IsNodeOnSrcSide((cell_size_t)i) ? 1u : 0u;
+	}
+
+	const auto tSrcSide = rdtscEnd();
+
+	const int nThreads = omp_get_max_threads();
+	std::vector<std::vector<RawFace>> threadFaces(nThreads);
+
+	// Pass 1: parallel � identify all boundary facets
+#pragma omp parallel
+	{
+		const int tid = omp_get_thread_num();
+		auto& localFaces = threadFaces[tid];
+		localFaces.reserve(totalCells / (4 * nThreads));
+
+#pragma omp for schedule(static)
+		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			const cell_handle_t ci = allCellHandles[idx];
+			const cell_size_t ciID = ci->info();
+			const uint8_t ciType = srcSide[ciID];
+
+			for (int i = 0; i < 4; ++i) {
+				if (delaunay.is_infinite(ci, i)) continue;
+				const cell_handle_t cj = ci->neighbor(i);
+				const cell_size_t cjID = cj->info();
+				if (ciID < cjID) continue;
+
+				if (ciType == srcSide[cjID]) continue;
+
+				const triangle_vhandles_t tri(getTriangle(ci, i));
+				RawFace rf;
+				rf.vidx[0] = tri.verts[0]->info().idx;
+				rf.vidx[1] = tri.verts[1]->info().idx;
+				rf.vidx[2] = tri.verts[2]->info().idx;
+				rf.flip = !ciType;
+				localFaces.push_back(rf);
+			}
+		}
+	}
+
+	const auto tPass1 = rdtscEnd();
+
+	_aligned_free(srcSide);
+
+	// Count total faces for reservation
+	size_t totalFaceCount = 0;
+	for (const auto& tf : threadFaces)
+		totalFaceCount += tf.size();
+
+	// Pass 2: sequential vertex dedup via flat remap array (vert_info_t::idx is
+	// dense in [0, g_idx)). Replaces robin_map<uint32_t,VIndex> -- O(1) lookup,
+	// no hashing, no allocations per insert. Sentinel = ~0u for "unseen".
+	const uint32_t numIDs = vert_info_t::g_idx;
+	constexpr Mesh::VIndex INVALID_VIDX = (Mesh::VIndex)~0u;
+	std::vector<Mesh::VIndex> vertRemap(numIDs, INVALID_VIDX);
+
+	const size_t nEstimatedNumVerts = delaunay.number_of_vertices();
+	mesh.vertices.Reserve((Mesh::VIndex)nEstimatedNumVerts);
+	mesh.faces.Reserve((Mesh::FIndex)totalFaceCount);
+
+	for (const auto& localFaces : threadFaces) {
+		for (const RawFace& rf : localFaces) {
+			Mesh::Face& face = mesh.faces.AddEmpty();
+			for (int v = 0; v < 3; ++v) {
+				const uint32_t vi = rf.vidx[v];
+				Mesh::VIndex& slot = vertRemap[vi];
+				if (slot == INVALID_VIDX) {
+					slot = (Mesh::VIndex)mesh.vertices.GetSize();
+					const Point3f& pt = idToPoint[vi];
+					mesh.vertices.Insert(Mesh::Vertex(pt.x, pt.y, pt.z));
+				}
+				face[v] = slot;
+			}
+			if (rf.flip)
+				std::swap(face[0], face[2]);
+		}
+	}
+
+	if (cpuHz > 0.0) {
+		const auto tEnd = rdtscEnd();
+		std::cout << "     [End srcSide   ] " << rdtscToSeconds(tSrcSide - tStart, cpuHz) << "\n";
+		std::cout << "     [End pass1     ] " << rdtscToSeconds(tPass1   - tSrcSide, cpuHz) << "\n";
+		std::cout << "     [End pass2     ] " << rdtscToSeconds(tEnd     - tPass1, cpuHz) << "\n";
+	}
+}
+#endif
+
 } // namespace DELAUNAY
 
 #pragma intrinsic(_InterlockedCompareExchange)
@@ -2300,6 +2729,9 @@ static inline float AtomicAddFloat(float* addr, float val)
 		LONG prev = _InterlockedCompareExchange(intAddr, newInt, oldInt);
 		if (prev == oldInt)
 			break; // success
+#if SCRREC_OPT_PREFETCH
+		_mm_pause(); // (C) yield µop port under contention; collapses retry storms
+#endif
 		oldInt = prev; // retry with updated oldInt
 	}
 
@@ -2372,56 +2804,20 @@ size_t ProcessPoints(
 	return numVertices;
 }
 
-float Quantize(float cap, float maxCap)
-{
-#if 1
-#if 1
-	// Branchless clamp to [0, maxCap]
-	float clamped = FastClampS(cap, 0.0f, maxCap);
-
-	// Exact "round half up" for non-negative values:
-	// MSVC lowers this to add + cvttss2si (truncate) -> very fast.
-	int scaled = static_cast<int>(clamped * 4.0f + 0.5f);
-	return 0.25f * static_cast<float>(scaled);
-#else
-	if (!std::isfinite(cap)) return maxCap;
-	if (cap <= 0.0f)
-	{
-		return 0.f;
-	}
-	else if (cap >= maxCap)
-	{
-		return maxCap;
-	}
-
-	int scaled = static_cast<int>(cap * 2.0f + 0.5f);
-	return 0.5f * scaled;
-#endif
-#else
-#ifdef APPROXIMATE_GRAPHCUT
-#if 1
-  int scaled = static_cast<int>(cap * 2.0f + 0.5f);
-  return 0.5f * scaled;
-#else
-  // Step is 0.2, so multiply by 5 and round to nearest int
-  int scaled = static_cast<int>(cap * 5.0f + 0.5f);
-  return 0.2f * scaled;
-#endif
-#else
-  if (!std::isfinite(cap)) return maxCap;
-  return cap <= 0.0f ? 0.0f : (cap >= maxCap ? maxCap : cap);
-#endif
-#endif
-}
-
 #include <algorithm>
 #include <cstdint>
 #include <vector>
 #include <limits>
 #include <cmath>
+#if defined(_MSC_VER) && _MSVC_LANG >= 201703L
+#include <execution>
+#endif
 
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
+#include <tbb/parallel_sort.h>
+
+#define PERMUTE_SCATTER_WARMUP
 
 template<class T0, class T1, class T2, class T3>
 void permuteScatter2(
@@ -2439,6 +2835,7 @@ void permuteScatter2(
 	const size_t totalBytes =
 		sizeof(T0) * cnt + sizeof(T1) * cnt + sizeof(T2) * cnt + sizeof(T3) * cnt;
 
+#ifdef PERMUTE_SCATTER_WARMUP
 	if (totalBytes > (1ull << 24)) { // ~16 MB threshold
 		tbb::parallel_for(tbb::blocked_range<size_t>(0, cnt, 1 << 16),
 			[&](auto const& r)
@@ -2453,6 +2850,7 @@ void permuteScatter2(
 					dst2[i] = T3();
 			});
 	}
+#endif
 
 	// ---- Main scatter ----
 	tbb::parallel_for(tbb::blocked_range<size_t>(0, cnt, 1 << 16),
@@ -2604,7 +3002,7 @@ void StatisticalOutlierRemoval(
 	// allocate as float to cut memory traffic in half
 	float* meanDist = static_cast<float*>(_aligned_malloc(sizeof(float) * n, 64));
 	knnMeanDistSq_nanoflann_fast(pts, n, k, meanDist);
-	// --- Welford�s one-pass algorithm for mean and variance -----------------
+	// --- Welford�s one-pass algorithm for mean and variance -----------------
 	float mean = 0.0f, m2 = 0.0f;
 	size_t count = 0;
 #pragma omp parallel
@@ -2699,6 +3097,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	float kInf
 )
 {
+#if 0 // JPB WIP BUG Experiment with kqual
+	kQual = 11.25f; // 0.75 didn't help 0.75f;
+#endif
 	double cpuHz = estimateCpuHz();
 
 	using namespace DELAUNAY;
@@ -2842,8 +3243,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	cell_info_t* __restrict infoCells;
 	std::vector<camera_cell_t> camCells;
 	std::vector<facet_t> hullFacets;
-	std::vector<delaunay_t::All_cells_iterator> cellIterators;
 	Point3f* idToPoint;
+	// Per-cell topology caches built once at cell enumeration time (after
+	// info() and allCells[] are fully populated). Survive through ray-walk
+	// weighting and graph-cut build; freed after extraction. Today only
+	// BuildGraphNodesAndEdges' Phase 3 reads these; step 2 wires them into
+	// intersect()'s FACET fast path so ray walks become flat-array lookups.
+	uint32_t* __restrict cellNbrID = nullptr;   // 4 IDs per cell (totalCells*4 entries)
+	uint8_t*  __restrict cellNbrSlot = nullptr; // packed 4x2-bit reverse slot per cell
 
 	size_t numVertices;
 #ifdef FACET_DIAGNOSTICS
@@ -2859,6 +3266,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	int li, lj;
 	size_t totalCells;
 	uint8_t* mask;
+	cell_handle_t* __restrict allCells;
 
 	{
 		TD_TIMER_STARTD();
@@ -2889,12 +3297,360 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					obb
 				);
 
+#if RECONSTRUCT_VOXEL_PREFILTER
+			// VOXEL PRE-FILTER: collapse near-duplicate points (same voxel
+			// cell) to a single representative.  This removes redundancy from
+			// over-sampled flat regions while leaving isolated boundary /
+			// thin-feature points untouched (a sparse cell with one point
+			// keeps its single point unconditionally -- no quality loss).
+			//
+			// Mechanism: bbox -> voxel size = maxSpan / kGrid.  For each
+			// point, compute a packed 63-bit voxel key (21 bits per axis).
+			// Build (key, pointIdx, conf) tuples; parallel-sort by key;
+			// linear-scan to keep the highest-confidence representative per
+			// run of equal keys.  conf falls back to 0 (first-arrival wins)
+			// if pointWeights is empty.
+			//
+			// Side benefit: the surviving indices[] come out roughly in
+			// z-order, which tends to warm up the subsequent CGAL
+			// spatial_sort (a clustered seed input helps it).
+			//
+			// Skipped in ROI mode (indices[] semantics: ProcessPoints<true>
+			// has already compacted indices[i] to non-original-cloud values,
+			// breaking pointWeightsOffsets[i] lookup).
+			if (!bUseOnlyROI && numVertices > 0) {
+				TD_TIMER_STARTD();
+
+				// Pass 1: parallel bbox over the active point set (origVertices[0..numVertices)).
+				float bbMinX =  std::numeric_limits<float>::max();
+				float bbMinY =  std::numeric_limits<float>::max();
+				float bbMinZ =  std::numeric_limits<float>::max();
+				float bbMaxX = -std::numeric_limits<float>::max();
+				float bbMaxY = -std::numeric_limits<float>::max();
+				float bbMaxZ = -std::numeric_limits<float>::max();
+#pragma omp parallel
+				{
+					float lMinX =  std::numeric_limits<float>::max();
+					float lMinY =  std::numeric_limits<float>::max();
+					float lMinZ =  std::numeric_limits<float>::max();
+					float lMaxX = -std::numeric_limits<float>::max();
+					float lMaxY = -std::numeric_limits<float>::max();
+					float lMaxZ = -std::numeric_limits<float>::max();
+#pragma omp for nowait schedule(static)
+					for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+						const auto& p = origVertices[i];
+						const float x = (float)p.x();
+						const float y = (float)p.y();
+						const float z = (float)p.z();
+						if (x < lMinX) lMinX = x;
+						if (y < lMinY) lMinY = y;
+						if (z < lMinZ) lMinZ = z;
+						if (x > lMaxX) lMaxX = x;
+						if (y > lMaxY) lMaxY = y;
+						if (z > lMaxZ) lMaxZ = z;
+					}
+#pragma omp critical
+					{
+						if (lMinX < bbMinX) bbMinX = lMinX;
+						if (lMinY < bbMinY) bbMinY = lMinY;
+						if (lMinZ < bbMinZ) bbMinZ = lMinZ;
+						if (lMaxX > bbMaxX) bbMaxX = lMaxX;
+						if (lMaxY > bbMaxY) bbMaxY = lMaxY;
+						if (lMaxZ > bbMaxZ) bbMaxZ = lMaxZ;
+					}
+				}
+
+				const float spanX = bbMaxX - bbMinX;
+				const float spanY = bbMaxY - bbMinY;
+				const float spanZ = bbMaxZ - bbMinZ;
+				const float maxSpan = std::max(std::max(spanX, spanY), spanZ);
+
+				if (maxSpan > 0.0f) {
+					// ---- Pass 2: density probe (auto-tune voxel size) ----
+					// Build a coarse 64^3 occupancy histogram; find the peak
+					// bin K_peak. Estimate dense-region inter-point spacing
+					// assuming a 2D surface populates that bin:
+					//   bin_side  = maxSpan / 64
+					//   spacing  ~= bin_side / sqrt(K_peak)
+					//   voxel     = spacing * VOXEL_SAFETY (config'd)
+					// Cap the resulting kGrid to a safe range.
+					constexpr int kProbe = 64;
+					constexpr int kProbeBins = kProbe * kProbe * kProbe;
+					const float probeSide = maxSpan / float(kProbe);
+					const float invProbe = 1.0f / probeSide;
+
+					const int nT = omp_get_max_threads();
+					std::vector<std::vector<uint32_t>> tProbe(nT,
+						std::vector<uint32_t>(kProbeBins, 0));
+#pragma omp parallel
+					{
+						const int tid = omp_get_thread_num();
+						auto& lh = tProbe[tid];
+#pragma omp for schedule(static)
+						for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+							const auto& p = origVertices[i];
+							int bx = (int)(((float)p.x() - bbMinX) * invProbe);
+							int by = (int)(((float)p.y() - bbMinY) * invProbe);
+							int bz = (int)(((float)p.z() - bbMinZ) * invProbe);
+							if (bx < 0) bx = 0; else if (bx >= kProbe) bx = kProbe - 1;
+							if (by < 0) by = 0; else if (by >= kProbe) by = kProbe - 1;
+							if (bz < 0) bz = 0; else if (bz >= kProbe) bz = kProbe - 1;
+							++lh[(bz * kProbe + by) * kProbe + bx];
+						}
+					}
+					// Reduce: per-bin sum + max-occupancy.
+					uint32_t kPeak = 0;
+					for (int b = 0; b < kProbeBins; ++b) {
+						uint32_t s = 0;
+						for (int t = 0; t < nT; ++t) s += tProbe[t][b];
+						if (s > kPeak) kPeak = s;
+					}
+
+					// Default: fall back to a safe grid if probe is uninformative.
+					int kGrid = 8192;
+					float voxel = maxSpan / float(kGrid);
+
+					if (kPeak >= 16) {
+						// Surface-density assumption: ~K_peak points spread
+						// over a (probeSide x probeSide) face of the bin.
+						const float estDense = probeSide / std::sqrt((float)kPeak);
+						const float safety = float(RECONSTRUCT_VOXEL_SAFETY_X100) / 100.0f;
+						const float wantVoxel = estDense * safety;
+						// kGrid must be in [256, 65535] so voxel stays in
+						// [maxSpan/65535, maxSpan/256]. The lower bound (65535)
+						// is the 16-bit-per-axis grid limit; the upper bound
+						// (256) prevents catastrophic merging on degenerate data.
+						float wantGrid = maxSpan / wantVoxel;
+						if (wantGrid < 256.0f)   wantGrid = 256.0f;
+						if (wantGrid > 65535.0f) wantGrid = 65535.0f;
+						kGrid = (int)wantGrid;
+						voxel = maxSpan / float(kGrid);
+					}
+					const float invVoxel = 1.0f / voxel;
+					const bool haveWeights = !pointcloud.pointWeightsMemory.empty();
+
+					// Build (voxelKey, pointIdx, conf) tuples.
+					// 16 bytes/entry; for 18M pts -> ~290MB, freed before insertion.
+					struct VoxelEntry {
+						uint64_t key;       // 21 bits per axis, LE-packed
+						uint32_t pointIdx;  // original cloud index
+						float    conf;      // tiebreaker; higher wins
+					};
+					VoxelEntry* __restrict entries = (VoxelEntry*)_aligned_malloc(
+						sizeof(VoxelEntry) * numVertices, 64);
+
+#pragma omp parallel for schedule(static)
+					for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+						const auto& p = origVertices[i];
+						const float x = (float)p.x();
+						const float y = (float)p.y();
+						const float z = (float)p.z();
+						uint32_t vx = (uint32_t)((x - bbMinX) * invVoxel);
+						uint32_t vy = (uint32_t)((y - bbMinY) * invVoxel);
+						uint32_t vz = (uint32_t)((z - bbMinZ) * invVoxel);
+						// Clamp the boundary point that lands on the upper edge.
+						if (vx >= (uint32_t)kGrid) vx = (uint32_t)kGrid - 1;
+						if (vy >= (uint32_t)kGrid) vy = (uint32_t)kGrid - 1;
+						if (vz >= (uint32_t)kGrid) vz = (uint32_t)kGrid - 1;
+						const uint64_t key =
+							((uint64_t)vx)         |
+							((uint64_t)vy << 21)   |
+							((uint64_t)vz << 42);
+
+						float c = 0.0f;
+						if (haveWeights) {
+							const uint32_t off = pointcloud.pointWeightsOffsets[i];
+							const uint32_t cnt = pointcloud.pointWeightsSizes[i];
+							for (uint32_t k = 0; k < cnt; ++k) {
+								const float w = pointcloud.pointWeightsMemory[off + k];
+								if (w > c) c = w;
+							}
+						}
+
+						entries[i].key      = key;
+						entries[i].pointIdx = (uint32_t)i;
+						entries[i].conf     = c;
+					}
+
+					// Parallel sort by voxel key.  TBB's parallel_sort scales
+					// well on 18M elements (~0.4-0.7s on 32-thread host).
+					tbb::parallel_sort(entries, entries + numVertices,
+						[](const VoxelEntry& a, const VoxelEntry& b) {
+							return a.key < b.key;
+						});
+
+					// Linear scan: within each run of equal keys, keep the
+					// highest-conf entry. Sequential by design (run-length
+					// detection is cheaper than parallel reduction here, and
+					// we're streaming a sorted array -- L1/L2 friendly).
+					size_t outIdx = 0;
+					size_t i = 0;
+					const size_t N = (size_t)numVertices;
+					while (i < N) {
+						const uint64_t k = entries[i].key;
+						size_t bestEntry = i;
+						float  bestConf  = entries[i].conf;
+						size_t j = i + 1;
+						while (j < N && entries[j].key == k) {
+							if (entries[j].conf > bestConf) {
+								bestConf  = entries[j].conf;
+								bestEntry = j;
+							}
+							++j;
+						}
+						indices[outIdx++] = (ptrdiff_t)entries[bestEntry].pointIdx;
+						i = j;
+					}
+
+					const size_t before  = (size_t)numVertices;
+					const size_t dropped = before - outIdx;
+					numVertices = outIdx;
+
+					DEBUG_EXTRA("Voxel pre-filter (auto: kPeak=%u, grid=%d, voxel=%.4g, bbox=[%.1f x %.1f x %.1f]): %zu/%zu dropped (%.1f%%) [%s]",
+						kPeak, kGrid, voxel, spanX, spanY, spanZ,
+						dropped, before,
+						100.0 * (double)dropped / (double)before,
+						TD_TIMER_GET_FMT().c_str());
+
+					_aligned_free(entries);
+				} else {
+					DEBUG_EXTRA("Voxel pre-filter: degenerate bbox -- skipped");
+				}
+			} else {
+				DEBUG_EXTRA("Voxel pre-filter: skipped (%s)",
+					bUseOnlyROI ? "ROI mode" : "empty");
+			}
+#endif
+
+#if RECONSTRUCT_EARLY_CONFIDENCE_FILTER
+			// EARLY confidence filter: drop the bottom-KPCT% lowest-confidence
+			// points NOW so that spatial_sort / SOR / DT insertion all see a
+			// smaller N.  Operates by compacting indices[] in-place; leaves
+			// origVertices[] at full size (it's freed right after permute and
+			// the bytes are unused anyway).  Spatial_sort consults
+			// origVertices[indices[i]] -- still valid.  permuteScatter2 looks
+			// up pointcloud arrays via indices[i] -- still valid (indices[]
+			// holds original cloud indices throughout).
+			//
+			// Skipped in ROI mode (ProcessPoints<true> compacts indices to
+			// non-original-cloud indices, breaking pointWeights lookup).
+			// Skipped if pointWeights empty (nothing to score with).
+			if (!bUseOnlyROI && !pointcloud.pointWeightsMemory.empty()) {
+				TD_TIMER_STARTD();
+				constexpr unsigned kPct = RECONSTRUCT_CONFIDENCE_FILTER_KPCT;
+				static_assert(kPct > 0 && kPct < 100,
+					"RECONSTRUCT_CONFIDENCE_FILTER_KPCT must be in (0, 100)");
+
+				float* __restrict ptConf = (float*)_aligned_malloc(
+					sizeof(float) * numVertices, 64);
+
+				// Pass 1: per-point max-weight + global min/max.
+				// In non-ROI mode after ProcessPoints, indices[i] == i, so we
+				// can index pointWeightsOffsets/Sizes directly by i.
+				float gMin =  std::numeric_limits<float>::max();
+				float gMax = -std::numeric_limits<float>::max();
+#pragma omp parallel
+				{
+					float lMin =  std::numeric_limits<float>::max();
+					float lMax = -std::numeric_limits<float>::max();
+#pragma omp for nowait schedule(static)
+					for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+						const uint32_t off = pointcloud.pointWeightsOffsets[i];
+						const uint32_t cnt = pointcloud.pointWeightsSizes[i];
+						float best = 0.0f;
+						for (uint32_t k = 0; k < cnt; ++k) {
+							const float w = pointcloud.pointWeightsMemory[off + k];
+							if (w > best) best = w;
+						}
+						ptConf[i] = best;
+						if (best < lMin) lMin = best;
+						if (best > lMax) lMax = best;
+					}
+#pragma omp critical
+					{
+						if (lMin < gMin) gMin = lMin;
+						if (lMax > gMax) gMax = lMax;
+					}
+				}
+
+				const float relSpread = (gMax > 0.0f)
+					? (gMax - gMin) / gMax
+					: 0.0f;
+				constexpr float kMinRelSpread = 0.10f; // 10%
+
+				if (gMax > gMin && relSpread >= kMinRelSpread) {
+					// Pass 2: 4096-bin histogram.
+					constexpr int kBins = 4096;
+					const float invSpan = float(kBins) / (gMax - gMin);
+
+					const int nT = omp_get_max_threads();
+					std::vector<std::vector<size_t>> tHist(nT,
+						std::vector<size_t>(kBins, 0));
+
+#pragma omp parallel
+					{
+						const int tid = omp_get_thread_num();
+						auto& lh = tHist[tid];
+#pragma omp for schedule(static)
+						for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+							int b = (int)((ptConf[i] - gMin) * invSpan);
+							if (b < 0) b = 0;
+							else if (b >= kBins) b = kBins - 1;
+							++lh[b];
+						}
+					}
+					std::vector<size_t> hist(kBins, 0);
+					for (int t = 0; t < nT; ++t)
+						for (int b = 0; b < kBins; ++b)
+							hist[b] += tHist[t][b];
+
+					const size_t target = ((size_t)numVertices * kPct + 99) / 100;
+					size_t cum = 0;
+					int cutBin = 0;
+					for (; cutBin < kBins; ++cutBin) {
+						cum += hist[cutBin];
+						if (cum >= target) break;
+					}
+					const float thr = gMin + (float)(cutBin + 1) / invSpan;
+
+					// Pass 3: in-place compaction of indices[].  Sequential
+					// because order matters (we want surviving indices to
+					// retain their relative order so spatial_sort sees a
+					// reasonable initial layout).  origVertices left intact.
+					size_t outIdx = 0;
+					for (size_t i = 0; i < (size_t)numVertices; ++i) {
+						if (ptConf[i] >= thr) {
+							indices[outIdx++] = (ptrdiff_t)i;
+						}
+					}
+					const size_t before = numVertices;
+					const size_t dropped = before - outIdx;
+					numVertices = outIdx;
+
+					DEBUG_EXTRA("Early confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu/%zu dropped (%.1f%%) [%s]",
+						kPct, gMin, gMax, thr, dropped, before,
+						100.0 * (double)dropped / (double)before,
+						TD_TIMER_GET_FMT().c_str());
+				} else {
+					DEBUG_EXTRA("Early confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
+						gMin, gMax, relSpread, kMinRelSpread * 100.0f);
+				}
+
+				_aligned_free(ptConf);
+			} else {
+				DEBUG_EXTRA("Early confidence filter: skipped (%s)",
+					bUseOnlyROI ? "ROI mode" : "no pointWeights");
+			}
+#endif
+
 #ifndef VALIDATE
 			// sort vertices (1.17s)
 			typedef CGAL::Spatial_sort_traits_adapter_3<delaunay_t::Geom_traits, point_t*> Search_traits;
-			// JPB The runtime here is not consistent.
-			// Defaults on this work really well.
-			CGAL::spatial_sort<CGAL::Parallel_tag>(
+			// Sequential_tag: nth_element is non-stable, so parallel splits
+			// (tbb::parallel_invoke) produce non-deterministic output ordering
+			// among equal-coordinate points. This causes 7s+ insertion variance.
+			// Sequential sort is ~1.2s — negligible vs 30s insertion.
+			CGAL::spatial_sort<CGAL::Sequential_tag>(
 				indices, indices + numVertices,
 				Search_traits(&origVertices[0], delaunay.geom_traits())
 			);
@@ -2917,8 +3673,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			);
 			_aligned_free(origVertices);
 			origVertices = 0;
-			_aligned_free(indices);
-			indices = 0;
+			// NOTE: 'indices' (sorted->original mapping) is freed AFTER the
+			// optional confidence filter below, which needs to look up
+			// pointWeights in original index space.
 
 			// The points of the cloud are now kept in vertices.  Ancillary data, for view information,
 			// is also maintained.
@@ -2929,10 +3686,140 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// 8/16 about the same, but better than 32, 64 much worse
 			// 16 removes more outliers.
 			// 1.39s/1.286s
+#if 0 // JPB WIP BUG not enough to warrant adding.
+			// Keep more points:
+			// - stddevMul=3.0: keep sparse boundary points (wider upper band)
+			// - interiorMul=FLT_MAX: effectively disable the lower-bound filter
+			//   (lowerThr = mean - FLT_MAX*stdev -> clamped to 1e-6f, keeps everything)
+			StatisticalOutlierRemoval(verticesf, numVertices, mask, 16, 3.0f, FLT_MAX);
+#else
 			StatisticalOutlierRemoval(verticesf, numVertices, mask, 16, 2);
+#endif
 
 			_aligned_free(verticesf);
 			verticesf = 0;
+
+#if RECONSTRUCT_CONFIDENCE_FILTER && !RECONSTRUCT_EARLY_CONFIDENCE_FILTER
+			// (3) Confidence-weighted filter. Per-point scalar confidence is
+			// the MAX over its per-view weights (strongest single-view
+			// evidence). Threshold = quantile at KPCT% (drops the bottom
+			// KPCT% by confidence). Quantile is robust to right-skewed weight
+			// distributions where mean - k*stdev would go negative.
+			// pointWeights are NOT permuted by permuteScatter2 -- look up the
+			// original index via 'indices' (still alive at this point).
+			if (pointcloud.pointWeightsMemory.empty()) {
+				DEBUG_EXTRA("Confidence filter: pointWeights empty -- skipped");
+			} else {
+				constexpr unsigned kPct = RECONSTRUCT_CONFIDENCE_FILTER_KPCT;
+				static_assert(kPct > 0 && kPct < 100,
+					"RECONSTRUCT_CONFIDENCE_FILTER_KPCT must be in (0, 100)");
+
+				float* __restrict ptConf = (float*)_aligned_malloc(
+					sizeof(float) * numVertices, 64);
+
+				// Pass 1: per-point max-weight + global min/max for histogram.
+				float gMin =  std::numeric_limits<float>::max();
+				float gMax = -std::numeric_limits<float>::max();
+#pragma omp parallel
+				{
+					float lMin =  std::numeric_limits<float>::max();
+					float lMax = -std::numeric_limits<float>::max();
+#pragma omp for nowait schedule(static)
+					for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+						const size_t o = (size_t)indices[i];
+						const uint32_t off = pointcloud.pointWeightsOffsets[o];
+						const uint32_t cnt = pointcloud.pointWeightsSizes[o];
+						float best = 0.0f;
+						for (uint32_t k = 0; k < cnt; ++k) {
+							const float w = pointcloud.pointWeightsMemory[off + k];
+							if (w > best) best = w;
+						}
+						ptConf[i] = best;
+						if (mask[i]) {
+							if (best < lMin) lMin = best;
+							if (best > lMax) lMax = best;
+						}
+					}
+#pragma omp critical
+					{
+						if (lMin < gMin) gMin = lMin;
+						if (lMax > gMax) gMax = lMax;
+					}
+				}
+
+				// Relative-spread guard: if the weight distribution is nearly
+				// flat, the bottom-KPCT% cut becomes a near-random spatial
+				// drop and can collapse thin/flat scenes.  Skip when the
+				// span is below a small fraction of the upper end.
+				const float relSpread = (gMax > 0.0f)
+					? (gMax - gMin) / gMax
+					: 0.0f;
+				constexpr float kMinRelSpread = 0.10f; // 10%
+
+				if (gMax > gMin && relSpread >= kMinRelSpread) {
+					// Pass 2: 4096-bin histogram of kept points.
+					constexpr int kBins = 4096;
+					std::vector<size_t> hist(kBins, 0);
+					const float invSpan = float(kBins) / (gMax - gMin);
+
+					const int nT = omp_get_max_threads();
+					std::vector<std::vector<size_t>> tHist(nT,
+						std::vector<size_t>(kBins, 0));
+
+#pragma omp parallel
+					{
+						const int tid = omp_get_thread_num();
+						auto& lh = tHist[tid];
+#pragma omp for schedule(static)
+						for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+							if (!mask[i]) continue;
+							int b = (int)((ptConf[i] - gMin) * invSpan);
+							if (b < 0) b = 0;
+							else if (b >= kBins) b = kBins - 1;
+							++lh[b];
+						}
+					}
+					for (int t = 0; t < nT; ++t)
+						for (int b = 0; b < kBins; ++b)
+							hist[b] += tHist[t][b];
+
+					size_t totalKept = 0;
+					for (int b = 0; b < kBins; ++b) totalKept += hist[b];
+
+					// Find smallest bin index where cumulative >= kPct% of totalKept.
+					const size_t target = (totalKept * kPct + 99) / 100;
+					size_t cum = 0;
+					int cutBin = 0;
+					for (; cutBin < kBins; ++cutBin) {
+						cum += hist[cutBin];
+						if (cum >= target) break;
+					}
+					// Threshold = upper edge of cutBin -- drop strictly below.
+					const float thr = gMin + (float)(cutBin + 1) / invSpan;
+
+					size_t dropped = 0;
+#pragma omp parallel for reduction(+:dropped) schedule(static)
+					for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i) {
+						if (mask[i] && ptConf[i] < thr) {
+							mask[i] = 0;
+							++dropped;
+						}
+					}
+					DEBUG_EXTRA("Confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu points dropped (%.1f%% of %zu)",
+						kPct, gMin, gMax, thr, dropped,
+						100.0 * (double)dropped / (double)totalKept,
+						totalKept);
+				} else {
+					DEBUG_EXTRA("Confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
+						gMin, gMax, relSpread, kMinRelSpread * 100.0f);
+				}
+
+				_aligned_free(ptConf);
+			}
+#endif
+
+			_aligned_free(indices);
+			indices = 0;
 
 			// insert vertices
 			// 6x vertices is a generous worst case, but uses too much memory.
@@ -2943,12 +3830,29 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			delaunay.tds().vertices().reserve(numVertices); // Should be sufficient to prevent reallocations.
 
 			// Can't avoid initialization.
+#if !DIRECT_VIEW_EXPANSION
 			allViews = (view_vec_t*)_aligned_malloc(sizeof(view_vec_t) * numVertices, 64);
 
 			//42ms
 #pragma omp parallel for schedule(static)
 			for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i)
 				new (&allViews[i]) view_vec_t();
+#else
+			pointToVertex = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numVertices, 64);
+			// UINT32_MAX sentinel = point was masked out or not inserted.
+			// Parallel first-touch: this is a 4*N-byte buffer (e.g. ~68MB at
+			// 17M points). A single-threaded memset is bandwidth-bound on one
+			// memory channel; parallelizing across cores engages more channels
+			// and also performs NUMA-friendly first-touch so subsequent writes
+			// during insertion hit local pages. Static schedule keeps each
+			// thread's pages contiguous.
+			{
+				const ptrdiff_t cnt = (ptrdiff_t)numVertices;
+				#pragma omp parallel for schedule(static)
+				for (ptrdiff_t i = 0; i < cnt; ++i)
+					pointToVertex[i] = UINT32_MAX;
+			}
+#endif
 
 			DEBUG_EXTRA("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
 		}
@@ -2963,7 +3867,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.19");
+		DEBUG("ReconstructMesh optimization version 1.1.21");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -2989,7 +3893,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				hint = delaunay.insert(p, hint);
 				ASSERT(anchor != vertex_handle_t());
 				// update point visibility info
+#if !DIRECT_VIEW_EXPANSION
 				InsertViews(hint->info().idx, pointcloud, i);
+#else
+				pointToVertex[i] = hint->info().idx;
+#endif
 			advance:
 				if (!(i & 16383)) {
 					progress += 16384;
@@ -3004,7 +3912,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			for (bool done = false; !done; ++i) {
 				if (mask[i]) {
 					hint = delaunay.insert(vertices[i]);
-					InsertViews(hint->info().idx, pointcloud, 0);
+#if !DIRECT_VIEW_EXPANSION
+					InsertViews(hint->info().idx, pointcloud, i);
+#else
+					pointToVertex[i] = hint->info().idx;
+#endif
 					done = true;
 				}
 			}
@@ -3015,9 +3927,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				}
 
 				const point_t& p = vertices[i];
-				const double px = p.x();
-				const double py = p.y();
-				const double pz = p.z();
 
 				uint32_t offset = offsets[i];
 				uint32_t numViews = sizes[i];
@@ -3050,6 +3959,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const point_t& nearestPt = nearest->point();
 					double bestSq = fast_sqdist2(qx, qy, qz, nearestPt.x(), nearestPt.y(), nearestPt.z());
 
+					// MSVC: hoist a restrict-qualified base pointer for vertexMarks so the
+					// optimizer can keep bestSq/qx/qy/qz in xmm registers across the inner
+					// loop and avoid reloading the std::vector base each iteration. The
+					// only writes inside the BFS go to *this* array and to tds_data().marker
+					// (a different allocation), so __restrict is sound.
+					uint32_t* __restrict pVertexMarks = vertexMarks.data();
+
 					// The key difference from the original code is that the original determines
 					// all adjacent cells and then looks at them.
 					// Here, we identify the adjacent cells as needed.
@@ -3058,7 +3974,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						if (marker == 0) {
 							std::fill(vertexMarks.begin(), vertexMarks.end(), 0);
 
-							// wrapped � reset all cell markers
+							// wrapped � reset all cell markers
 							// NOTE: you do NOT need to reset conflict_state
 							for (auto ci = delaunay.all_cells_begin(); ci != delaunay.all_cells_end(); ++ci) {
 								ci->tds_data().marker = 0;
@@ -3076,7 +3992,22 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						size_t queueIndex = 0;
 #if 1
 						// inside your loop:
+#if INSERTION_BFS_MAX_CELLS > 0
+						size_t bfsVisited = 0;
+#endif
 						while (queueIndex < cellQueue.size()) {
+#if INSERTION_BFS_MAX_CELLS > 0
+							if (bfsVisited >= INSERTION_BFS_MAX_CELLS) {
+								// Cap hit: accept current `best` as approximate nearest.
+								// Falling out here behaves identically to natural exhaustion
+								// of the queue with no improvement found — outer loop will
+								// see best == nearest (if no improvement during this pass)
+								// and break. If improvement DID happen, `goto refine_restart`
+								// already fired and we wouldn't reach here.
+								break;
+							}
+							++bfsVisited;
+#endif
 							const cell_handle_t c = cellQueue[queueIndex++];
 
 							// fetch vertices once; reuse in both phases
@@ -3085,9 +4016,20 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							const vertex_handle_t v2 = c->vertex(2);
 							const vertex_handle_t v3 = c->vertex(3);
 
+							// Issue 4 parallel random loads of the Vertex objects (point + info
+							// share a cache line in Vertex_with_info_3). Without this, the 4
+							// TRY_VERTEX_ZFIRST calls below serialize on the data-dependency
+							// chain  vh -> vh->info().idx -> vertexMarks[idx]. With the prefetch
+							// the lines are en route while the first TRY runs, so subsequent
+							// iterations see L1/L2 hits. Pure latency-hiding; bandwidth cheap.
+							_mm_prefetch((const char*)&v0->point(), _MM_HINT_T0);
+							_mm_prefetch((const char*)&v1->point(), _MM_HINT_T0);
+							_mm_prefetch((const char*)&v2->point(), _MM_HINT_T0);
+							_mm_prefetch((const char*)&v3->point(), _MM_HINT_T0);
+
 #define TRY_VERTEX_ZFIRST(vh, rejectLabel) do {                    \
   if ((vh) != nearest && (vh) != infV) {                           \
-    uint32_t* m = &vertexMarks[(vh)->info().idx];                  \
+    uint32_t* m = &pVertexMarks[(vh)->info().idx];                 \
     if (*m != marker) {                                            \
       *m = marker;                                                 \
       const point_t& pt = (vh)->point();                           \
@@ -3208,7 +4150,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							break;
 
 						nearest = best;
-						vertexMarks[nearest->info().idx] = marker;
+						pVertexMarks[nearest->info().idx] = marker;
 						const point_t& nearestPtNew = nearest->point();
 						bestSq = fast_sqdist2(qx, qy, qz, nearestPtNew.x(), nearestPtNew.y(), nearestPtNew.z());
 					}
@@ -3216,16 +4158,56 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				hint = nearest;
 
 				//const auto& hintPt2 = hint->point();
+#ifndef _RELEASE
+				// IMPORTANT: this verification runs a FULL CGAL nearest-vertex walk
+				// per point — it dominates insertion cost when present. Keep it gated
+				// so it only runs in debug/validation builds, not in Release.
 				ASSERT(hint == delaunay.nearest_vertex(p, hint->cell()));
+#endif
 
 				// Projection visibility check
-				const float pxF = (float)px, pyF = (float)py, pzF = (float)pz;
+				const float pxF = (float)p.x(), pyF = (float)p.y(), pzF = (float)p.z();
 				const float nxF = (float)hint->point().x(), nyF = (float)hint->point().y(), nzF = (float)hint->point().z();
 
 				constexpr float depthThreshold = 0.01f;
 
+#if 0 // JPB WIP BUG doesn't improve quality.
 				bool shouldInsert = false;
 				for (size_t j = 0; j < numViews; ++j) {
+					const float* __restrict camera = &viewCameras[views[j]][0];
+
+					const float pez = camera[8] * pxF + camera[9] * pyF + camera[10] * pzF + camera[11];
+					if (pez <= 0.f) continue;
+
+					const float pnz = camera[8] * nxF + camera[9] * nyF + camera[10] * nzF + camera[11];
+					if (pnz <= 0.f) continue;
+
+					const float zprod = pez * pnz;
+
+					// ---- X axis only ----
+					const float pex = camera[0] * pxF + camera[1] * pyF + camera[2] * pzF + camera[3];
+					const float pnx = camera[0] * nxF + camera[1] * nyF + camera[2] * nzF + camera[3];
+
+					const float dx = pex * pnz - pnx * pez;
+
+					// ---- Y axis only ----
+					const float pey = camera[4] * pxF + camera[5] * pyF + camera[6] * pzF + camera[7];
+					const float pny = camera[4] * nxF + camera[5] * nyF + camera[6] * nzF + camera[7];
+
+					const float dy = pey * pnz - pny * pez;
+
+					if (dx * dx + dy * dy > distInsertSq * zprod * zprod) {
+						shouldInsert = true;
+						break;
+					}
+				}
+#else
+				bool shouldInsert = false;
+				for (size_t j = 0; j < numViews; ++j) {
+					// Prefetch next view's camera matrix (random gather by view ID,
+					// ~1 cache line per camera). Cheap latency hide on small loops.
+					if (j + 1 < numViews)
+						_mm_prefetch((const char*)&viewCameras[views[j + 1]][0], _MM_HINT_T0);
 					const float* __restrict camera = &viewCameras[views[j]][0];
 
 					const float pez = camera[8] * pxF + camera[9] * pyF + camera[10] * pzF + camera[11];
@@ -3268,6 +4250,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						break;
 					}
 				}
+#endif
 
 				if (shouldInsert) {
 					hint = delaunay.insert(p, lt, c, li, lj);
@@ -3276,9 +4259,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 				// Visibility information not needed for the dt, but used in the next step.
 				// idx is the index of the spatially sorted point.
+#if !DIRECT_VIEW_EXPANSION
 				InsertViews(hint->info().idx, pointcloud, i);
+#else
+				pointToVertex[i] = hint->info().idx;
+#endif
 			advance2:
-				if (!(i & 1023)) progress += 1024;
+				if (!(i & 4095)) progress += 4096;
 			}
 		}
 
@@ -3290,6 +4277,170 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		_aligned_free(vertices);
 		vertices = 0;
 
+#if DIRECT_VIEW_EXPANSION
+		// --- Expansion pass: convert pointToVertex[] into flat per-vertex ViewCount arrays ---
+		// This replaces the per-vertex allViews random pushes with a single sequential scan.
+		// Phase 3 is parallelized: each vertex is independent, each thread gets its own countByImageID.
+		{
+			TD_TIMER_STARTD();
+			const uint32_t numVtxIDs = vert_info_t::g_idx; // total vertex IDs assigned
+
+			// Phase 1: Count how many points map to each vertex AND accumulate
+			// per-vertex view-bound (sum of sizes of its points = upper bound on unique views).
+			uint32_t* __restrict vtxPointCount = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numVtxIDs, 64);
+			uint32_t* __restrict vtxViewBound = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numVtxIDs, 64);
+			memset(vtxPointCount, 0, sizeof(uint32_t) * numVtxIDs);
+			memset(vtxViewBound, 0, sizeof(uint32_t) * numVtxIDs);
+			{
+				const uint32_t* __restrict pTV = pointToVertex;
+				const uint32_t* __restrict sz = sizes;
+				for (uint32_t i = 0; i < numVertices; ++i) {
+					const uint32_t v = pTV[i];
+					if (v != UINT32_MAX) {
+						++vtxPointCount[v];
+						vtxViewBound[v] += sz[i];
+					}
+				}
+			}
+
+			// Phase 2: Build CSR for point-to-vertex gather + compute per-vertex
+			// upper-bound offsets into vcData (so each vertex has a non-overlapping write region).
+			uint32_t* __restrict vtxPointOffsets = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * (numVtxIDs + 1), 64);
+			vcOffsets = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numVtxIDs, 64);
+			vcSizes = (uint16_t*)_aligned_malloc(sizeof(uint16_t) * numVtxIDs, 64);
+
+			vtxPointOffsets[0] = 0;
+			vcOffsets[0] = 0;
+			for (uint32_t v = 0; v < numVtxIDs; ++v) {
+				vtxPointOffsets[v + 1] = vtxPointOffsets[v] + vtxPointCount[v];
+				if (v + 1 < numVtxIDs)
+					vcOffsets[v + 1] = vcOffsets[v] + vtxViewBound[v];
+			}
+			const uint64_t totalViewsBound = (uint64_t)vcOffsets[numVtxIDs - 1] + vtxViewBound[numVtxIDs - 1];
+
+			const uint32_t totalMapped = vtxPointOffsets[numVtxIDs];
+			uint32_t* __restrict vtxPointList = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * (totalMapped + 1), 64);
+
+			// Scatter points into per-vertex buckets (reuse vtxPointCount as write cursors)
+			memset(vtxPointCount, 0, sizeof(uint32_t) * numVtxIDs);
+			{
+				const uint32_t* __restrict pTV = pointToVertex;
+				for (uint32_t i = 0; i < numVertices; ++i) {
+					const uint32_t v = pTV[i];
+					if (v != UINT32_MAX) {
+						vtxPointList[vtxPointOffsets[v] + vtxPointCount[v]] = i;
+						++vtxPointCount[v];
+					}
+				}
+			}
+
+			_aligned_free(vtxPointCount);
+			_aligned_free(vtxViewBound);
+
+			// Phase 3: Expand views per vertex with deduplication — PARALLEL.
+			// Each vertex writes to vcData[vcOffsets[v]..vcOffsets[v]+vcSizes[v]).
+			// Per-thread countByImageID for O(1) dedup.
+			// Static scheduling: vertices are roughly uniform work, and static gives
+			// each thread a contiguous block → sequential reads through vtxPointOffsets,
+			// vtxPointList, and vcData regions. Dynamic would randomize access patterns.
+			vcData = (ExpandedViewCount*)_aligned_malloc(sizeof(ExpandedViewCount) * (totalViewsBound + 1), 64);
+			const uint32_t numImages = (uint32_t)images.size();
+
+			// Capture restrict-qualified pointers for the parallel region.
+			const uint32_t* __restrict pOffsets = offsets;
+			const uint32_t* __restrict pSizes = sizes;
+			const uint32_t* __restrict pViewsMem = pointcloud.pointViewsMemory.data();
+			const uint32_t* __restrict pVtxPtList = vtxPointList;
+			const uint32_t* __restrict pVtxPtOffsets = vtxPointOffsets;
+			ExpandedViewCount* __restrict pVcData = vcData;
+			uint32_t* __restrict pVcOffsets = vcOffsets;
+			uint16_t* __restrict pVcSizes = vcSizes;
+
+#pragma omp parallel
+			{
+				uint16_t* __restrict myCountByImageID = (uint16_t*)_aligned_malloc(sizeof(uint16_t) * numImages, 64);
+				memset(myCountByImageID, 0, sizeof(uint16_t) * numImages);
+
+#pragma omp for schedule(static)
+				for (int64_t v = 0; v < (int64_t)numVtxIDs; ++v) {
+					const uint32_t pBegin = pVtxPtOffsets[v];
+					const uint32_t pEnd = pVtxPtOffsets[v + 1];
+					if (pBegin == pEnd) {
+						pVcSizes[v] = 0;
+						continue;
+					}
+
+					ExpandedViewCount* __restrict dst = &pVcData[pVcOffsets[v]];
+					uint16_t numViews = 0;
+
+					for (uint32_t pi = pBegin; pi < pEnd; ++pi) {
+						const uint32_t ptIdx = pVtxPtList[pi];
+						// Prefetch next point's view data while processing current
+						if (pi + 1 < pEnd) {
+							const uint32_t nextPt = pVtxPtList[pi + 1];
+							_mm_prefetch((const char*)&pViewsMem[pOffsets[nextPt]], _MM_HINT_T0);
+						}
+						const uint32_t* __restrict src = &pViewsMem[pOffsets[ptIdx]];
+						const uint32_t cnt = pSizes[ptIdx];
+						for (uint32_t k = 0; k < cnt; ++k) {
+							const uint32_t id = src[k];
+							uint16_t& slot = myCountByImageID[id];
+							if (slot != 0) {
+								++dst[slot - 1].count;
+							} else {
+								dst[numViews] = { id, 1 };
+								slot = static_cast<uint16_t>(numViews + 1);
+								++numViews;
+							}
+						}
+					}
+
+					// Reset touched slots
+					for (uint16_t j = 0; j < numViews; ++j)
+						myCountByImageID[dst[j].id] = 0;
+
+					pVcSizes[v] = numViews;
+				}
+
+				_aligned_free(myCountByImageID);
+			} // omp parallel
+
+			// --- Compaction pass: pack vcData tightly so the weighting loop streams sequentially ---
+			// The parallel phase wrote each vertex's data at upper-bound offsets (with gaps).
+			// This linear sweep moves entries to contiguous positions. Cost: ~memcpy of actual data.
+			{
+				uint32_t writePos = 0;
+				for (uint32_t v = 0; v < numVtxIDs; ++v) {
+					const uint16_t sz = pVcSizes[v];
+					if (sz == 0) {
+						pVcOffsets[v] = writePos;
+						continue;
+					}
+					const uint32_t oldOff = pVcOffsets[v];
+					if (oldOff != writePos)
+						memmove(&pVcData[writePos], &pVcData[oldOff], sizeof(ExpandedViewCount) * sz);
+					pVcOffsets[v] = writePos;
+					writePos += sz;
+				}
+				// writePos is now the actual total — much smaller than totalViewsBound
+			}
+
+			_aligned_free(vtxPointList);
+			_aligned_free(vtxPointOffsets);
+			_aligned_free(pointToVertex);
+			pointToVertex = 0;
+
+			// Free offsets/sizes now — they're no longer needed
+			_aligned_free(offsets);
+			offsets = 0;
+			_aligned_free(sizes);
+			sizes = 0;
+
+			DEBUG_EXTRA("View expansion pass completed: %u vertices, %llu view bound (%s)",
+				numVtxIDs, (unsigned long long)totalViewsBound, TD_TIMER_GET_FMT().c_str());
+		}
+#endif
+
 		// JPB WIP BUG decltype(cellQueue)().swap(cellQueue);
 		decltype(viewCameras)().swap(viewCameras);
 
@@ -3297,112 +4448,371 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		std::cerr << "verts : " << numDelaunayVertices << "\n";
 		const size_t numNodes(delaunay.number_of_cells());
 		const size_t numCells = numNodes; // cheaper than all_cells.size() if available
-		cellIterators.reserve(numCells);
+		// AFTER: Enumerate cells and build hull facets without storing all iterators.
+		// Also build a flat arrays for all cells and a separate one for finite cells for the median pass.
 		cell_size_t ciID(0);
 
-		DWORD64 t0 = __rdtsc();
+		size_t maxCells = delaunay.number_of_cells();
+		cell_handle_t* __restrict finiteCells = (cell_handle_t*)_aligned_malloc(sizeof(cell_handle_t) * maxCells, 64);
+		allCells = (cell_handle_t*)_aligned_malloc(sizeof(cell_handle_t) * maxCells, 64);
 
-		cell_handle_t* __restrict finiteCells = (cell_handle_t*)_aligned_malloc(sizeof(cell_handle_t) * delaunay.number_of_cells(), 64);
+		// Per-cell side cache populated during the cell enumeration that is
+		// already required to assign IDs (Morton or baseline). Both passes
+		// already cold-deref every cell + its 4 vertex_t records to compute
+		// the centroid / isFinite — capturing idx[] and the pointer-ordering
+		// edge mask here costs almost nothing because the cachelines are hot.
+		// The median pass downstream then runs as pure SoA streaming with zero
+		// CGAL pointer derefs (eliminates ~5-7 s on 286M-cell scenes).
+		// Mask uses vertex_handle_t pointer compare to match the original
+		// median semantics bit-for-bit.
+		struct CellMeta {
+			uint32_t idx[4]; // 16 B  vertex idx of vertex(0..3)
+			uint8_t  mask;   //  1 B  edges where vh_lo < vh_hi (pointer compare)
+			uint8_t  _pad[3];
+		};
+		static_assert(sizeof(CellMeta) == 20, "unexpected CellMeta layout");
+		CellMeta* __restrict finiteCellMeta = (CellMeta*)_aligned_malloc(sizeof(CellMeta) * maxCells, 64);
+
 		size_t numFiniteCells = 0;
 		size_t numInfiniteCells = 0;
 
-		for (delaunay_t::All_cells_iterator ci = delaunay.all_cells_begin(), eci = delaunay.all_cells_end(); ci != eci; ++ci, ++ciID) {
-			cellIterators.push_back(ci);
-			ci->info() = ciID;
+		// Toggle: spatial reordering of cell IDs by Morton key on cell centroids.
+		// Set to 0 to restore CGAL creation-order assignment for benchmarking.
+		#ifndef RECONSTRUCT_OPT_MORTON_CELLS
+		#define RECONSTRUCT_OPT_MORTON_CELLS 1
+		#endif
 
-			if (ci->vertex(0) != infV && ci->vertex(1) != infV && ci->vertex(2) != infV && ci->vertex(3) != infV) {
-				// skip the finite cells
-				finiteCells[numFiniteCells++] = ci;
+#if RECONSTRUCT_OPT_MORTON_CELLS
+		// Spatial reordering of cell IDs by Morton (Z-order) key on cell centroids.
+		// CGAL iterates cells in creation/refinement order, which is only weakly
+		// spatial. IBFS does graph-local BFS walks; placing graph-adjacent cells
+		// at adjacent IDs ⇒ memory-adjacent ⇒ massively better L1/L2/TLB hit
+		// rates during BuildGraphNodesAndEdges and especially during max-flow.
+		// Pure permutation; no edge weights, no source/sink caps, no cut result
+		// changes — byte-identical mesh out, just faster.
+		{
+			cell_handle_t* __restrict tmpCells = (cell_handle_t*)_aligned_malloc(sizeof(cell_handle_t) * maxCells, 64);
+			float* __restrict cx = (float*)_aligned_malloc(sizeof(float) * maxCells, 64);
+			float* __restrict cy = (float*)_aligned_malloc(sizeof(float) * maxCells, 64);
+			float* __restrict cz = (float*)_aligned_malloc(sizeof(float) * maxCells, 64);
+			// Per-cell metadata in original (tmpCells) order. Filled in Pass 2
+			// alongside the centroid loads — same cold cell+vertex_t cachelines.
+			// Permuted into finiteCellMeta during Pass 5 compaction. Freed at
+			// end of the Morton block. Memory: ~5.7 GB for 286M cells.
+			CellMeta* __restrict origMeta = (CellMeta*)_aligned_malloc(sizeof(CellMeta) * maxCells, 64);
+
+			// Pass 1 (serial, fast): collect cell handles via CGAL iterator.
+			// CGAL's All_cells_iterator is a forward iterator over an internal
+			// linked list, so this can't be parallelized without a copy step.
+			size_t kk = 0;
+			for (delaunay_t::All_cells_iterator ci = delaunay.all_cells_begin(), eci = delaunay.all_cells_end(); ci != eci; ++ci, ++kk) {
+				tmpCells[kk] = ci;
 			}
-			else {
+			const size_t numAll = kk;
+
+			// Pass 2 (parallel): centroid + per-thread bbox reduction +
+			// per-cell metadata cache (vertex idx[4] + pointer-order edge mask).
+			float bbMinX =  std::numeric_limits<float>::max();
+			float bbMinY =  std::numeric_limits<float>::max();
+			float bbMinZ =  std::numeric_limits<float>::max();
+			float bbMaxX = -std::numeric_limits<float>::max();
+			float bbMaxY = -std::numeric_limits<float>::max();
+			float bbMaxZ = -std::numeric_limits<float>::max();
+#pragma omp parallel
+			{
+				float lMinX =  std::numeric_limits<float>::max();
+				float lMinY =  std::numeric_limits<float>::max();
+				float lMinZ =  std::numeric_limits<float>::max();
+				float lMaxX = -std::numeric_limits<float>::max();
+				float lMaxY = -std::numeric_limits<float>::max();
+				float lMaxZ = -std::numeric_limits<float>::max();
+#pragma omp for schedule(static) nowait
+				for (ptrdiff_t i = 0; i < (ptrdiff_t)numAll; ++i) {
+					const cell_handle_t ci = tmpCells[i];
+					const auto vh0 = ci->vertex(0);
+					const auto vh1 = ci->vertex(1);
+					const auto vh2 = ci->vertex(2);
+					const auto vh3 = ci->vertex(3);
+					const bool fin = (vh0 != infV) & (vh1 != infV) & (vh2 != infV) & (vh3 != infV);
+
+					float sx = 0.f, sy = 0.f, sz = 0.f;
+					if (fin) {
+						// Single point load each — used for centroid AND idx[].
+						const auto& p0 = vh0->point();
+						const auto& p1 = vh1->point();
+						const auto& p2 = vh2->point();
+						const auto& p3 = vh3->point();
+						sx = float(p0.x()) + float(p1.x()) + float(p2.x()) + float(p3.x());
+						sy = float(p0.y()) + float(p1.y()) + float(p2.y()) + float(p3.y());
+						sz = float(p0.z()) + float(p1.z()) + float(p2.z()) + float(p3.z());
+
+						// Pointer-order edge mask — bit-identical to legacy median.
+						uint8_t m = 0;
+						m |= (vh0 < vh1) ? 0x01 : 0;
+						m |= (vh0 < vh2) ? 0x02 : 0;
+						m |= (vh0 < vh3) ? 0x04 : 0;
+						m |= (vh1 < vh2) ? 0x08 : 0;
+						m |= (vh1 < vh3) ? 0x10 : 0;
+						m |= (vh2 < vh3) ? 0x20 : 0;
+
+						CellMeta& cm = origMeta[i];
+						cm.idx[0] = vh0->info().idx;
+						cm.idx[1] = vh1->info().idx;
+						cm.idx[2] = vh2->info().idx;
+						cm.idx[3] = vh3->info().idx;
+						cm.mask = m;
+						const float inv = 0.25f;
+						sx *= inv; sy *= inv; sz *= inv;
+					} else {
+						// Infinite cell: centroid over finite vertices only,
+						// matching legacy behavior. Meta unused downstream.
+						int n = 0;
+						if (vh0 != infV) { const auto& p = vh0->point(); sx += float(p.x()); sy += float(p.y()); sz += float(p.z()); ++n; }
+						if (vh1 != infV) { const auto& p = vh1->point(); sx += float(p.x()); sy += float(p.y()); sz += float(p.z()); ++n; }
+						if (vh2 != infV) { const auto& p = vh2->point(); sx += float(p.x()); sy += float(p.y()); sz += float(p.z()); ++n; }
+						if (vh3 != infV) { const auto& p = vh3->point(); sx += float(p.x()); sy += float(p.y()); sz += float(p.z()); ++n; }
+						const float inv = 1.0f / float(n);
+						sx *= inv; sy *= inv; sz *= inv;
+						origMeta[i].mask = 0; // sentinel; not consumed for infinite cells
+					}
+					cx[i] = sx; cy[i] = sy; cz[i] = sz;
+					if (sx < lMinX) lMinX = sx; if (sy < lMinY) lMinY = sy; if (sz < lMinZ) lMinZ = sz;
+					if (sx > lMaxX) lMaxX = sx; if (sy > lMaxY) lMaxY = sy; if (sz > lMaxZ) lMaxZ = sz;
+				}
+#pragma omp critical
+				{
+					if (lMinX < bbMinX) bbMinX = lMinX; if (lMinY < bbMinY) bbMinY = lMinY; if (lMinZ < bbMinZ) bbMinZ = lMinZ;
+					if (lMaxX > bbMaxX) bbMaxX = lMaxX; if (lMaxY > bbMaxY) bbMaxY = lMaxY; if (lMaxZ > bbMaxZ) bbMaxZ = lMaxZ;
+				}
+			}
+
+			const float spanX = std::max(bbMaxX - bbMinX, 1e-6f);
+			const float spanY = std::max(bbMaxY - bbMinY, 1e-6f);
+			const float spanZ = std::max(bbMaxZ - bbMinZ, 1e-6f);
+			const float scaleX = float((1u << 21) - 1) / spanX;
+			const float scaleY = float((1u << 21) - 1) / spanY;
+			const float scaleZ = float((1u << 21) - 1) / spanZ;
+
+			// 21-bit-per-axis Morton encoder (3*21=63 bits → fits uint64_t).
+			auto splitBy3 = [](uint32_t a) -> uint64_t {
+				uint64_t v = a & 0x1FFFFFu;
+				v = (v | (v << 32)) & 0x1F00000000FFFFull;
+				v = (v | (v << 16)) & 0x1F0000FF0000FFull;
+				v = (v | (v <<  8)) & 0x100F00F00F00F00Full;
+				v = (v | (v <<  4)) & 0x10C30C30C30C30C3ull;
+				v = (v | (v <<  2)) & 0x1249249249249249ull;
+				return v;
+			};
+
+			uint64_t* __restrict keys = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * numAll, 64);
+			uint32_t* __restrict perm = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * numAll, 64);
+
+			// Pass 3 (parallel): Morton key + permutation init.
+#pragma omp parallel for schedule(static)
+			for (ptrdiff_t i = 0; i < (ptrdiff_t)numAll; ++i) {
+				const uint32_t qx = (uint32_t)((cx[i] - bbMinX) * scaleX);
+				const uint32_t qy = (uint32_t)((cy[i] - bbMinY) * scaleY);
+				const uint32_t qz = (uint32_t)((cz[i] - bbMinZ) * scaleZ);
+				keys[i] = splitBy3(qx) | (splitBy3(qy) << 1) | (splitBy3(qz) << 2);
+				perm[i] = (uint32_t)i;
+			}
+
+			// Parallel sort if available (MSVC <execution> / libstdc++ par).
+#if defined(_MSC_VER) && _MSVC_LANG >= 201703L
+			std::sort(std::execution::par_unseq, perm, perm + numAll,
+				[keys](uint32_t a, uint32_t b) { return keys[a] < keys[b]; });
+#else
+			std::sort(perm, perm + numAll,
+				[keys](uint32_t a, uint32_t b) { return keys[a] < keys[b]; });
+#endif
+
+			// Pass 4 (parallel): assign info() / allCells; cache isFinite.
+			// Drops the 4-vertex deref for isFinite — origMeta already has it
+			// implicitly (mask==0 only for infinite cells; we use a separate
+			// isFinite[] flag to keep Pass 5 a clean linear scan).
+			// ci->info() and allCells[ciID] are per-cell distinct memory locations,
+			// so parallel writes are race-free.
+			uint8_t* __restrict isFinite = (uint8_t*)_aligned_malloc(numAll, 64);
+#pragma omp parallel for schedule(static)
+			for (ptrdiff_t k = 0; k < (ptrdiff_t)numAll; ++k) {
+				const uint32_t origIdx = perm[k];
+				const cell_handle_t ci = tmpCells[origIdx];
+				const cell_size_t id = (cell_size_t)k;
+				ci->info() = id;
+				allCells[id] = ci;
+				// Vertex-handle compare to infV — these pointers live in the
+				// cell record we just touched for the info() write, so the
+				// loads are essentially free (same cacheline).
+				const bool fin = (ci->vertex(0) != infV) & (ci->vertex(1) != infV)
+					& (ci->vertex(2) != infV) & (ci->vertex(3) != infV);
+				isFinite[k] = fin ? 1u : 0u;
+			}
+
+			// Pass 5 (serial compaction): finiteCells + finiteCellMeta + hullFacets.
+			// Reads origMeta[perm[k]] when finite — random access pattern but
+			// only ~5 GB total over the finite cells, bandwidth-friendly.
+			for (size_t k = 0; k < numAll; ++k) {
+				const cell_handle_t ci = allCells[k];
+				if (isFinite[k]) {
+					finiteCellMeta[numFiniteCells] = origMeta[perm[k]];
+					finiteCells[numFiniteCells++] = ci;
+				} else {
+					++numInfiniteCells;
+					hullFacets.emplace_back(ci, ci->index(infV));
+				}
+			}
+			ciID = (cell_size_t)numAll;
+
+			_aligned_free(isFinite);
+			_aligned_free(perm);
+			_aligned_free(keys);
+			_aligned_free(cz);
+			_aligned_free(cy);
+			_aligned_free(cx);
+			_aligned_free(origMeta);
+			_aligned_free(tmpCells);
+		}
+#else
+		// Original creation-order assignment (baseline for A/B test).
+		for (delaunay_t::All_cells_iterator ci = delaunay.all_cells_begin(), eci = delaunay.all_cells_end(); ci != eci; ++ci, ++ciID) {
+			ci->info() = ciID;
+			allCells[ciID] = ci;
+
+			const auto vh0 = ci->vertex(0);
+			const auto vh1 = ci->vertex(1);
+			const auto vh2 = ci->vertex(2);
+			const auto vh3 = ci->vertex(3);
+			if (vh0 != infV && vh1 != infV && vh2 != infV && vh3 != infV) {
+				CellMeta& cm = finiteCellMeta[numFiniteCells];
+				cm.idx[0] = vh0->info().idx;
+				cm.idx[1] = vh1->info().idx;
+				cm.idx[2] = vh2->info().idx;
+				cm.idx[3] = vh3->info().idx;
+				uint8_t m = 0;
+				m |= (vh0 < vh1) ? 0x01 : 0;
+				m |= (vh0 < vh2) ? 0x02 : 0;
+				m |= (vh0 < vh3) ? 0x04 : 0;
+				m |= (vh1 < vh2) ? 0x08 : 0;
+				m |= (vh1 < vh3) ? 0x10 : 0;
+				m |= (vh2 < vh3) ? 0x20 : 0;
+				cm.mask = m;
+				finiteCells[numFiniteCells++] = ci;
+			} else {
 				++numInfiniteCells;
 				hullFacets.emplace_back(ci, ci->index(delaunay.infinite_vertex()));
 			}
 		}
+#endif
 		totalCells = ciID;
+
+		// Build per-cell neighbor ID + reverse-slot caches once, here, where
+		// allCells[] and ci->info() are fully populated. Identical to the
+		// code that previously lived in BuildGraphNodesAndEdges' P2b — just
+		// relocated so the data is available during ray-walk weighting too.
+		// Cell pool is touched once (cold) per cell here; later phases read
+		// only the flat arrays.
+		cellNbrID   = (uint32_t*)_aligned_malloc(sizeof(uint32_t) * totalCells * 4, 64);
+		cellNbrSlot = (uint8_t*) _aligned_malloc(sizeof(uint8_t)  * totalCells,     64);
+#pragma omp parallel for schedule(static)
+		for (ptrdiff_t idx = 0; idx < (ptrdiff_t)totalCells; ++idx) {
+			uint32_t* __restrict dstNb = cellNbrID + idx * 4;
+			const cell_handle_t  ci    = allCells[idx];
+			uint8_t slotPack = 0;
+			for (int i = 0; i < 4; ++i) {
+				const cell_handle_t cj   = ci->neighbor(i);
+				const cell_size_t   cjID = cj->info();
+				dstNb[i] = (uint32_t)cjID;
+				slotPack |= (uint8_t)((cj->index(ci) & 3u) << (i * 2));
+			}
+			cellNbrSlot[idx] = slotPack;
+		}
+
+		auto t0 = rdtscEnd();
 
 #if 1 // New idea for median calculation
 		const auto maxIndex = vert_info_t::g_idx;
 		idToPoint = (Point3f*)_aligned_malloc(sizeof(Point3f) * (maxIndex + 1), 64);
 		for (auto vit = delaunay.finite_vertices_begin(), end = delaunay.finite_vertices_end(); vit != end; ++vit) {
-
 			const auto& p = vit->point();
 			const uint32_t id = vit->info().idx;
-
 			idToPoint[id].x = float(p.x());
 			idToPoint[id].y = float(p.y());
 			idToPoint[id].z = float(p.z());
 		}
 
-		const size_t totalEstimate = 6ull * numFiniteCells;
-		uint64_t* __restrict edges = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * totalEstimate, 64);
+		// Per-cell metadata is already in finiteCellMeta — populated during
+		// the cell-enumeration pass that had to cold-deref every cell anyway.
+		// Median work is now pure SoA streaming: one popcount pass for offsets,
+		// one distance pass over finiteCellMeta + idToPoint. No CGAL pointer
+		// derefs at all.
+		const int nMedianThreads = omp_get_max_threads();
+		std::vector<size_t> threadEdgeCounts(nMedianThreads, 0);
 
+		// Pass 1: count edges per thread (popcount over cached masks only).
 #pragma omp parallel
 		{
-			int tid = omp_get_thread_num();
-			int numThreads = omp_get_num_threads();
+			const int tid = omp_get_thread_num();
+			size_t localCount = 0;
 
-			// Assign cell range to this thread
-			size_t cellStart = numFiniteCells * tid / numThreads;
-			size_t cellEnd = numFiniteCells * (tid + 1) / numThreads;
-			const cell_handle_t* __restrict cellsPtr = finiteCells;
+#pragma omp for schedule(static)
+			for (ptrdiff_t i = 0; i < (ptrdiff_t)numFiniteCells; ++i) {
+				localCount += __popcnt(finiteCellMeta[i].mask);
+			}
+			threadEdgeCounts[tid] = localCount;
+		}
 
-			// Each cell produces 6 edges and compute edge range
-			size_t edgeStart = 6 * cellStart;
-			uint64_t* __restrict dst = edges + edgeStart;
+		// Prefix-sum to get per-thread write offsets.
+		std::vector<size_t> threadOffsets(nMedianThreads + 1, 0);
+		for (int t = 0; t < nMedianThreads; ++t)
+			threadOffsets[t + 1] = threadOffsets[t] + threadEdgeCounts[t];
+		const size_t totalEdges = threadOffsets[nMedianThreads];
 
-			for (size_t i = cellStart; i < cellEnd; ++i) {
-				const cell_handle_t c = cellsPtr[i];
+		float* __restrict dists = (float*)_aligned_malloc(sizeof(float) * totalEdges, 64);
 
-				const uint32_t a = c->vertex(0)->info().idx;
-				const uint32_t b = c->vertex(1)->info().idx;
-				const uint32_t c0 = c->vertex(2)->info().idx;
-				const uint32_t d = c->vertex(3)->info().idx;
+		// Pass 2: read finiteCellMeta[i] + idToPoint[]. No cell-handle or vertex_t
+		// loads. Same write order per cell as before -> identical dists[].
+#pragma omp parallel
+		{
+			const int tid = omp_get_thread_num();
+			float* __restrict dst = dists + threadOffsets[tid];
 
-#define PACK(u,v) do { \
-  const uint32_t lo = (u < v ? u : v); \
-  const uint32_t hi = (u ^ v ^ lo); \
-  *dst++ = (uint64_t(lo) << 32) | hi; \
-} while (0)
+#pragma omp for schedule(static)
+			for (ptrdiff_t i = 0; i < (ptrdiff_t)numFiniteCells; ++i) {
+				const CellMeta& cm = finiteCellMeta[i];
+				const Point3f& p0 = idToPoint[cm.idx[0]];
+				const Point3f& p1 = idToPoint[cm.idx[1]];
+				const Point3f& p2 = idToPoint[cm.idx[2]];
+				const Point3f& p3 = idToPoint[cm.idx[3]];
+				const uint8_t  m = cm.mask;
 
-				PACK(a, b);
-				PACK(a, c0);
-				PACK(a, d);
-				PACK(b, c0);
-				PACK(b, d);
-				PACK(c0, d);
+#define MEDIAN_EDGE_DIST_IF(bit, pa, pb) do {                          \
+				if (m & (bit)) {                                   \
+					const float dx = pa.x - pb.x;                  \
+					const float dy = pa.y - pb.y;                  \
+					const float dz = pa.z - pb.z;                  \
+					*dst++ = dx*dx + dy*dy + dz*dz;                \
+				}                                                  \
+			} while(0)
+
+				MEDIAN_EDGE_DIST_IF(0x01, p0, p1);
+				MEDIAN_EDGE_DIST_IF(0x02, p0, p2);
+				MEDIAN_EDGE_DIST_IF(0x04, p0, p3);
+				MEDIAN_EDGE_DIST_IF(0x08, p1, p2);
+				MEDIAN_EDGE_DIST_IF(0x10, p1, p3);
+				MEDIAN_EDGE_DIST_IF(0x20, p2, p3);
+#undef MEDIAN_EDGE_DIST_IF
 			}
 		}
 
+		_aligned_free(finiteCellMeta);
 		_aligned_free(finiteCells);
+		finiteCells = 0;
 
-		// Sort and deduplicate
-		tbb::parallel_sort(edges, edges + totalEstimate);
-		uint64_t* newEnd = std::unique(edges, edges + totalEstimate);
-		size_t edgeCount = static_cast<size_t>(newEnd - edges);
+		std::nth_element(dists, dists + totalEdges / 2, dists + totalEdges);
+		approxMedian = dists[totalEdges / 2];
 
-		float* __restrict dists = (float*)_aligned_malloc(sizeof(float) * edgeCount, 64);
-
-#pragma omp parallel for schedule(static)
-		for (ptrdiff_t i = 0; i < static_cast<ptrdiff_t>(edgeCount); ++i) {
-			uint64_t code = edges[i];
-			uint32_t id0 = code >> 32;
-			uint32_t id1 = code & 0xFFFFFFFF;
-
-			const Point3f& p0 = idToPoint[id0];
-			const Point3f& p1 = idToPoint[id1];
-
-			const float dx = p0.x - p1.x;
-			const float dy = p0.y - p1.y;
-			const float dz = p0.z - p1.z;
-			dists[i] = dx * dx + dy * dy + dz * dz;
-		}
-
-		std::nth_element(dists, dists + edgeCount/2, dists + edgeCount);
-		approxMedian = dists[edgeCount /2];
-
-		_aligned_free(edges);
-		edges = 0;
+		_aligned_free(dists);
+		dists = 0;
 #else
 		const int numThreads = omp_get_max_threads();
 		std::vector<std::vector<float>> threadDists(numThreads);
@@ -3421,7 +4831,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 #pragma omp for schedule(static)
 			for (ptrdiff_t i = 0; i < (ptrdiff_t)finiteCells.size(); ++i) {
 				const cell_handle_t ci = finiteCells[i];
-		
+
 				const auto v0 = ci->vertex(0);
 				const auto v1 = ci->vertex(1);
 				const auto v2 = ci->vertex(2);
@@ -3431,15 +4841,15 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				const point_t& __restrict p1 = v1->point();
 				const point_t& __restrict p2 = v2->point();
 				const point_t& __restrict p3 = v3->point();
-	
-				if (v0 < v1) { float dx = p0.x() - p1.x(), dy = p0.y() - p1.y(), dz = p0.z() - p1.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				if (v0 < v2) { float dx = p0.x() - p2.x(), dy = p0.y() - p2.y(), dz = p0.z() - p2.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				if (v0 < v3) { float dx = p0.x() - p3.x(), dy = p0.y() - p3.y(), dz = p0.z() - p3.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				if (v1 < v2) { float dx = p1.x() - p2.x(), dy = p1.y() - p2.y(), dz = p1.z() - p2.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				if (v1 < v3) { float dx = p1.x() - p3.x(), dy = p1.y() - p3.y(), dz = p1.z() - p3.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				if (v2 < v3) { float dx = p2.x() - p3.x(), dy = p2.y() - p3.y(), dz = p2.z() - p3.z(); local.push_back(dx*dx + dy*dy + dz*dz); }
-				}
+
+				if (v0 < v1) { float dx = p0.x() - p1.x(), dy = p0.y() - p1.y(), dz = p0.z() - p1.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
+				if (v0 < v2) { float dx = p0.x() - p2.x(), dy = p0.y() - p2.y(), dz = p0.z() - p2.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
+				if (v0 < v3) { float dx = p0.x() - p3.x(), dy = p0.y() - p3.y(), dz = p0.z() - p3.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
+				if (v1 < v2) { float dx = p1.x() - p2.x(), dy = p1.y() - p2.y(), dz = p1.z() - p2.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
+				if (v1 < v3) { float dx = p1.x() - p3.x(), dy = p1.y() - p3.y(), dz = p1.z() - p3.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
+				if (v2 < v3) { float dx = p2.x() - p3.x(), dy = p2.y() - p3.y(), dz = p2.z() - p3.z(); local.push_back(dx * dx + dy * dy + dz * dz); }
 			}
+		}
 
 		size_t totalSize = 0;
 		for (const auto& vec : threadDists)
@@ -3454,7 +4864,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		}
 
 #ifdef VALIDATE
-  omp_set_num_threads(oldThreadCount);
+		omp_set_num_threads(oldThreadCount);
 #endif
 
 		// Compute median approximately.
@@ -3462,12 +4872,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// going with the idea that this is a large piece of irregular data where a little
 		// error is tolerable.  Here we technically want the average of the two middle elements,
 		// but we are just using the first of these elements.
-		std::nth_element(distsSq.get(), distsSq.get() + totalSize/2, distsSq.get() + totalSize);
-		approxMedian = distsSq[totalSize/2];
+		std::nth_element(distsSq.get(), distsSq.get() + totalSize / 2, distsSq.get() + totalSize);
+		approxMedian = distsSq[totalSize / 2];
 #endif
 
 		auto t1 = rdtscEnd();
-
 
 		DEBUG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
 
@@ -3492,14 +4901,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			ASSERT(camCell.cell != cell_handle_t());
 			fetchCellFacets<CGAL::POSITIVE>(delaunay, viewFrustums[i], hullFacets, camCell.cell, imageData, camCell.facets);
 			// link all cells contained by the camera to the source
-			for (const facet_t& f: camCell.facets)
+			for (const facet_t& f : camCell.facets)
 				infoCells[f.first->info()].s = kInf;
 		}
 
 #ifdef FACET_DIAGNOSTICS // Just used in diagnostics
 		numFiniteFacets = 0;
 		numFacets = 0;
-		for (auto fi=delaunay.facets_begin(), ffi=delaunay.facets_end(); fi!=ffi; ++fi) {
+		for (auto fi = delaunay.facets_begin(), ffi = delaunay.facets_end(); fi != ffi; ++fi) {
 			if (!delaunay.is_infinite(*fi)) {
 				++numFiniteFacets;
 			}
@@ -3509,7 +4918,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 #ifdef FACET_DIAGNOSTICS
 		DEBUG_EXTRA("Delaunay tetrahedralization completed: %u points -> %u vertices, %u (+%u) cells, %u (+%u) faces (%s)",
-			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, numFiniteFacets,  numFacets-numFiniteFacets, TD_TIMER_GET_FMT().c_str());
+			numVertices, delaunay.number_of_vertices(), numFiniteCells, infiniteCells, numFiniteFacets, numFacets - numFiniteFacets, TD_TIMER_GET_FMT().c_str());
 #else
 		DEBUG_EXTRA("Delaunay tetrahedralization completed: %u points -> %u vertices, %u (+%u) cells, faces not calculated (%s)",
 			numVertices, delaunay.number_of_vertices(), numFiniteCells, numInfiniteCells, TD_TIMER_GET_FMT().c_str());
@@ -3674,6 +5083,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			edge_cap_t  mVis[kMaxStepsPerBatch];
 			edge_cap_t  mDist[kMaxStepsPerBatch];
 			PaddedVector<ViewCount>     mViewCounts;
+			uint16_t* mCountByImageID; // direct-indexed lookup, sized to images.size()
 		};
 
 		std::vector<ThreadData> perThreadData;
@@ -3727,6 +5137,9 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			auto& viewCounts = td.mViewCounts.mData;
 			viewCounts.resize(images.size());
 
+			td.mCountByImageID = (uint16_t*)_aligned_malloc(sizeof(uint16_t) * images.size(), 64);
+			memset(td.mCountByImageID, 0, sizeof(uint16_t)* images.size());
+
 #pragma omp for schedule(static, 1024) // 1024 better than alternatives on 7950X
 			for (int64_t i = 0; i < nVerts; ++i) {
 #if 1
@@ -3737,6 +5150,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 				vi = vertexIter++;
 #endif
 				vert_info_t& vert(vi->info());
+#if !DIRECT_VIEW_EXPANSION
 				auto& viewInstance = allViews[vert.idx];
 				if (viewInstance.empty())//IsEmpty())
 					continue;
@@ -3745,10 +5159,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 				// To accelerate the vert.views creation, we just store
 				// them as fast as possible.
-				// Here, because there may be duplicates we sort them
-				// and assign a (constant) weight to the point which equals
-				// the number of views.
+				// Here, because there may be duplicates we count them
+				// and assign a weight to the point which equals
+				// the number of observations from each view.
 				uint32_t numViews = 0;
+				// viewCounts is sized to images.size() and reused per-vertex.
+				// Use a parallel flat array for O(1) duplicate detection.
+				// countByImageID[id] holds the index+1 into viewCounts (0 = absent).
+				uint16_t* __restrict countByImageID = td.mCountByImageID;
 
 				for (uint32_t v : viewInstance) {
 					const uint32_t* src = &pointcloud.pointViewsMemory[offsets[v]];
@@ -3756,20 +5174,33 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 					for (uint32_t k = 0; k < cnt; ++k) {
 						const uint32_t id = src[k];
-
-						uint32_t j = 0;
-						for (; j < numViews; ++j) {
-							if (viewCounts[j].id == id) {
-								++viewCounts[j].count;
-								break;
-							}
+						uint16_t& slot = countByImageID[id];
+						if (slot != 0) {
+							// already seen � increment count
+							++viewCounts[slot - 1].count;
 						}
-
-						if (j == numViews) {
-							viewCounts[numViews++] = { id, 1 };
+						else {
+							// new view
+							viewCounts[numViews] = { id, 1 };
+							slot = static_cast<uint16_t>(numViews + 1);
+							++numViews;
 						}
 					}
 				}
+
+				// Reset only the slots we touched (cheaper than memset over all images)
+				for (uint32_t j = 0; j < numViews; ++j)
+					countByImageID[viewCounts[j].id] = 0;
+#else
+				const uint16_t vcCount = vcSizes[vert.idx];
+				if (vcCount == 0)
+					continue;
+				const point_t& p(vi->point());
+				const Point3f pt(p.x(), p.y(), p.z());
+
+				const uint32_t numViews = vcCount;
+				const ExpandedViewCount* __restrict vcEntry = &vcData[vcOffsets[vert.idx]];
+#endif
 
 #ifdef VALIDATE
 				auto vi2 = vertexHandles2[i];
@@ -3819,8 +5250,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					// process a small batch of views
 					// ===============================
 					for (uint32_t viBatch = vBase; viBatch < vEnd; ++viBatch) {
+#if !DIRECT_VIEW_EXPANSION
 						const uint32_t imageID = viewCounts[viBatch].id;
 						const edge_cap_t alpha_vis = edge_cap_t(viewCounts[viBatch].count);
+#else
+						const uint32_t imageID = vcEntry[viBatch].id;
+						const edge_cap_t alpha_vis = edge_cap_t(vcEntry[viBatch].count);
+#endif
 
 						const Image& imageData = images[imageID];
 						ASSERT(imageData.IsValid());
@@ -3853,7 +5289,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 						// Prematurely exiting the intersection loop can leave facets non-empty.
 						facets.resize(0);
-						if (!intersect(delaunay, segCamPoint, camCell.facets, facets, inter))
+						if (!intersect(delaunay, segCamPoint, camCell.facets, facets, inter, cellNbrID, allCells))
 							continue;
 
 						float lastDist = inter.dist;
@@ -3869,15 +5305,19 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							if (++steps >= kMaxSteps)
 								break;
 
+#ifdef EARLY_OUT_WEIGHTING
 							if (inter.dist > kSigmaCut)
 								break;
+#endif
 
 							// advance to NEXT intersection
-							if (!intersect(delaunay, segCamPoint, facets, facets, inter))
+							if (!intersect(delaunay, segCamPoint, facets, facets, inter, cellNbrID, allCells))
 								break;
 
+#ifdef EARLY_OUT_WEIGHTING
 							if (inter.dist - lastDist < kMin)
 								break;
+#endif
 
 							lastDist = inter.dist;
 						}
@@ -3895,17 +5335,22 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 						facets.resize(0);
 						steps = 0;
-						if (intersect(delaunay, segEndPoint, facets, facets, inter)) {
+						if (intersect(delaunay, segEndPoint, facets, facets, inter, cellNbrID, allCells)) {
 							lastDist = inter.dist;
 							for (;;) {
 								cell_handle_t  c = inter.facet.first;
 								const int      i = inter.facet.second;
-								cell_handle_t  nc = c->neighbor(i);
-								const int      mi = delaunay.mirror_index(c, i);
+								// Replace c->neighbor(i) random deref + delaunay.mirror_index(c, i)
+								// (which itself does nc->index(c)) with two flat-array reads.
+								// c->info() reads a field on the cell record that intersect() just
+								// touched, so it's a warm-cache load.
+								const cell_size_t cID  = c->info();
+								const cell_size_t ncID = cellNbrID[(size_t)cID * 4 + i];
+								const int         mi   = (cellNbrSlot[cID] >> (i * 2)) & 3;
 
 								// assign score, weighted by the distance from the point to the intersection
 								// inline mirror_facet
-								edge_cap_t* fp = &infoCells[nc->info()].f[mi];
+								edge_cap_t* fp = &infoCells[ncID].f[mi];
 								pPts[totalSteps] = fp;
 								pVis[totalSteps] = alpha_vis;
 								pDist[totalSteps] = (edge_cap_t)inter.dist;
@@ -3914,14 +5359,18 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 								if (++steps >= kMaxSteps)
 									break;
 
+#ifdef EARLY_OUT_WEIGHTING
 								if (inter.dist > kSigmaCut)
 									break;
+#endif
 
-								if (!intersect(delaunay, segEndPoint, facets, facets, inter))
+								if (!intersect(delaunay, segEndPoint, facets, facets, inter, cellNbrID, allCells))
 									break;
 
+#ifdef EARLY_OUT_WEIGHTING
 								if (inter.dist - lastDist < kMin)
 									break;
+#endif
 
 								lastDist = inter.dist;
 							}
@@ -3941,6 +5390,19 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					for (size_t i = 0; i < numFours; ++i) {
 						const size_t base = i << 2;
 
+#if SCRREC_OPT_PREFETCH
+						// (A) Warm cachelines ~2 quads ahead (8 atomics of latency).
+						// pPts is linear so reading the future pointers is free;
+						// the targets they point at are random per cell.
+						if (i + 2 < numFours) {
+							const size_t pf = (i + 2) << 2;
+							_mm_prefetch((const char*)pPts[pf + 0], _MM_HINT_T0);
+							_mm_prefetch((const char*)pPts[pf + 1], _MM_HINT_T0);
+							_mm_prefetch((const char*)pPts[pf + 2], _MM_HINT_T0);
+							_mm_prefetch((const char*)pPts[pf + 3], _MM_HINT_T0);
+						}
+#endif
+
 						// load pointers
 						float* p0 = pPts[base + 0];
 						float* p1 = pPts[base + 1];
@@ -3952,14 +5414,11 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						const _Data vAlphaVis = _LoadA(pVis + base);
 						const _Data vDistsSq = _Mul(vDists, vDists);
 						const _Data vDistsSqFactor = _Mul(vDistsSq, vInv2SigmaSq);
-						_Data vExp = BetterFastExpSse(vDistsSqFactor);
+						_Data vExp = BetterFastExpSse(vDistsSqFactor); // JPB WIP BUG Why does it fail? FastExpNoClampNegativeRcp(vDistsSqFactor);
 						const _Data vOneMinusExpAndFactor = _Sub(vOne, vExp);
 						const _Data vResult = _Mul(vOneMinusExpAndFactor, vAlphaVis);
-
-						float v0 = _AsArray(vResult, 0);
-						float v1 = _AsArray(vResult, 1);
-						float v2 = _AsArray(vResult, 2);
-						float v3 = _AsArray(vResult, 3);
+						alignas(16) float vRes[4];
+						_mm_store_ps(vRes, vResult);
 
 #if 1
 						// common case: all distinct
@@ -3968,36 +5427,35 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							p0 != p2 && p1 != p3)
 						{
 #endif
-						AtomicAddFloat(p0, v0);
-						AtomicAddFloat(p1, v1);
-						AtomicAddFloat(p2, v2);
-						AtomicAddFloat(p3, v3);
+							AtomicAddFloat(p0, vRes[0]);
+							AtomicAddFloat(p1, vRes[1]);
+							AtomicAddFloat(p2, vRes[2]);
+							AtomicAddFloat(p3, vRes[3]);
 #if 1
 						}
 						else
 						{
 							// rare slow path
 							if (p0 == p1) {
-								AtomicAddFloat(p0, v0 + v1);
-								AtomicAddFloat(p2, v2);
-								AtomicAddFloat(p3, v3);
+								AtomicAddFloat(p0, vRes[0] + vRes[1]);
+								AtomicAddFloat(p2, vRes[2]);
+								AtomicAddFloat(p3, vRes[3]);
 					}
 							else if (p2 == p3) {
-								AtomicAddFloat(p0, v0);
-								AtomicAddFloat(p1, v1);
-								AtomicAddFloat(p2, v2 + v3);
+								AtomicAddFloat(p0, vRes[0]);
+								AtomicAddFloat(p1, vRes[1]);
+								AtomicAddFloat(p2, vRes[2] + vRes[3]);
 							}
 							else {
 								// extremely rare: cross-pair duplicates
 								float* ptr[4] = { p0, p1, p2, p3 };
-								float  val[4] = { v0, v1, v2, v3 };
 
 								for (int i = 0; i < 4; ++i) {
 									if (!ptr[i]) continue;
-									float sum = val[i];
+									float sum = vRes[i];
 									for (int j = i + 1; j < 4; ++j) {
 										if (ptr[j] == ptr[i]) {
-											sum += val[j];
+											sum += vRes[j];
 											ptr[j] = nullptr;
 										}
 									}
@@ -4025,7 +5483,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						const _Data vAlphaVis = _LoadA(tmpVis);
 						const _Data vSq = _Mul(vD, vD);
 						const _Data vF = _Mul(vSq, vInv2SigmaSq);
-						_Data vExp = BetterFastExpSse(vF);
+						_Data vExp = BetterFastExpSse(vF); // JPB WIP BUG Is this wrong? FastExpNoClampNegativeRcp(vF);
 						const _Data vRes = _Mul(_Sub(vOne, vExp), vAlphaVis);
 
 						// Scalar atomics ONLY for valid lanes
@@ -4266,9 +5724,17 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		progress.process();
 		progress.close();
 
+		decltype(hullFacets)().swap(hullFacets);
+		decltype(viewFrustums)().swap(viewFrustums);
+
 		_aligned_free(vertexHandles);
 		vertexHandles = 0;
 
+		// Free per-thread lookup arrays
+		for (auto& td : perThreadData)
+			_aligned_free(td.mCountByImageID);
+
+#if !DIRECT_VIEW_EXPANSION
 		// Confirmed faster to parallel destroy.
 #pragma omp parallel for schedule(static, 256)
 		for (ptrdiff_t i = 0; i < (ptrdiff_t)numVertices; ++i)
@@ -4280,6 +5746,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		offsets = 0;
 		_aligned_free(sizes);
 		sizes = 0;
+#else
+		_aligned_free(vcData);
+		vcData = 0;
+		_aligned_free(vcOffsets);
+		vcOffsets = 0;
+		_aligned_free(vcSizes);
+		vcSizes = 0;
+#endif
 		decltype(camCells)().swap(camCells);
 
 	 // DEBUG_EXTRA("Rays %g, steps %g, avg steps per ray %f", (double) rays.load(), (double) steps.load(), (double)steps.load() / (float)rays.load());
@@ -4291,463 +5765,209 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		#endif
 	}
 
-	// JPB WIP BUG Parallel graphcut neds to change compuatePlaneSphareAngle 
 
-	// run graph-cut and extract the mesh
+		// run graph-cut and extract the mesh
 	{
 		TD_TIMER_STARTD();
-		//DWORD_PTR originalMask = SetAffinityToCPU0();
 
+#if 1 // new conservative work
 		auto t0 = rdtscStart();
 
-		// create graph
-		constexpr edge_cap_t maxCap = 1e8f;     // safe, tight
+		MaxFlow<cell_size_t, edge_cap_t> graph(totalCells);
+		constexpr edge_cap_t maxCap(3.402823466e+34f);
 
-#if 1 // parallel graph-cut set up brings 29s to about 9s
-		MaxFlow<cell_size_t,edge_cap_t> graph(cellIterators.size());
+		BuildGraphNodesAndEdges(graph, allCells, delaunay, infoCells, cellNbrID, cellNbrSlot, totalCells, kQual, maxCap, cpuHz);
+		auto tFG0 = rdtscEnd();
+		graph.FinalizeGraphPrebuilt();
+		auto tFG1 = rdtscEnd();
+		std::cout << "     [FinalizeGraph ] " << rdtscToSeconds(tFG1 - tFG0, cpuHz) << "\n";
 
-		struct FacetAngleIndex {
-			FacetAngleIndex(int n) :
-				kQual_oneMinusAngle((float*) _aligned_malloc(n * 4 * sizeof(float), 64)),
-				cellIDToIdx((uint32_t*) _aligned_malloc(n * sizeof(uint32_t), 64))
-			{}
-			~FacetAngleIndex()
-			{
-				_aligned_free(kQual_oneMinusAngle);
-				_aligned_free(cellIDToIdx);
-			}
-
-			// Flat angle array, 4 per cell
-			float* kQual_oneMinusAngle;     // size = 4 * totalCells
-			uint32_t* cellIDToIdx;     // size = totalCells
-		};
-
-		FacetAngleIndex facetData(totalCells);
-
-		_Data vQual = _Set(kQual);
-
-		std::vector<uint8_t> cellMask(totalCells, false);
-
-		// --- Compute facet angles in parallel ---
-		#pragma omp parallel for schedule(static)
-		for (ptrdiff_t i = 0; i < (ptrdiff_t)totalCells; ++i) {
-			if (i + 64 < totalCells)
-				_mm_prefetch((const char*)&cellIterators[i + 64], _MM_HINT_T0);
-
-			const auto ci = cellIterators[i];
-			const cell_size_t cellID = ci->info();
-
-			const auto& w = infoCells[cellID].f;
-			float totalWeight = w[0] + w[1] + w[2] + w[3];
-			cellMask[i] = (totalWeight > 1e-6f); // Threshold tunable; skip very low-weight cells
-
-			// Safe single-thread write if cellIDs are unique
-			facetData.cellIDToIdx[cellID] = (int32_t)i;
-			computeOneMinusPlaneSphereAngle4(delaunay, ci, vQual, &facetData.kQual_oneMinusAngle[i * 4]);
-		}
-
-		// --- Graph construction pass ---
-		struct EdgeDesc
-		{
-			EdgeDesc() {}
-			EdgeDesc(int f, int t, edge_cap_t c, edge_cap_t r):
-				from(f),
-				to(t),
-				cap(c),
-				revCap(r)
-			{}
-			
-			int from, to;
-			edge_cap_t cap, revCap;
-		};
-
-		struct alignas(64)  ThreadLocalBuffer
-		{
-			std::vector<EdgeDesc> edges;
-			alignas(64) edge_cap_t flow;
-		};
-
-#if 0
-
-		node is big 144 bytes memset takes a long time 8 seconds or so
-
-			need this par:
-
-		template < class T, class Allocator, class Increment_policy, class TimeStamper >
-		void Compact_container<T, Allocator, Increment_policy, TimeStamper>::clear()
-		{
-			for (typename All_items::iterator it = all_items.begin(), itend = all_items.end();
-				it != itend; ++it) {
-				pointer p = it->first;
-				size_type s = it->second;
-				for (pointer pp = p + 1; pp != p + s - 1; ++pp) {
-					if (type(pp) == USED)
-					{
-						std::allocator_traits<allocator_type>::destroy(alloc, pp);
-						set_type(pp, nullptr, FREE);
-					}
-				}
-				alloc.deallocate(p, s);
-			}
-			init();
-		}
-
-
-
-		eneed flow parallel(atomic)
-
-			save scene as binary
-			--archive - type  1 add to GM
-#endif
-
-#if 0
-			double nonZeroS = 0, nonZeroT = 0, nonZeroF = 0;
-		for (int i = 0; i < totalCells; ++i) {
-			auto& c = infoCells[i];
-			if (c.s > 0) ++nonZeroS;
-			if (c.t > 0) ++nonZeroT;
-			for (int i = 0; i < 4; ++i)
-				if (c.f[i] > 0) ++nonZeroF;
-		}
-		DEBUG("non-zero s: %.1f%%  t: %.1f%%  f[i]: %.1f%%\n",
-			100.0 * nonZeroS / totalCells,
-			100.0 * nonZeroT / totalCells,
-			100.0 * nonZeroF / (totalCells * 4));
-#endif
-
-		const int threadCount = omp_get_max_threads();
-		std::vector<ThreadLocalBuffer> threadBuffers(threadCount);
-
-#if 0
-		std::atomic<int> edgesConsidered = 0;
-		std::atomic<int> edgesDropped = 0;
-		std::atomic<int> weakConsidered = 0;
-		std::atomic<int> weakDropped = 0;
-#endif
-
-		// Remember, s is always either 0 or kInf.
-		auto& g = graph.graph;
-#pragma omp parallel
-		{
-			int tid = omp_get_thread_num();
-			ThreadLocalBuffer& buf = threadBuffers[tid];
-
-			const size_t est = (totalCells + threadCount - 1) / threadCount;
-			constexpr size_t pad = 2048; // schedule
-			buf.edges.reserve((est + pad) * 4); // Worst case. 6.4Gb total
-			buf.edges.clear();
-
-			// Manual static partition
-			const ptrdiff_t chunk = (totalCells + threadCount - 1) / threadCount;
-			const ptrdiff_t start = tid * chunk;
-			const ptrdiff_t end = std::min<ptrdiff_t>(start + chunk, totalCells);
-
-			// constants
-			const __m128 kTwo = _mm_set1_ps(2.0f);
-			const __m128 kFour = _mm_set1_ps(4.0f);
-			const __m128 kEight = _mm_set1_ps(8.0f);
-			const __m128 kHalf = _mm_set1_ps(0.5f);
-			const __m128 kQtr = _mm_set1_ps(0.25f);
-			const __m128 kEighth = _mm_set1_ps(1.0f/8.0f);
-			const __m128 kMaxV = _mm_set1_ps(maxCap);
-			const __m128 kSixteen = _mm_set1_ps(16.0f);
-			const __m128 kSixteenth = _mm_set1_ps(1.f/16.0f);
-
-			for (ptrdiff_t idx = start; idx < end; ++idx) {
-				//++weakConsidered;
-				if (!cellMask[idx]) {
-					//++weakDropped;
-					continue;
-				}
-				const auto ci = cellIterators[idx];
-				const int ciID = ci->info();
-
-				const auto& ciInfo = infoCells[ciID];
-				auto& node = g.nodes[ciID];
-
-				// Compute terminal capacities
-				edge_cap_t s = ciInfo.s;
-				edge_cap_t t = FastMinS(ciInfo.t, maxCap);
-				const edge_cap_t push = FastMinS(s, t);
-				const edge_cap_t excess = (s == kInf) ? maxCap : (s - t);
-				const int base = idx << 2; // idx * 4
-
-				bool hasEdge = false;
-
-				for (int i = 0; i < 4; ++i) {
-					const auto cj = ci->neighbor(i);
-					const int cjID = cj->info();
-
-					if (cjID < ciID) continue;
-
-					const int j = cj->index(ci);
-					const auto& cjInfo = infoCells[cjID];
-
-					const float kQual_oneMinusAngleCi = facetData.kQual_oneMinusAngle[base + i];
-					const int cjIdx = facetData.cellIDToIdx[cjID];
-					const float kQual_oneMinusAngleCj = facetData.kQual_oneMinusAngle[cjIdx * 4 + j];
-
-					float kQual_oneMinusMinAngle = FastMaxS(kQual_oneMinusAngleCi, kQual_oneMinusAngleCj);
-#if 1
-					// load both caps and apply q
-					// layout: [cj, ci, 0, 0]
-					// ci, cj >= 0
-					__m128 v = _mm_set_ps(0, 0, cjInfo.f[j] + kQual_oneMinusMinAngle, ciInfo.f[i] + kQual_oneMinusMinAngle);
-
-					// identical clamp semantics
-					v = _mm_min_ps(v, kMaxV);
-
-					// identical quantization: multiply add truncate
-#if 1
-					const __m128 vScaled = _mm_add_ps(_mm_mul_ps(v, kSixteen), kHalf);
-					const	__m128i ival = _mm_cvttps_epi32(vScaled);
-					const __m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(ival), kSixteenth);
-#else
-
-
-#if 1
-					v = _mm_add_ps(_mm_mul_ps(v, kTwo), kHalf);
-					__m128i iscaled = _mm_cvttps_epi32(v);
-					__m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(iscaled), kHalf); // Divide by 2.0f instead of 4.0f
-#else
-					v = _mm_add_ps(_mm_mul_ps(v, kFour), kHalf);
-					__m128i iscaled = _mm_cvttps_epi32(v);
-					__m128 qv = _mm_mul_ps(_mm_cvtepi32_ps(iscaled), kQtr);
-#endif
-#endif
-
-					const float iCap = _mm_cvtss_f32(qv);
-					const float jCap = _mm_cvtss_f32(_mm_shuffle_ps(qv, qv, 1));
-
-					//++edgesConsidered;
-					// --- prune edges with no flow capacity ---
-					if (iCap == 0.0f && jCap == 0.0f) {
-						//++edgesDropped;
-						continue;
-					}
-
-					hasEdge = true;
-#else
-					const edge_cap_t iCap = (ciInfo.f[i] >= maxCap) ? maxCap : Quantize(ciInfo.f[i] + q, maxCap);
-					const edge_cap_t jCap = (cjInfo.f[j] >= maxCap) ? maxCap : Quantize(cjInfo.f[j] + q, maxCap);
-#endif
-					buf.edges.emplace_back(ciID, cjID, iCap, jCap);
-				}
-
-				node.excess = excess;
-				buf.flow += push;
-			}
-		}
-
-#if 0
-		DEBUG("%d edges considered, %d edges dropped (%.1f%%)\n",
-			edgesConsidered.load(),
-			edgesDropped.load(),
-      100.0f * edgesDropped.load() / edgesConsidered.load());
-
-		DEBUG("%d weak nodes considered, %d weak nodes dropped (%.1f%%)\n",
-			weakConsidered.load(),
-			weakDropped.load(),
-			100.0f * weakDropped.load() / weakConsidered.load());
-#endif
-
-		for (const auto& buf : threadBuffers)
-			g.flow += buf.flow;
-
-#if 1
-#pragma omp parallel for schedule(static)
-		for (int i = 0; i < (int)threadBuffers.size(); ++i) {
-			const auto& buf = threadBuffers[i];
-			for (const auto& e : buf.edges) {
-				graph.AddEdge(e.from, e.to, e.cap, e.revCap); // now thread-safe
-			}
-		}
-#else
-		for (const auto& buf : threadBuffers)
-			for (const auto& e : buf.edges)
-				graph.AddEdge(e.from, e.to, e.cap, e.revCap);
-#endif
-
-#else
-		MaxFlow<cell_size_t,edge_cap_t> graph(delaunay.number_of_cells());
-		// set weights
-		for (delaunay_t::All_cells_iterator ci=delaunay.all_cells_begin(), ce=delaunay.all_cells_end(); ci!=ce; ++ci) {
-			const cell_size_t ciID(ci->info());
-			const cell_info_t& ciInfo(infoCells[ciID]);
-			graph.AddNode(ciID, ciInfo.s, MINF(ciInfo.t, maxCap));
-		for (int i = 0; i < 4; ++i) {
-				const cell_handle_t cj(ci->neighbor(i));
-				const cell_size_t cjID(cj->info());
-			if (cjID < ciID) continue;
-				const cell_info_t& cjInfo(infoCells[cjID]);
-				const int j(cj->index(ci));
-				const edge_cap_t q((1.f - MINF(computePlaneSphereAngle(delaunay, facet_t(ci,i)), computePlaneSphereAngle(delaunay, facet_t(cj,j))))*kQual);
-				graph.AddEdge(ciID, cjID, ciInfo.f[i]+q, cjInfo.f[j]+q);
-		}
-		}
-		#endif
-
-		auto t1 = rdtscEnd();
-	  //RestoreAffinity(originalMask); // Restore original affinity
-
-		graph.FinalizeGraph();
-
-#if 0 // validate graph
-		// 1) Sum of excess over graph nodes
-		edge_cap_t sum_excess = 0;
-		for (int i = 0; i < g.numNodes; ++i)
-			sum_excess += g.nodes[i].excess;
-
-		// 2) Sum of (s - t) over *masked* cells only
-		edge_cap_t st_masked = 0;
-		edge_cap_t pushSum = 0;
-
-		for (int idx = 0; idx < totalCells; ++idx) {
-			if (!cellMask[idx]) continue;
-
-			const cell_size_t ciID = cellIterators[idx]->info();
-			edge_cap_t s = infoCells[ciID].s;
-			edge_cap_t t = FastMinS(infoCells[ciID].t, maxCap);
-
-			edge_cap_t excess = (s == kInf) ? maxCap : (s - t);
-			st_masked += excess;
-
-			pushSum += FastMinS(s, t);
-		}
-
-		// These are the *only* valid invariants
-		HARD_ASSERT(sum_excess == st_masked);
-		HARD_ASSERT(pushSum == g.flow);
-#endif
-
-		VirtualFree(infoCells, 0, MEM_RELEASE);
-		infoCells = 0;
-
-#if 1
-		int numRemoved = graph.CollapseDegree1Nodes();
-    std::cout << "   Removed " << numRemoved << " degree-1 nodes.\n";	
-
-		// One or both of these is wrong.
-		graph.PrelabelDominantNodes();
-#endif
-
+		auto t1 = rdtscStart();
 		std::cout << "   Startup: " << rdtscToSeconds(t1 - t0, cpuHz) << "\n";
+
+		// ---------------------------------------------------------------
+		// Picard-Queyranne fixability diagnostic.
+		// For each node i with excess = s_i - t_i:
+		//   sumFwd = sum of arc.rCap for outgoing arcs    (cap i->j)
+		//   sumRev = sum of nodes[j].arcs[revIdx].rCap     (cap j->i)
+		// Pass-1 fixable counts (no propagation):
+		//   excess >  sumFwd  -> S-side
+		//  -excess >  sumRev  -> T-side
+		// Reports the % of cells that are *immediately* fixable. The
+		// iterative propagation pass will only add to this -- this is
+		// a strict lower bound on the reduced-graph savings.
+		// Side effect: zero (read-only).
+		{
+			auto tDiag0 = rdtscStart();
+			auto* __restrict ibNodes = graph.graph.nodes;
+			const ptrdiff_t N = (ptrdiff_t)totalCells;
+
+			size_t fixS = 0, fixT = 0;
+			size_t hasArcs = 0;
+			double sumFwdAvg = 0.0, sumRevAvg = 0.0;
+			double sumExcAvg = 0.0;
+
+			// Arc-count histogram (cnt in [0..4]).
+			size_t cntHist0 = 0, cntHist1 = 0, cntHist2 = 0, cntHist3 = 0, cntHist4 = 0;
+
+#pragma omp parallel for schedule(static) \
+				reduction(+:fixS,fixT,hasArcs,sumFwdAvg,sumRevAvg,sumExcAvg, \
+				           cntHist0,cntHist1,cntHist2,cntHist3,cntHist4)
+			for (ptrdiff_t i = 0; i < N; ++i) {
+				const auto& u = ibNodes[i];
+				const int cnt = u.arcCount;
+				edge_cap_t sumFwd = 0.f;
+				edge_cap_t sumRev = 0.f;
+				for (int a = 0; a < cnt; ++a) {
+					const auto& arc = u.arcs[a];
+					sumFwd += arc.rCap;
+					sumRev += ibNodes[arc.headIdx()].arcs[arc.revIdx()].rCap;
+				}
+				const edge_cap_t exc = u.excess;
+				if (cnt > 0) ++hasArcs;
+				sumFwdAvg += (double)sumFwd;
+				sumRevAvg += (double)sumRev;
+				sumExcAvg += (double)std::abs(exc);
+				if      (exc       > sumFwd) ++fixS;
+				else if ((-exc)    > sumRev) ++fixT;
+
+				switch (cnt) {
+					case 0: ++cntHist0; break;
+					case 1: ++cntHist1; break;
+					case 2: ++cntHist2; break;
+					case 3: ++cntHist3; break;
+					case 4: ++cntHist4; break;
+					default: break;
+				}
+			}
+
+			auto tDiag1 = rdtscEnd();
+			const double dT = rdtscToSeconds(tDiag1 - tDiag0, cpuHz);
+			const double pctS = 100.0 * (double)fixS / (double)N;
+			const double pctT = 100.0 * (double)fixT / (double)N;
+			const double pctTot = pctS + pctT;
+			std::cout << "   [PQ-Fixable Pass1] "
+			          << fixS << " S (" << pctS << "%) + "
+			          << fixT << " T (" << pctT << "%) = "
+			          << (fixS+fixT) << " / " << N
+			          << " (" << pctTot << "%)  in " << dT << "s\n";
+			if (hasArcs > 0) {
+				std::cout << "   [PQ-Fixable means] |excess|=" << (sumExcAvg / (double)hasArcs)
+				          << "  sumFwd=" << (sumFwdAvg / (double)hasArcs)
+				          << "  sumRev=" << (sumRevAvg / (double)hasArcs) << "\n";
+			}
+			{
+				const double dN = (double)N;
+				std::cout << "   [ArcCount Hist   ] "
+				          << "0:" << cntHist0 << " (" << (100.0*cntHist0/dN) << "%) "
+				          << "1:" << cntHist1 << " (" << (100.0*cntHist1/dN) << "%) "
+				          << "2:" << cntHist2 << " (" << (100.0*cntHist2/dN) << "%) "
+				          << "3:" << cntHist3 << " (" << (100.0*cntHist3/dN) << "%) "
+				          << "4:" << cntHist4 << " (" << (100.0*cntHist4/dN) << "%)\n";
+			}
+			// Decision guide:
+			//   pctTot > 70% -> implement full propagation+reduce, expect 5-15x
+			//   30-70%       -> moderate gain expected (~2-3x)
+			//   < 30%        -> not worth it on this dataset
+		}
 
 		// find graph-cut solution
 		const float maxflow(graph.ComputeMaxFlow());
 
-		//originalMask = SetAffinityToCPU0();
-		auto t2 = rdtscStart();
-
+		auto t2 = rdtscEnd();
 		std::cout << "   Graph-cut itself: " << rdtscToSeconds(t2 - t1, cpuHz) << "\n";
 
-#if 1 // parallel surface extraction.
-		std::vector<uint8_t> nodeSide(g.numNodes);
-		const bool noActiveT = (g.activeT1.len == 0);
-
-#pragma omp parallel for schedule(static)
-		for (int i = 0; i < g.numNodes; ++i) {
-			const int lbl = g.nodes[i].label;
-			nodeSide[i] = (lbl != 0 && lbl != g.numNodes)
-				? (lbl > 0)
-				: noActiveT;
-		}
-
-		struct LocalMeshData {
-			std::vector<Mesh::Face> localFaces;
-		  std::vector<uint32_t> localVertexIDs; // vertex idxs
-			tsl::robin_map<uint32_t, Mesh::VIndex> localIndexMap;
-		};
-		const int nThreads = omp_get_max_threads();
-
-		std::vector<LocalMeshData> localData(nThreads);
-
-		const size_t cellsPerThread = (totalCells + nThreads - 1) / nThreads;
-		for (int t = 0; t < nThreads; ++t) {
-			localData[t].localFaces.reserve(cellsPerThread * 4);
-			localData[t].localVertexIDs.reserve(cellsPerThread * 12);
-			// Reserve on the map is much more expensive than vector reserve.
-		}
-
-		#pragma omp parallel
+#if IBSTATS
 		{
-			// Remove all barriers.
-			const int tid = omp_get_thread_num();
-			auto& local = localData[tid];
-			int nt = omp_get_num_threads();
-
-			ptrdiff_t chunk = (totalCells + nt - 1) / nt;
-			ptrdiff_t start = tid * chunk;
-			ptrdiff_t end = std::min(start + chunk, (ptrdiff_t) totalCells);
-
-			const uint8_t* __restrict side = nodeSide.data();
-
-			for (ptrdiff_t idx = start; idx < end; ++idx) {
-				// Do not mask during surface extraction as flow may have been propagated
-				// through the cell.
-				auto ci = cellIterators[idx];
-				const cell_size_t ciID = ci->info();
-				const bool ciType = side[ciID];
-
-				Mesh::Face face;
-				for (int f = 0; f < 4; ++f) {
-					if (delaunay.is_infinite(ci, f)) continue;
-					const cell_handle_t cj = ci->neighbor(f);
-					const cell_size_t cjID = cj->info();
-					if (ciID < cjID) continue;
-
-					if (ciType == side[cjID]) continue;
-
-					const triangle_vhandles_t tri = getTriangle(ci, f);
-
-					for (int v = 0; v < 3; ++v) {
-						const vertex_handle_t vh = tri.verts[v];
-						const uint32_t vertexID = vh->info().idx;
-
-						auto [it, inserted] = local.localIndexMap.try_emplace(vertexID, (Mesh::VIndex)local.localVertexIDs.size());
-						if (inserted)
-							local.localVertexIDs.push_back(vertexID);
-
-						face[v] = it->second; // local index
-					}
-
-					if (!ciType)
-						std::swap(face[0], face[2]);
-
-					local.localFaces.emplace_back(face[0], face[1], face[2]);
-				}
-			}
+			IBFS::IBFSStats st = graph.graph.getStats();
+			std::cout << "     [IBSTATS augs       ] " << st.getAugs() << "\n";
+			std::cout << "     [IBSTATS growthS    ] " << st.getGrowthS() << "\n";
+			std::cout << "     [IBSTATS growthT    ] " << st.getGrowthT() << "\n";
+			std::cout << "     [IBSTATS growthArcs ] " << st.getGrowthArcs() << "\n";
+			std::cout << "     [IBSTATS pushes     ] " << st.getPushes() << "\n";
+			std::cout << "     [IBSTATS orphans    ] " << st.getOrphans() << "\n";
+			std::cout << "     [IBSTATS orphanArcs1] " << st.getOrphanArcs1() << "\n";
+			std::cout << "     [IBSTATS orphanArcs2] " << st.getOrphanArcs2() << "\n";
+			std::cout << "     [IBSTATS orphanArcs3] " << st.getOrphanArcs3() << "\n";
+			std::cout << "     [IBSTATS augLenMin  ] " << st.getAugLenMin() << "\n";
+			std::cout << "     [IBSTATS augLenMax  ] " << st.getAugLenMax() << "\n";
 		}
+#endif
 
-		std::vector<delaunay_t::All_cells_iterator>().swap(cellIterators); // free memory
-
-		constexpr Mesh::VIndex kInvalid = ~0;
-		const size_t numVertices = delaunay.number_of_vertices();
-		std::vector<Mesh::VIndex> idxToGlobalIndex(numVertices, kInvalid);
-
-		mesh.vertices.Reserve((Mesh::VIndex)numVertices);
-		mesh.faces.Reserve((Mesh::FIndex)numVertices * 4); // Worst-case
-
-		for (const auto& local : localData) {
-			for (uint32_t idx : local.localVertexIDs) {
-				if (idxToGlobalIndex[idx] == kInvalid) {
-					idxToGlobalIndex[idx] = mesh.vertices.GetSize();
-
-					const Point3f& p = idToPoint[idx];
-					mesh.vertices.Insert(p);
-				}
-			}
-		}
-
-		// Remap local faces to global indices and insert
-		for (const auto& local : localData) {
-			for (const auto& face : local.localFaces) {
-				Mesh::Face& f = mesh.faces.AddEmpty(); // creates a reference directly in-place
-				for (int i = 0; i < 3; ++i)
-					f[i] = idxToGlobalIndex[local.localVertexIDs[face[i]]];
-			}
-		}
+#ifdef PARALLEL_GRAPH_CUT_EXTRACTION
+		// extract surface formed by the facets between inside/outside cells
+		ExtractGraphCutSurface(delaunay, allCells, graph, totalCells, idToPoint, mesh, cpuHz);
 #else
+		const size_t nEstimatedNumVerts(delaunay.number_of_vertices());
+		std::unordered_map<void*,Mesh::VIndex> mapVertices;
+		#if defined(_MSC_VER) && (_MSC_VER > 1600)
+		mapVertices.reserve(nEstimatedNumVerts);
+		#endif
+		mesh.vertices.Reserve((Mesh::VIndex)nEstimatedNumVerts);
+		mesh.faces.Reserve((Mesh::FIndex)nEstimatedNumVerts*2);
+		for (delaunay_t::All_cells_iterator ci=delaunay.all_cells_begin(), ce=delaunay.all_cells_end(); ci!=ce; ++ci) {
+			const cell_size_t ciID(ci->info());
+			for (int i=0; i<4; ++i) {
+				if (delaunay.is_infinite(ci, i)) continue;
+				const cell_handle_t cj(ci->neighbor(i));
+				const cell_size_t cjID(cj->info());
+				if (ciID < cjID) continue;
+				const bool ciType(graph.IsNodeOnSrcSide(ciID));
+				if (ciType == graph.IsNodeOnSrcSide(cjID)) continue;
+				Mesh::Face& face = mesh.faces.AddEmpty();
+				const triangle_vhandles_t tri(getTriangle(ci, i));
+				for (int v=0; v<3; ++v) {
+					const vertex_handle_t vh(tri.verts[v]);
+					ASSERT(vh->point() == delaunay.triangle(ci,i)[v]);
+					const auto pairItID(mapVertices.insert(std::make_pair(vh.for_compact_container(), (Mesh::VIndex)mesh.vertices.GetSize())));
+					if (pairItID.second)
+						mesh.vertices.Insert(CGAL2MVS<Mesh::Vertex::Type>(vh->point()));
+					ASSERT(pairItID.first->second < mesh.vertices.GetSize());
+					face[v] = pairItID.first->second;
+				}
+				// correct face orientation
+				if (!ciType)
+					std::swap(face[0], face[2]);
+			}
+		}
+#endif
+
+		_aligned_free(allCells);
+		allCells = 0;
+		_aligned_free(cellNbrSlot);
+		cellNbrSlot = nullptr;
+		_aligned_free(cellNbrID);
+		cellNbrID = nullptr;
+
+		auto t3 = rdtscEnd();
+		std::cout << "   End: " << rdtscToSeconds(t3 - t2, cpuHz) << "\n";
+#else
+
+		// create graph
+		MaxFlow<cell_size_t,edge_cap_t> graph(delaunay.number_of_cells());
+
+		// set weights
+		constexpr edge_cap_t maxCap(3.402823466e+34f/*FLT_MAX*0.0001f*/);
+		for (delaunay_t::All_cells_iterator ci=delaunay.all_cells_begin(), ce=delaunay.all_cells_end(); ci!=ce; ++ci) {
+			const cell_size_t ciID(ci->info());
+			const cell_info_t& ciInfo(infoCells[ciID]);
+			graph.AddNode(ciID, ciInfo.s, MINF(ciInfo.t, maxCap));
+			for (int i=0; i<4; ++i) {
+				const cell_handle_t cj(ci->neighbor(i));
+				const cell_size_t cjID(cj->info());
+				if (cjID < ciID) continue;
+				const cell_info_t& cjInfo(infoCells[cjID]);
+				const int j(cj->index(ci));
+				const edge_cap_t q((1.f - MINF(computePlaneSphereAngle(delaunay, facet_t(ci,i)), computePlaneSphereAngle(delaunay, facet_t(cj,j))))*kQual);
+				graph.AddEdge(ciID, cjID, ciInfo.f[i]+q, cjInfo.f[j]+q);
+			}
+		}
+
+		graph.FinalizeGraph();
+
+
+		// find graph-cut solution
+		const float maxflow(graph.ComputeMaxFlow());
 		// extract surface formed by the facets between inside/outside cells
 		const size_t nEstimatedNumVerts(delaunay.number_of_vertices());
 		std::unordered_map<void*,Mesh::VIndex> mapVertices;
@@ -4782,13 +6002,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			}
 		}
 #endif
-		// JPB WIP BUG Not needed memory released on exit. delaunay.clear();
-
-		auto t3 = rdtscEnd();
-	  //RestoreAffinity(originalMask); // Restore original affinity
-
-		std::cout << "   End: " << rdtscToSeconds(t3 - t2, cpuHz) << "\n";
-
+		delaunay.clear();
 		DEBUG_EXTRA("Delaunay tetrahedras graph-cut completed (%g flow): %u vertices, %u faces (%s)", maxflow, mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 

@@ -58,7 +58,6 @@
 #undef DPC_EXTENDED_OMP_THREADING // Changes threading order and drastically affects the result.
 #define DPC_EXTENDED_OMP_THREADING2
 #define DPC_NEW_FUSING
-#define DPC_FLUSH_DENORMALS
 
 // Use a faster, but less accurate, exp function in score factor calculation?
 #define DPC_FASTER_SCORE_FACTOR

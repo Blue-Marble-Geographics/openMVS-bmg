@@ -84,7 +84,7 @@ namespace CGAL {
     // P2P debug support
 inline std::pair<bool, int> info()
 {
-  constexpr int version = 7;
+  constexpr int version = 8;
 #ifdef CGAL_LINKED_WITH_TBB
   return { true, version };
 #else

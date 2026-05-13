@@ -64,7 +64,7 @@ void spatial_sort (RandomAccessIterator begin, RandomAccessIterator end,
   typedef std::iterator_traits<RandomAccessIterator> Iterator_traits;
   typedef typename Iterator_traits::difference_type Diff_t;
   typedef Hilbert_sort_3<Kernel, Policy, ConcurrencyTag> Sort;
-  boost::rand48 random;
+  boost::rand48 random(42);  // fixed seed for deterministic spatial sort
   boost::random_number_generator<boost::rand48, Diff_t> rng(random);
   CGAL::cpp98::random_shuffle(begin,end, rng);
 

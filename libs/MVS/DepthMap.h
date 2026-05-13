@@ -144,6 +144,7 @@ extern bool bFilterAdjust;
 extern bool bAddCorners;
 extern bool bInitSparse;
 extern bool bRemoveDmaps;
+extern bool bDenseFuse;
 extern float fViewMinScore;
 extern float fViewMinScoreRatio;
 extern float fMinArea;
@@ -226,18 +227,6 @@ struct Normal4
 	Normal4(const _Data& v)
 	{
 		data = v;
-	}
-
-	float Dot4S(_Data v) const
-	{
-		v = _Mul(v, data);
-
-		// 	https://stackoverflow.com/questions/6996764/fastest-way-to-do-horizontal-sse-vector-sum-or-other-reduction
-		const _Data vT1 = _mm_movehl_ps(v, v);
-		const _Data vT2 = _Add(v, vT1);
-		const _Data sum = _Add(vT1, _mm_shuffle_ps(vT2, vT2, 1));
-
-		return _vFirst(sum);
 	}
 
 	float Dot3S(_Data v) const
@@ -446,6 +435,7 @@ struct MVS_API DepthData {
 	ConfidenceMap confMap; // confidence-map
 	ViewsMap viewsMap; // view-IDs map (indexing images vector starting after first view)
 	float dMin, dMax; // global depth range for this image
+	cv::Size size; // image size used to estimate this depth-map
 	unsigned references; // how many times this depth-map is referenced (on 0 can be safely unloaded)
 	CriticalSection cs; // used to count references
 
@@ -486,6 +476,8 @@ struct MVS_API DepthData {
 	unsigned GetRef();
 	unsigned IncRef(const String& fileName);
 	unsigned DecRef();
+
+	size_t GetMemorySize() const;
 
 	#ifdef _USE_BOOST
 	// implement BOOST serialization
@@ -1058,6 +1050,7 @@ struct MVS_API DepthEstimator {
 		const _Data vX0AsFloat2 = _Sub(vX0AsFloat, image0.mK02K12);
 		vX0 = _Mul(vX0AsFloat2, image0.mInvK00K11);
 		_AsArray(vX0, 2) = 1.f;
+		_AsArray(vX0, 3) = 0.f; // JPB WIP BUG Remove this debugging
 		// vX0 is 0
 
 		if constexpr( HasLowResDepthMap ) {

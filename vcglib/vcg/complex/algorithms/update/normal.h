@@ -578,7 +578,7 @@ static void NormalizePerVertex(ComputeMeshType& m)
 #pragma omp parallel for
     for (int64_t i = 0; i < numVertices; ++i) {
         auto& v = m.vert[i];
-        if (!v.IsD && v.isRW()) {
+        if (!v.IsD() && v.IsRW()) {
             v.N().Normalize();
         }
     }

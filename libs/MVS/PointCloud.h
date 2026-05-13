@@ -226,11 +226,12 @@ public:
 		normalsXYZ.emplace_back(pt.z);
 	}
 
-	void AddPoint(const Point3f& pt)
+	float* AddPoint(const Point3f& pt)
 	{
 		pointsXYZ.emplace_back(pt.x);
 		pointsXYZ.emplace_back(pt.y);
 		pointsXYZ.emplace_back(pt.z);
+		return &pointsXYZ[pointsXYZ.size() - 3];
 	}
 
 	const uint8_t* ColorStream() const noexcept { return colorsRGB.empty() ? nullptr : colorsRGB.data(); }
@@ -290,7 +291,7 @@ public:
 	size_t NumPoints() const { return pointsXYZ.size()/3; }
 
 	inline bool IsEmpty() const { return pointsXYZ.empty(); }
-	inline bool IsValid() const { return !pointWeightsMemory.empty(); }
+	inline bool IsValid() const { return !pointViewsMemory.empty(); }
 	inline size_t GetSize() const { return pointsXYZ.size()/3; }
 
 	bool Load(const String& fileName);

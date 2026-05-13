@@ -501,7 +501,11 @@ template<class EAR>
       }while(fp!=p);
 
       // Main Ear closing Loop
-      while( holeSize > 2 && !EarHeap.empty() )
+      // Guard: allow at most holeSize * holeSize total iterations to prevent
+      // infinite loops when every ear candidate fails intersection tests.
+      const int maxIter = holeSize * holeSize + holeSize * 10;
+      int iter = 0;
+      while( holeSize > 2 && !EarHeap.empty() && iter++ < maxIter )
       {
         EAR BestEar=EarHeap.top();
         EarHeap.pop();
@@ -524,7 +528,7 @@ template<class EAR>
             ++f;
           }
         }//is update()
-      } 
+      }
       
       // If the hole had k non manifold vertexes it requires less than n-2 faces,
       // so we delete only the REMAINING UNUSED faces in our allocated range.
@@ -612,36 +616,78 @@ template<class EAR>
         if (info.size >= maxHoleSize)
           continue;
 
-        // Build boundary ring
+        // After filling previous holes, this hole's starting Pos may
+        // have been invalidated (face deleted, or edge no longer border).
+        if (info.p.f == nullptr || info.p.f->IsD() || !info.p.IsBorder())
+          continue;
+
+        // Build boundary ring with a hard iteration guard.
         ring.clear();
         ring.reserve(info.size);
 
+        const int maxSteps = info.size * 2 + 10;
         typename tri::Hole<MESH>::PosType p = info.p;
         int guard = 0;
         do {
           ring.push_back(p.v);
           p.NextB();
-        } while (p != info.p && ++guard < 100000);
+          if (++guard > maxSteps) break;
+        } while (p != info.p);
 
-        if (ring.size() < 3 || guard >= 100000)
+        if (guard > maxSteps || ring.size() < 3)
           continue;
 
-        closed++;
+        // Collect the set of boundary face pointers so we can exclude them
+        // from the adjacency ring. Faces directly on the hole boundary
+        // trivially share edges with any ear triangle and cause false
+        // intersection-test rejections.
+        std::unordered_set<typename MESH::FacePointer> borderFaces;
+        borderFaces.reserve(info.size);
+        p = info.p;
+        guard = 0;
+        do {
+          borderFaces.insert(p.f);
+          p.NextB();
+          if (++guard > maxSteps) break;
+        } while (p != info.p);
 
-        // Build adjacency ring for only boundary-adjacent faces
+        if (guard > maxSteps)
+          continue;
+
+        // Build adjacency ring: faces around the hole boundary,
+        // excluding the boundary faces themselves.
         EAR::AdjacencyRing().clear();
         EAR::AdjacencyRing().reserve(info.size * 3);
 
         p = info.p;
+        guard = 0;
         do {
           typename tri::Hole<MESH>::PosType q = p;
+          int innerGuard = 0;
           do {
             q.FlipE();
             q.FlipF();
-            EAR::AdjacencyRing().push_back(q.f);
+            if (borderFaces.find(q.f) == borderFaces.end())
+              EAR::AdjacencyRing().push_back(q.f);
+            if (++innerGuard > 1000) break;
           } while (!q.IsBorder());
           p.NextB();
+          if (++guard > maxSteps) break;
         } while (p != info.p);
+
+        if (guard > maxSteps) {
+          EAR::AdjacencyRing().clear();
+          continue;
+        }
+
+        // Deduplicate the adjacency ring — faces appear multiple times
+        // when adjacent to more than one boundary vertex.
+        std::sort(EAR::AdjacencyRing().begin(), EAR::AdjacencyRing().end());
+        EAR::AdjacencyRing().erase(
+          std::unique(EAR::AdjacencyRing().begin(), EAR::AdjacencyRing().end()),
+          EAR::AdjacencyRing().end());
+
+        closed++;
 
         // Fill only local adjacency
         facePtrToBeUpdated.clear();
@@ -654,14 +700,16 @@ template<class EAR>
         for (size_t ai = 0; ai < EAR::AdjacencyRing().size(); ++ai)
           facePtrToBeUpdated.push_back(&EAR::AdjacencyRing()[ai]);
 
-        tri::Hole<MESH>::FillHoleEar<EAR>(m, info.p, facePtrToBeUpdated);
+        tri::Hole<MESH>::template FillHoleEar<EAR>(m, info.p, facePtrToBeUpdated);
+
+        // NO TrivialEar fallback. If SelfIntersectionEar could not
+        // close the hole, it is a bridge gap and must stay open.
 
         EAR::AdjacencyRing().clear();
       }
 
       return closed;
     }
-
 #else
 #if 0
     template<class EAR>

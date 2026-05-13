@@ -2152,8 +2152,8 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 		// High-quality confidence-weighted boundary refinement
 		// ----------------------------------------------------------------------
 		{
-			const float normalThreshold = 0.6f;   // cosine threshold
-			const int maxPasses = 3;              // controlled expansion depth
+			const float normalThreshold = 0.3f;   // cosine threshold
+			const int maxPasses = 8;              // controlled expansion depth
 
 			// --------------------------------------------------
 			// Compute per-face confidence for labeled faces
@@ -2251,12 +2251,12 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 			// Final safety: assign best available camera if still NO_ID
 			// (prevents holes entirely)
 			// --------------------------------------------------
+			// Pass 1: assign from own camera data if available
 			for (FIndex f = 0; f < numFaces; ++f) {
 				if (labels[f] != NO_ID)
 					continue;
 
 				const FaceDataArr& fDatas = facesDatas[f];
-
 				if (fDatas.empty())
 					continue;
 
@@ -2273,6 +2273,53 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				if (bestLabel != NO_ID) {
 					labels[f] = bestLabel;
 					faceConfidence[f] = bestQuality / maxQ;
+				}
+			}
+
+			// Pass 2: for faces with NO camera data at all (invisible faces,
+			// e.g. from hole-filling), propagate the label from any adjacent
+			// labeled face. This eliminates the white specks in the texture
+			// caused by faces that point into uninitialized atlas regions.
+			{
+				bool changed = true;
+				int propagationPasses = 0;
+				const int maxPropagationPasses = 20;
+
+				while (changed && propagationPasses < maxPropagationPasses) {
+					changed = false;
+					++propagationPasses;
+
+					for (FIndex f = 0; f < numFaces; ++f) {
+						if (labels[f] != NO_ID)
+							continue;
+
+						const Mesh::FaceFaces& adj = faceFaces[f];
+						Label bestLabel = NO_ID;
+						float bestConf = -1.0f;
+
+						for (int k = 0; k < 3; ++k) {
+							FIndex fn = adj[k];
+							if (fn == NO_ID)
+								continue;
+							if (labels[fn] == NO_ID)
+								continue;
+
+							if (faceConfidence[fn] > bestConf) {
+								bestConf = faceConfidence[fn];
+								bestLabel = labels[fn];
+							}
+						}
+
+						if (bestLabel != NO_ID) {
+							labels[f] = bestLabel;
+							faceConfidence[f] = bestConf * 0.5f; // decay
+							changed = true;
+						}
+					}
+				}
+
+				if (propagationPasses > 1) {
+					DEBUG("Label propagation to invisible faces: %d passes", propagationPasses);
 				}
 			}
 		}

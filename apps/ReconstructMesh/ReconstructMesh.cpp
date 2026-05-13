@@ -140,7 +140,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("remove-spurious", boost::program_options::value(&OPT::fRemoveSpurious)->default_value(20.f), "spurious factor for removing faces with too long edges or isolated components (0 - disabled)")
 		("remove-spikes", boost::program_options::value(&OPT::bRemoveSpikes)->default_value(true), "flag controlling the removal of spike faces")
 		("close-holes", boost::program_options::value(&OPT::nCloseHoles)->default_value(30), "try to close small holes in the reconstructed surface (0 - disabled)")
-		("smooth", boost::program_options::value(&OPT::nSmoothMesh)->default_value(2), "number of iterations to smooth the reconstructed surface (0 - disabled)")
+		("smooth", boost::program_options::value(&OPT::nSmoothMesh)->default_value(1/* JPB WIP 2*/), "number of iterations to smooth the reconstructed surface (0 - disabled)")
 		("edge-length", boost::program_options::value(&OPT::fEdgeLength)->default_value(0.f), "remesh such that the average edge length is this size (0 - disabled)")
 		("roi-border", boost::program_options::value(&OPT::fBorderROI)->default_value(0), "add a border to the region-of-interest when cropping the scene (0 - disabled, >0 - percentage, <0 - absolute)")
 		("crop-to-roi", boost::program_options::value(&OPT::bCrop2ROI)->default_value(true), "crop scene using the region-of-interest")
@@ -402,29 +402,29 @@ int main(int argc, LPCTSTR* argv)
 		if (OPT::strMeshFileName.IsEmpty() && scene.mesh.IsEmpty()) {
 			// reset image resolution to the original size and
 			// make sure the image neighbors are initialized before deleting the point-cloud
-			#ifdef RECMESH_USE_OPENMP
+#ifdef RECMESH_USE_OPENMP
 			bool bAbort(false);
-			#pragma omp parallel for
+#pragma omp parallel for
 			for (int_t idx=0; idx<(int_t)scene.images.GetSize(); ++idx) {
-				#pragma omp flush (bAbort)
+#pragma omp flush (bAbort)
 				if (bAbort)
 					continue;
 				const uint32_t idxImage((uint32_t)idx);
-			#else
+#else
 			FOREACH(idxImage, scene.images) {
-			#endif
+#endif
 				Image& imageData = scene.images[idxImage];
 				if (!imageData.IsValid())
 					continue;
 				// reset image resolution
 				if (!imageData.ReloadImage(0, false)) {
-					#ifdef RECMESH_USE_OPENMP
+#ifdef RECMESH_USE_OPENMP
 					bAbort = true;
-					#pragma omp flush (bAbort)
+#pragma omp flush (bAbort)
 					continue;
-					#else
+#else
 					return EXIT_FAILURE;
-					#endif
+#endif
 				}
 				imageData.UpdateCamera(scene.platforms);
 				// select neighbor views
@@ -433,15 +433,25 @@ int main(int argc, LPCTSTR* argv)
 					scene.SelectNeighborViews(idxImage, points);
 				}
 			}
-			#ifdef RECMESH_USE_OPENMP
+#ifdef RECMESH_USE_OPENMP
 			if (bAbort)
 				return EXIT_FAILURE;
-			#endif
+#endif
 			// reconstruct a coarse mesh from the given point-cloud
 			TD_TIMER_START();
+#if 0 // JPB WIP BUG For testing confidence filter
 			if (OPT::bUseConstantWeight)
 				scene.pointcloud.ReleaseWeights();
-			if (!scene.ReconstructMesh(OPT::fDistInsert, false /* JPB Not supported OPT::bUseFreeSpaceSupport */, OPT::bUseOnlyROI, 4, OPT::fThicknessFactor, OPT::fQualityFactor))
+#endif
+			// JPB TEMP: pass CLI values straight through; tuning has moved
+			// to the Mesh::Clean call below (remove-spurious override).
+			if (!scene.ReconstructMesh(
+					OPT::fDistInsert,
+					false /* JPB Not supported OPT::bUseFreeSpaceSupport */,
+					OPT::bUseOnlyROI,
+					4,
+					OPT::fThicknessFactor,
+					OPT::fQualityFactor))
 				return EXIT_FAILURE;
 			VERBOSE("Mesh reconstruction completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 			#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -465,7 +475,16 @@ int main(int argc, LPCTSTR* argv)
 				numVertices-scene.mesh.vertices.size(), numFaces-scene.mesh.faces.size(), TD_TIMER_GET_FMT().c_str());
 		}
 		const float fDecimate(OPT::nTargetFaceNum ? static_cast<float>(OPT::nTargetFaceNum) / scene.mesh.faces.size() : OPT::fDecimateMesh);
-		scene.mesh.Clean(fDecimate, OPT::fRemoveSpurious, OPT::bRemoveSpikes, OPT::nCloseHoles, OPT::nSmoothMesh, OPT::fEdgeLength, true);
+		// JPB TEMP overrides:
+		//   remove-spurious  CLI 0/20 -> 25  (kill worst long-edge sheets while keeping boundary detail)
+		//   close-holes      CLI 100  -> 30
+		//   smooth           default 2 -> 1
+		scene.mesh.Clean(fDecimate,
+			OPT::fRemoveSpurious, // JPB WIP BUG 15 will give more edges, but not in a good way.
+			OPT::bRemoveSpikes,
+			OPT::nCloseHoles,
+			OPT::nSmoothMesh,
+			OPT::fEdgeLength, true);
 
 		scene.obb = initialOBB;
 

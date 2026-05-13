@@ -78,6 +78,9 @@ If you require another license, please contact the above.
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <memory>
+#include <atomic>
+#include <vector>
 
 
 #ifndef IBIO
@@ -94,13 +97,37 @@ If you require another license, please contact the above.
 #endif
 
 #define IB_ALTERNATE_SMART 1
-#define IB_ORPHANS_END ((Node*)1)
+
+// Sort each node's arcs by headIdx after finalizeGraph(). Combined with the
+// upstream Morton cell-id ordering, this makes the inner BFS / adoption /
+// augment loops walk monotonically increasing memory addresses, which the
+// hardware prefetcher loves. Two-pass parallel impl is race-free; pure
+// permutation, no semantic change.
+#ifndef IBFS_OPT_ARC_SORT
+#define IBFS_OPT_ARC_SORT 1
+#endif
 
 
 namespace IBFS {
 
 typedef float Real;
 typedef float EdgeCap;
+
+// 32-bit index types for compact Node/Arc layout.
+// kNullIdx       : "no node" sentinel (e.g. unset firstSon, end-of-list).
+// kOrphansEndIdx : terminator used inside orphan/bucket linked lists,
+//                  distinguishable from kNullIdx for legacy semantics.
+// kNullParent    : "no parent" sentinel for ParentRef.
+typedef uint32_t NodeIdx;
+typedef uint32_t ParentRef;     // packed (nodeIdx << 2) | arcSlot(0..3)
+
+static constexpr NodeIdx   kNullIdx       = 0xFFFFFFFFu;
+static constexpr NodeIdx   kOrphansEndIdx = 0xFFFFFFFEu;
+static constexpr ParentRef kNullParent    = 0xFFFFFFFFu;
+
+// Maximum supported node count given 30 bits of headIdx packed inside Arc.
+// Bits [31..30] = revIdx (2 bits), [29..0] = headIdx (30 bits, max ~1.07B).
+static constexpr uint32_t  kMaxNodes      = (1u << 30) - 2u; // leave room for sentinels
 
 class IBFSStats
 {
@@ -185,12 +212,151 @@ public:
 	{
 #pragma omp parallel for schedule(static)
 		for (int i = 0; i < numNodes; ++i) {
-			nodes[i].arcCount =
-				nodes[i].arcCountBuild.load(std::memory_order_relaxed);
+			nodes[i].arcCount = static_cast<uint8_t>(
+				arcCountBuild[i].load(std::memory_order_relaxed));
 		}
 
 		// Optional but documents the phase boundary
 		std::atomic_thread_fence(std::memory_order_acquire);
+
+#if IBFS_OPT_ARC_SORT
+		// Per-node arc sort by headIdx. Each node has ≤4 arcs; selection sort
+		// in registers. Carries the entire Arc struct (incl. stale revIdx).
+		// Pass A: sort arcs locally, record old→new permutation packed into a
+		//         single byte (4 × 2-bit fields).
+		// Pass B: rewrite each arc's revIdx by looking up the *peer* node's
+		//         permutation table — race-free because each thread only
+		//         writes to its own node's arcs in this pass.
+		std::unique_ptr<uint8_t[]> invP(new uint8_t[numNodes]);
+
+		// Identity packing 0xE4 = 11_10_01_00 maps slot i → i for all i ∈ {0..3}.
+		const uint8_t kIdentity = 0xE4u;
+
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < numNodes; ++i) {
+			Node& u = nodes[i];
+			const int cnt = u.arcCount;
+			if (cnt <= 1) { invP[i] = kIdentity; continue; }
+
+			// permutation indices into u.arcs[]; selection sort by headIdx.
+			uint8_t p[4] = { 0, 1, 2, 3 };
+			for (int a = 0; a < cnt - 1; ++a) {
+				int best = a;
+				NodeIdx bestKey = u.arcs[p[a]].headIdx();
+				for (int b = a + 1; b < cnt; ++b) {
+					const NodeIdx kHead = u.arcs[p[b]].headIdx();
+					if (kHead < bestKey) { best = b; bestKey = kHead; }
+				}
+				if (best != a) { uint8_t t = p[a]; p[a] = p[best]; p[best] = t; }
+			}
+
+			// reorder Arc structs in place via a stack copy.
+			Arc tmp[4];
+			for (int a = 0; a < cnt; ++a) tmp[a] = u.arcs[p[a]];
+			for (int a = 0; a < cnt; ++a) u.arcs[a] = tmp[a];
+
+			// Also permute residBits to follow the new arc order.
+			{
+				const uint8_t oldBits = u.residBits;
+				uint8_t newBits = 0;
+				for (int a = 0; a < cnt; ++a)
+					newBits |= (uint8_t)(((oldBits >> p[a]) & 1u) << a);
+				u.residBits = newBits;
+			}
+
+			// pack: invMap[oldSlot] = newSlot. Initialize as identity, then
+			// overwrite the active slots so unused-arc slots remain identity.
+			uint8_t pack = kIdentity;
+			for (int newSlot = 0; newSlot < cnt; ++newSlot) {
+				const int oldSlot = p[newSlot];
+				pack &= ~(uint8_t)(0x3u << (oldSlot * 2));
+				pack |=  (uint8_t)((newSlot & 0x3) << (oldSlot * 2));
+			}
+			invP[i] = pack;
+		}
+
+		// Pass B: rewrite each arc.revIdx via peer's permutation table.
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < numNodes; ++i) {
+			Node& u = nodes[i];
+			const int cnt = u.arcCount;
+			for (int a = 0; a < cnt; ++a) {
+				Arc& arc = u.arcs[a];
+				const uint8_t pkPeer = invP[arc.headIdx()];
+				const int oldRev = arc.revIdx();
+				const int newRev = (pkPeer >> (oldRev * 2)) & 0x3;
+				arc.setRev(static_cast<uint8_t>(newRev));
+			}
+		}
+#endif // IBFS_OPT_ARC_SORT
+	}
+
+	// Variant of finalizeGraph for callers that have already written every
+	// node's arcs[] directly and set arcCount themselves (bypassing addEdge
+	// and arcCountBuild). Skips the atomic-counter copy, runs only the
+	// optional arc-sort pass. Used by the OpenMVS Delaunay graph build,
+	// where every cell has exactly 4 neighbors and slot assignment is
+	// deterministic from the neighbor index — no atomics required.
+	void finalizeGraphPrebuilt()
+	{
+		std::atomic_thread_fence(std::memory_order_acquire);
+
+#if IBFS_OPT_ARC_SORT
+		std::unique_ptr<uint8_t[]> invP(new uint8_t[numNodes]);
+		const uint8_t kIdentity = 0xE4u;
+
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < numNodes; ++i) {
+			Node& u = nodes[i];
+			const int cnt = u.arcCount;
+			if (cnt <= 1) { invP[i] = kIdentity; continue; }
+
+			uint8_t p[4] = { 0, 1, 2, 3 };
+			for (int a = 0; a < cnt - 1; ++a) {
+				int best = a;
+				NodeIdx bestKey = u.arcs[p[a]].headIdx();
+				for (int b = a + 1; b < cnt; ++b) {
+					const NodeIdx kHead = u.arcs[p[b]].headIdx();
+					if (kHead < bestKey) { best = b; bestKey = kHead; }
+				}
+				if (best != a) { uint8_t t = p[a]; p[a] = p[best]; p[best] = t; }
+			}
+
+			Arc tmp[4];
+			for (int a = 0; a < cnt; ++a) tmp[a] = u.arcs[p[a]];
+			for (int a = 0; a < cnt; ++a) u.arcs[a] = tmp[a];
+
+			// Permute residBits to follow the new arc order.
+			{
+				const uint8_t oldBits = u.residBits;
+				uint8_t newBits = 0;
+				for (int a = 0; a < cnt; ++a)
+					newBits |= (uint8_t)(((oldBits >> p[a]) & 1u) << a);
+				u.residBits = newBits;
+			}
+
+			uint8_t pack = kIdentity;
+			for (int newSlot = 0; newSlot < cnt; ++newSlot) {
+				const int oldSlot = p[newSlot];
+				pack &= ~(uint8_t)(0x3u << (oldSlot * 2));
+				pack |=  (uint8_t)((newSlot & 0x3) << (oldSlot * 2));
+			}
+			invP[i] = pack;
+		}
+
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < numNodes; ++i) {
+			Node& u = nodes[i];
+			const int cnt = u.arcCount;
+			for (int a = 0; a < cnt; ++a) {
+				Arc& arc = u.arcs[a];
+				const uint8_t pkPeer = invP[arc.headIdx()];
+				const int oldRev = arc.revIdx();
+				const int newRev = (pkPeer >> (oldRev * 2)) & 0x3;
+				arc.setRev(static_cast<uint8_t>(newRev));
+			}
+		}
+#endif // IBFS_OPT_ARC_SORT
 	}
 
 	void initGraph();
@@ -203,169 +369,11 @@ public:
 		return flow;
 	}
 
-#if 1
-	int CollapseDegree1Nodes()
-	{
-		std::vector<uint8_t> removed(numNodes, 0);
-		std::vector<int> q;
-		q.reserve(numNodes);
-
-		// ------------------------------------------------------------------
-		// 1) Seed queue with structurally removable degree-1 nodes
-		//    Only nodes with ZERO terminal capacity are safe.
-		// ------------------------------------------------------------------
-		for (int u = 0; u < numNodes; ++u) {
-			Node& nu = nodes[u];
-			if (nu.arcCount == 1 && nu.excess == 0) {
-				q.push_back(u);
-			}
-		}
-
-		int numRemoved = 0;
-
-		// ------------------------------------------------------------------
-		// 2) Process queue
-		// ------------------------------------------------------------------
-		for (size_t qi = 0; qi < q.size(); ++qi) {
-			const int u = q[qi];
-			if (removed[u]) continue;
-
-			Node& nu = nodes[u];
-
-			// Conditions may have changed
-			if (nu.arcCount != 1) continue;
-			if (nu.excess != 0) continue;   // must still be structurally neutral
-
-			Arc& a = nu.arcs[0];
-			const int v = int(a.head - nodes);
-			if (removed[v]) continue;
-
-			Node& nv = nodes[v];
-
-			// --------------------------------------------------------------
-			// Safe contraction (pre-maxflow):
-			// Since nu.excess == 0 and no flow exists yet,
-			// removing u does NOT change cut energy.
-			// --------------------------------------------------------------
-
-			const int ridx = a.revIdx;
-
-			// Remove reverse arc v -> u by compacting
-			nv.arcCount--;
-			if (ridx != nv.arcCount) {
-				nv.arcs[ridx] = nv.arcs[nv.arcCount];
-
-				// Fix reverse index of moved arc
-				Arc& moved = nv.arcs[ridx];
-				Node* other = moved.head;
-				other->arcs[moved.revIdx].revIdx = ridx;
-			}
-
-			// Remove u completely
-			nu.arcCount = 0;
-			removed[u] = 1;
-			++numRemoved;
-
-			// --------------------------------------------------------------
-			// 3) If v becomes degree-1 and remains structurally neutral,
-			//    enqueue it
-			// --------------------------------------------------------------
-			if (!removed[v] && nv.arcCount == 1 && nv.excess == 0) {
-				q.push_back(v);
-			}
-		}
-
-		return numRemoved;
-	}
-
-#else
-	int CollapseDegree1Nodes()
-	{
-		int numRemoved = 0;
-
-		std::vector<uint8_t> removed(numNodes, 0);
-
-		constexpr float maxCap = 1e8f;     // safe, tight
-
-		bool changed;
-		do {
-			changed = false;
-
-			for (int u = 0; u < numNodes; ++u) {
-				if (removed[u]) continue;
-
-				Node& nu = nodes[u];
-
-				// hard terminal nodes must remain
-				if (nu.excess >= maxCap)
-					continue;
-
-				if (nu.arcCount != 1)
-					continue;
-
-				Arc& a = nu.arcs[0];
-				const int v = int(a.head - nodes);
-				if (removed[v]) continue;
-
-				Node& nv = nodes[v];
-
-				// absorb terminal excess
-				nv.excess += nu.excess;
-
-				// remove reverse arc v -> u
-				const int ridx = a.revIdx;
-				Arc& rv = nv.arcs[ridx];
-				rv.rCap += a.rCap;
-
-				// compact v arcs
-				nv.arcCount--;
-				if (ridx != nv.arcCount) {
-					nv.arcs[ridx] = nv.arcs[nv.arcCount];
-
-					// FIX reverse index of moved arc
-					Arc& moved = nv.arcs[ridx];
-					Node* other = moved.head;
-					other->arcs[moved.revIdx].revIdx = ridx;
-				}
-
-				// mark u removed
-				nu.arcCount = 0;
-				removed[u] = 1;
-        ++numRemoved;
-
-				changed = true;
-			}
-		} while (changed);
-
-		return numRemoved;
-	}
-#endif
-
-	void PrelabelDominantNodes()
-	{
-		for (int u = 0; u < numNodes; ++u) {
-			Node& n = nodes[u];
-			if (n.arcCount == 0)
-				continue;
-
-			float sumCaps = 0;
-			for (int i = 0; i < n.arcCount; ++i)
-				sumCaps += n.arcs[i].rCap;
-
-			if (n.excess >= sumCaps) {
-				n.label = 1;   // forced source
-			}
-			else if (-n.excess >= sumCaps) {
-				n.label = -1;  // forced sink
-			}
-		}
-	}
-
 	bool isNodeOnSrcSide(int nodeIndex) const;
 
 	struct Node;
 
-#if 0 // BLock quaantize
+#if 0 // BLock quantize
 	struct Arc {
 		Node* head;
 		Arc* rev;
@@ -401,129 +409,150 @@ public:
 	}
 #else
 	struct Arc {
-		Node* head;        // 8
-		EdgeCap  rCap;        // 4
-		uint8_t  revIdx;      // 1
-		uint8_t  isRevResidual; // 1
-		uint8_t  pad[2];      // explicit
-	};
+		// Packed: [31..30]=revIdx (2 bits), [29..0]=headIdx (30 bits).
+		// isRevResidual lives in the owning Node's residBits field (same
+		// cache line), freeing the full 30-bit range for headIdx.
+		// 8 B total (was 12), so Node arcs[4] = 32 B; Node fits in one
+		// 64-byte cache line.
+		uint32_t pack;           // 4
+		EdgeCap  rCap;           // 4
+
+		static constexpr uint32_t kHeadMask  = (1u << 30) - 1u;       // [29..0]
+		static constexpr uint32_t kRevShift  = 30u;
+		static constexpr uint32_t kRevMask   = 0x3u << kRevShift;
+
+		__forceinline NodeIdx  headIdx()       const { return pack & kHeadMask; }
+		__forceinline uint8_t  revIdx()        const { return (uint8_t)(pack >> kRevShift); }
+
+		__forceinline void setHead (NodeIdx h)  { pack = (pack & ~kHeadMask)  | (h & kHeadMask); }
+		__forceinline void setRev  (uint8_t r)  { pack = (pack & ~kRevMask)   | ((uint32_t)(r & 0x3) << kRevShift); }
+
+		// Build-time single-shot init (no resid — that's on the Node now).
+		__forceinline void initFields(NodeIdx h, uint8_t r) {
+			pack = (h & kHeadMask)
+			     | ((uint32_t)(r & 0x3) << kRevShift);
+		}
+	};                           // = 8 B
+	static_assert(sizeof(Arc) == 8, "Arc must be 8 bytes after compaction");
 
 	struct Node {
 		static constexpr int kMaxArcs = 4;
 
 		// ---- hot path ----
-		EdgeCap excess;              // 4
-		int     label;               // 4
+		EdgeCap   excess;            // 4
+		int       label;             // 4
 
-		Arc* parent;              // 8
-		Node* firstSon;            // 8
-		Node* nextPtr;             // 8
+		ParentRef parentRef;         // 4   (was Arc* parent)
+		NodeIdx   firstSonIdx;       // 4   (was Node* firstSon)
+		NodeIdx   nextPtrIdx;        // 4   (was Node* nextPtr)
 
-		uint32_t lastAugTimestamp;   // 4
-		uint8_t  isParentCurr;       // 1
-		uint8_t  pad0[3];            // align
+		uint32_t  lastAugTimestamp;  // 4
+		uint8_t   isParentCurr;      // 1
+		uint8_t   arcCount;          // 1
+		uint8_t   residBits;         // 1  bits [0..3] = isRevResidual for arcs[0..3]
+		uint8_t   pad0;              // 1  -> header: 28 B
 
 		// ---- arc data (hot but secondary) ----
-		int arcCount;                // 4
-		Arc arcs[kMaxArcs];          // 4 * sizeof(Arc)
+		Arc       arcs[kMaxArcs];    // 4 * 8 = 32 B  -> 60 B
 
-		// ---- cold / build-only ----
-		std::atomic<int> arcCountBuild;
+		// Pad to 64 B = one cache line per Node.
+		uint8_t   pad1[4];
 	};
+
+	static_assert(Node::kMaxArcs <= 4,
+		"ParentRef encodes the arc slot in 2 bits; kMaxArcs must be <= 4");
+
+	std::atomic<int>* arcCountBuild;  // allocated as separate array in initSize
 #endif
 
 	class ActiveList
 	{
 	public:
-		inline ActiveList() {
-			list = NULL;
+		inline ActiveList() { len = 0; }
+		inline void init(int /*numNodes*/) {
+			list_vec.reserve(1 << 20);
 			len = 0;
 		}
-		inline void init(int numNodes) {
-			list = new Node*[numNodes];
-			len = 0;
-		}
-		inline void release() {
-			if (list != NULL) {
-				delete[] list;
-				list = NULL;
-			}
-		}
-		inline void clear() {
-			len = 0;
-		}
+		inline void release() { std::vector<Node*>().swap(list_vec); }
+		inline void clear() { len = 0; }
 		inline void add(Node* x) {
-			list[len] = x;
+			if ((size_t)len < list_vec.size())
+				list_vec[len] = x;
+			else
+				list_vec.push_back(x);
 			len++;
 		}
 		inline static void swapLists(ActiveList *a, ActiveList *b) {
-			ActiveList tmp = (*a);
-			(*a) = (*b);
-			(*b) = tmp;
+			std::swap(a->list_vec, b->list_vec);
+			std::swap(a->len, b->len);
 		}
-		Node **list;
+		std::vector<Node*> list_vec;
 		int len;
 	};
 
 	class Buckets
 	{
 	public:
-		inline Buckets() {
-			buckets = NULL;
-			prevPtrs = NULL;
-			maxBucket = 0;
-			nodes = NULL;
-		}
+		inline Buckets() { maxBucket = 0; nodes = NULL; numNodesTotal = 0; }
 		inline void init(Node *a_nodes, int numNodes) {
 			nodes = a_nodes;
-			buckets = new Node*[numNodes];
-			memset(buckets, 0, sizeof(Node*)*numNodes);
-			prevPtrs = new Node*[numNodes];
-			memset(prevPtrs, 0, sizeof(Node*)*numNodes);
+			numNodesTotal = numNodes;
 			maxBucket = 0;
+			// prevPtrs is indexed by node offset (x - nodes), so it must
+			// cover all nodes, not just the number of bucket levels.
+			prevPtrs.assign(numNodes, kNullIdx);
+		}
+		inline void ensureSize(int bucket) {
+			if (bucket >= (int)buckets.size()) {
+				int newSize = std::max(bucket + 1, (int)buckets.size() * 2);
+				newSize = std::min(newSize, numNodesTotal);
+				buckets.resize(newSize, kNullIdx);
+			}
 		}
 		inline void release() {
-			if (buckets != NULL) {
-				delete[] buckets;
-				buckets = NULL;
-			}
-			if (prevPtrs != NULL) {
-				delete[] prevPtrs;
-				prevPtrs = NULL;
-			}
+			std::vector<NodeIdx>().swap(buckets);
+			std::vector<NodeIdx>().swap(prevPtrs);
 		}
 		template <bool sTree> inline void add(Node* x) {
 			int bucket = (sTree ? (x->label) : (-x->label));
-			if (buckets[bucket] == NULL || buckets[bucket] == IB_ORPHANS_END) {
-				x->nextPtr = IB_ORPHANS_END;
+			ensureSize(bucket);
+			NodeIdx headI = buckets[bucket];
+			NodeIdx xi    = static_cast<NodeIdx>(x - nodes);
+			if (headI == kNullIdx || headI == kOrphansEndIdx) {
+				x->nextPtrIdx = kOrphansEndIdx;
 			} else {
-				x->nextPtr = buckets[bucket];
-				prevPtrs[x->nextPtr-nodes] = x;
+				x->nextPtrIdx = headI;
+				prevPtrs[headI] = xi;
 			}
-			buckets[bucket] = x;
+			buckets[bucket] = xi;
 			if (bucket > maxBucket) maxBucket = bucket;
 		}
 		inline Node* popFront(int bucket) {
-			Node *x = buckets[bucket];
-			if (x == NULL || x == IB_ORPHANS_END) return NULL;
-			buckets[bucket] = x->nextPtr;
-			//x->nextOrphan = NULL;
+			if (bucket >= (int)buckets.size()) return NULL;
+			NodeIdx i = buckets[bucket];
+			if (i == kNullIdx || i == kOrphansEndIdx) return NULL;
+			Node *x = nodes + i;
+			buckets[bucket] = x->nextPtrIdx;
 			return x;
 		}
 		template <bool sTree> inline void remove(Node *x) {
 			int bucket = (sTree ? (x->label) : (-x->label));
-			if (buckets[bucket] == x) {
-				buckets[bucket] = x->nextPtr;
+			if (bucket >= (int)buckets.size()) return;
+			NodeIdx xi = static_cast<NodeIdx>(x - nodes);
+			if (buckets[bucket] == xi) {
+				buckets[bucket] = x->nextPtrIdx;
 			} else {
-				prevPtrs[x-nodes]->nextPtr = x->nextPtr;
-				if (x->nextPtr != IB_ORPHANS_END) prevPtrs[x->nextPtr-nodes] = prevPtrs[x-nodes];
+				NodeIdx prev = prevPtrs[xi];
+				nodes[prev].nextPtrIdx = x->nextPtrIdx;
+				if (x->nextPtrIdx != kOrphansEndIdx)
+					prevPtrs[x->nextPtrIdx] = prev;
 			}
-			//x->nextOrphan = NULL;
 		}
 
-		Node **buckets;
-		Node **prevPtrs;
+		std::vector<NodeIdx> buckets;
+		std::vector<NodeIdx> prevPtrs;
 		Node *nodes;
+		int numNodesTotal;
 		int maxBucket;
 	};
 
@@ -536,13 +565,30 @@ public:
 
 	unsigned short augTimestamp;
 	unsigned int uniqOrphansS, uniqOrphansT;
-	Node* orphanFirst;
-	Node* orphanLast;
+	NodeIdx orphanFirstIdx;
+	NodeIdx orphanLastIdx;
 	int topLevelS, topLevelT;
 
 	ActiveList active0, activeS1, activeT1;
 	Buckets orphanBuckets;
 	bool verbose;
+
+	// ---- index helpers ----
+	inline NodeIdx idxOf(const Node* n) const noexcept {
+		return static_cast<NodeIdx>(n - nodes);
+	}
+	inline ParentRef packParent(const Arc* a, const Node* owner) const noexcept {
+		if (a == nullptr) return kNullParent;
+		uint32_t slot = static_cast<uint32_t>(a - owner->arcs);
+		return (idxOf(owner) << 2) | slot;
+	}
+	inline Arc* unpackParent(ParentRef r) const noexcept {
+		if (r == kNullParent) return nullptr;
+		return &nodes[r >> 2].arcs[r & 0x3u];
+	}
+	inline Node* parentOwner(ParentRef r) const noexcept {
+		return (r == kNullParent) ? nullptr : &nodes[r >> 2];
+	}
 
 	void augment(Arc* __restrict bridge);
 
@@ -623,8 +669,8 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 
 #if 1 // JPB WIP Faster than serial code by 25%
 	// Atomically get the next arc index for each node
-	int uArcIdx = u->arcCountBuild.fetch_add(1, std::memory_order_relaxed);
-	int vArcIdx = v->arcCountBuild.fetch_add(1, std::memory_order_relaxed);
+	int uArcIdx = arcCountBuild[from].fetch_add(1, std::memory_order_relaxed);
+	int vArcIdx = arcCountBuild[to].fetch_add(1, std::memory_order_relaxed);
 
 	Arc* __restrict uv = &u->arcs[uArcIdx];
 	Arc* __restrict vu = &v->arcs[vArcIdx];
@@ -634,17 +680,14 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 #endif
 
 	// forward arc
-	uv->head = v;
-	uv->revIdx = static_cast<uint8_t>(vArcIdx);
+	uv->initFields(static_cast<NodeIdx>(to), static_cast<uint8_t>(vArcIdx));
 	uv->rCap = cap;
-	uv->isRevResidual = (revCap > 0);
-
+	if (revCap > 0) u->residBits |= (1u << uArcIdx);
 
 	// reverse arc
-	vu->head = u;
-	vu->revIdx = static_cast<uint8_t>(uArcIdx);
+	vu->initFields(static_cast<NodeIdx>(from), static_cast<uint8_t>(uArcIdx));
 	vu->rCap = revCap;
-	vu->isRevResidual = (cap > 0);
+	if (cap > 0) v->residBits |= (1u << vArcIdx);
 }
 
 inline bool IBFSGraph::isNodeOnSrcSide(int nodeIndex) const
