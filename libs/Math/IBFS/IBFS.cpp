@@ -43,6 +43,25 @@ If you require another license, please contact the above.
 #define IBFS_OPT_PREFETCH 1
 #endif
 
+// IBFS_OPT_PREFETCH_DEEP_DIST: distance ahead (in active-list slots) for the
+// deep prefetch in growth()'s outer loop.  The existing IBFS_OPT_PREFETCH
+// path issues a depth-1 _MM_HINT_T0 prefetch, which only buys ~10ns of
+// overlap — enough to mask L2→L1 latency but not the ~60–100ns DRAM
+// page-miss cost on random Node[] accesses (computeMaxFlow is pointer-chase
+// DRAM-latency-bound on the ~1.4 GB nodes[] array).  This adds a second,
+// deeper prefetch with _MM_HINT_T1 (lands in L2 only — won't thrash L1) so
+// the +1 T0 prefetch can promote it to L1 just before use.  Two-stage
+// prefetch chain: DRAM→L2 at +DEEP_DIST, L2→L1 at +1, use at +0.
+//
+// LFB budget: x86 has ~10–12 line-fill buffers per core.  With single-
+// threaded computeMaxFlow, depth 8 keeps ~8 lines in flight, safely under
+// the limit.  Set to 0 to disable the deep prefetch (keeps existing +1).
+// Set to 12 or 16 to push further if your CPU has 12+ LFBs and DRAM
+// latency is dominant.
+#ifndef IBFS_OPT_PREFETCH_DEEP_DIST
+#define IBFS_OPT_PREFETCH_DEEP_DIST 12
+#endif
+
 using namespace IBFS;
 
 //
@@ -734,6 +753,19 @@ void IBFSGraph::growth()
 		// At the start of each outer iteration in growth(), prefetch the next active node
 		if (active + 1 < active0.list_vec.data() + active0.len)
 			_mm_prefetch((const char*)*(active + 1), _MM_HINT_T0);
+#endif
+
+#if IBFS_OPT_PREFETCH && (IBFS_OPT_PREFETCH_DEEP_DIST > 0)
+		// Deep prefetch: target Node at +DEEP_DIST iterations ahead, into L2.
+		// Active list is contiguous Node*[] (sequential reads, prefetcher-friendly);
+		// the *random* miss is on the dereferenced Node body in nodes[].  Sized to
+		// mask DRAM page-miss latency without exceeding LFB capacity.  T1 (L2-only)
+		// keeps L1 cold for the +1 prefetch above, which promotes L2→L1 just-in-time.
+		//
+		// Bounds-check is mandatory: list_vec is std::vector<Node*>, reading past
+		// data()+len is UB even for a pointer load.  Same form as the +1 check.
+		if (active + IBFS_OPT_PREFETCH_DEEP_DIST < active0.list_vec.data() + active0.len)
+			_mm_prefetch((const char*)*(active + IBFS_OPT_PREFETCH_DEEP_DIST), _MM_HINT_T1);
 #endif
 
 		if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
