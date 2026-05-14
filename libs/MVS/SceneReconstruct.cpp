@@ -199,7 +199,7 @@
 //
 // Set to 0 to use the original BFS-refined path.
 #ifndef RECONSTRUCT_FAST_DISTINSERT
-#define RECONSTRUCT_FAST_DISTINSERT 1
+#define RECONSTRUCT_FAST_DISTINSERT 0
 #endif
 
 // RECONSTRUCT_PARALLEL_PASS5: Parallelize the Morton-cell Pass 5 compaction
