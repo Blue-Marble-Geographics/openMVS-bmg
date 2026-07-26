@@ -41,6 +41,84 @@
 
 using namespace MVS; 
 
+// [MEM] TEMPORARY per-stage peak-memory probe (Windows). PeakWorkingSetSize is
+// monotonic, so the FIRST stage boundary where it jumps owns the peak. Used to
+// target the 32 GB fit; remove once the dominant allocation is identified.
+#ifdef _WIN32
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+static void LogPeakMem(const char* stage) {
+	PROCESS_MEMORY_COUNTERS pmc = {};
+	pmc.cb = sizeof(pmc);
+	if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+		DEBUG_EXTRA("[MEM] %-26s peakWS=%.2f GB  curWS=%.2f GB", stage,
+			pmc.PeakWorkingSetSize / (1024.0*1024.0*1024.0),
+			pmc.WorkingSetSize / (1024.0*1024.0*1024.0));
+}
+#else
+static void LogPeakMem(const char*) {}
+#endif
+
+// Return freed heap pages to the OS. cv::Mat pixel buffers go through the CRT
+// heap (malloc); on Windows a released large allocation is put back on the heap
+// free list but NOT decommitted, so a transient that decodes hundreds of full-res
+// source images (~20 GB) keeps inflating the working set of every later stage even
+// after release(). _heapmin() (HeapCompact) decommits those free pages so the
+// working set actually drops. Cheap; call it once after a big transient is freed.
+#ifdef _WIN32
+#include <malloc.h>
+static inline void TrimHeap() { _heapmin(); }
+#else
+#include <malloc.h>
+static inline void TrimHeap() {
+#ifdef __GLIBC__
+	malloc_trim(0);
+#endif
+}
+#endif
+
+// ============================================================================
+// [PROFILE] Lightweight, easily-removable stage timing for this module.
+// Everything is gated behind TEXTURE_PROFILE. Set it to 0 (or delete this block
+// plus the TEX_PROFILE_* call sites) to strip every timer at compile time with
+// ZERO residual overhead -- when disabled the macros expand to ((void)0).
+// Output goes through DEBUG_EXTRA with a [PROFILE] tag so it sits next to the
+// existing [MEM] probes.
+//   - TEX_PROFILE_SCOPE("name")   : times the enclosing { } scope via RAII.
+//   - TEX_PROFILE_BEGIN(tok)      : start a manual timer named by token `tok`.
+//   - TEX_PROFILE_END(tok,"name") : stop that timer and log elapsed ms.
+// NOTE: place SCOPE/BEGIN/END only on the MAIN thread (at stage granularity),
+// never inside an omp parallel-for body, or the log will be spammed per-item.
+// ============================================================================
+#ifndef TEXTURE_PROFILE
+#define TEXTURE_PROFILE 1
+#endif
+
+#if TEXTURE_PROFILE
+#include <chrono>
+namespace { namespace texprof {
+	using Clock = std::chrono::steady_clock;
+	static inline void Log(const char* name, Clock::time_point t0) {
+		const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+		DEBUG_EXTRA("[PROFILE] %-44s %10.2f ms", name, ms);
+	}
+	struct ScopeTimer {
+		const char* name; Clock::time_point t0;
+		inline ScopeTimer(const char* n) : name(n), t0(Clock::now()) {}
+		inline ~ScopeTimer() { Log(name, t0); }
+	};
+} }
+#define TEX_PROFILE_CONCAT_(a, b) a##b
+#define TEX_PROFILE_CONCAT(a, b) TEX_PROFILE_CONCAT_(a, b)
+#define TEX_PROFILE_SCOPE(name) texprof::ScopeTimer TEX_PROFILE_CONCAT(texprofScope_, __LINE__)(name)
+#define TEX_PROFILE_BEGIN(tok) const texprof::Clock::time_point tok(texprof::Clock::now())
+#define TEX_PROFILE_END(tok, name) texprof::Log((name), (tok))
+#else
+#define TEX_PROFILE_SCOPE(name) ((void)0)
+#define TEX_PROFILE_BEGIN(tok) ((void)0)
+#define TEX_PROFILE_END(tok, name) ((void)0)
+#endif
+
 // D E F I N E S ///////////////////////////////////////////////////
 
 // uncomment to enable multi-threading based on OpenMP
@@ -51,6 +129,316 @@ using namespace MVS;
 #define FASTER_OUTLIER_DETECTION
 #undef COUNT_ITERATIONS
 #undef STATS
+
+// TEXTURE_DATACOLOR_UNOBSERVED: when 1, faces with NO genuine camera view
+// (e.g. Poisson-extrapolated / hole-filled surface) are NOT smeared with a
+// neighbor's projected texture (the label-propagation pass is skipped for them);
+// instead each is filled with a flat color sampled from the dense point cloud
+// (nearest populated voxel), baked as a solid texel appended to the atlas -- the
+// competitor's "vertex-colored" margin on poorly-defined areas. Default 0 ->
+// texturing behaves EXACTLY as before (zero impact when off).
+#ifndef TEXTURE_DATACOLOR_UNOBSERVED
+#define TEXTURE_DATACOLOR_UNOBSERVED 1
+#endif
+
+// Iterations of Laplacian color-smoothing over face adjacency applied to the
+// data-colored faces, so the flat per-face fill reads as a smooth color field
+// instead of a noisy triangle patchwork. 0 = off (raw per-face nearest color).
+// The Bayer dither in the bake (build 8) de-correlates the per-atlas-cell 8-bit
+// rounding, so heavy flattening NO LONGER reintroduces the "crazing" seam network
+// that capped this at 40 before. 240 strongly averages out the streaky gradients
+// produced when an unobserved region is ringed by disparate boundary colours
+// (e.g. interior holes: dark inside vs bright outside) -> a smooth, artifact-free
+// fill, which is what reads best on these synthesized regions. Lower (~40) keeps
+// more spatial variation but shows those seed streaks; higher is essentially a
+// per-component flat colour.
+#ifndef TEXTURE_DATACOLOR_SMOOTH_ITERS
+#define TEXTURE_DATACOLOR_SMOOTH_ITERS 240
+#endif
+
+// TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS: bounded seam-smoothing passes applied to the
+// component-tile fill AFTER the nearest-colour inpaint has completed. The old single
+// TEXTURE_DATACOLOR_SMOOTH_ITERS knob did BOTH the fill and the smoothing in one loop,
+// so a large value (240) was needed to fill big holes -- but that same large value then
+// kept averaging every already-filled vertex, collapsing each connected component to a
+// single flat colour (the "muddy smear"). The component path now fills first (nearest
+// observed surface colour, so a fill spanning e.g. grass->road keeps grass near grass and
+// road near road) and ONLY THEN applies this many light averaging passes to hide the
+// propagation-front seams -- with the boundary seed vertices PINNED so the fill stays
+// locked to the real texture it abuts (no drift = no visible seam). ~40 removes the fronts
+// without flattening the large-scale spatial variation; raise for a softer/flatter fill,
+// lower to keep more variation (and slightly sharper internal fronts). Only used by the
+// component-tile bake; the legacy per-face bake still uses TEXTURE_DATACOLOR_SMOOTH_ITERS.
+#ifndef TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS
+#define TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS 40
+#endif
+
+// TEXTURE_DATACOLOR_TILE_NORMAL_COS: the component-tile bake projects each connected
+// no-view region onto ONE plane (its average face normal). If a connected fill wraps
+// around a multi-faceted object (e.g. the top AND sides of a box), faces steeply angled
+// to that single plane foreshorten to near-degenerate tile triangles -> they get too few
+// texels and their shared edges render as a faint CRACK NETWORK tracing the tessellation.
+// To keep every tile near-planar (injective, foldover-free projection) the component BFS
+// only merges two edge-adjacent faces into the SAME tile when their normals agree to at
+// least this cosine; sharper creases start a new tile. The per-vertex fill colour is
+// computed over the FULL mesh adjacency BEFORE tiling, so it stays continuous across a
+// split (both tiles share the crease vertices' colours) -> the split boundary is a
+// near-invisible seam at a genuine geometry crease, not a mid-surface crack. 0.5 ~= split
+// at creases sharper than 60deg (keeps gentle curves as one tile). Raise toward 1 to split
+// more aggressively (flatter tiles, more/smaller tiles); lower to merge more (risking
+// foldover). 1.0 splits at every non-coplanar edge; <=0 disables the split (old behaviour).
+#ifndef TEXTURE_DATACOLOR_TILE_NORMAL_COS
+#define TEXTURE_DATACOLOR_TILE_NORMAL_COS 0.5f
+#endif
+
+// TEXTURE_DATACOLOR_DETAIL_GAIN: amount of REAL high-frequency texture detail transplanted
+// onto the smooth fill. A correct, smooth, seamless fill still reads as an obvious blurry
+// blob against detailed surroundings (worst on vegetation/foliage, gravel, etc.). To fix
+// that, the bake picks the largest OBSERVED face bordering each fill tile, crops a square of
+// its real atlas texture, high-passes it (crop minus a blur = zero-mean grain), and adds that
+// detail -- mirror-tiled -- on top of the smooth base colour. The base colour (correct and
+// seamless) is preserved; only local contrast/grain is injected, so the fill looks like the
+// surrounding surface instead of a flat patch. 1.0 = full real detail amplitude; lower for a
+// subtler effect; 0 disables (smooth base only, previous behaviour).
+// SET TO 0 for the same reason as TEXTURE_DATACOLOR_MIRROR_GAIN: the injected high-frequency
+// grain is the very thing that made the fill read as textured next to the smooth-converged
+// observed band, drawing the polygonal seam line. Smooth fill = continuous frequency at the
+// boundary = no traceable edge (the chosen "prefer smooth" behaviour).
+#ifndef TEXTURE_DATACOLOR_DETAIL_GAIN
+#define TEXTURE_DATACOLOR_DETAIL_GAIN 0.0f
+#endif
+
+// TEXTURE_DATACOLOR_MIRROR_GAIN: strength of REFLECTION PADDING at the fill boundary. The
+// smooth fill reads as a flat blob next to the sharp real texture no matter how well the
+// colour matches, because it lacks the neighbour's high-frequency structure. To fix that,
+// each fill face that borders an OBSERVED (real-texture) face mirrors that neighbour's
+// actual texture across their shared edge into the fill: a fill texel at barycentric depth
+// d from the shared edge samples the observed neighbour at the same along-edge position and
+// depth d on ITS side (a reflection). At the edge (d=0) the sample IS the neighbour's colour
+// at the shared edge -> seamless; moving inward it pulls real detail from the neighbour,
+// faded by (1-d) so it vanishes at the fill face's far vertex. Each boundary face mirrors
+// its OWN neighbour, so different stretches of the boundary get locally-correct detail (no
+// single-donor tiling look). This only affects the ~1-face-deep fill boundary band -- the
+// seam -- where the crisp/flat mismatch is most visible. 1.0 = full mirrored detail at the
+// edge; lower for a subtler effect; 0 disables (smooth base + grain only, previous look).
+// SET TO 0: the mirrored real detail made the fill GRAINY right at the boundary while the
+// seam-feather converges the OBSERVED side to the pure smooth vr/vg/vb field (no grain).
+// That frequency reversal -- grainy-fill next to smooth-observed at the SAME colour -- is
+// exactly the crisp polygonal LINE the eye traced along the triangle edges. Zeroing it makes
+// the fill the same smooth field the feather ends on, so value AND frequency are continuous
+// across the seam (no line). Re-enable (0.3-0.5) only if the fill must carry real grain AND
+// the observed feather is changed to preserve detail too.
+#ifndef TEXTURE_DATACOLOR_MIRROR_GAIN
+#define TEXTURE_DATACOLOR_MIRROR_GAIN 0.0f
+#endif
+
+// TEXTURE_DATACOLOR_MIN_VIEW_COS: faces whose ONLY/best camera observation is at
+// a grazing angle (cos(faceNormal, camDir) below this) are the Poisson-extrapolated
+// mesh RIM past good camera coverage. The labeling forces a view onto them anyway
+// ("assign best available camera"), so they end up as per-face projected patches
+// that render as gray facets (a distant/oblique view's pixels stretched across the
+// rim). When TEXTURE_DATACOLOR_UNOBSERVED is on, such faces are instead demoted to
+// NO_ID so the surface-propagated data-color fill takes them from their well-seen
+// neighbours -- exactly like the rest of the unobserved fill. cos is a true cosine
+// (1 = frontal/nadir, 0 = edge-on). 0 disables the demotion (pre-existing behaviour).
+// 0.20 ~= demote observations more grazing than ~78deg; raise to demote more of the
+// rim, lower to keep more grazing-but-real texture.
+#ifndef TEXTURE_DATACOLOR_MIN_VIEW_COS
+#define TEXTURE_DATACOLOR_MIN_VIEW_COS 0.20f
+#endif
+
+// TEXTURE_DATACOLOR_BAKE: master switch for the actual data-color FILL/bake step in
+// GenerateTexture. Independent of TEXTURE_DATACOLOR_UNOBSERVED on purpose: with this
+// 0 and TEXTURE_DATACOLOR_UNOBSERVED still 1, the legacy label-forcing stays gated
+// off (no gray-facet smear comes back) AND the per-face quadratic-patch bake is
+// skipped, so no-view faces simply stay NO_ID / colEmpty (blank). Use this to review
+// the camera-textured result WITHOUT the synthesized-fill triangle-banding anomaly.
+// Set back to 1 to restore the data-color fill. Set to 0 to go back to the blank/grey
+// review state.
+// TEST 3 RESULT: bake OFF did NOT change the trailer veins -> that surface is
+// OBSERVED texture, not data-color fill. Bake restored to 1.
+#ifndef TEXTURE_DATACOLOR_BAKE
+#define TEXTURE_DATACOLOR_BAKE 1
+#endif
+
+// TEXTURE_DATACOLOR_COMPONENT_BAKE: selects HOW the data-color fill is baked into the
+// atlas (only matters when TEXTURE_DATACOLOR_BAKE is on).
+//  1 = COMPONENT-TILE bake: each connected component of no-view faces is packed into
+//      ONE shared atlas tile and the smooth colour field is rasterised across the whole
+//      tile at once. Adjacent faces share texels along shared edges -> there are no
+//      per-face cell boundaries, so the per-cell 8-bit quantization "crazing" that the
+//      per-face bake shows on large near-uniform regions cannot occur. The fill is a
+//      smooth field, so the planar per-component projection tolerates foldover of
+//      non-planar (tree-blob) components (overlapping faces paint near-equal colours).
+//  0 = legacy PER-FACE cell bake (one tiny M x M quadratic-patch cell per face; smooth
+//      but crazes on big regions).
+#ifndef TEXTURE_DATACOLOR_COMPONENT_BAKE
+#define TEXTURE_DATACOLOR_COMPONENT_BAKE 1
+#endif
+
+// TEXTURE_DATACOLOR_FEATHER_RINGS: width (in face-rings) of the seam-feather band that
+// softens the boundary between the real observed texture and the synthesized fill (and the
+// mesh silhouette/rim). Within this band the observed texture is progressively BLURRED
+// (smeared) toward the boundary so the sharp detail dissolves into the blurry fill/halo and
+// the transition becomes invisible -- rather than a sharp region abutting a blurry one. The
+// blur radius ramps from TEXTURE_DATACOLOR_FEATHER_BLUR_PX at the boundary (fully smeared,
+// matching the fill) down to 0 at the far edge of the band. Wider = the smear extends deeper
+// into the real texture (more of it lost, but a longer/gentler dissolve). 0 disables the
+// feather (hard boundary, previous behaviour); 4-8 is a reasonable band.
+// RAISED to 14: the fill is heavily blurred, so a wide observed band gives the real
+// texture room to dissolve gradually into it; combined with the smoothstep ramp in the
+// blend, the point where real detail returns is imperceptible (no visible inner edge).
+#ifndef TEXTURE_DATACOLOR_FEATHER_RINGS
+#define TEXTURE_DATACOLOR_FEATHER_RINGS 14
+#endif
+
+// TEXTURE_DATACOLOR_FEATHER_STRENGTH: scales the maximum smear (at the boundary). 1.0 = the
+// boundary observed texels are blurred with the full TEXTURE_DATACOLOR_FEATHER_BLUR_PX radius
+// (maximally smeared -> best hides the seam, most detail lost right at the edge); lower keeps
+// a little more detail at the seam. Only used when TEXTURE_DATACOLOR_FEATHER_RINGS > 0.
+#ifndef TEXTURE_DATACOLOR_FEATHER_STRENGTH
+#define TEXTURE_DATACOLOR_FEATHER_STRENGTH 1.0f
+#endif
+
+// TEXTURE_DATACOLOR_FEATHER_BLUR_PX: the maximum blur radius (in atlas pixels) applied to the
+// observed texture right at the fill/rim boundary. Each band texel is replaced by a box
+// average of the original observed atlas over a radius that ramps from this value at the
+// boundary to 0 at the band's inner edge. Larger = a heavier smear that more completely
+// dissolves the seam (match it to how blurry the fill looks); smaller = a subtler smear.
+// Cost grows ~radius^2 per band texel, so keep it modest (6-12).
+// RAISED to 18 to match the heavily-blurred fill: at 10 the observed side stayed too crisp
+// right up to the boundary, so the sharp/blurry mismatch still read as a clear separation.
+// If this ever becomes a bake-time bottleneck, switch the smear to a single pre-blurred
+// atlas + blend-by-ramp (O(atlas) instead of O(band*radius^2)); costs one atlas-sized temp.
+#ifndef TEXTURE_DATACOLOR_FEATHER_BLUR_PX
+#define TEXTURE_DATACOLOR_FEATHER_BLUR_PX 18
+#endif
+
+// TEXTURE_DATACOLOR_DEBUG_TINT: diagnostic only. When 1, every synthesized data-color
+// FILL texel is painted solid bright MAGENTA (255,0,255) instead of its computed colour,
+// so in the viewer it is instantly obvious which faces are synthetic fill vs real observed
+// texture. Use this to tell whether a blurry region abutting the real texture is the fill
+// on the SAME surface (it turns magenta) or a separate/background surface seen past the
+// mesh edge (it stays as-is while the magenta fill is elsewhere) -- i.e. whether the hard
+// transition is a texture-atlas problem or a geometry/occlusion silhouette. 0 = normal
+// (off). REMOVE / set back to 0 after diagnosing.
+// DIAGNOSIS DONE: the fill = the Poisson-extrapolated OUTER RIM/skirt of the mesh (a thin
+// ragged border in plan view; droops down so it fills the frame in oblique shots). It is on
+// the same surface, so it is texturable. Tint restored to 0.
+// (July 2026: briefly re-enabled to diagnose the jagged line, but the "still there" reports were
+// from running the WRONG exe -- diagnosis invalid. Tint back to 0 so the ACTUAL current build
+// (smoothstep ramp + mirror/detail grain zeroed) can be retested cleanly.)
+#ifndef TEXTURE_DATACOLOR_DEBUG_TINT
+#define TEXTURE_DATACOLOR_DEBUG_TINT 0
+#endif
+
+// TEXTURE_DATACOLOR_DIAG / TEXTURE_DATACOLOR_DIAG_TINT: investigation instrumentation for the
+// synthetic-vs-real SEAM. DIAG (1) logs a [DATACOLOR-DIAG] line with: #no-view faces, #component
+// tiles, #feather band faces, how many band texels the feather WROTE vs SKIPPED (skipEmpty = the
+// band texel sat on colEmpty in the atlas so the blend was skipped -> an UNBLENDED seam there;
+// skipAlpha = the ramp had reached 0), and the boundary VALUE-STEP stats: meanStep/maxStep =
+// |observed - fill target| at the ring-0 boundary (how big a jump the feather must cross), and
+// meanResid/maxResid = |blended result - fill target| there. meanResid should be ~0 if the feather
+// fully flattens the observed side to the fill colour at the seam; if it is LARGE the observed side
+// never actually reaches the fill colour at the boundary -> that residual step IS the visible line.
+// DIAG_TINT (1) additionally FALSE-COLOURS the atlas so the seam location is unambiguous: synthetic
+// FILL tiles -> MAGENTA, feather BAND -> GREEN (bright at the boundary, dimming inward), plain
+// observed texture -> unchanged. In the render, note whether the jagged seam lies on the
+// MAGENTA<->GREEN edge (fill/band seam), the GREEN<->normal edge (band inner edge), or entirely
+// within normal texture (a camera-to-camera OBSERVED seam, unrelated to the fill). Set BOTH back to
+// 0 for a normal render. Cheap: the stats loop only runs over the feather band.
+#ifndef TEXTURE_DATACOLOR_DIAG
+#define TEXTURE_DATACOLOR_DIAG 1
+#endif
+#ifndef TEXTURE_DATACOLOR_DIAG_TINT
+#define TEXTURE_DATACOLOR_DIAG_TINT 0
+#endif
+
+// TEXTURE_DATACOLOR_FILL_RES / TEXTURE_DATACOLOR_FILL_MAX_TILE: resolution (longest-side px)
+// each connected fill component's tile is baked at, and the hard cap on a tile's dimension.
+// The fill reads as a BLURRY BLOB largely because it was baked at only 96 px then magnified
+// over the (drooping) skirt, so the mirrored real texture + injected grain are smeared to
+// mush. Raising this bakes the fill sharper -> the reflection-padded real detail near the
+// boundary and the grain actually resolve. Cost: more appended atlas rows (~(res/96)^2 for
+// the fill area, which is only the rim), so more memory/atlas size. Lower if the atlas gets
+// too big; the old values were 96 / 256.
+#ifndef TEXTURE_DATACOLOR_FILL_RES
+#define TEXTURE_DATACOLOR_FILL_RES 192
+#endif
+#ifndef TEXTURE_DATACOLOR_FILL_MAX_TILE
+#define TEXTURE_DATACOLOR_FILL_MAX_TILE 384
+#endif
+
+// TEXTURE_FINAL_RESIZE: gates the final atlas downscale (the INTER_AREA resize
+// that caps the atlas to nMaxTextureSize). Set to 0 to skip the cap and keep the
+// full-resolution atlas -- tests whether the residual dark patch-boundary seam
+// lines are caused by the downscale/mip bleed. 1 = normal.
+#ifndef TEXTURE_FINAL_RESIZE
+#define TEXTURE_FINAL_RESIZE 1
+#endif
+
+// TEXTURE_ENABLE_SHARPEN: gates the final unsharp-mask sharpening pass. Unsharp
+// masking puts dark halos on every contrast edge, so a faint patch-boundary
+// exposure step can be amplified into a crisp dark line. Set to 0 to skip
+// sharpening entirely (regardless of fSharpnessWeight).
+// TEST 1 (ACTIVE): sharpen DISABLED to check if the unsharp-mask halo is the
+// source of the residual dark patch-boundary seam lines. Restore to 1 after.
+#ifndef TEXTURE_ENABLE_SHARPEN
+#define TEXTURE_ENABLE_SHARPEN 0
+#endif
+
+// TEXTURE_ENABLE_GLOBAL_SEAM / TEXTURE_ENABLE_LOCAL_SEAM: compile-time gates that
+// AND with the runtime bGlobalSeamLeveling / bLocalSeamLeveling flags, so a pass
+// can be disabled without changing the command line. GlobalSeamLeveling equalizes
+// whole-patch EXPOSURE between patches (low-frequency); LocalSeamLeveling DRAWS a
+// mean-colour seam line and Poisson-blends a ~3px ribbon (high-frequency). On a
+// large near-uniform bright wall the local drawn seam line reads as a faint vein
+// tracing patch boundaries if the two patches differ in exposure.
+// TEST 2 (ACTIVE): local seam leveling DISABLED to check if the wall veins are the
+// local drawn seams. Restore to 1 after.
+// CANDIDATE FINAL: seam leveling RE-ENABLED (needed scene-wide). The trailer veins
+// were amplified by sharpen (now off) + global seam over an underlying geometry
+// patch-boundary ghost; gSmoothnessWeight was raised (1000->2000) to cut those
+// boundaries so there is less to ghost/mis-level. If the trailer vein returns
+// strongly, global seam is the amplifier -> set TEXTURE_ENABLE_GLOBAL_SEAM 0.
+#ifndef TEXTURE_ENABLE_GLOBAL_SEAM
+#define TEXTURE_ENABLE_GLOBAL_SEAM 1
+#endif
+#ifndef TEXTURE_ENABLE_LOCAL_SEAM
+#define TEXTURE_ENABLE_LOCAL_SEAM 1
+#endif
+
+// TEXTURE_SEAM_MEM_BUDGET_GB: memory-budget cap on the LocalSeamLeveling worker count.
+// Each worker holds, sized to the patch it is currently processing, 2x Image32F3
+// (24 B/px) + an Image8U mask + the PoissonBlendingNoBias thread_local scratch
+// (~77 B/px LIVE). The MEASURED peak footprint is ~4x that (~256 B/px): per-patch
+// cv::Mat::create()/vector resize() churn transiently holds old+new during realloc,
+// and the pseam:: vectors keep their largest-patch capacity across patches. Sized to
+// the LARGEST patch x every core, this is the +20-30 GB TRANSIENT that sets the whole
+// texturing peak on res-0 (large multi-MP patches x many threads). The cap limits
+// workers so that T * (maxPatchArea * ~256 B) stays under this many GB. Semantics-
+// neutral: patches are seam-corrected independently, so fewer workers changes only
+// parallelism, never the output pixels. 0 disables the cap (use every core).
+#ifndef TEXTURE_SEAM_MEM_BUDGET_GB
+#define TEXTURE_SEAM_MEM_BUDGET_GB 8
+#endif
+
+// TEXTURE_CROP_IMAGES: after view-selection, each source image only contributes the
+// bounding box of the faces assigned to it (~0.6 MP of an ~18.6 MP original), yet the
+// whole full-res image sits in RAM for the entire run (~20 GB across 367 images on a
+// high-res aerial set). When 1: (a) ListCameraFaces frees each image right after its
+// view (so that stage holds only ~nThreads images, not all of them); (b) GenerateTexture
+// projects patch rects from the stored image DIMENSIONS (camera is intact, pixels gone);
+// (c) right after projection each image is reloaded and CROPPED to the union of its patch
+// rects, and those rects are rebased to the crop origin. Total resident image memory then
+// drops ~30x (20 GB -> ~0.7 GB) with ZERO resolution loss -- crops are 1:1 from the full
+// source. Coordinate-transparent: every downstream stage samples via rect.tl(), and
+// rebasing rect by -union.tl() makes proj = faceTexcoords + rect.tl() land in crop-local
+// coords, so seam leveling / merge / assemble need no changes. Cost: one extra image
+// decode pass (~25 s on 367 imgs). 0 = keep all full-res images resident (previous behaviour).
+#ifndef TEXTURE_CROP_IMAGES
+#define TEXTURE_CROP_IMAGES 1
+#endif
 
 // uncomment to use SparseLU for solving the linear systems
 // (should be faster, but not working on old Eigen)
@@ -76,6 +464,16 @@ static const Scene* gSceneForSmoothness = nullptr;
 
 // inference algorithm
 #if TEXOPT_INFERENCE == TEXOPT_INFERENCE_LBP
+// LBP message-passing sweep cap. Measured on a 2.75M-face scene: the MRF energy
+// (dominated by the Potts seam term) is HIGHLY sensitive to this -- energy@25
+// was 33% higher than energy@50, i.e. materially more patch fragmentation. The
+// tail sweeps are NOT cosmetic here; they consolidate labels / remove seams
+// (even 50 is not fully converged). Keep at 50 for quality; lower ONLY after
+// A/B-ing the rendered texture and confirming no added fragmentation on THIS
+// dataset.
+#ifndef LBP_MAX_ITERS
+#define LBP_MAX_ITERS 50u
+#endif
 #include "../Math/LBP.h"
 namespace MVS {
 typedef LBPInference::NodeID NodeID;
@@ -84,7 +482,7 @@ LBPInference::EnergyType STCALL SmoothnessPotts(LBPInference::NodeID, LBPInferen
 	return l1 == l2 && l1 != 0 && l2 != 0 ? LBPInference::EnergyType(0) : LBPInference::EnergyType(LBPInference::MaxEnergy);
 }
 
-static LBPInference::EnergyType gSmoothnessWeight = 1000;
+static LBPInference::EnergyType gSmoothnessWeight = 2000;
 
 #ifdef INCREASE_PATCHES
 static LBPInference::EnergyType SmoothnessPottsStrong(
@@ -105,23 +503,22 @@ static LBPInference::EnergyType SmoothnessPottsStrong(
 		cosAngle = 0.0f;
 	}
 
-	// Gate: below this, do not encourage sameness at all
-	// Raising this reduces merging (more patches); lowering increases merging (fewer patches).
-	const float cosGate = 0.8f;
+	// CRACK-NETWORK FIX: the previous version applied a 0.8 cosine GATE and then
+	// rescaled [0.8,1.0] -> [0,1], so any pair of faces whose smoothed normals
+	// differed by more than ~37deg got only the tiny switchPenalty (~2), and even
+	// gently-curved / normal-noisy neighbours (cos 0.85-0.95, extremely common on
+	// real MVS road/ground meshes) got just ~250-750. With the rank-based data
+	// cost that was frequently cheaper than switching cameras, so large flat
+	// surfaces SHATTERED into hundreds of tiny patches whose seams render as the
+	// crack network. We now keep a STRONG constant floor (switching a label is
+	// always expensive) PLUS a coplanarity bonus, so the graph cut still prefers
+	// to place seams at genuine geometry creases but the surface no longer
+	// fragments. Tuning: lower gSmoothnessWeight to permit more/smaller patches,
+	// raise it for even fewer.
+	const float baseSwitchPenalty = (float)gSmoothnessWeight;            // always-on strong floor
+	const float coplanarBonus     = (float)gSmoothnessWeight * cosAngle; // extra "glue" on flat surfaces
 
-	if (cosAngle < cosGate) {
-		cosAngle = 0.0f;
-	}
-	else {
-		cosAngle = (cosAngle - cosGate) / (1.0f - cosGate);
-	}
-
-	// Baseline penalty for switching labels (prevents checkerboard fragmentation)
-	// Increase -> fewer patches; decrease -> more patches.
-	const float switchPenalty = 2.0f;
-
-	// Angle-weighted additional penalty
-	const float w = switchPenalty + (float)gSmoothnessWeight * cosAngle;
+	const float w = baseSwitchPenalty + coplanarBonus;
 
 	// If EnergyType is integer, rounding is better than truncation
 	return (LBPInference::EnergyType)(w + 0.5f);
@@ -286,6 +683,9 @@ struct MeshTexture {
 		Mesh::FaceIdxArr faces; // indices of the faces contained by the patch
 		RectsBinPack::Rect rect; // the bounding box in the view containing the patch
 		std::vector<MatIdx> vertexRows;   // same size as faces.size() * 3
+#if TEXTURE_CROP_IMAGES
+		Image8U3 image; // per-patch private crop of the source image (rect-local, rect.tl()==0)
+#endif
 	};
 	typedef cList<TexturePatch,const TexturePatch&,1,1024,FIndex> TexturePatchArr;
 
@@ -525,6 +925,17 @@ public:
 	void GlobalSeamLeveling();
 	void LocalSeamLeveling();
 	void GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize);
+
+	// Source pixels for a patch: its private rect-local crop when TEXTURE_CROP_IMAGES is on
+	// (built in GenerateTexture right after projection), else the shared full source image.
+	// Centralizes the switch for every seam-leveling / assemble read.
+	inline const Image8U3& PatchSrcImage(uint32_t idxPatch) const {
+#if TEXTURE_CROP_IMAGES
+		return texturePatches[idxPatch].image;
+#else
+		return images[texturePatches[idxPatch].label].image;
+#endif
+	}
 
 	template <typename PIXEL>
 	static inline PIXEL RGB2YCBCR(const PIXEL& v) {
@@ -799,11 +1210,34 @@ inline int CeilPos(float y) {
 }
 
 // extract array of faces viewed by each image
+// Cap on candidate views (observations) kept per face in ListCameraFaces. On
+// high-overlap scenes a face can be seen by 60+ views; the MRF view-selection
+// only ever picks the best (winner is ~top-1 by quality; the smoothness term
+// rarely reaches past the top few), so keeping the long low-quality tail only
+// bloats facesDatas and the MRF graph. Capping to the top-N by quality bounds
+// that memory ~linearly with the texture essentially unchanged.
+// 0 = unlimited (original behaviour).
+// NOTE: measured NO benefit on RichmondHistoric (facesDatas is small; the peak is
+// the resident image/mesh base + seam-leveling transient, not per-face-per-view),
+// and it is output-affecting, so it defaults OFF. Left as a knob for scenes that
+// genuinely have a huge views/face tail.
+#ifndef TEXTURE_MAX_VIEWS_PER_FACE
+#define TEXTURE_MAX_VIEWS_PER_FACE 0
+#endif
+
+template<typename TYPE1, typename TYPE2 = TYPE1>
+inline TYPE2 ComputeAngle2(const TYPE1* V1, const TYPE1* V2) {
+	return CLAMP(TYPE2((V1[0] * V2[0] + V1[1] * V2[1] + V1[2] * V2[2]) / FastSqrtS((V1[0] * V1[0] + V1[1] * V1[1] + V1[2] * V1[2]) * (V2[0] * V2[0] + V2[1] * V2[1] + V2[2] * V2[2]))), TYPE2(-1), TYPE2(1));
+} // ComputeAngle
+
 bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThreshold, const IIndexArr& _views)
 {
+	TEX_PROFILE_SCOPE("ListCameraFaces (total)");
 	// create faces octree
+	TEX_PROFILE_BEGIN(_tLcfOctree);
 	Mesh::Octree octree;
 	Mesh::FacesInserter::CreateOctree(octree, scene.mesh);
+	TEX_PROFILE_END(_tLcfOctree, "ListCameraFaces: build octree");
 
 	// extract array of faces viewed by each image
 	IIndexArr views(_views);
@@ -823,7 +1257,11 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		float quality;
 		uint32_t area;
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		Color color;
+		// Integer per-channel color sums (c0,c1,c2), averaged to a float mean once per
+		// face at finalize. Accumulating raw uint8 channels avoids a per-pixel int->float
+		// convert (cvtdq2ps x3) and turns each channel into a single add-to-memory.
+		// Bound: 255 * area must fit uint32 -> safe up to ~16.7M rasterized px per face.
+		uint32_t color[3];
 #endif
 	};
 
@@ -835,10 +1273,11 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	perViewOut.resize(views.size());
 
 	// Since we are controlling the threading per-view, don't let cv thread
-// when performing its work.
+	// when performing its work.
 	const int prevCvThreads = cv::getNumThreads();
-	cv::setNumThreads(1);
+	cv::setNumThreads(0);
 
+	TEX_PROFILE_BEGIN(_tLcfCenters);
 	static std::vector<Point3f> gFaceCenter;
 	gFaceCenter.resize(faces.size());
 
@@ -854,7 +1293,9 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			(a.z + b.z + c.z) * (1.0f / 3.0f)
 		);
 	}
+	TEX_PROFILE_END(_tLcfCenters, "ListCameraFaces: face centers");
 
+	TEX_PROFILE_BEGIN(_tLcfPerView);
 #ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
 #pragma omp parallel for private(imageGradMag, mGrad, faceMap, depthMap)
@@ -906,6 +1347,11 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		cv::filter2D(imageGradMag, grad[1], cv::DataType<real>::type, kernel.t());
 #endif
 		(TImage<real>::EMatMap)imageGradMag = (mGrad[0].cwiseAbs2() + mGrad[1].cwiseAbs2()).cwiseSqrt();
+		// Free the two full-res Sobel planes now (per-thread, 8 B/px each): they are
+		// not used again this iteration, and releasing them BEFORE the concurrent
+		// rasterization (faceMap/depthMap) below lowers the multi-thread memory peak.
+		// Re-grown by resize() on the next image (1 alloc/image, negligible).
+		{ TImage<real>::EMat empty0, empty1; mGrad[0].swap(empty0); mGrad[1].swap(empty1); }
 		// apply some blur on the gradient to lower noise/glossiness effects onto face-quality score
 		cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(15, 15), 0, 0, cv::BORDER_DEFAULT);
 		// select faces inside view frustum
@@ -919,19 +1365,20 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		depthMap.create(imageData.height, imageData.width);
 		RasterMesh rasterer(vertices, imageData.camera, depthMap, faceMap);
 		rasterer.Clear();
-		for (auto idxFace : cameraFaces) {
-			const Face& facet = faces[idxFace];
-			rasterer.idxFace = idxFace;
+		// Rasterize storing a LOCAL face index (position in cameraFaces) into faceMap
+		// instead of the global face id. This lets the per-pixel accumulation below
+		// index a dense, cameraFaces-sized array directly instead of hashing every
+		// rasterized pixel into a robin_map (millions of hash ops per view otherwise).
+		const uint32_t numCameraFaces((uint32_t)cameraFaces.size());
+		for (uint32_t li = 0; li < numCameraFaces; ++li) {
+			const Face& facet = faces[cameraFaces[li]];
+			rasterer.idxFace = (FIndex)li;
 			rasterer.Project(facet);
 		}
-		// compute the projection area of visible faces
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-		CLISTDEF0IDX(uint32_t, FIndex) areas(faces.GetSize());
-		areas.Memset(0);
-#endif
 
-		tsl::robin_map<uint32_t, FaceAccum> acc;
-		acc.reserve(cameraFaces.size()); // decent heuristic
+		// accumulate per-face quality/area/color over the rasterized pixels; the dense
+		// buffer is indexed by the local face index written into faceMap above.
+		std::vector<FaceAccum> acc(numCameraFaces); // Value initializes acc as well.
 
 		for (int j = 0; j < faceMap.rows; ++j) {
 			const FIndex* __restrict fm = faceMap.ptr<FIndex>(j);
@@ -941,58 +1388,66 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 #endif
 
 			for (int i = 0; i < faceMap.cols; ++i) {
-				const uint32_t f = (uint32_t)fm[i];
-				if (f == (uint32_t)NO_ID) {
+				const uint32_t li = (uint32_t)fm[i];
+				if (li == (uint32_t)NO_ID) {
 					continue;
 				}
-
-				auto ins = acc.emplace(f, FaceAccum{});
-				FaceAccum& a = ins.first.value();
-
-				if (ins.second) {
-					a.quality = (float)gm[i];
-					a.area = 1;
+				FaceAccum& a = acc[li];
+				a.quality += (float)gm[i];
+				a.area++;
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-					a.color = Color(im[i]);
+				const auto& px = im[i];
+				a.color[0] += px[0];
+				a.color[1] += px[1];
+				a.color[2] += px[2];
 #endif
-				}
-				else {
-					a.quality += (float)gm[i];
-					a.area++;
-#if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-					a.color += Color(im[i]);
-#endif
-				}
 			}
 		}
 
-		// ---- angle adjustment per face (same as your logic) ----
+		// ---- angle adjustment per face ----
 		// Build output list for this view:
 		std::vector<FaceOut> out;
-		out.reserve(acc.size());
-		for (auto it = acc.begin(); it != acc.end(); ++it) {
-			const FIndex idxFace = it.key();
-			FaceAccum& a = it.value();
+		out.reserve(numCameraFaces);
+		for (uint32_t li = 0; li < numCameraFaces; ++li) {
+			FaceAccum& a = acc[li];
+			if (a.area == 0)
+				continue; // face had no rasterized pixel in this view
+			const FIndex idxFace = cameraFaces[li];
 
 			const Face& f = faces[idxFace];
 			const auto& faceCenter = gFaceCenter[idxFace];
 			const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
 			const Normal& faceNormal = scene.mesh.faceNormals[idxFace];
-			const float cosFaceCam(MAXF(0.001f, ComputeAngle(camDir.ptr(), faceNormal.ptr())));
-			a.quality *= SQUARE(cosFaceCam);
+			const float rawCosFaceCam(ComputeAngle2(camDir.ptr(), faceNormal.ptr()));
+			// skip observations where the camera looks at the back of the face
+			// (rawCos <= 0); keeping them causes wrong-side texturing on edges.
+			if (rawCosFaceCam <= 0.f) {
+				continue;
+			}
+			a.quality *= SQUARE(rawCosFaceCam);
 
 			FaceOut fo;
 			fo.idxFace = idxFace;
 			fo.data.idxView = idxView;
 			fo.data.quality = a.quality;
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
-			Color c = a.color * (1.f / (float)a.area);
-			fo.data.color = RGB2YCBCR(Color(c));
+			const float inv = 1.f / (float)a.area;
+			const Color c((float)a.color[0] * inv, (float)a.color[1] * inv, (float)a.color[2] * inv);
+			fo.data.color = RGB2YCBCR(c);
 #endif
 			out.push_back(fo);
 		}
 
 		perViewOut[(size_t)idx].swap(out);
+
+#if TEXTURE_CROP_IMAGES
+		// Crop-images mode: this view's pixels are fully consumed. Free them now so
+		// ListCameraFaces holds only ~nThreads images resident instead of all of them.
+		// GenerateTexture reloads each image and crops it to its used region. The
+		// width/height/camera members stay intact (release() only frees the pixel Mat),
+		// so projection can still compute patch rects from the stored dimensions.
+		imageData.image.release();
+#endif
 
 		++progress;
 	}
@@ -1001,6 +1456,24 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	if (bAbort)
 		return false;
 #endif
+	TEX_PROFILE_END(_tLcfPerView, "ListCameraFaces: per-view rasterize+quality");
+
+	// [MEM-DECOMP] TEMPORARY: decompose the ListCameraFaces resident footprint so we
+	// can target the ~20 GB base that stage-level probes leave unexplained. Measures
+	// the ACTUAL bytes of the two big suspects at their peak (perViewOut is fully
+	// built here, just before the merge frees it). Remove once the hog is identified.
+	{
+		size_t pvBytes = 0, pvObs = 0;
+		for (const auto& v : perViewOut) { pvBytes += v.capacity() * sizeof(FaceOut); pvObs += v.size(); }
+		size_t imgBytes = 0; unsigned imgResident = 0;
+		for (const Image& im : images) if (!im.image.empty()) { imgBytes += (size_t)im.image.total() * im.image.elemSize(); ++imgResident; }
+		const double G = 1.0 / (1024.0*1024.0*1024.0);
+		DEBUG_EXTRA("[MEM-DECOMP] perViewOut=%.2f GB (%zu obs, %zuB/obs) | images=%.2f GB (%u resident, %zuB/px*3) | mesh.faces=%u verts=%u",
+			pvBytes*G, pvObs, sizeof(FaceOut), imgBytes*G, imgResident, (size_t)3, faces.GetSize(), vertices.GetSize());
+		LogPeakMem("LCF: after per-view (perViewOut full)");
+	}
+
+	TEX_PROFILE_BEGIN(_tLcfMerge);
 	// Pass 1: count how many FaceOut entries per face
 	std::vector<uint32_t> addCount(facesDatas.GetSize(), 0);
 
@@ -1011,26 +1484,67 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		}
 	}
 
-	// Pass 2: reserve capacity in each FaceDataArr once
+	// Number of candidate views kept per face (see TEXTURE_MAX_VIEWS_PER_FACE).
+	const uint32_t capN = TEXTURE_MAX_VIEWS_PER_FACE;
+
+	// Pass 2: reserve capacity in each FaceDataArr once (bounded by the cap so we
+	// never allocate room for the long low-quality observation tail).
 	for (size_t f = 0; f < (size_t)facesDatas.GetSize(); ++f) {
-		const uint32_t nAdd = addCount[f];
+		uint32_t nAdd = addCount[f];
 		if (nAdd == 0) {
 			continue;
 		}
+		if (capN != 0 && nAdd > capN)
+			nAdd = capN;
 		FaceDataArr& arr = facesDatas[(FIndex)f];
-		// Reserve exactly current size + new adds.
-		// Use whatever your container's reserve is called (Reserve / reserve / EnsureCapacity).
 		arr.Reserve(arr.GetSize() + nAdd);
 	}
 
-	// Pass 3: your original merge (unchanged)
+	// Pass 3: merge into facesDatas, CAPPING each face to its top-N observations
+	// by quality, and freeing each per-view buffer AS IT IS CONSUMED. Without the
+	// cap a face on a high-overlap scene keeps 60+ observations; the MRF only uses
+	// the best, so the tail is pure memory. Without the per-view free, perViewOut
+	// and facesDatas would both stay fully resident at the peak.
 	for (size_t idx = 0; idx < perViewOut.size(); ++idx) {
-		const auto& out = perViewOut[idx];
+		auto& out = perViewOut[idx];
 		for (const FaceOut& fo : out) {
 			FaceDataArr& arr = facesDatas[fo.idxFace];
-			FaceData& fd = arr.AddEmpty();
-			fd = fo.data;
+			if (capN == 0 || arr.GetSize() < capN) {
+				FaceData& fd = arr.AddEmpty();
+				fd = fo.data;
+			} else {
+				// at capacity: keep the top-N by quality -- replace the lowest-quality
+				// kept observation if this one is better (N is small so the scan is cheap)
+				uint32_t worst = 0;
+				float worstQ = arr[0].quality;
+				for (uint32_t k = 1; k < arr.GetSize(); ++k) {
+					if (arr[k].quality < worstQ) { worstQ = arr[k].quality; worst = k; }
+				}
+				if (fo.data.quality > worstQ)
+					arr[worst] = fo.data;
+			}
 		}
+		std::vector<FaceOut>().swap(out); // release this view's buffer immediately
+	}
+	std::vector<std::vector<FaceOut>>().swap(perViewOut); // drop the outer array too
+	TEX_PROFILE_END(_tLcfMerge, "ListCameraFaces: merge into facesDatas");
+
+	// [MEM-DECOMP] TEMPORARY: size facesDatas now that perViewOut is freed. Includes
+	// both the live observations and the cList capacity slack (grow-by-doubling can
+	// hold ~2x the live bytes). Remove once the hog is identified.
+	{
+		size_t fdData = 0, fdCap = 0, fdObs = 0;
+		for (FIndex f = 0; f < facesDatas.GetSize(); ++f) {
+			const FaceDataArr& a = facesDatas[f];
+			fdObs += a.GetSize();
+			fdData += (size_t)a.GetSize() * sizeof(FaceData);
+			fdCap += (size_t)a.GetCapacity() * sizeof(FaceData);
+		}
+		const double G = 1.0 / (1024.0*1024.0*1024.0);
+		DEBUG_EXTRA("[MEM-DECOMP] facesDatas live=%.2f GB cap=%.2f GB (%zu obs, %zuB/obs, %u faces headers=%.2f GB)",
+			fdData*G, fdCap*G, fdObs, sizeof(FaceData), facesDatas.GetSize(),
+			((size_t)facesDatas.GetSize()*sizeof(FaceDataArr))*G);
+		LogPeakMem("LCF: after merge (facesDatas full)");
 	}
 
 	progress.close();
@@ -1040,10 +1554,12 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	if (fOutlierThreshold > 0) {
+		TEX_PROFILE_BEGIN(_tLcfOutlier);
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
 		for (FaceDataArr& faceDatas : facesDatas)
 			FaceOutlierDetection(faceDatas, fOutlierThreshold);
+		TEX_PROFILE_END(_tLcfOutlier, "ListCameraFaces: outlier detection");
 	}
 #endif
 	return true;
@@ -1679,18 +2195,24 @@ CollapseSmallLabelIslands(
 
 bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras, float fOutlierThreshold, float fRatioDataSmoothness, const IIndexArr& views)
 {
+	TEX_PROFILE_SCOPE("FaceViewSelection (total)");
 	// extract array of triangles incident to each vertex
+	TEX_PROFILE_BEGIN(_tFvsListVerts);
 	ListVertexFaces();
+	TEX_PROFILE_END(_tFvsListVerts, "FaceViewSelection: ListVertexFaces");
 
 	// create texture patches
 	{
 		// compute face normals and smoothen them
+		TEX_PROFILE_BEGIN(_tFvsSmoothN);
 		scene.mesh.SmoothNormalFaces();
+		TEX_PROFILE_END(_tFvsSmoothN, "FaceViewSelection: SmoothNormalFaces");
 
 		// list all views for each face
 		FaceDataViewArr facesDatas;
 		if (!ListCameraFaces(facesDatas, fOutlierThreshold, views))
 			return false;
+		LogPeakMem("FVS: after ListCameraFaces");
 
 #ifdef STATS
 		double avgChoices = 0.0;
@@ -1920,6 +2442,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 		// ------------------------------------------------------------
 		// Compute geometric connected components WITHOUT Boost
 		// ------------------------------------------------------------
+		TEX_PROFILE_BEGIN(_tFvsCompGeom);
 		std::vector<int> compGeom(numFaces, -1);
 
 		int nGeomComponents = 0;
@@ -1956,6 +2479,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 
 			++nGeomComponents;
 		}
+		TEX_PROFILE_END(_tFvsCompGeom, "FaceViewSelection: geometric components");
 
 		ASSERT((Mesh::FIndex)boost::num_vertices(graph) == numFaces);
 
@@ -1981,12 +2505,18 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				// initialize inference structures
 				const LBPInference::EnergyType MaxEnergy(
 					fRatioDataSmoothness * LBPInference::MaxEnergy);
+				TEX_PROFILE_BEGIN(_tFvsLbpBuild);
 				LBPInference inference;
 				{
 					inference.SetNumNodes(numFaces);
 
 					gSceneForSmoothness = &scene;
 					inference.SetSmoothCost(SmoothnessPottsStrong);
+					// SmoothnessPottsStrong is a generalized Potts model (0 for l1==l2,
+					// a per-edge normal-based constant otherwise) -> enable the O(L1+L2)
+					// message fast path (bit-identical result, avoids the L1*L2 dot-product
+					// evaluations that dominate LBP Optimize).
+					inference.SetPottsSmoothness(true);
 
 					// ---- 1. Count undirected edges once ----
 					size_t edgeCount = 0;
@@ -2092,8 +2622,11 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 						node.dataCosts.push_back(dataCost);
 					}
 				}
+				TEX_PROFILE_END(_tFvsLbpBuild, "FaceViewSelection: LBP build graph+datacost");
 
+				TEX_PROFILE_BEGIN(_tFvsLbpOpt);
 				inference.Optimize();
+				TEX_PROFILE_END(_tFvsLbpOpt, "FaceViewSelection: LBP Optimize");
 
 #ifdef STATS
 				int countLabel0 = 0;
@@ -2151,6 +2684,13 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 		// ----------------------------------------------------------------------
 		// High-quality confidence-weighted boundary refinement
 		// ----------------------------------------------------------------------
+		// GATED OFF when TEXTURE_DATACOLOR_UNOBSERVED is on: this whole legacy
+		// label-forcing stage (8-pass boundary propagation + "assign best available
+		// camera" Pass 1 + Pass 2 smear) exists to leave NO face NO_ID, which fills
+		// the unobserved/grazing rim with stretched oblique projections (the gray
+		// facets). With data-color on, the MRF labels stand as-is and every face left
+		// NO_ID is handed to the surface-propagated data-color fill instead.
+#if !TEXTURE_DATACOLOR_UNOBSERVED
 		{
 			const float normalThreshold = 0.3f;   // cosine threshold
 			const int maxPasses = 8;              // controlled expansion depth
@@ -2323,6 +2863,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				}
 			}
 		}
+#endif // !TEXTURE_DATACOLOR_UNOBSERVED (legacy label-forcing stage; data-color owns NO_ID faces instead)
 
 #if 0 // JPB WIP BUG Until i can get this to work. def INCREASE_PATCHES
 		// create texture patches (connected components of same-label adjacency)
@@ -2623,6 +3164,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 #else
 		// create texture patches
 		{
+			TEX_PROFILE_SCOPE("FaceViewSelection: create patches");
 			seamEdges.clear();
 
 			// Build seam edges directly from face adjacency
@@ -2646,50 +3188,63 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				}
 			}
 
-			// Speckles caused by patch fragmentation.
-			// Large flat areas can contain many small patches which can produce contrast
-			// variation.
-
+			// Create texture patches as CONNECTED COMPONENTS of same-label face
+			// adjacency (flood fill over faceFaces where both faces share a label).
+			// The previous grouping (compGeom*numLabels + label) merged ALL same-label
+			// faces of a geometric component into ONE patch even when they were SCATTERED
+			// across the mesh -> the patch's image bounding box became the WHOLE source
+			// frame (MEASURED: 367 patches, each ~19 Mpx = a full image, 7076 Mpx total).
+			// That blew the per-patch crops to ~20 GB AND forced the packer to tile 367
+			// full images into an ~84000px atlas that was then downscaled ~5.7x to fit the
+			// GPU cap -- silently crushing res-0 detail. Connected components give each
+			// contiguous region its OWN tight bbox: crops shrink to the real coverage, the
+			// atlas packs near 1:1 (little/no downscale -> SHARPER), and NO new seams are
+			// introduced (the split pieces are non-adjacent, so they never shared a seam
+			// edge -- seam leveling sees the identical set of label boundaries as before).
 			components.resize(numFaces);
+			for (FIndex f = 0; f < numFaces; ++f)
+				components[f] = (FIndex)-1;
 
-			for (FIndex f = 0; f < numFaces; ++f) {
-				if (labels[f] == NO_ID)	{
-					components[f] = -1;
-					continue;
+			int nextComp = 0;
+			{
+				std::vector<FIndex> stack;
+				stack.reserve(1024);
+				for (FIndex f0 = 0; f0 < numFaces; ++f0) {
+					if (labels[f0] == NO_ID || (int)components[f0] != -1)
+						continue;
+					const int cid = nextComp++;
+					const Label lbl = labels[f0];
+					components[f0] = (FIndex)cid;
+					stack.clear();
+					stack.push_back(f0);
+					while (!stack.empty()) {
+						const FIndex cur = stack.back();
+						stack.pop_back();
+						const Mesh::FaceFaces& adj = faceFaces[cur];
+						for (int k = 0; k < 3; ++k) {
+							const FIndex fn = adj[k];
+							if (fn == NO_ID || (int)components[fn] != -1 || labels[fn] != lbl)
+								continue;
+							components[fn] = (FIndex)cid;
+							stack.push_back(fn);
+						}
+					}
 				}
-
-				components[f] =
-					compGeom[f] * numLabels + labels[f];
 			}
 
-			FIndex nComponents =
-				nGeomComponents * numLabels;
-
 			texturePatches.clear();
-			texturePatches.reserve(nComponents);
+			texturePatches.resize(nextComp);
+			for (int p = 0; p < nextComp; ++p)
+				texturePatches[(uint32_t)p].label = NO_ID;
 
-			std::unordered_map<int, int> compToPatch;
-
-			for (FIndex f = 0; f < numFaces; ++f)	{
-				if (labels[f] == NO_ID)
+			for (FIndex f = 0; f < numFaces; ++f) {
+				const int cid = (int)components[f];
+				if (cid < 0)
 					continue;
-
-				int compID = components[f];
-
-				auto it = compToPatch.find(compID);
-
-				if (it == compToPatch.end()) {
-					TexturePatch patch;
-					patch.label = labels[f];
-
-					int patchIdx = (int)texturePatches.size();
-					texturePatches.push_back(std::move(patch));
-					compToPatch[compID] = patchIdx;
-
-					it = compToPatch.find(compID);
-				}
-
-				texturePatches[it->second].faces.Insert(f);
+				TexturePatch& tp = texturePatches[(uint32_t)cid];
+				if (tp.label == NO_ID)
+					tp.label = labels[f];
+				tp.faces.Insert(f);
 			}
 		}
 	}
@@ -2856,104 +3411,131 @@ static inline PIXEL YCBCR_DELTA2RGB(const PIXEL& d) {
 	);
 }
 
+// Per-thread GlobalSeamLeveling scratch. Declared at namespace scope (as
+// thread_local) rather than as function-local `static thread_local` so it can
+// be released after seam leveling (see ReleaseSeamScratch); function-local
+// statics are unreachable from outside and would stay pinned for the whole run.
+namespace { namespace gseam {
+	thread_local std::vector<MatIdx> faceRowIndices;
+	thread_local TImage<Point3f> imageAdj; // == MeshTexture::ColorMap (Color=Point3f); Color is a private member typedef, not visible here
+	thread_local std::vector<uint8_t> mask;
+} }
+
 void MeshTexture::GlobalSeamLeveling()
 {
+	TEX_PROFILE_SCOPE("GlobalSeamLeveling (total)");
 	ASSERT(!seamVertices.empty());
 	const unsigned numPatches(texturePatches.size());
 
 	// ------------------------------------------------------------
-	// Build vertex -> patch adjacency without critical section
+	// Build vertex -> sorted-unique patch adjacency via a flat CSR layout.
+	//
+	// The old approach allocated T * numVertices tiny std::vectors (millions
+	// of empty vector headers) and grew each per-(thread,vertex) bucket with
+	// push_back, then merged by scanning all T buckets for every vertex and
+	// dedup'd each with a full std::sort + std::unique. Here we instead size
+	// an exact flat buffer from an incidence count, scatter patch ids once
+	// with no reallocation, then dedup each (tiny) per-vertex run in place
+	// with a single-pass sorted insert. The dominant interior-vertex case
+	// (all incidences share one patch id) collapses in O(n) with zero shifts.
 	// ------------------------------------------------------------
 
-	const int T = omp_get_max_threads();
 	const size_t numVertices = vertices.size();
 
-	std::vector<std::vector<uint32_t>> vertexPatches(numVertices);
+	// Pass 1: count face incidences per vertex (valid patches only).
+	std::vector<size_t> offsets(numVertices + 1, 0);
+#pragma omp parallel for schedule(dynamic, 64)
+	for (int64_t p = 0; p < (int64_t)texturePatches.size(); ++p) {
+		if (texturePatches[p].label == NO_ID)
+			continue;
+		for (const FIndex f : texturePatches[p].faces) {
+			const Face& face = faces[f];
+			for (int k = 0; k < 3; ++k) {
+#pragma omp atomic
+				++offsets[face[k] + 1];
+			}
+		}
+	}
 
-	// Per-thread buckets: [thread][vertex] -> list of patches
-	std::vector<std::vector<std::vector<uint32_t>>> threadBuckets(
-		T, std::vector<std::vector<uint32_t>>(numVertices)
-	);
+	// Exclusive prefix sum -> CSR row offsets [offsets[v], offsets[v+1]).
+	for (size_t v = 0; v < numVertices; ++v)
+		offsets[v + 1] += offsets[v];
+	const size_t totalIncidences = offsets[numVertices];
 
-	// Parallel fill (no locking)
-#pragma omp parallel
+	// Pass 2: scatter patch ids into the flat buffer. `cursor` starts at each
+	// vertex's base offset and is bumped per write (no reallocs). Uses a C++
+	// std::atomic fetch_add rather than `#pragma omp atomic capture` so it
+	// builds under MSVC's default OpenMP 2.0 (which lacks the capture clause).
+	std::vector<uint32_t> flatPatches(totalIncidences);
 	{
-		const int tid = omp_get_thread_num();
-		auto& local = threadBuckets[tid];
-
-#pragma omp for schedule(static)
+		std::vector<std::atomic<size_t>> cursor(numVertices);
+		for (size_t v = 0; v < numVertices; ++v)
+			cursor[v].store(offsets[v], std::memory_order_relaxed);
+#pragma omp parallel for schedule(dynamic, 64)
 		for (int64_t p = 0; p < (int64_t)texturePatches.size(); ++p) {
 			if (texturePatches[p].label == NO_ID)
 				continue;
-
 			for (const FIndex f : texturePatches[p].faces) {
 				const Face& face = faces[f];
-
-				local[face[0]].push_back((uint32_t)p);
-				local[face[1]].push_back((uint32_t)p);
-				local[face[2]].push_back((uint32_t)p);
+				for (int k = 0; k < 3; ++k) {
+					const size_t pos = cursor[face[k]].fetch_add(1, std::memory_order_relaxed);
+					flatPatches[pos] = (uint32_t)p;
+				}
 			}
 		}
 	}
 
-	for (auto& vp : vertexPatches)
-		vp.reserve(4);
-
-	// Merge phase (single-threaded, no locks needed)
-	for (size_t v = 0; v < numVertices; ++v) {
-		auto& dst = vertexPatches[v];
-
-		for (int t = 0; t < T; ++t) {
-			auto& src = threadBuckets[t][v];
-			if (!src.empty()) {
-				dst.insert(dst.end(), src.begin(), src.end());
-			}
+	// Dedup each per-vertex run in place (sorted insert) and record the unique
+	// count. Runs are tiny: interior vertices touch exactly one patch, seam
+	// vertices a handful, so this is cheaper than sort+unique and keeps the
+	// ascending order the downstream two-pointer merges rely on.
+	std::vector<VertexPatchRow> vertpatch2rows(numVertices);
+	std::vector<MatIdx> uniqCount(numVertices);
+#pragma omp parallel for schedule(static)
+	for (int64_t v = 0; v < (int64_t)numVertices; ++v) {
+		uint32_t* const first = flatPatches.data() + offsets[v];
+		uint32_t* const last = flatPatches.data() + offsets[v + 1];
+		uint32_t* out = first; // [first,out) stays sorted & unique
+		for (uint32_t* it = first; it != last; ++it) {
+			const uint32_t val = *it;
+			uint32_t* pos = out;
+			while (pos != first && *(pos - 1) > val)
+				--pos;
+			if (pos != first && *(pos - 1) == val)
+				continue; // duplicate (only possible at pos-1, the largest <= val)
+			for (uint32_t* q = out; q != pos; --q)
+				*q = *(q - 1);
+			*pos = val;
+			++out;
 		}
+		const size_t n = (size_t)(out - first);
+		uniqCount[v] = (MatIdx)n;
+		vertpatch2rows[v].patches.assign(first, first + n);
 	}
 
-#pragma omp parallel for
-	for (int v = 0; v < vertexPatches.size(); ++v) {
-		auto& vp = vertexPatches[v];
-		if (vp.empty()) continue;
-		std::sort(vp.begin(), vp.end());
-		vp.erase(std::unique(vp.begin(), vp.end()), vp.end());
-	}
-
-	// assign a row index within the solution vector x to each vertex/patch
-	std::vector<VertexPatchRow> vertpatch2rows(vertices.size());
-
-	std::vector<MatIdx> counts(vertices.size());
-
-#pragma omp parallel for
-	for (int v = 0; v < vertices.size(); ++v)
-		counts[v] = vertexPatches[v].size();
-
+	// Assign a contiguous row index to each (vertex,patch) pair.
 	MatIdx rowsX = 0;
-	for (size_t v = 0; v < counts.size(); ++v) {
-		MatIdx c = counts[v];
-		counts[v] = rowsX;
-		rowsX += c;
+	std::vector<MatIdx> base(numVertices);
+	for (size_t v = 0; v < numVertices; ++v) {
+		base[v] = rowsX;
+		rowsX += uniqCount[v];
 	}
 
-#pragma omp parallel for
-	for (int v = 0; v < vertices.size(); ++v) {
+#pragma omp parallel for schedule(static)
+	for (int64_t v = 0; v < (int64_t)numVertices; ++v) {
 		auto& dst = vertpatch2rows[v];
-		const auto& vp = vertexPatches[v];
-
-		dst.patches = vp;
-		dst.rows.resize(vp.size());
-
-		MatIdx base = counts[v];
-		for (size_t i = 0; i < vp.size(); ++i)
-			dst.rows[i] = base + i;
+		const MatIdx b = base[v];
+		const size_t n = dst.patches.size();
+		dst.rows.resize(n);
+		for (size_t i = 0; i < n; ++i)
+			dst.rows[i] = b + (MatIdx)i;
 	}
 
 	// fill Tikhonov's Gamma matrix (regularization constraints)
 	const float lambda = 0.1f;
 	const float w = lambda * lambda;
 
-	CLISTDEF0(MatEntry) AtATriplets;
-	AtATriplets.Reserve(vertices.size() * 8);
+	CLISTDEF0(MatEntry) AtATriplets; // sized exactly in the merge below
 
 	Eigen::MatrixXf Atb = Eigen::MatrixXf::Zero(rowsX, 3);
 
@@ -3058,11 +3640,8 @@ void MeshTexture::GlobalSeamLeveling()
 				const SeamVertex::Patch& patch0 =
 					seamVertex.patches[indices[i]];
 
-				const uint32_t label =
-					texturePatches[patch0.idxPatch].label;
-
 				SampleImage sampler(
-					images[label].image
+					PatchSrcImage(patch0.idxPatch)
 				);
 
 				for (const auto& edge : patch0.edges) {
@@ -3120,28 +3699,44 @@ void MeshTexture::GlobalSeamLeveling()
 		}
 	}
 
-	// -------- SERIAL MERGE --------
+	// -------- MERGE --------
+	// Concatenate the per-thread triplet lists into one contiguous array.
+	// The lists are disjoint and MatEntry is trivially copyable, so we size
+	// the destination exactly once (thread blocks + the Tikhonov diagonal)
+	// and let threads memcpy their block into place in parallel. The old
+	// code copied every triplet one-by-one through Insert() on a single
+	// thread, reallocating as it grew.
+	const float eps = 1e-6f;
 
+	std::vector<IDX> triOffset(numThreads + 1, 0);
+	for (int t = 0; t < numThreads; ++t)
+		triOffset[t + 1] = triOffset[t] + threadTriplets[t].GetSize();
+	const IDX totalTri = triOffset[numThreads];
+
+	AtATriplets.Resize(totalTri + (IDX)rowsX);
+
+#pragma omp parallel for schedule(dynamic, 1)
 	for (int t = 0; t < numThreads; ++t) {
-		auto& localTriplets = threadTriplets[t];
-		const IDX n = localTriplets.GetSize();
+		const IDX n = threadTriplets[t].GetSize();
+		if (n)
+			std::memcpy(AtATriplets.Begin() + triOffset[t],
+				threadTriplets[t].Begin(),
+				(size_t)n * sizeof(MatEntry));
+	}
 
-		AtATriplets.Reserve(AtATriplets.GetSize() + n);
+	// Tikhonov diagonal epsilon occupies the disjoint tail region.
+#pragma omp parallel for schedule(static)
+	for (int64_t i = 0; i < (int64_t)rowsX; ++i)
+		AtATriplets[totalTri + (IDX)i] = MatEntry((MatIdx)i, (MatIdx)i, eps);
 
-		for (IDX i = 0; i < n; ++i)
-			AtATriplets.Insert(localTriplets[i]);
-
+	// Atb accumulation stays serial: seam rows collide across threads and
+	// the volume (seam constraints only) is tiny next to the triplets.
+	for (int t = 0; t < numThreads; ++t)
 		for (auto& acc : threadAtb[t]) {
 			Atb(acc.first, 0) += acc.second[0];
 			Atb(acc.first, 1) += acc.second[1];
 			Atb(acc.first, 2) += acc.second[2];
 		}
-	}
-
-	const float eps = 1e-6f;
-
-	for (MatIdx i = 0; i < rowsX; ++i)
-		AtATriplets.emplace_back(i, i, eps);
 
 	SparseMatRM Lhs(rowsX, rowsX);
 	Lhs.reserve(AtATriplets.GetSize());
@@ -3202,7 +3797,7 @@ void MeshTexture::GlobalSeamLeveling()
 		TexturePatch& texturePatch = texturePatches[idxPatch];
 
 		// ---- build row indices once for this patch ----
-		static thread_local std::vector<MatIdx> faceRowIndices;
+		auto& faceRowIndices = gseam::faceRowIndices; // thread_local scratch (released post-seam)
 
 		const size_t needed = texturePatch.faces.size() * 3;
 		if (faceRowIndices.size() < needed)
@@ -3230,7 +3825,7 @@ void MeshTexture::GlobalSeamLeveling()
 			}
 		}
 
-		static thread_local ColorMap imageAdj;
+		auto& imageAdj = gseam::imageAdj; // thread_local scratch (released post-seam)
 		if (imageAdj.size() != texturePatch.rect.size())
 			imageAdj.create(texturePatch.rect.size());
 
@@ -3238,7 +3833,7 @@ void MeshTexture::GlobalSeamLeveling()
 		std::memset(imageAdj.data, 0,
 			imageAdj.width() * imageAdj.height() * sizeof(Color));
 
-		static thread_local std::vector<uint8_t> mask;
+		auto& mask = gseam::mask; // thread_local scratch (released post-seam)
 		int w = texturePatch.rect.width;
 		const int h = texturePatch.rect.height;
 		const int n = w * h;
@@ -3277,12 +3872,12 @@ void MeshTexture::GlobalSeamLeveling()
 
 		// dilate with one pixel width, in order to make sure patch border smooths out a little
 		// Fused and optimized for DilateMean<1> case
-		const Image& img = images[texturePatch.label];
+		const Image8U3& imgImage = PatchSrcImage(idxPatch);
 
 		cv::Rect roi = texturePatch.rect;
 
-		const int imgW = img.image.cols;
-		const int imgH = img.image.rows;
+		const int imgW = imgImage.cols;
+		const int imgH = imgImage.rows;
 
 		// Clamp left/top by shrinking
 		if (roi.x < 0) {
@@ -3308,7 +3903,7 @@ void MeshTexture::GlobalSeamLeveling()
 		}
 
 		// Use roi (NOT texturePatch.rect)
-		cv::Mat image(img.image(roi));
+		cv::Mat image(imgImage(roi));
 		uint8_t* maskData = mask.data();
 
 		w = image.cols;
@@ -3381,6 +3976,17 @@ void MeshTexture::GlobalSeamLeveling()
 // set to one in order to dilate also on the diagonal of the border
 // (normally not needed)
 #define DILATE_EXTRA 0
+
+// Per-thread ProcessMask3 scratch, reused across patches so LocalSeamLeveling
+// does not re-allocate the patch-sized visited/frontier buffers 168x per run.
+// Namespace-scope thread_local (not function-local static) so ReleaseSeamScratch
+// can free it after seam leveling. Pure scratch -> semantics-neutral.
+namespace { namespace pmask {
+	thread_local std::vector<int> frontier;
+	thread_local std::vector<int> nextFrontier;
+	thread_local std::vector<uint8_t> visited;
+} }
+
 void MeshTexture::ProcessMask3(Image8U& mask)
 {
 	typedef Image8U::Type Type;
@@ -3477,12 +4083,16 @@ void MeshTexture::ProcessMask3(Image8U& mask)
 
 	const int nPix = width * height;
 
-	std::vector<int> frontier;
-	std::vector<int> nextFrontier;
+	// reused thread_local scratch (released post-seam via ReleaseSeamScratch)
+	std::vector<int>& frontier = pmask::frontier;
+	std::vector<int>& nextFrontier = pmask::nextFrontier;
+	std::vector<uint8_t>& visited = pmask::visited;
+	frontier.clear();
+	nextFrontier.clear();
 	frontier.reserve(width * 4);        // heuristic
 	nextFrontier.reserve(width * 4);
 
-	std::vector<uint8_t> visited(nPix, 0);
+	visited.assign(nPix, 0);
 
 	// ------------------------------------------------------------
 	// 1) Initial frontier (single full scan)
@@ -3802,6 +4412,35 @@ static void SolvePoissonSOR_Compact(
 #endif
 }
 
+// Per-thread Poisson (LocalSeamLeveling) scratch; namespace-scope thread_local
+// so ReleaseSeamScratch can free it after seam leveling instead of it staying
+// pinned (sized to the largest patch x every worker) for the whole run.
+namespace { namespace pseam {
+	thread_local TImage<MatIdx> indices;
+	thread_local std::vector<PoissonStencil> stencil;
+	thread_local std::vector<float> xR, xG, xB, bR, bG, bB;
+	thread_local std::vector<MatIdx> redInterior, blackInterior;
+} }
+
+// Free every per-thread seam-leveling scratch buffer. Must be called once per
+// worker (from an omp parallel region) so each thread releases its OWN copies.
+// Pure scratch -> semantics-neutral; buffers are re-grown on next use.
+static void ReleaseSeamScratch()
+{
+	std::vector<MatIdx>().swap(gseam::faceRowIndices);
+	gseam::imageAdj.release();
+	std::vector<uint8_t>().swap(gseam::mask);
+	pseam::indices.release();
+	std::vector<PoissonStencil>().swap(pseam::stencil);
+	std::vector<float>().swap(pseam::xR); std::vector<float>().swap(pseam::xG); std::vector<float>().swap(pseam::xB);
+	std::vector<float>().swap(pseam::bR); std::vector<float>().swap(pseam::bG); std::vector<float>().swap(pseam::bB);
+	std::vector<MatIdx>().swap(pseam::redInterior);
+	std::vector<MatIdx>().swap(pseam::blackInterior);
+	std::vector<int>().swap(pmask::frontier);
+	std::vector<int>().swap(pmask::nextFrontier);
+	std::vector<uint8_t>().swap(pmask::visited);
+}
+
 void MeshTexture::PoissonBlendingNoBias(
 	const Image32F3& src,
 	Image32F3& dst,
@@ -3817,7 +4456,7 @@ void MeshTexture::PoissonBlendingNoBias(
 	const int n = width * height;
 
 	// Compact indexing (now using tiles)
-	static thread_local TImage<MatIdx> indices;
+	auto& indices = pseam::indices; // thread_local scratch (released post-seam)
 
 	if (indices.size() != dst.size()) {
 		indices.create(dst.size());   // or whatever alloc method TImage uses
@@ -3846,11 +4485,11 @@ void MeshTexture::PoissonBlendingNoBias(
 		}
 	}
 
-	static thread_local std::vector<PoissonStencil> stencil;
-	static thread_local std::vector<float> xR, xG, xB;
-	static thread_local std::vector<float> bR, bG, bB;
-	static thread_local std::vector<MatIdx> redInterior;
-	static thread_local std::vector<MatIdx> blackInterior;
+	auto& stencil = pseam::stencil; // thread_local scratch (released post-seam)
+	auto& xR = pseam::xR; auto& xG = pseam::xG; auto& xB = pseam::xB;
+	auto& bR = pseam::bR; auto& bG = pseam::bG; auto& bB = pseam::bB;
+	auto& redInterior = pseam::redInterior;
+	auto& blackInterior = pseam::blackInterior;
 
 	stencil.resize(nnz);
 	xR.resize(nnz);
@@ -3998,7 +4637,9 @@ void MeshTexture::PoissonBlendingNoBias(
 		blackInterior,
 		1.7f,    // omega
 		0.f, // drop tolereance1e-6f,    // tolerance
-		25 /* JPB WIP BUG On 400 */       // max iters
+		25       // max iters (400 tested: no effect on the residual boundary
+		         // lines, so LocalSeamLeveling convergence is NOT the cause;
+		         // kept low for speed)
 	);
 
 	// Scatter back
@@ -4108,6 +4749,7 @@ void MeshTexture::PoissonBlending(const Image32F3& src, Image32F3& dst, const Im
 #if 1
 void MeshTexture::LocalSeamLeveling()
 {
+	TEX_PROFILE_SCOPE("LocalSeamLeveling (total)");
 	ASSERT(!seamVertices.empty());
 	const uint32_t numPatches = (uint32_t)texturePatches.size();
 
@@ -4228,17 +4870,57 @@ void MeshTexture::LocalSeamLeveling()
 		}
 	};
 
-	cv::setNumThreads(1); // Disable OpenCV threading
+	const int prevCvThreads = cv::getNumThreads();
+	cv::setNumThreads(0);
 
 	// Better to fully thread
   // Notice, we must use dynamic scheduling here as patch size can vary a lot and cause load imbalance.
-	const int T = omp_get_max_threads();
+	int T = omp_get_max_threads();
+
+	// MEMORY-BUDGET THREAD CAP (see TEXTURE_SEAM_MEM_BUDGET_GB): the per-thread patch
+	// buffers below (2x Image32F3 + mask + Poisson scratch, ~80 B/px) sized to the
+	// LARGEST patch x T workers are the transient that sets the texturing peak on res-0.
+	// Cap T so that footprint stays under the budget. Fewer workers -> identical output,
+	// just less parallelism. 0 disables the cap.
+	if (TEXTURE_SEAM_MEM_BUDGET_GB > 0) {
+		uint64_t maxPatchArea = 0;
+		for (uint32_t p = 0; p < numPatches; ++p) {
+			const TexturePatch& tp = texturePatches[p];
+			if (tp.label == NO_ID || tp.rect.width <= 0 || tp.rect.height <= 0)
+				continue;
+			const uint64_t area = (uint64_t)tp.rect.width * (uint64_t)tp.rect.height;
+			if (area > maxPatchArea)
+				maxPatchArea = area;
+		}
+		if (maxPatchArea > 0) {
+			// Effective peak footprint per worker. The LIVE buffers are only ~77 B/px
+			// (2x Image32F3 = 24, mask = 1, Poisson stencil = 16, 6 float x/b = 24,
+			// red/black interior ~8, indices = 4). BUT the measured peak is ~4x that:
+			// the per-patch cv::Mat::create()/vector resize() churn transiently holds
+			// OLD+NEW during realloc, and the pseam:: vectors keep their LARGEST-patch
+			// capacity across patches. A naive 80 B/px model never fired (cap computed
+			// > core count) and the peak blew ~27 GB past an 8 GB budget on a real
+			// 227-image res-0 scene, so use the empirically-observed ~256 B/px.
+			const uint64_t perThreadBytes = maxPatchArea * 256ull;
+			const uint64_t budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_GB * 1024ull * 1024ull * 1024ull;
+			int cap = (int)(budgetBytes / perThreadBytes);
+			if (cap < 1)
+				cap = 1;
+			// Always log the decision (even when NOT capping) so the memory budget is
+			// observable in the profile trace.
+			DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (largest patch %llu px, ~%.2f GB/thread est, %d GB budget)",
+				T, (cap < T ? cap : T), (unsigned long long)maxPatchArea,
+				perThreadBytes / (1024.0*1024.0*1024.0), (int)TEXTURE_SEAM_MEM_BUDGET_GB);
+			if (cap < T)
+				T = cap;
+		}
+	}
 
 	std::vector<Image32F3> tlsImage((size_t)T);
 	std::vector<Image32F3> tlsImageOrg((size_t)T);
 	std::vector<Image8U> tlsMask((size_t)T);
 
-#pragma omp parallel for schedule(dynamic, 4)
+#pragma omp parallel for schedule(dynamic, 4) num_threads(T)
 	for (int i = 0; i < (int)numPatches; ++i) {
 		const int tid = omp_get_thread_num();
 
@@ -4257,7 +4939,7 @@ void MeshTexture::LocalSeamLeveling()
 			continue;
 		}
 
-		const Image8U3& image0 = images[texturePatch.label].image;
+		const Image8U3& image0 = PatchSrcImage(idxPatch);
 		const cv::Size sz = texturePatch.rect.size();
 
 		if (image.size() != sz) {
@@ -4346,7 +5028,7 @@ void MeshTexture::LocalSeamLeveling()
 							const TexCoord& p1Adj = patch1Adj.proj;
 
 							const Image8U3& image1 =
-								images[texturePatches[patch1.idxPatch].label].image;
+								PatchSrcImage(patch1.idxPatch);
 
 							RasterPatch data(
 								image, mask,
@@ -4360,7 +5042,7 @@ void MeshTexture::LocalSeamLeveling()
 					}
 				}
 				else {
-					// Rare non-manifold case — fallback to original logic
+					// Rare non-manifold case â€” fallback to original logic
 					for (uint32_t idxVertPatch1 = 0;
 						idxVertPatch1 < numPatchesAtVertex;
 						++idxVertPatch1) {
@@ -4390,7 +5072,7 @@ void MeshTexture::LocalSeamLeveling()
 						const TexCoord& p1Adj = patch1Adj.proj;
 
 						const Image8U3& image1 =
-							images[texturePatches[patch1.idxPatch].label].image;
+							PatchSrcImage(patch1.idxPatch);
 
 						RasterPatch data(
 							image, mask,
@@ -4408,7 +5090,7 @@ void MeshTexture::LocalSeamLeveling()
 			// render vertex color
 			AccumColor accumColor;
 			for (const SeamVertex::Patch& patch : seamVertex0.patches) {
-				const Image8U3& img = images[texturePatches[patch.idxPatch].label].image;
+				const Image8U3& img = PatchSrcImage(patch.idxPatch);
 				accumColor.Add(img.sample<Sampler, Color>(sampler, patch.proj) / 255.f, 1.f);
 			}
 
@@ -4427,10 +5109,14 @@ void MeshTexture::LocalSeamLeveling()
 		cv::Mat imagePatch(image0(texturePatch.rect));
 		for (int r = 0; r < image.rows; ++r) {
 			Pixel8U* row = imagePatch.ptr<Pixel8U>(r);
+			// Cache the mask/image row bases once per row: rows are contiguous, so
+			// maskRow[c]/imgRow[c] avoid cv::Mat_::operator()'s per-pixel step*r recompute.
+			const uint8_t* const maskRow = mask.ptr<uint8_t>(r);
+			const Color* const imgRow = image.ptr<Color>(r);
 			for (int c = 0; c < image.cols; ++c) {
-				if (mask(r, c) == empty)
+				if (maskRow[c] == empty)
 					continue;
-				const Color& a = image(r, c);
+				const Color& a = imgRow[c];
 				Pixel8U& v = row[c];
 				// scale once
 				__m128 af = _mm_set_ps(0.0f, a[2] * 255.f, a[1] * 255.f, a[0] * 255.f);
@@ -4458,7 +5144,7 @@ void MeshTexture::LocalSeamLeveling()
 		}
 	}
 
-	cv::setNumThreads(-1); // Restore OpenCV threading
+	cv::setNumThreads(prevCvThreads); // Restore OpenCV threading
 
 #ifdef COUNT_ITERATIONS
 	double tt = iterations;
@@ -4857,9 +5543,112 @@ static bool PackShelfReasonablySquare(
   return true;
 }
 
+// TEXTURE_OUTWARD_DILATE_PX: after the atlas is assembled, bleed real texel
+// colors outward into the empty (colEmpty) background by this many pixels via a
+// frontier flood (each ring = mean of known neighbors). Fills atlas gutters /
+// seams and grows the textured margin outward so the edge fades into plausible
+// color instead of a hard empty band -- the "dilate the texture to fill the
+// outside" effect, benefiting both the 3D mesh and the ortho. 0 = disabled.
+#ifndef TEXTURE_OUTWARD_DILATE_PX
+#define TEXTURE_OUTWARD_DILATE_PX 24
+#endif
+
+// TEXTURE_ATLAS_FULL_FLOOD: when 1, the outward dilation does not stop after
+// TEXTURE_OUTWARD_DILATE_PX rings -- it keeps flooding until EVERY colEmpty texel in
+// the atlas has been filled with its nearest known colour (the background gap between
+// patches is fully padded). This is the standard "seamless atlas gutter" and it is the
+// real fix for the thin DARK RIM that traces a patch/fill silhouette: with a bounded
+// 24px margin the observed patch edge still borders dark colEmpty a little further out,
+// and GPU MIPMAP MINIFICATION (when the surface is viewed at distance) averages across
+// that margin into the dark background, painting a dark line along the edge. Leaving no
+// colEmpty anywhere near a used texel means no mip level can ever pull in the dark
+// background, so the rim disappears at every viewing distance. The flood is a single
+// frontier pass over the atlas (each texel filled once) so it is O(atlas area) -- the
+// extra rings past 24 only touch the still-empty background, which is never sampled at
+// base resolution, so this changes nothing at full res and only sanitises the mip chain.
+// 0 = keep the bounded TEXTURE_OUTWARD_DILATE_PX margin (previous behaviour).
+#ifndef TEXTURE_ATLAS_FULL_FLOOD
+#define TEXTURE_ATLAS_FULL_FLOOD 1
+#endif
+
+// When --max-texture-size is NEGATIVE, the final atlas is capped to the GPU's
+// GL_MAX_TEXTURE_SIZE instead of a fixed value: the viewer is always OpenGL, so
+// that is the largest atlas it can upload without doing its own crude rescale.
+// (0 keeps its original meaning: UNBOUNDED / no cap.) Windows-only: spin up a
+// throwaway hidden-window WGL context once, query GL_MAX_TEXTURE_SIZE, tear it
+// down, and cache the result. On any failure (headless / no driver) fall back to
+// 16384, the minimum every modern GL implementation guarantees.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+#pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "user32.lib")
+#endif
+
+static int GetOpenGLMaxTextureSize()
+{
+	static int cached = 0;
+	if (cached != 0)
+		return cached;
+	int result = 16384; // GL guaranteed minimum; safe fallback
+#ifdef _WIN32
+	WNDCLASSA wc = {};
+	wc.lpfnWndProc = DefWindowProcA;
+	wc.hInstance = GetModuleHandleA(nullptr);
+	wc.lpszClassName = "OpenMVS_GLProbe";
+	RegisterClassA(&wc);
+	if (HWND hWnd = CreateWindowA(wc.lpszClassName, "", WS_OVERLAPPEDWINDOW, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr)) {
+		if (HDC hDC = GetDC(hWnd)) {
+			PIXELFORMATDESCRIPTOR pfd = {};
+			pfd.nSize = sizeof(pfd);
+			pfd.nVersion = 1;
+			pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+			pfd.iPixelType = PFD_TYPE_RGBA;
+			pfd.cColorBits = 32;
+			pfd.cDepthBits = 24;
+			pfd.iLayerType = PFD_MAIN_PLANE;
+			const int pf = ChoosePixelFormat(hDC, &pfd);
+			if (pf && SetPixelFormat(hDC, pf, &pfd)) {
+				if (HGLRC hRC = wglCreateContext(hDC)) {
+					if (wglMakeCurrent(hDC, hRC)) {
+						GLint maxTex = 0;
+						glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+						if (maxTex >= 1024)
+							result = (int)maxTex;
+						wglMakeCurrent(nullptr, nullptr);
+					}
+					wglDeleteContext(hRC);
+				}
+			}
+			ReleaseDC(hWnd, hDC);
+		}
+		DestroyWindow(hWnd);
+	}
+	UnregisterClassA(wc.lpszClassName, wc.hInstance);
+#endif
+	cached = result;
+	return cached;
+}
+
 void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
 {
+	// --max-texture-size < 0 => cap the final atlas to the GPU's native
+	// GL_MAX_TEXTURE_SIZE (the viewer is OpenGL). == 0 keeps its original meaning:
+	// UNBOUNDED (no cap). Resolved once here so BOTH the packer's starting
+	// dimension and the final "enforce max size" step use it.
+	if (nMaxTextureSize < 0) {
+		nMaxTextureSize = GetOpenGLMaxTextureSize();
+		DEBUG_EXTRA("Texture max size < 0 -> GL_MAX_TEXTURE_SIZE = %d", nMaxTextureSize);
+	}
 	// project patches in the corresponding view and compute texture-coordinates and bounding-box
+	TEX_PROFILE_BEGIN(_tGtProject);
 	const int border(2);
 	faceTexcoords.resize(faces.size() * 3);
 #ifdef TEXOPT_USE_OPENMP
@@ -4872,13 +5661,24 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		TexturePatch& texturePatch = *pTexturePatch;
 #endif
 		const Image& imageData = images[texturePatch.label];
+#if TEXTURE_CROP_IMAGES
+		// Pixels were released after ListCameraFaces; use the stored dimensions (camera
+		// is intact). They equal the res-0 loaded size, so these projections + rects match
+		// the image that will be reloaded and cropped immediately after this loop.
+		const int imgCols = (int)imageData.width;
+		const int imgRows = (int)imageData.height;
+#else
+		const int imgCols = imageData.image.cols;
+		const int imgRows = imageData.image.rows;
+#endif
 		AABB2f aabb(true);
 		for (const FIndex idxFace : texturePatch.faces) {
 			const Face& face = faces[idxFace];
 			TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
 			for (int i = 0; i < 3; ++i) {
 				texcoords[i] = imageData.camera.ProjectPointP(vertices[face[i]]);
-				ASSERT(imageData.image.isInsideWithBorder(texcoords[i], border));
+				ASSERT(texcoords[i].x >= (float)border && texcoords[i].x < (float)(imgCols - border) &&
+					texcoords[i].y >= (float)border && texcoords[i].y < (float)(imgRows - border));
 				aabb.InsertFull(texcoords[i]);
 			}
 		}
@@ -4891,8 +5691,8 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		// Clamp BEFORE building rect
 		x0 = std::max(0, x0);
 		y0 = std::max(0, y0);
-		x1 = std::min(imageData.image.cols, x1);
-		y1 = std::min(imageData.image.rows, y1);
+		x1 = std::min(imgCols, x1);
+		y1 = std::min(imgRows, y1);
 
 		texturePatch.rect = cv::Rect(
 			x0,
@@ -4916,29 +5716,158 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				texcoords[v] -= offset;
 		}
 	}
+	TEX_PROFILE_END(_tGtProject, "GenerateTexture: project patches");
+
+	LogPeakMem("GenTex: after projection");
+
+#if TEXTURE_CROP_IMAGES
+	// PER-PATCH EXTRACTION: give every texture patch its OWN pixel buffer, cropped from
+	// the source image to just THAT patch's rect (full resolution), then rebase the rect
+	// to its own origin (0,0). A union-per-label crop failed because on aerial data a
+	// single image's assigned faces scatter across MANY components, so the union bbox is
+	// ~the whole image (no saving). Per-patch keeps only the sum of the actual patch rects
+	// (~= the atlas area), dropping resident image memory ~20 GB -> ~1-2 GB at FULL res.
+	// Coordinate-transparent: faceTexcoords stay 0-based to the old rect and every
+	// downstream stage reads PatchSrcImage(idx) at faceTexcoords + rect.tl(); with rect
+	// rebased to (0,0) that is exactly the patch-local coordinate. The overlapping-patch
+	// MERGE is DISABLED below when this is on (it would reassign a contained patch's faces
+	// to another patch's buffer, which no longer shares source pixels).
+	{
+		TEX_PROFILE_SCOPE("GenerateTexture: extract per-patch images");
+		const uint32_t nImages = (uint32_t)images.size();
+		std::vector<std::vector<uint32_t>> patchesByLabel(nImages);
+		for (uint32_t p = 0; p < texturePatches.GetSize(); ++p) {
+			const TexturePatch& tp = texturePatches[p];
+			if (tp.label == NO_ID || tp.rect.width <= 0 || tp.rect.height <= 0)
+				continue;
+			patchesByLabel[tp.label].push_back(p);
+		}
+		std::vector<uint32_t> usedLabels;
+		usedLabels.reserve(nImages);
+		for (uint32_t lbl = 0; lbl < nImages; ++lbl)
+			if (!patchesByLabel[lbl].empty())
+				usedLabels.push_back(lbl);
+
+		// Decode into a BOUNDED set of REUSED per-thread buffers instead of a fresh
+		// imageData.image per image. Image::ReadImage() calls image.create(H,W), which
+		// REUSES an existing same-size buffer, so at res-0 (all source images identical
+		// size) each worker decodes every one of its images into the SAME scratch Mat.
+		// The OpenCV allocator therefore never grows past ~nThreads full images (~1.8 GB)
+		// instead of retaining all 367 freed decodes (~20 GB). That retention is why the
+		// peak was ~46 GB: release() returns each decode to OpenCV's OWN CRT heap free
+		// list, and the app-side _heapmin() cannot decommit a different module's heap, so
+		// the freed 20 GB stayed committed under every later stage. The tiny crops
+		// (~0.6 GB total) are cloned out and kept; the scratch is freed right after.
+		const int T = std::max(1, omp_get_max_threads());
+		std::vector<Image8U3> reloadScratch((size_t)T);
+#ifdef TEXOPT_USE_OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(T)
+#endif
+		for (int li = 0; li < (int)usedLabels.size(); ++li) {
+			const uint32_t label = usedLabels[(size_t)li];
+			Image& imageData = images[label];
+			Image8U3& scratch = reloadScratch[(size_t)omp_get_thread_num()];
+
+			// decode the full source image into the reused scratch (create() reuses the
+			// buffer when the size matches -> no per-image allocation churn)
+			unsigned level(nResolutionLevel);
+			const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
+			if (Image::ReadImage(imageData.name, scratch) == NULL)
+				continue; // decode failed; patches keep empty images -> skipped downstream
+			// match the resolution level ListCameraFaces used (res-0 => imageSize == full
+			// original, so no resize and the scratch buffer is reused verbatim)
+			if ((unsigned)MAXF(scratch.cols, scratch.rows) > imageSize) {
+				const double s = (double)imageSize / (double)MAXF(scratch.cols, scratch.rows);
+				cv::resize(scratch, scratch, cv::Size(), s, s, cv::INTER_AREA);
+			}
+			imageData.UpdateCamera(scene.platforms);
+			if (scratch.empty())
+				continue;
+
+			const int srcW = scratch.cols, srcH = scratch.rows;
+			for (const uint32_t p : patchesByLabel[label]) {
+				TexturePatch& tp = texturePatches[p];
+				cv::Rect r = tp.rect;
+				// clamp to the reloaded image (projection already clamped; defensive)
+				if (r.x < 0) { r.width += r.x; r.x = 0; }
+				if (r.y < 0) { r.height += r.y; r.y = 0; }
+				if (r.x + r.width > srcW) r.width = srcW - r.x;
+				if (r.y + r.height > srcH) r.height = srcH - r.y;
+				if (r.width <= 0 || r.height <= 0) { tp.rect = cv::Rect(0, 0, 0, 0); continue; }
+				tp.image = scratch(r).clone();               // private full-res crop
+				tp.rect = cv::Rect(0, 0, r.width, r.height); // rebase to its own origin
+			}
+		}
+		// free the (few) reused decode buffers now that all crops are cloned out
+		reloadScratch.clear();
+		reloadScratch.shrink_to_fit();
+		// [CROP-DECOMP] TEMP decisive measurement: is the +20 GB after this stage the
+		// CROPS themselves, or retained/committed image-decode memory that our buffer
+		// management can't reach? Sum the actual bytes held in every patch crop. If this
+		// prints ~0.6 GB while curWS jumped ~20 GB, the crops are NOT the hog (it is
+		// OpenCV/jpeg decode retention). If it prints ~20 GB, the patch rects really are
+		// huge and the packing-area estimate was wrong. Remove once answered.
+		{
+			size_t cropBytes = 0, cropPx = 0; unsigned nCrop = 0, nBig = 0; size_t maxPx = 0;
+			for (uint32_t p = 0; p < texturePatches.GetSize(); ++p) {
+				const Image8U3& im = texturePatches[p].image;
+				if (im.empty()) continue;
+				const size_t px = (size_t)im.total();
+				cropBytes += px * im.elemSize(); cropPx += px; ++nCrop;
+				if (px > maxPx) maxPx = px;
+				if (px > 4000000) ++nBig; // patches bigger than ~2000x2000
+			}
+			DEBUG_EXTRA("[CROP-DECOMP] crops=%.2f GB (%u patches, %.1f Mpx total, largest %.1f Mpx, %u patches >4Mpx)",
+				cropBytes / (1024.0*1024.0*1024.0), nCrop, cropPx / 1e6, maxPx / 1e6, nBig);
+		}
+		LogPeakMem("GenTex: after per-patch extract");
+	}
+#endif // TEXTURE_CROP_IMAGES
 
 	// perform seam leveling
 	// (is introducing a green tint).
 	if (texturePatches.GetSize() > 2 && (bGlobalSeamLeveling || bLocalSeamLeveling)) {
 		// create seam vertices and edges
+		TEX_PROFILE_BEGIN(_tGtSeamVerts);
 		CreateSeamVertices();
+		TEX_PROFILE_END(_tGtSeamVerts, "GenerateTexture: CreateSeamVertices");
+		LogPeakMem("GenTex: after CreateSeamVertices");
 
 		// perform global seam leveling
-		if (bGlobalSeamLeveling) {
+		if (bGlobalSeamLeveling && TEXTURE_ENABLE_GLOBAL_SEAM) {
 			TD_TIMER_STARTD();
 			GlobalSeamLeveling();
 			DEBUG_ULTIMATE("\tglobal seam leveling completed (%s)", TD_TIMER_GET_FMT().c_str());
 		}
+		LogPeakMem("GenTex: after GlobalSeamLeveling");
 
 		// perform local seam leveling
-		if (bLocalSeamLeveling) {
+		if (bLocalSeamLeveling && TEXTURE_ENABLE_LOCAL_SEAM) {
 			TD_TIMER_STARTD();
 			LocalSeamLeveling();
 			DEBUG_ULTIMATE("\tlocal seam leveling completed (%s)", TD_TIMER_GET_FMT().c_str());
 		}
+		LogPeakMem("GenTex: after LocalSeamLeveling");
+
+		// Release the per-thread seam-leveling scratch now. It is thread_local
+		// (lives for the whole run in the OMP worker pool) and sized to the
+		// largest patch, so otherwise it stays resident straight through the
+		// data-color bake + save. Each worker frees its OWN copies via this
+		// parallel region (semantics-neutral: pure scratch, re-grown on next use).
+#ifdef TEXOPT_USE_OPENMP
+#pragma omp parallel
+		{ ReleaseSeamScratch(); }
+#else
+		ReleaseSeamScratch();
+#endif
 	}
+	LogPeakMem("GenTex: after seam leveling (pre-merge)");
 
 	// merge texture patches with overlapping rectangles
+	TEX_PROFILE_BEGIN(_tGtMergePatches);
+#if !TEXTURE_CROP_IMAGES
+	// (disabled under per-patch extraction: each patch owns a PRIVATE rebased crop, so a
+	// contained patch cannot be re-pointed into another patch's buffer)
 	for (unsigned i = 0; i < texturePatches.size(); ++i) {
 		TexturePatch& texturePatchBig = texturePatches[i];
 
@@ -4964,6 +5893,8 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			texturePatches.RemoveAtMove(j); // j stays the same (new element moved into j)
 		}
 	}
+#endif // !TEXTURE_CROP_IMAGES
+	TEX_PROFILE_END(_tGtMergePatches, "GenerateTexture: merge overlapping patches");
 
 	// create texture
 	{
@@ -4982,6 +5913,7 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		// Optional: hard safety cap so you don't allocate something insane
 		const int hardCap = 262144; // pick something you can tolerate
 
+		TEX_PROFILE_BEGIN(_tGtPack);
 		bool ok = false;
 
 		while (!ok) {
@@ -5009,86 +5941,153 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		}
 
 		rects.swap(placed);
+		TEX_PROFILE_END(_tGtPack, "GenerateTexture: rect packing");
 
+		LogPeakMem("GenTex: after seam+pack");
+		TEX_PROFILE_BEGIN(_tGtAssemble);
 		textureDiffuse.create(atlasH, atlasW);
-		textureDiffuse.setTo(cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
+		{
+			const cv::Scalar emptyScalar(colEmpty.b, colEmpty.g, colEmpty.r);
+#ifdef TEXOPT_USE_OPENMP
+			// Parallelize the whole-atlas background fill across row bands
+			// (cv::Mat::setTo is single-threaded); identical result.
+#pragma omp parallel
+			{
+				const int nth = omp_get_num_threads();
+				const int tid = omp_get_thread_num();
+				const int band = (atlasH + nth - 1) / nth;
+				const int r0 = tid * band;
+				const int r1 = std::min(atlasH, r0 + band);
+				if (r1 > r0)
+					textureDiffuse.rowRange(r0, r1).setTo(emptyScalar);
+			}
+#else
+			textureDiffuse.setTo(emptyScalar);
+#endif
+		}
+
+		// Assemble the atlas GROUPED BY SOURCE IMAGE (label), releasing each image's
+		// pixel buffer the moment its last patch has been copied. On a high-res scene
+		// the source images are ~15 GB; during the (thread-capped, minutes-long)
+		// LocalSeamLeveling the OS pages most of them out, then a naive parallel-over-
+		// patches assemble faults ALL of them back in at once -> a ~15 GB spike that
+		// sets the whole GenerateTexture peak (observed 45.7 GB on a 367-image res-0
+		// scene, PageFaultCount ~114M = thrashing). Processing one label at a time and
+		// releasing its image keeps only ~nThreads images resident during assemble
+		// instead of all of them. Each label is owned by exactly one thread, so the
+		// per-image release is race-free. Output is bit-identical (same copy + same
+		// per-face UV offsets); only the traversal order and image lifetime change.
+		std::vector<std::vector<int_t>> patchesByLabel(images.size());
+		for (int_t i = 0; i < (int_t)texturePatches.size(); ++i)
+			patchesByLabel[texturePatches[i].label].push_back(i);
+		std::vector<uint32_t> usedLabels;
+		usedLabels.reserve(images.size());
+		for (uint32_t lbl = 0; lbl < (uint32_t)images.size(); ++lbl)
+			if (!patchesByLabel[lbl].empty())
+				usedLabels.push_back(lbl);
 
 #ifdef TEXOPT_USE_OPENMP
-#pragma omp parallel for schedule(static, 1)
+#pragma omp parallel for schedule(dynamic)
 #endif
-		for (int_t i = 0; i < (int_t)texturePatches.size(); ++i)
+		for (int_t li = 0; li < (int_t)usedLabels.size(); ++li)
 		{
-			const TexturePatch& texturePatch = texturePatches[i];
-			const RectsBinPack::Rect& rect = rects[i];
+			const uint32_t label = usedLabels[(size_t)li];
 
-			int x = 0;
-			int y = 1;
+			for (const int_t i : patchesByLabel[label])
+			{
+				TexturePatch& texturePatch = texturePatches[i];
+				const RectsBinPack::Rect& rect = rects[i];
 
-			const Image& imageData = images[texturePatch.label];
+				int x = 0;
+				int y = 1;
 
-			// Clamp ROI to image bounds BEFORE making cv::Mat(roi)
-			cv::Rect roi = texturePatch.rect;
+				// Source pixels: per-patch crop (TEXTURE_CROP_IMAGES) or shared source image.
+				const Image8U3& srcImg = PatchSrcImage((uint32_t)i);
+				const int imgW = srcImg.cols;
+				const int imgH = srcImg.rows;
 
-			const int imgW = imageData.image.cols;
-			const int imgH = imageData.image.rows;
+				// Clamp ROI to image bounds BEFORE making cv::Mat(roi)
+				cv::Rect roi = texturePatch.rect;
 
-			// Clamp left/top by shrinking width/height
-			if (roi.x < 0) {
-				roi.width += roi.x;
-				roi.x = 0;
-			}
-			if (roi.y < 0) {
-				roi.height += roi.y;
-				roi.y = 0;
-			}
-
-			// Clamp right/bottom
-			if (roi.x + roi.width > imgW) {
-				roi.width = imgW - roi.x;
-			}
-			if (roi.y + roi.height > imgH) {
-				roi.height = imgH - roi.y;
-			}
-
-			// Skip if invalid
-			if (roi.width <= 0 || roi.height <= 0) {
-				continue;
-			}
-
-			cv::Mat patch(imageData.image(roi));
-
-			if (rect.width != roi.width) {
-				patch = patch.t();
-				x = 1;
-				y = 0;
-			}
-
-			patch.copyTo(textureDiffuse(rect));
-
-#if 0
-			// --- DEBUG: color atlas by camera index instead of copying image ---
-			cv::Scalar debugColor(
-				(texturePatch.label * 53) % 255,
-				(texturePatch.label * 97) % 255,
-				(texturePatch.label * 193) % 255
-			);
-
-			textureDiffuse(rect).setTo(debugColor);
-#endif
-
-			// Update per-face UV offsets
-			const TexCoord offset(rect.tl());
-			for (const FIndex idxFace : texturePatch.faces) {
-				TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
-				for (int v = 0; v < 3; ++v) {
-					TexCoord& texcoord = texcoords[v];
-
-					float u = texcoord[x] + offset.x;
-					float v2 = texcoord[y] + offset.y;
-
-					texcoord = TexCoord(u, v2);
+				// Clamp left/top by shrinking width/height
+				if (roi.x < 0) {
+					roi.width += roi.x;
+					roi.x = 0;
 				}
+				if (roi.y < 0) {
+					roi.height += roi.y;
+					roi.y = 0;
+				}
+
+				// Clamp right/bottom
+				if (roi.x + roi.width > imgW) {
+					roi.width = imgW - roi.x;
+				}
+				if (roi.y + roi.height > imgH) {
+					roi.height = imgH - roi.y;
+				}
+
+				// Skip if invalid
+				if (roi.width <= 0 || roi.height <= 0) {
+#if TEXTURE_CROP_IMAGES
+					texturePatch.image.release();
+#endif
+					continue;
+				}
+
+				const cv::Mat patch(srcImg(roi));
+
+				if (rect.width != roi.width) {
+					x = 1;
+					y = 0;
+					// Transpose directly into the atlas ROI: one pass, no temp Mat
+					// (avoids patch.t()'s allocation + a second copyTo).
+					cv::transpose(patch, textureDiffuse(rect));
+				}
+				else {
+					patch.copyTo(textureDiffuse(rect));
+				}
+
+				// Update per-face UV offsets
+				const TexCoord offset(rect.tl());
+				for (const FIndex idxFace : texturePatch.faces) {
+					TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+					for (int v = 0; v < 3; ++v) {
+						TexCoord& texcoord = texcoords[v];
+
+						float u = texcoord[x] + offset.x;
+						float v2 = texcoord[y] + offset.y;
+
+						texcoord = TexCoord(u, v2);
+					}
+				}
+
+#if TEXTURE_CROP_IMAGES
+				// per-patch buffer consumed -> free it immediately
+				texturePatch.image.release();
+#endif
 			}
+
+#if !TEXTURE_CROP_IMAGES
+			// This image's pixels are fully consumed -> free them now so the atlas
+			// assemble never holds more than ~nThreads source images resident.
+			images[label].image.release();
+#endif
+		}
+		TEX_PROFILE_END(_tGtAssemble, "GenerateTexture: assemble atlas");
+
+		// Release any remaining source-image pixel buffers (labels with no patches,
+		// or invalid/unreferenced images). The referenced ones were freed inline in
+		// the label loop above. Every remaining step in GenerateTexture (outward
+		// dilate, data-color bake, resize/sharpen) operates SOLELY on textureDiffuse
+		// and never samples images[].image again. Metadata/cameras stay intact;
+		// ReloadImage would restore pixels on demand if a later stage needed them.
+		{
+			TEX_PROFILE_SCOPE("GenerateTexture: release source images");
+			for (Image& imageData : images)
+				imageData.image.release();
+			TrimHeap(); // decommit the freed crop/image pages before the atlas post-processing
+			LogPeakMem("GenTex: after releasing source images");
 		}
 
 #if 0
@@ -5121,10 +6120,1058 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		}
 #endif
 
-		// 4) Enforce max size BEFORE allocating huge texture
-		const int nMaxTextureSize = 60000;
+#if TEXTURE_OUTWARD_DILATE_PX > 0
+		// ------------------------------------------------------------
+		// Texture dilation: bleed real texel colors outward into the empty
+		// (colEmpty) background by TEXTURE_OUTWARD_DILATE_PX pixels via a
+		// frontier flood (each ring = mean of known neighbors). Fills atlas
+		// gutters/seams and grows the textured margin outward so the edge fades
+		// into plausible color instead of a hard empty band. Full-res (pre-resize).
+		// ------------------------------------------------------------
+		{
+			TEX_PROFILE_SCOPE("GenerateTexture: outward dilate");
+			const int H = textureDiffuse.rows, W = textureDiffuse.cols;
+			const uint8_t eb = (uint8_t)colEmpty.b, eg = (uint8_t)colEmpty.g, er = (uint8_t)colEmpty.r;
+			cv::Mat_<uint8_t> known(H, W);
+			// Cache raw base pointers + row strides once: the flood loops do random
+			// (yy,xx) neighbor access millions of times; direct base[y*stride+x]
+			// indexing avoids cv::Mat_::operator()/at<>()'s per-call step-member
+			// read and type dispatch.
+			uint8_t* const kbase = known.ptr<uint8_t>(0);
+			const size_t kstride = known.step.p[0];
+			cv::Vec3b* const tbase = textureDiffuse.ptr<cv::Vec3b>(0);
+			const size_t tstride = textureDiffuse.step.p[0] / sizeof(cv::Vec3b);
+#pragma omp parallel for schedule(static)
+			for (int y = 0; y < H; ++y) {
+				const cv::Vec3b* row = tbase + (size_t)y * tstride;
+				uint8_t* k = kbase + (size_t)y * kstride;
+				for (int x = 0; x < W; ++x)
+					k[x] = (row[x][0] == eb && row[x][1] == eg && row[x][2] == er) ? 0 : 1;
+			}
+			std::vector<cv::Point> frontier, next;
+			// Initial frontier build (parallel; Jacobi wave -> frontier order does not
+			// affect the result, so per-thread collection + concat is neutral).
+			{
+				const int nThreads = omp_get_max_threads();
+				std::vector<std::vector<cv::Point>> tls((size_t)nThreads);
+#pragma omp parallel
+				{
+					std::vector<cv::Point>& loc = tls[(size_t)omp_get_thread_num()];
+#pragma omp for schedule(static)
+					for (int y = 0; y < H; ++y) {
+						const uint8_t* krow = kbase + (size_t)y * kstride;
+						for (int x = 0; x < W; ++x) {
+							if (krow[x]) continue;
+							bool adj = false;
+							for (int dy = -1; dy <= 1 && !adj; ++dy) {
+								const int yy = y + dy;
+								if ((unsigned)yy >= (unsigned)H) continue;
+								const uint8_t* knrow = kbase + (size_t)yy * kstride;
+								for (int dx = -1; dx <= 1; ++dx) {
+									const int xx = x + dx;
+									if ((unsigned)xx < (unsigned)W && knrow[xx] == 1) { adj = true; break; }
+								}
+							}
+							if (adj) loc.emplace_back(x, y);
+						}
+					}
+				}
+				for (std::vector<cv::Point>& v : tls) frontier.insert(frontier.end(), v.begin(), v.end());
+			}
+			// Ring cap: bounded margin, OR a full flood of every colEmpty texel (mip-safe,
+			// kills the dark rim). (H + W) is >= the max Manhattan distance from any empty
+			// texel to a known one, so it always completes the flood; the loop still exits
+			// early via `!frontier.empty()` once nothing is left to fill.
+			const int dilateRings = TEXTURE_ATLAS_FULL_FLOOD ? (H + W) : TEXTURE_OUTWARD_DILATE_PX;
+			for (int it = 0; it < dilateRings && !frontier.empty(); ++it) {
+				const int nFront = (int)frontier.size();
+				std::vector<cv::Vec3b> fillCol(nFront);
+#pragma omp parallel for schedule(static)
+				for (int i = 0; i < nFront; ++i) {
+					const int x = frontier[i].x, y = frontier[i].y;
+					cv::Vec3i sum(0, 0, 0); int n = 0;
+					for (int dy = -1; dy <= 1; ++dy) {
+						const int yy = y + dy;
+						if ((unsigned)yy >= (unsigned)H) continue;
+						const uint8_t* knrow = kbase + (size_t)yy * kstride;
+						const cv::Vec3b* tnrow = tbase + (size_t)yy * tstride;
+						for (int dx = -1; dx <= 1; ++dx) {
+							const int xx = x + dx;
+							if ((unsigned)xx < (unsigned)W && knrow[xx] == 1) {
+								sum += cv::Vec3i(tnrow[xx]); ++n;
+							}
+						}
+					}
+					fillCol[i] = n ? cv::Vec3b((uchar)(sum[0] / n), (uchar)(sum[1] / n), (uchar)(sum[2] / n)) : cv::Vec3b(eb, eg, er);
+				}
+#pragma omp parallel for schedule(static)
+				for (int i = 0; i < nFront; ++i) {
+					const int x = frontier[i].x, y = frontier[i].y;
+					uint8_t& kxy = kbase[(size_t)y * kstride + x];
+					if (kxy == 1) continue;
+					tbase[(size_t)y * tstride + x] = fillCol[i];
+					kxy = 1;
+				}
+				next.clear();
+				next.reserve((size_t)nFront * 2);
+				for (int i = 0; i < nFront; ++i) {
+					const int x = frontier[i].x, y = frontier[i].y;
+					for (int dy = -1; dy <= 1; ++dy) {
+						const int yy = y + dy;
+						if ((unsigned)yy >= (unsigned)H) continue;
+						uint8_t* knrow = kbase + (size_t)yy * kstride;
+						for (int dx = -1; dx <= 1; ++dx) {
+							const int xx = x + dx;
+							if ((unsigned)xx < (unsigned)W && knrow[xx] == 0) {
+								knrow[xx] = 2; // tentatively queued (dedup within wave)
+								next.emplace_back(xx, yy);
+							}
+						}
+					}
+				}
+				for (const cv::Point& p : next) {
+					uint8_t& kp = kbase[(size_t)p.y * kstride + p.x];
+					if (kp == 2) kp = 0;
+				}
+				frontier.swap(next);
+			}
+		}
+#endif // TEXTURE_OUTWARD_DILATE_PX
 
-		if (std::max(textureDiffuse.cols, textureDiffuse.rows) > nMaxTextureSize) {
+#if TEXTURE_DATACOLOR_UNOBSERVED && TEXTURE_DATACOLOR_BAKE
+		// ------------------------------------------------------------
+		// Data-color faces with NO genuine camera view (smear-propagation was
+		// skipped for them). Take the color from the OBSERVED faces adjacent to
+		// them on the same surface (their real texture color) and propagate it
+		// inward along the mesh, baking a per-vertex gradient texel into the atlas.
+		// This gives a locally-correct color instead of smeared neighbor texture.
+		// ------------------------------------------------------------
+		{
+			{
+				TEX_PROFILE_SCOPE("GenerateTexture: data-color bake");
+				std::vector<uint8_t> covered(faces.size(), 0);
+				for (const TexturePatch& tp : texturePatches)
+					for (const FIndex fc : tp.faces)
+						covered[fc] = 1;
+				std::vector<FIndex> noViewFaces;
+				for (FIndex f = 0; f < (FIndex)faces.size(); ++f)
+					if (!covered[f])
+						noViewFaces.push_back(f);
+				if (!noViewFaces.empty()) {
+					// PER-VERTEX color so shared vertices get ONE color -> the per-face
+					// gradient baked below is C0-continuous across shared edges (no facet
+					// seams). A flat per-face color is ALWAYS faceted (constant per triangle,
+					// jumps at every edge) no matter how much the field is smoothed.
+					const int cols = textureDiffuse.cols;
+					const int oldRows = textureDiffuse.rows;
+					const int N = (int)noViewFaces.size();
+					const size_t NV = vertices.size();
+					std::vector<uint8_t> vUsed(NV, 0);
+					for (int i = 0; i < N; ++i) {
+						const Face& face = faces[noViewFaces[i]];
+						vUsed[face[0]] = vUsed[face[1]] = vUsed[face[2]] = 1;
+					}
+					// compact list of the unobserved-region vertices: the sampling and
+					// diffusion loops below touch only these, not the whole mesh (the old
+					// code rescanned all NV vertices 2x per smoothing iteration).
+					std::vector<uint32_t> usedList;
+					usedList.reserve((size_t)N * 2);
+					for (size_t v = 0; v < NV; ++v) if (vUsed[v]) usedList.push_back((uint32_t)v);
+					const int NU = (int)usedList.size();
+					const uint32_t* __restrict pUsed = usedList.data();
+					std::vector<float> vr(NV, 0.f), vg(NV, 0.f), vb(NV, 0.f);
+					std::vector<uint8_t> vValid(NV, 0);
+					// vSeed marks the boundary vertices seeded directly from real observed
+					// texture; these are PINNED during smoothing so the fill boundary never
+					// drifts away from the texture it meets (kills the hard fill/real seam).
+					std::vector<uint8_t> vSeed(NV, 0);
+					// Seed the unobserved-region BOUNDARY vertices with the REAL color of
+					// the OBSERVED faces adjacent to them (sampled from the atlas at the
+					// observed face's texels). faceTexcoords for covered faces are absolute
+					// atlas pixel coords at this point. The diffusion below then spreads this
+					// colour inward ALONG THE MESH SURFACE, so each unobserved face takes the
+					// colour of the nearest observed surface it is connected to -- not a 3D
+					// point-cloud average that blends unrelated surfaces.
+					{
+						const int texW = textureDiffuse.cols, texH = textureDiffuse.rows;
+						const uchar eB = colEmpty.b, eG = colEmpty.g, eR = colEmpty.r;
+						// Cache base pointer + row stride once: the seed sampler does scattered
+						// (sy,sx) reads; base[sy*stride+sx] avoids cv::Mat::at<>()'s per-call
+						// step read + type dispatch.
+						const cv::Vec3b* const texBase = textureDiffuse.ptr<cv::Vec3b>(0);
+						const size_t texStride = textureDiffuse.step.p[0] / sizeof(cv::Vec3b);
+						std::vector<float> ssr(NV, 0.f), ssg(NV, 0.f), ssb(NV, 0.f);
+						std::vector<uint32_t> scnt(NV, 0);
+						// Barycentric interpolation factors from a boundary vertex toward the
+						// observed triangle's centroid. Sampling SEVERAL texels a little way
+						// INSIDE the triangle (never the exact corner, which frequently lands on
+						// a patch gutter / seam-levelling border) and averaging them makes the
+						// seed robust to single-pixel JPEG/compression noise. The old code took
+						// one texel at the raw corner -- the main source of the "wrong colour"
+						// fill, because that single pixel was often a gutter or outlier texel.
+						static const float kSeedT[4] = { 0.18f, 0.34f, 0.50f, 0.66f };
+						for (const TexturePatch& tp : texturePatches) {
+							for (const FIndex fc : tp.faces) {
+								const Face& face = faces[fc];
+								if (!(vUsed[face[0]] || vUsed[face[1]] || vUsed[face[2]]))
+									continue; // face doesn't touch the fill region
+								const TexCoord* tc = faceTexcoords.data() + (size_t)fc * 3;
+								const float cx = (tc[0].x + tc[1].x + tc[2].x) * (1.f / 3.f);
+								const float cy = (tc[0].y + tc[1].y + tc[2].y) * (1.f / 3.f);
+								for (int k = 0; k < 3; ++k) {
+									const uint32_t v = face[k];
+									if (!vUsed[v]) continue; // only boundary verts feed the fill
+									float ar = 0.f, ag = 0.f, ab = 0.f; int an = 0;
+									for (int s = 0; s < 4; ++s) {
+										const float t = kSeedT[s];
+										const int sx = (int)(tc[k].x + (cx - tc[k].x) * t + 0.5f);
+										const int sy = (int)(tc[k].y + (cy - tc[k].y) * t + 0.5f);
+										if ((unsigned)sx >= (unsigned)texW || (unsigned)sy >= (unsigned)texH) continue;
+										const cv::Vec3b& bgr = texBase[(size_t)sy * texStride + sx];
+										if (bgr[0] == eB && bgr[1] == eG && bgr[2] == eR) continue; // skip empty/gutter texels
+										ar += (float)bgr[2]; ag += (float)bgr[1]; ab += (float)bgr[0]; ++an;
+									}
+									if (an > 0) {
+										const float inv = 1.f / (float)an;
+										ssr[v] += ar * inv; ssg[v] += ag * inv; ssb[v] += ab * inv;
+										++scnt[v];
+									}
+								}
+							}
+						}
+						for (int u = 0; u < NU; ++u) {
+							const uint32_t v = pUsed[u];
+							if (scnt[v] > 0) {
+								const float inv = 1.f / (float)scnt[v];
+								vr[v] = ssr[v] * inv; vg[v] = ssg[v] * inv; vb[v] = ssb[v] * inv;
+								vValid[v] = 1; vSeed[v] = 1;
+							}
+						}
+					}
+					// global average of the valid colors (fallback so unfilled vertices
+					// NEVER use the empty color, which would speckle)
+					double gsr = 0, gsg = 0, gsb = 0; size_t gcnt = 0;
+					for (int u = 0; u < NU; ++u) {
+						const uint32_t v = pUsed[u];
+						if (vValid[v]) { gsr += vr[v]; gsg += vg[v]; gsb += vb[v]; ++gcnt; }
+					}
+					const float gAvgR = gcnt ? (float)(gsr / gcnt) : (float)colEmpty.r;
+					const float gAvgG = gcnt ? (float)(gsg / gcnt) : (float)colEmpty.g;
+					const float gAvgB = gcnt ? (float)(gsb / gcnt) : (float)colEmpty.b;
+					// Build neighbour incidence (CSR) over the no-view faces ONCE, so each
+					// diffusion iteration is a conflict-free parallel Jacobi gather instead
+					// of a serial per-face scatter (+= into shared vertices). Each face
+					// contributes its two opposite vertices to every corner -- duplicates
+					// kept, matching the old per-face accumulation's weighting.
+					std::vector<uint32_t> off(NV + 1, 0);
+					for (int i = 0; i < N; ++i) {
+						const Face& face = faces[noViewFaces[i]];
+						off[face[0] + 1] += 2; off[face[1] + 1] += 2; off[face[2] + 1] += 2;
+					}
+					for (size_t v = 0; v < NV; ++v) off[v + 1] += off[v];
+					std::vector<uint32_t> nbr(off[NV]);
+					{
+						std::vector<uint32_t> cur(off.begin(), off.end());
+						for (int i = 0; i < N; ++i) {
+							const Face& face = faces[noViewFaces[i]];
+							const uint32_t a0 = face[0], a1 = face[1], a2 = face[2];
+							nbr[cur[a0]++] = a1; nbr[cur[a0]++] = a2;
+							nbr[cur[a1]++] = a0; nbr[cur[a1]++] = a2;
+							nbr[cur[a2]++] = a0; nbr[cur[a2]++] = a1;
+						}
+					}
+					// TWO-PHASE INPAINT (replaces the old single 240-iteration Jacobi blur,
+					// which did filling and smoothing in one loop and therefore averaged every
+					// component down to one flat colour = the "muddy smear").
+					//
+					// PHASE 1 -- FILL: propagate the boundary seed colour inward using the
+					// NEAREST valid neighbours only. Seeds stay fixed, so each interior vertex
+					// converges to the colour of the observed surface it is closest to along the
+					// mesh. A fill that spans two surfaces (e.g. grass->road) keeps grass near
+					// grass and road near road instead of blending into mud. Runs until the front
+					// stops advancing (fully filled, or an isolated remainder -> global average).
+					{
+						const int fillMax = 8192; // safety cap; loop early-exits when the front stalls
+						const uint32_t* __restrict pOff = off.data();
+						const uint32_t* __restrict pNbr = nbr.data();
+						std::vector<float> nr(vr), ng(vg), nb(vb);
+						std::vector<uint8_t> nValid(vValid);
+						for (int iter = 0; iter < fillMax; ++iter) {
+							int filled = 0;
+							const float* __restrict pvr = vr.data();
+							const float* __restrict pvg = vg.data();
+							const float* __restrict pvb = vb.data();
+							const uint8_t* __restrict pVal = vValid.data();
+							float* __restrict pnr = nr.data();
+							float* __restrict png = ng.data();
+							float* __restrict pnb = nb.data();
+							uint8_t* __restrict pnVal = nValid.data();
+#ifdef TEXOPT_USE_OPENMP
+							#pragma omp parallel for schedule(static) reduction(+:filled)
+#endif
+							for (int u = 0; u < NU; ++u) {
+								const uint32_t v = pUsed[u];
+								if (pVal[v]) { pnr[v] = pvr[v]; png[v] = pvg[v]; pnb[v] = pvb[v]; pnVal[v] = 1; continue; }
+								float sr = 0.f, sg = 0.f, sb = 0.f; uint32_t c = 0;
+								const uint32_t e = pOff[v + 1];
+								for (uint32_t k = pOff[v]; k < e; ++k) {
+									const uint32_t w = pNbr[k];
+									if (pVal[w]) { sr += pvr[w]; sg += pvg[w]; sb += pvb[w]; ++c; }
+								}
+								if (c > 0) { const float inv = 1.f / c; pnr[v] = sr * inv; png[v] = sg * inv; pnb[v] = sb * inv; pnVal[v] = 1; ++filled; }
+								else { pnr[v] = pvr[v]; png[v] = pvg[v]; pnb[v] = pvb[v]; pnVal[v] = 0; }
+							}
+							vr.swap(nr); vg.swap(ng); vb.swap(nb); vValid.swap(nValid);
+							if (filled == 0) break;
+						}
+					}
+					// PHASE 2 -- light seam smoothing: a BOUNDED number of averaging passes over
+					// the filled interior, with the boundary seed vertices PINNED. This blurs the
+					// propagation fronts left by phase 1 without collapsing the large-scale spatial
+					// variation (that is why it no longer needs the 240-iteration global blur), and
+					// pinning the seeds keeps the fill locked to the real texture at its border ->
+					// no visible fill/real seam.
+					{
+						const int iters = std::max(0, (int)TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS);
+						const uint32_t* __restrict pOff = off.data();
+						const uint32_t* __restrict pNbr = nbr.data();
+						const uint8_t* __restrict pSeed = vSeed.data();
+						std::vector<float> nr(vr), ng(vg), nb(vb);
+						for (int iter = 0; iter < iters; ++iter) {
+							const float* __restrict pvr = vr.data();
+							const float* __restrict pvg = vg.data();
+							const float* __restrict pvb = vb.data();
+							const uint8_t* __restrict pVal = vValid.data();
+							float* __restrict pnr = nr.data();
+							float* __restrict png = ng.data();
+							float* __restrict pnb = nb.data();
+#ifdef TEXOPT_USE_OPENMP
+							#pragma omp parallel for schedule(static)
+#endif
+							for (int u = 0; u < NU; ++u) {
+								const uint32_t v = pUsed[u];
+								if (pSeed[v] || !pVal[v]) { pnr[v] = pvr[v]; png[v] = pvg[v]; pnb[v] = pvb[v]; continue; }
+								float sr = pvr[v], sg = pvg[v], sb = pvb[v]; uint32_t c = 1;
+								const uint32_t e = pOff[v + 1];
+								for (uint32_t k = pOff[v]; k < e; ++k) {
+									const uint32_t w = pNbr[k];
+									if (pVal[w]) { sr += pvr[w]; sg += pvg[w]; sb += pvb[w]; ++c; }
+								}
+								const float inv = 1.f / c; pnr[v] = sr * inv; png[v] = sg * inv; pnb[v] = sb * inv;
+							}
+							vr.swap(nr); vg.swap(ng); vb.swap(nb);
+						}
+					}
+					// any vertex STILL unfilled (isolated from all valid color) -> global average
+					for (int u = 0; u < NU; ++u) {
+						const uint32_t v = pUsed[u];
+						if (!vValid[v]) { vr[v] = gAvgR; vg[v] = gAvgG; vb[v] = gAvgB; }
+					}
+#if TEXTURE_DATACOLOR_COMPONENT_BAKE
+					// COMPONENT-TILE bake: pack each connected component of no-view faces
+					// into ONE shared atlas tile and rasterise the smooth per-vertex colour
+					// field across the whole tile in a single pass. Faces sharing an edge
+					// share texels (same tile coordinate space) -> no per-face cell boundary,
+					// so the per-cell 8-bit quantization crazing of the per-face bake cannot
+					// appear. Because the colour is a smooth diffused field, the planar
+					// per-component projection tolerates the foldover of non-planar blobs.
+					const int gutter = 2;
+					const float targetMaxPx = (float)TEXTURE_DATACOLOR_FILL_RES;
+					const int maxTilePx = TEXTURE_DATACOLOR_FILL_MAX_TILE;
+					const int minTileDim = 2 + 2 * gutter;
+					// 1) connected components of the no-view faces (edge adjacency), split at
+					//    sharp creases so each tile stays near-planar (avoids the single-plane
+					//    projection foldover that turns steep faces into degenerate tile triangles
+					//    -> faint crack network). Colour is already continuous across the split.
+					const float tileNormalCos = (float)TEXTURE_DATACOLOR_TILE_NORMAL_COS;
+					std::vector<uint8_t> isNoView(faces.size(), 0);
+					for (int i = 0; i < N; ++i) isNoView[noViewFaces[i]] = 1;
+					std::vector<int> faceComp(faces.size(), -1);
+					std::vector<std::vector<FIndex>> compFaces;
+					{
+						std::vector<FIndex> bfs;
+						for (int i = 0; i < N; ++i) {
+							const FIndex f0 = noViewFaces[i];
+							if (faceComp[f0] != -1) continue;
+							const int cid = (int)compFaces.size();
+							compFaces.emplace_back();
+							faceComp[f0] = cid; bfs.clear(); bfs.push_back(f0);
+							while (!bfs.empty()) {
+								const FIndex f = bfs.back(); bfs.pop_back();
+								compFaces[cid].push_back(f);
+								const Normal& nf = scene.mesh.faceNormals[f];
+								const Mesh::FaceFaces& adj = faceFaces[f];
+								for (int k = 0; k < 3; ++k) {
+									const FIndex fn = adj[k];
+									if (fn == NO_ID || !isNoView[fn] || faceComp[fn] != -1) continue;
+									// keep the tile near-planar: don't cross a sharp crease
+									if (tileNormalCos > 0.f) {
+										const Normal& nn = scene.mesh.faceNormals[fn];
+										if (nf.dot(nn) < tileNormalCos) continue;
+									}
+									faceComp[fn] = cid; bfs.push_back(fn);
+								}
+							}
+						}
+					}
+					const int nComp = (int)compFaces.size();
+					// 2) per-component planar basis (avg face normal), projection bounds, tile size
+					struct Tile { Point3f c, t, b; float umin, vmin, scale; int x, y, w, h; };
+					std::vector<Tile> tiles(nComp);
+					for (int cc = 0; cc < nComp; ++cc) {
+						const std::vector<FIndex>& cfs = compFaces[cc];
+						Point3f nrm(0, 0, 0), cen(0, 0, 0); int vcnt = 0;
+						for (const FIndex f : cfs) {
+							const Normal& fnm = scene.mesh.faceNormals[f];
+							nrm.x += fnm.x; nrm.y += fnm.y; nrm.z += fnm.z;
+							const Face& face = faces[f];
+							for (int k = 0; k < 3; ++k) { const Vertex& P = vertices[face[k]]; cen.x += P.x; cen.y += P.y; cen.z += P.z; ++vcnt; }
+						}
+						const float invc = vcnt ? 1.f / (float)vcnt : 1.f;
+						cen.x *= invc; cen.y *= invc; cen.z *= invc;
+						float nl = std::sqrt(nrm.x * nrm.x + nrm.y * nrm.y + nrm.z * nrm.z);
+						if (nl < 1e-12f) { nrm = Point3f(0, 0, 1); nl = 1.f; }
+						nrm.x /= nl; nrm.y /= nl; nrm.z /= nl;
+						const Point3f a = (fabsf(nrm.x) < 0.9f) ? Point3f(1, 0, 0) : Point3f(0, 1, 0);
+						Point3f t(a.y * nrm.z - a.z * nrm.y, a.z * nrm.x - a.x * nrm.z, a.x * nrm.y - a.y * nrm.x);
+						float tl = std::sqrt(t.x * t.x + t.y * t.y + t.z * t.z); if (tl < 1e-12f) tl = 1.f;
+						t.x /= tl; t.y /= tl; t.z /= tl;
+						const Point3f bb(nrm.y * t.z - nrm.z * t.y, nrm.z * t.x - nrm.x * t.z, nrm.x * t.y - nrm.y * t.x);
+						float umin = 1e30f, umax = -1e30f, vmin = 1e30f, vmax = -1e30f;
+						for (const FIndex f : cfs) {
+							const Face& face = faces[f];
+							for (int k = 0; k < 3; ++k) {
+								const Vertex& P = vertices[face[k]];
+								const float du = (P.x - cen.x) * t.x + (P.y - cen.y) * t.y + (P.z - cen.z) * t.z;
+								const float dv = (P.x - cen.x) * bb.x + (P.y - cen.y) * bb.y + (P.z - cen.z) * bb.z;
+								umin = std::min(umin, du); umax = std::max(umax, du);
+								vmin = std::min(vmin, dv); vmax = std::max(vmax, dv);
+							}
+						}
+						const float eu = std::max(0.f, umax - umin), ev = std::max(0.f, vmax - vmin);
+						const float ext = std::max(eu, ev);
+						const float scale = (ext > 1e-9f) ? (targetMaxPx / ext) : 1.f;
+						int w = std::min(std::max((int)std::ceil(eu * scale) + 2 * gutter, minTileDim), maxTilePx);
+						int h = std::min(std::max((int)std::ceil(ev * scale) + 2 * gutter, minTileDim), maxTilePx);
+						if (w > cols) w = cols;
+						tiles[cc] = Tile{ cen, t, bb, umin, vmin, scale, 0, 0, w, h };
+					}
+					// 3) shelf-pack the tiles into appended atlas rows
+					int shelfX = 0, shelfY = 0, shelfH = 0;
+					for (int cc = 0; cc < nComp; ++cc) {
+						Tile& T = tiles[cc];
+						if (shelfX + T.w > cols) { shelfY += shelfH; shelfX = 0; shelfH = 0; }
+						T.x = shelfX; T.y = oldRows + shelfY;
+						shelfX += T.w; shelfH = std::max(shelfH, T.h);
+					}
+					const int extraRows = shelfY + shelfH;
+					cv::Mat newTex(oldRows + extraRows, cols, CV_8UC3, cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
+					textureDiffuse.copyTo(newTex(cv::Rect(0, 0, cols, oldRows)));
+					// Cache newTex base pointer + row stride once (shared read-only across the
+					// component-parallel loop; each thread writes a disjoint tile). Replaces the
+					// per-texel newTex.at<cv::Vec3b>() in the bake + flood hot loops.
+					cv::Vec3b* const nbase = newTex.ptr<cv::Vec3b>(0);
+					const size_t nstride = newTex.step.p[0] / sizeof(cv::Vec3b);
+					static const float kBayer4c[16] = { 0.f,8.f,2.f,10.f, 12.f,4.f,14.f,6.f, 3.f,11.f,1.f,9.f, 15.f,7.f,13.f,5.f };
+					const float detailGain = (float)TEXTURE_DATACOLOR_DETAIL_GAIN;
+					const int DETAIL_D = 64; // donor detail patch size (px)
+					// Reflection-padding (mirror) source = the ORIGINAL observed atlas, read-only
+					// (writes go to newTex, so sampling textureDiffuse here is thread-safe).
+					const float mirrorGain = (float)TEXTURE_DATACOLOR_MIRROR_GAIN;
+					const cv::Vec3b* const tdBase = textureDiffuse.ptr<cv::Vec3b>(0);
+					const size_t tdStride = textureDiffuse.step.p[0] / sizeof(cv::Vec3b);
+					const int tdW = textureDiffuse.cols, tdH = textureDiffuse.rows;
+					const uchar meB = (uchar)colEmpty.b, meG = (uchar)colEmpty.g, meR = (uchar)colEmpty.r;
+					// 4) rasterise each component's faces into its tile (Gouraud over the shared
+					//    field), then a small gutter dilation so GPU bilinear at the tile border
+					//    samples in-colour texels, not the colEmpty background. Tiles are disjoint
+					//    atlas regions and each face is in exactly one component -> parallel safe.
+#ifdef TEXOPT_USE_OPENMP
+					#pragma omp parallel for schedule(dynamic, 8)
+#endif
+					for (int cc = 0; cc < nComp; ++cc) {
+						const Tile& T = tiles[cc];
+						const int tx = T.x, ty = T.y, tw = T.w, th = T.h;
+						std::vector<uint8_t> painted((size_t)tw * th, 0);
+						// DETAIL DONOR: real high-frequency texture from the observed surface that
+						// borders this fill tile, so the fill carries foliage/gravel grain instead
+						// of reading as a flat blob. Pick the largest-area OBSERVED neighbour face,
+						// crop a square of real atlas texture around it, and high-pass it (subtract a
+						// blur) -> zero-mean grain in BGR. Added mirror-tiled onto the smooth base
+						// during the texel bake below. textureDiffuse here is still the ORIGINAL
+						// observed atlas (read-only) and covered faces keep absolute-atlas texcoords
+						// -> thread-safe.
+						cv::Mat detail; // DETAIL_D x DETAIL_D CV_32FC3 high-pass, empty => none
+						if (detailGain > 0.f) {
+							const int dW = textureDiffuse.cols, dH = textureDiffuse.rows;
+							FIndex donorFace = NO_ID; float donorArea = 0.f;
+							for (const FIndex f : compFaces[cc]) {
+								const Mesh::FaceFaces& adj = faceFaces[f];
+								for (int k = 0; k < 3; ++k) {
+									const FIndex fn = adj[k];
+									if (fn == NO_ID || !covered[fn]) continue;
+									const TexCoord* tc = faceTexcoords.data() + (size_t)fn * 3;
+									const float aw = std::max(std::max(tc[0].x, tc[1].x), tc[2].x) - std::min(std::min(tc[0].x, tc[1].x), tc[2].x);
+									const float ah = std::max(std::max(tc[0].y, tc[1].y), tc[2].y) - std::min(std::min(tc[0].y, tc[1].y), tc[2].y);
+									const float area = aw * ah;
+									if (area > donorArea) { donorArea = area; donorFace = fn; }
+								}
+							}
+							if (donorFace != NO_ID && dW >= DETAIL_D && dH >= DETAIL_D) {
+								const TexCoord* tc = faceTexcoords.data() + (size_t)donorFace * 3;
+								int x0 = (int)((tc[0].x + tc[1].x + tc[2].x) / 3.f) - DETAIL_D / 2;
+								int y0 = (int)((tc[0].y + tc[1].y + tc[2].y) / 3.f) - DETAIL_D / 2;
+								x0 = std::max(0, std::min(x0, dW - DETAIL_D));
+								y0 = std::max(0, std::min(y0, dH - DETAIL_D));
+								cv::Mat crop, low;
+								textureDiffuse(cv::Rect(x0, y0, DETAIL_D, DETAIL_D)).convertTo(crop, CV_32FC3);
+								cv::blur(crop, low, cv::Size(9, 9));
+								detail = crop - low; // zero-mean high-pass grain (BGR)
+							}
+						}
+						const cv::Vec3f* const dbase = detail.empty() ? nullptr : detail.ptr<cv::Vec3f>(0);
+						const size_t dstride = detail.empty() ? 0 : detail.step.p[0] / sizeof(cv::Vec3f);
+						for (const FIndex f : compFaces[cc]) {
+							const Face& face = faces[f];
+							float ax[3], ay[3], cr[3], cg[3], cb[3];
+							for (int k = 0; k < 3; ++k) {
+								const Vertex& P = vertices[face[k]];
+								const float du = (P.x - T.c.x) * T.t.x + (P.y - T.c.y) * T.t.y + (P.z - T.c.z) * T.t.z;
+								const float dv = (P.x - T.c.x) * T.b.x + (P.y - T.c.y) * T.b.y + (P.z - T.c.z) * T.b.z;
+								ax[k] = tx + gutter + (du - T.umin) * T.scale;
+								ay[k] = ty + gutter + (dv - T.vmin) * T.scale;
+								cr[k] = vr[face[k]]; cg[k] = vg[face[k]]; cb[k] = vb[face[k]];
+							}
+							TexCoord* texcoords = faceTexcoords.data() + (size_t)f * 3;
+							texcoords[0] = TexCoord(ax[0], ay[0]);
+							texcoords[1] = TexCoord(ax[1], ay[1]);
+							texcoords[2] = TexCoord(ax[2], ay[2]);
+							// MIRROR SOURCE: if this fill face borders an OBSERVED face, set up
+							// reflection padding across their shared edge. mS0,mS1 = this face's
+							// vertex slots on the shared edge; mFo = its far (opposite) slot;
+							// mOTsa/mOTsb/mOToc = the observed neighbour's atlas texcoords for
+							// (sharedA, sharedB, neighbourOpposite). A fill texel with barycentric
+							// depth d = w[mFo] from the shared edge samples the neighbour at bary
+							// (sharedA,sharedB,oppO) = ((1-d)*along, (1-d)*(1-along), d) -> the
+							// reflected point; blended by mirrorGain*(1-d) below.
+							int mS0 = -1, mS1 = -1, mFo = -1;
+							TexCoord mOTsa, mOTsb, mOToc;
+							if (mirrorGain > 0.f) {
+								const Mesh::FaceFaces& adjF = faceFaces[f];
+								for (int k = 0; k < 3; ++k) {
+									const FIndex fo = adjF[k];
+									if (fo == NO_ID || !covered[fo]) continue;
+									const Face& of = faces[fo];
+									int sSlot[2], ns = 0, oppSlot = -1;
+									for (int a = 0; a < 3; ++a) {
+										bool sh = (face[a] == of[0] || face[a] == of[1] || face[a] == of[2]);
+										if (sh) { if (ns < 2) sSlot[ns] = a; ++ns; } else oppSlot = a;
+									}
+									if (ns != 2 || oppSlot < 0) continue;
+									const uint32_t vsa = face[sSlot[0]], vsb = face[sSlot[1]];
+									int oa = -1, ob = -1, ocSlot = -1;
+									for (int b = 0; b < 3; ++b) {
+										if (of[b] == vsa) oa = b; else if (of[b] == vsb) ob = b; else ocSlot = b;
+									}
+									if (oa < 0 || ob < 0 || ocSlot < 0) continue;
+									const TexCoord* otc = faceTexcoords.data() + (size_t)fo * 3;
+									mS0 = sSlot[0]; mS1 = sSlot[1]; mFo = oppSlot;
+									mOTsa = otc[oa]; mOTsb = otc[ob]; mOToc = otc[ocSlot];
+									break;
+								}
+							}
+							const float denom = (ay[1] - ay[2]) * (ax[0] - ax[2]) + (ax[2] - ax[1]) * (ay[0] - ay[2]);
+							const float invDen = (fabsf(denom) > 1e-6f) ? 1.f / denom : 0.f;
+							int minx = (int)std::floor(std::min(ax[0], std::min(ax[1], ax[2])));
+							int maxx = (int)std::ceil (std::max(ax[0], std::max(ax[1], ax[2])));
+							int miny = (int)std::floor(std::min(ay[0], std::min(ay[1], ay[2])));
+							int maxy = (int)std::ceil (std::max(ay[0], std::max(ay[1], ay[2])));
+							minx = std::max(minx, tx); maxx = std::min(maxx, tx + tw - 1);
+							miny = std::max(miny, ty); maxy = std::min(maxy, ty + th - 1);
+							for (int py = miny; py <= maxy; ++py)
+								for (int px = minx; px <= maxx; ++px) {
+									const float fx = px + 0.5f, fy = py + 0.5f;
+									float w0 = ((ay[1] - ay[2]) * (fx - ax[2]) + (ax[2] - ax[1]) * (fy - ay[2])) * invDen;
+									float w1 = ((ay[2] - ay[0]) * (fx - ax[2]) + (ax[0] - ax[2]) * (fy - ay[2])) * invDen;
+									float w2 = 1.f - w0 - w1;
+									if (w0 < -0.01f || w1 < -0.01f || w2 < -0.01f) continue;
+									if (w0 < 0) w0 = 0; if (w1 < 0) w1 = 0; if (w2 < 0) w2 = 0;
+									const float s = w0 + w1 + w2; if (s <= 1e-6f) continue;
+									const float iw = 1.f / s; w0 *= iw; w1 *= iw; w2 *= iw;
+									float rr = cr[0]*w0 + cr[1]*w1 + cr[2]*w2;
+									float gg = cg[0]*w0 + cg[1]*w1 + cg[2]*w2;
+									float bv = cb[0]*w0 + cb[1]*w1 + cb[2]*w2;
+									// REFLECTION PADDING: mirror the observed neighbour's real texture
+									// across the shared edge into this fill texel, strong at the edge
+									// (seamless) and fading inward -> the fill carries real detail.
+									if (mS0 >= 0) {
+										const float wv[3] = { w0, w1, w2 };
+										const float d = wv[mFo];              // depth from shared edge
+										const float ab = wv[mS0] + wv[mS1];    // along-edge weight
+										if (ab > 1e-6f) {
+											const float along = wv[mS0] / ab;
+											const float bsa = (1.f - d) * along;
+											const float bsb = (1.f - d) * (1.f - along);
+											const float mmx = bsa * mOTsa.x + bsb * mOTsb.x + d * mOToc.x;
+											const float mmy = bsa * mOTsa.y + bsb * mOTsb.y + d * mOToc.y;
+											const int ix = (int)(mmx + 0.5f), iy = (int)(mmy + 0.5f);
+											if ((unsigned)ix < (unsigned)tdW && (unsigned)iy < (unsigned)tdH) {
+												const cv::Vec3b& mc = tdBase[(size_t)iy * tdStride + ix];
+												if (!(mc[0] == meB && mc[1] == meG && mc[2] == meR)) {
+													const float wm = mirrorGain * (1.f - d);
+													bv += wm * ((float)mc[0] - bv);
+													gg += wm * ((float)mc[1] - gg);
+													rr += wm * ((float)mc[2] - rr);
+												}
+											}
+										}
+									}
+									// inject real texture grain (mirror-tiled donor high-pass)
+									if (!detail.empty()) {
+										const int per = 2 * DETAIL_D;
+										int mx = (px - tx) % per; if (mx < 0) mx += per; if (mx >= DETAIL_D) mx = per - 1 - mx;
+										int my = (py - ty) % per; if (my < 0) my += per; if (my >= DETAIL_D) my = per - 1 - my;
+										const cv::Vec3f& dv = dbase[(size_t)my * dstride + mx];
+										bv += detailGain * dv[0]; gg += detailGain * dv[1]; rr += detailGain * dv[2];
+									}
+									const float dth = (kBayer4c[(py & 3) * 4 + (px & 3)] + 0.5f) * (1.f / 16.f) - 0.5f;
+									int ir = (int)(rr + 0.5f + dth); ir = ir < 0 ? 0 : (ir > 255 ? 255 : ir);
+									int ig = (int)(gg + 0.5f + dth); ig = ig < 0 ? 0 : (ig > 255 ? 255 : ig);
+									int ib = (int)(bv + 0.5f + dth); ib = ib < 0 ? 0 : (ib > 255 ? 255 : ib);
+#if TEXTURE_DATACOLOR_DEBUG_TINT || TEXTURE_DATACOLOR_DIAG_TINT
+									// DEBUG: mark all synthetic fill bright magenta (BGR 255,0,255)
+									ib = 255; ig = 0; ir = 255;
+#endif
+									nbase[(size_t)py * nstride + px] = cv::Vec3b((uchar)ib, (uchar)ig, (uchar)ir);
+									painted[(size_t)(py - ty) * tw + (px - tx)] = 1;
+								}
+						}
+						// FULL-TILE FLOOD: dilate the painted fill colour outward until the ENTIRE
+						// tile background is filled (not just a 2px gutter). The tile background is
+						// initialised to the dark colEmpty; if any of it survives near the fill's
+						// outer boundary, GPU bilinear filtering -- and especially mipmap
+						// minification -- blends the fill with that dark background and paints a
+						// dark rim tracing the fill edge (the observed patches avoid this via the
+						// 24px TEXTURE_OUTWARD_DILATE_PX; the fill tiles only had 2px). Flooding the
+						// whole tile with nearest-colour removes the dark background entirely, so the
+						// fill boundary blends cleanly into the surrounding real texture. Tiles are
+						// small (<=256px) so a full flood is cheap. (gutter still insets the triangle
+						// placement; this just guarantees no colEmpty is ever sampled.)
+						// FRONTIER (BFS wavefront) flood: same multi-source Jacobi rings as a
+						// full-tile-rescan-per-pass, but O(tile area) total instead of
+						// O(area * perimeter) -- only cells on the advancing front are visited,
+						// not the whole tile every pass. Each cell is filled with the average of
+						// its already-painted neighbours at the moment it is reached, and all
+						// cells of a ring are committed together (reads use the pre-ring painted
+						// state), so the rings and averages -- hence the output -- are identical
+						// to the rescan version.
+						std::vector<int> frontier, nextf;
+						std::vector<uint8_t> queued((size_t)tw * th, 0);
+						// seed: unpainted cells adjacent to a painted cell (one scan, O(area))
+						for (int ly = 0; ly < th; ++ly)
+							for (int lx = 0; lx < tw; ++lx) {
+								if (painted[(size_t)ly * tw + lx]) continue;
+								bool adj = false;
+								for (int dy = -1; dy <= 1 && !adj; ++dy) {
+									const int ny = ly + dy; if ((unsigned)ny >= (unsigned)th) continue;
+									for (int dx = -1; dx <= 1; ++dx) {
+										const int nx = lx + dx; if ((unsigned)nx >= (unsigned)tw) continue;
+										if (painted[(size_t)ny * tw + nx]) { adj = true; break; }
+									}
+								}
+								if (adj) { const int id = (int)((size_t)ly * tw + lx); frontier.push_back(id); queued[id] = 1; }
+							}
+						std::vector<std::pair<int, cv::Vec3b>> adds;
+						while (!frontier.empty()) {
+							adds.clear();
+							for (const int id : frontier) {
+								const int ly = id / tw, lx = id % tw;
+								cv::Vec3i sum(0, 0, 0); int cntn = 0;
+								for (int dy = -1; dy <= 1; ++dy) {
+									const int ny = ly + dy; if ((unsigned)ny >= (unsigned)th) continue;
+									for (int dx = -1; dx <= 1; ++dx) {
+										const int nx = lx + dx; if ((unsigned)nx >= (unsigned)tw) continue;
+										if (!painted[(size_t)ny * tw + nx]) continue;
+										sum += cv::Vec3i(nbase[(size_t)(ty + ny) * nstride + (tx + nx)]); ++cntn;
+									}
+								}
+								if (cntn) adds.emplace_back(id, cv::Vec3b((uchar)(sum[0] / cntn), (uchar)(sum[1] / cntn), (uchar)(sum[2] / cntn)));
+							}
+							if (adds.empty()) break;
+							// commit this ring (all reads above used the pre-ring painted state)
+							for (const auto& ad : adds) {
+								const int ly = ad.first / tw, lx = ad.first % tw;
+								nbase[(size_t)(ty + ly) * nstride + (tx + lx)] = ad.second;
+								painted[ad.first] = 1;
+							}
+							// build next front from the newly painted cells' unpainted neighbours
+							nextf.clear();
+							for (const auto& ad : adds) {
+								const int ly = ad.first / tw, lx = ad.first % tw;
+								for (int dy = -1; dy <= 1; ++dy) {
+									const int ny = ly + dy; if ((unsigned)ny >= (unsigned)th) continue;
+									for (int dx = -1; dx <= 1; ++dx) {
+										const int nx = lx + dx; if ((unsigned)nx >= (unsigned)tw) continue;
+										const int nid = (int)((size_t)ny * tw + nx);
+										if (!painted[nid] && !queued[nid]) { queued[nid] = 1; nextf.push_back(nid); }
+									}
+								}
+							}
+							frontier.swap(nextf);
+						}
+					}
+#if TEXTURE_DATACOLOR_FEATHER_RINGS > 0
+					// ------------------------------------------------------------
+					// SEAM BLEND: make the boundary of the real observed texture disappear --
+					// both where it meets the synthesized fill AND where the mesh simply ends
+					// (the silhouette/rim). Over a band of OBSERVED faces (up to K face-rings
+					// from the boundary) the observed texture is cross-faded toward the FILL's
+					// OWN pinned colour field, ramping from FEATHER_STRENGTH at the boundary to
+					// 0 at the band's inner edge. Because both sides use the SAME colour along
+					// the shared mesh edge, there is no continuity break (no jagged seam line);
+					// and the fade to a smooth colour also matches the fill's blurriness so the
+					// sharp-vs-blurry mismatch is gone too. Per-vertex ring (shared at a vertex)
+					// keeps the ramp continuous across shared edges.
+					{
+						const int K = (int)TEXTURE_DATACOLOR_FEATHER_RINGS;
+						const float maxAlpha = (float)TEXTURE_DATACOLOR_FEATHER_STRENGTH;
+						// 1) face BFS ring index. Ring 0 = every COVERED (real-texture) face on
+						//    the BOUNDARY of the textured region -- i.e. adjacent to a no-view
+						//    fill face OR to an OPEN mesh edge (faceFaces == NO_ID, the mesh
+						//    silhouette/rim). Seeding the rim as well lets the feather soften the
+						//    crisp silhouette where the mesh simply ENDS (the fill/flood halo
+						//    beyond it is blurry, so a hard crisp edge stands out), not only the
+						//    observed<->fill seam. One O(faces) scan.
+						std::vector<int> fRing(faces.size(), -1);
+						std::vector<FIndex> cur, nxt, bandFaces;
+						for (FIndex f = 0; f < (FIndex)faces.size(); ++f) {
+							if (!covered[f]) continue;
+							const Mesh::FaceFaces& adj = faceFaces[f];
+							bool boundary = false;
+							for (int k = 0; k < 3; ++k) {
+								const FIndex fn = adj[k];
+								if (fn == NO_ID || !covered[fn]) { boundary = true; break; }
+							}
+							if (boundary) { fRing[f] = 0; cur.push_back(f); bandFaces.push_back(f); }
+						}
+						for (int r = 1; r < K && !cur.empty(); ++r) {
+							nxt.clear();
+							for (const FIndex f : cur) {
+								const Mesh::FaceFaces& adj = faceFaces[f];
+								for (int k = 0; k < 3; ++k) {
+									const FIndex fn = adj[k];
+									if (fn == NO_ID || !covered[fn] || fRing[fn] != -1) continue;
+									fRing[fn] = r; nxt.push_back(fn); bandFaces.push_back(fn);
+								}
+							}
+							cur.swap(nxt);
+						}
+						if (!bandFaces.empty()) {
+							const size_t NVv = vertices.size();
+							// 2) per-vertex ring (min over incident band faces) -> the alpha ramp.
+							std::vector<int> vRing(NVv, K);
+							for (const FIndex f : bandFaces) {
+								const Face& face = faces[f];
+								for (int k = 0; k < 3; ++k) { const uint32_t v = face[k]; if (fRing[f] < vRing[v]) vRing[v] = fRing[f]; }
+							}
+							// 3) CONTINUITY BLEND (replaces the box-blur smear, which left a jagged
+							//    seam: it blurred each side toward its OWN neighbourhood, so the
+							//    observed and fill values still differed at the shared mesh edge).
+							//    Instead, blend the observed band toward the FILL's OWN pinned colour
+							//    field (vr/vg/vb): extend that field outward across the band, then at
+							//    each band texel mix observed->fill-colour by the ramped alpha (1 at
+							//    the boundary, 0 at the band's inner edge). At the shared edge the
+							//    observed target IS vr/vg/vb -- exactly what the fill face uses there
+							//    -- so both sides evaluate the SAME colour along the edge => no seam.
+							//    Moving inward the alpha fades so the real detail returns; the flatten
+							//    toward the (smooth) fill colour also matches the fill's blurriness.
+							std::vector<float> tr(NVv, 0.f), tg(NVv, 0.f), tb(NVv, 0.f);
+							std::vector<uint8_t> tv(NVv, 0);
+							for (const FIndex f : bandFaces) {
+								const Face& face = faces[f];
+								for (int k = 0; k < 3; ++k) {
+									const uint32_t v = face[k];
+									if (!tv[v] && vValid[v]) { tr[v] = vr[v]; tg[v] = vg[v]; tb[v] = vb[v]; tv[v] = 1; }
+								}
+							}
+							// propagate the fill colour outward to every band vertex (K passes over
+							// the band faces; each pass fills an invalid vertex from its face's valid
+							// verts) so the whole band has a fill-consistent target colour.
+							for (int pass = 0; pass < K; ++pass) {
+								int filled = 0;
+								for (const FIndex f : bandFaces) {
+									const Face& face = faces[f];
+									float sr = 0.f, sg = 0.f, sb = 0.f; int cn = 0;
+									for (int k = 0; k < 3; ++k) { const uint32_t v = face[k]; if (tv[v]) { sr += tr[v]; sg += tg[v]; sb += tb[v]; ++cn; } }
+									if (cn == 0 || cn == 3) continue;
+									const float inv = 1.f / (float)cn;
+									for (int k = 0; k < 3; ++k) { const uint32_t v = face[k]; if (!tv[v]) { tr[v] = sr * inv; tg[v] = sg * inv; tb[v] = sb * inv; tv[v] = 2; ++filled; } }
+								}
+								for (const FIndex f : bandFaces) { const Face& face = faces[f]; for (int k = 0; k < 3; ++k) if (tv[face[k]] == 2) tv[face[k]] = 1; }
+								if (filled == 0) break;
+							}
+							// 4) rasterise each band face, blend observed -> fill colour by the ramp.
+							//    SOURCE observed = tdBase (original, unmodified) to avoid feedback;
+							//    DEST = newTex. Serial: band faces in a patch can share edge texels.
+#if TEXTURE_DATACOLOR_DIAG
+							long long dgWritten = 0, dgSkipEmpty = 0, dgSkipAlpha = 0, dgBoundN = 0;
+							double dgSumStep = 0, dgMaxStep = 0, dgSumResid = 0, dgMaxResid = 0;
+#endif
+							const float invK = (K > 1) ? 1.f / (float)(K - 1) : 0.f;
+							for (const FIndex f : bandFaces) {
+								const Face& face = faces[f];
+								const TexCoord* tc = faceTexcoords.data() + (size_t)f * 3;
+								float ax[3], ay[3], al[3], cr[3], cg[3], cb[3];
+								bool ok = true;
+								for (int k = 0; k < 3; ++k) {
+									const uint32_t v = face[k];
+									ax[k] = tc[k].x; ay[k] = tc[k].y;
+									if (!tv[v]) { ok = false; break; }
+									cr[k] = tr[v]; cg[k] = tg[v]; cb[k] = tb[v];
+									// SMOOTHSTEP ramp: t=1 at the boundary (full continuity with the
+									// fill) -> t=0 at the band's inner edge. The S-curve has ~zero
+									// slope at BOTH ends, so the seam stays locked AND the real detail
+									// returns with no visible front (a linear ramp leaves a faint kink).
+									float t = (K > 1) ? (float)(K - 1 - vRing[v]) * invK : 1.f;
+									t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
+									al[k] = maxAlpha * t * t * (3.f - 2.f * t);
+								}
+								if (!ok) continue;
+								const float denom = (ay[1] - ay[2]) * (ax[0] - ax[2]) + (ax[2] - ax[1]) * (ay[0] - ay[2]);
+								const float invDen = (fabsf(denom) > 1e-6f) ? 1.f / denom : 0.f;
+								int minx = (int)std::floor(std::min(ax[0], std::min(ax[1], ax[2])));
+								int maxx = (int)std::ceil (std::max(ax[0], std::max(ax[1], ax[2])));
+								int miny = (int)std::floor(std::min(ay[0], std::min(ay[1], ay[2])));
+								int maxy = (int)std::ceil (std::max(ay[0], std::max(ay[1], ay[2])));
+								minx = std::max(minx, 0); maxx = std::min(maxx, tdW - 1);
+								miny = std::max(miny, 0); maxy = std::min(maxy, tdH - 1);
+								for (int py = miny; py <= maxy; ++py)
+									for (int px = minx; px <= maxx; ++px) {
+										const float fx = px + 0.5f, fy = py + 0.5f;
+										float w0 = ((ay[1] - ay[2]) * (fx - ax[2]) + (ax[2] - ax[1]) * (fy - ay[2])) * invDen;
+										float w1 = ((ay[2] - ay[0]) * (fx - ax[2]) + (ax[0] - ax[2]) * (fy - ay[2])) * invDen;
+										float w2 = 1.f - w0 - w1;
+										if (w0 < -0.01f || w1 < -0.01f || w2 < -0.01f) continue;
+										if (w0 < 0) w0 = 0; if (w1 < 0) w1 = 0; if (w2 < 0) w2 = 0;
+										const float s = w0 + w1 + w2; if (s <= 1e-6f) continue;
+										const float iw = 1.f / s; w0 *= iw; w1 *= iw; w2 *= iw;
+										const float a = al[0] * w0 + al[1] * w1 + al[2] * w2;
+										if (a <= 0.f) {
+#if TEXTURE_DATACOLOR_DIAG
+											++dgSkipAlpha;
+#endif
+											continue;
+										}
+										cv::Vec3b& p3 = nbase[(size_t)py * nstride + px];
+										if (p3[0] == meB && p3[1] == meG && p3[2] == meR) {
+#if TEXTURE_DATACOLOR_DIAG
+											++dgSkipEmpty;
+#endif
+											continue;
+										}
+										const cv::Vec3b& obs = tdBase[(size_t)py * tdStride + px];
+										const float tR = cr[0] * w0 + cr[1] * w1 + cr[2] * w2;
+										const float tG = cg[0] * w0 + cg[1] * w1 + cg[2] * w2;
+										const float tB = cb[0] * w0 + cb[1] * w1 + cb[2] * w2;
+										int ib = (int)((float)obs[0] + a * (tB - (float)obs[0]) + 0.5f); ib = ib < 0 ? 0 : (ib > 255 ? 255 : ib);
+										int ig = (int)((float)obs[1] + a * (tG - (float)obs[1]) + 0.5f); ig = ig < 0 ? 0 : (ig > 255 ? 255 : ig);
+										int ir = (int)((float)obs[2] + a * (tR - (float)obs[2]) + 0.5f); ir = ir < 0 ? 0 : (ir > 255 ? 255 : ir);
+#if TEXTURE_DATACOLOR_DIAG
+										{
+											const double tl = ((double)tR + tG + tB) * (1.0 / 3.0);
+											const double ol = ((double)obs[0] + obs[1] + obs[2]) * (1.0 / 3.0);
+											const double rl = ((double)ib + ig + ir) * (1.0 / 3.0);
+											++dgWritten;
+											if (a > 0.9f) { // near the ring-0 boundary
+												++dgBoundN;
+												const double ds = std::fabs(ol - tl); dgSumStep += ds; if (ds > dgMaxStep) dgMaxStep = ds;
+												const double rs = std::fabs(rl - tl); dgSumResid += rs; if (rs > dgMaxResid) dgMaxResid = rs;
+											}
+										}
+#endif
+#if TEXTURE_DATACOLOR_DIAG_TINT
+										// region false-colour: feather BAND = GREEN (bright at the boundary,
+										// dimming inward) so fill/band/observed are visually distinct.
+										{ int gv = (int)(60.f + 195.f * a); if (gv > 255) gv = 255; p3 = cv::Vec3b(0, (uchar)gv, 0); continue; }
+#endif
+										p3 = cv::Vec3b((uchar)ib, (uchar)ig, (uchar)ir);
+									}
+							}
+#if TEXTURE_DATACOLOR_DIAG
+							DEBUG("[DATACOLOR-DIAG] noView=%d nComp=%d band=%d | written=%lld skipEmpty=%lld skipAlpha=%lld | boundary=%lld meanStep=%.2f maxStep=%.2f meanResid=%.2f maxResid=%.2f",
+								N, nComp, (int)bandFaces.size(),
+								dgWritten, dgSkipEmpty, dgSkipAlpha, dgBoundN,
+								dgBoundN ? dgSumStep / (double)dgBoundN : 0.0, dgMaxStep,
+								dgBoundN ? dgSumResid / (double)dgBoundN : 0.0, dgMaxResid);
+#endif
+						}
+					}
+#endif // TEXTURE_DATACOLOR_FEATHER_RINGS
+					textureDiffuse = newTex;
+					DEBUG("Data-colored %d unobserved faces in %d component tiles (%d atlas rows, nearest-fill + %d seam-smooth iters)", N, nComp, extraRows, (int)TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS);
+#else
+					// PN-triangle (quadratic Bezier) edge control colours -- this is what
+					// removes the residual triangle BANDING. A linear barycentric blend of
+					// the 3 vertex colours is only C0: its value matches across a shared
+					// edge but its SLOPE jumps, so on the large unobserved-region triangles
+					// the eye reads those C1 discontinuities as facets (Mach banding).
+					// Promote every face to a quadratic colour patch with 3 extra edge
+					// control colours. Each edge control colour is computed SYMMETRICALLY
+					// from the two faces that share the edge (the 2 edge-endpoint colours +
+					// the 2 opposite-vertex colours), so both faces produce the IDENTICAL
+					// control colour for the shared edge -> the patch is continuous in value
+					// AND cross-edge slope = no facet seams. ecX[i*3+e] is the control for
+					// edge e of face i: e0=(v0,v1), e1=(v1,v2), e2=(v2,v0).
+					std::vector<float> ecR((size_t)N * 3), ecG((size_t)N * 3), ecB((size_t)N * 3);
+					{
+						struct EdgeOpp { int count; int o0; int o1; }; // value-inits to {0,0,0}
+						std::unordered_map<uint64_t, EdgeOpp> edgeOpp;
+						edgeOpp.reserve((size_t)N * 3);
+						auto ekey = [](uint32_t a, uint32_t b) -> uint64_t {
+							if (a > b) { const uint32_t t = a; a = b; b = t; }
+							return ((uint64_t)a << 32) | (uint64_t)b;
+						};
+						// Pass 1: collect the (up to 2) opposite vertices per edge.
+						for (int i = 0; i < N; ++i) {
+							const Face& face = faces[noViewFaces[i]];
+							const uint32_t v0 = face[0], v1 = face[1], v2 = face[2];
+							const uint32_t ea[3] = { v0, v1, v2 };
+							const uint32_t eb[3] = { v1, v2, v0 };
+							const uint32_t opp[3] = { v2, v0, v1 };
+							for (int e = 0; e < 3; ++e) {
+								EdgeOpp& s = edgeOpp[ekey(ea[e], eb[e])];
+								if (s.count == 0) s.o0 = (int)opp[e];
+								else if (s.count == 1) s.o1 = (int)opp[e];
+								++s.count;
+							}
+						}
+						// Pass 2: per-face edge control colour = mean of the surrounding
+						// vertices (2 endpoints + up to 2 opposite). Shared edges resolve to
+						// the same vertex set from either side -> identical control colour.
+						for (int i = 0; i < N; ++i) {
+							const Face& face = faces[noViewFaces[i]];
+							const uint32_t v0 = face[0], v1 = face[1], v2 = face[2];
+							const uint32_t ea[3] = { v0, v1, v2 };
+							const uint32_t eb[3] = { v1, v2, v0 };
+							for (int e = 0; e < 3; ++e) {
+								const uint32_t a = ea[e], b = eb[e];
+								float sr = vr[a] + vr[b], sg = vg[a] + vg[b], sb = vb[a] + vb[b];
+								int cnt = 2;
+								const auto it = edgeOpp.find(ekey(a, b));
+								if (it != edgeOpp.end()) {
+									const EdgeOpp& s = it->second;
+									const int no = s.count < 2 ? s.count : 2;
+									if (no >= 1) { const int o = s.o0; sr += vr[o]; sg += vg[o]; sb += vb[o]; ++cnt; }
+									if (no >= 2) { const int o = s.o1; sr += vr[o]; sg += vg[o]; sb += vb[o]; ++cnt; }
+								}
+								const float inv = 1.f / (float)cnt;
+								const size_t idx = (size_t)i * 3 + e;
+								ecR[idx] = sr * inv; ecG[idx] = sg * inv; ecB[idx] = sb * inv;
+							}
+						}
+					}
+					// bake one small quadratic-patch cell per face; UVs -> the 3 corners
+					// M is the cell size; G is a GUTTER (px) kept on every side. The
+					// triangle's 3 corners are inset by G so the rendered triangle edges
+					// sit >=G px inside the cell. The bake fills the FULL cell (clamped
+					// barycentric outside the triangle = edge colour), so when the GPU
+					// bilinearly samples a texel right on a triangle edge, its filter
+					// kernel reaches only into same-colour gutter texels -- never into the
+					// neighbouring atlas cell or the dark colEmpty background. Without the
+					// gutter (G~0.5) that bleed shows up as dark seams along every edge.
+					const int M = 12; // cell size (px)
+					const float G = 2.0f; // gutter (px) on each side
+					const int cellsPerRow = std::max(1, cols / M);
+					const int cellRows = (N + cellsPerRow - 1) / cellsPerRow;
+					const int extraRows = cellRows * M;
+					cv::Mat newTex(oldRows + extraRows, cols, CV_8UC3, cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
+					textureDiffuse.copyTo(newTex(cv::Rect(0, 0, cols, oldRows)));
+					// 4x4 ordered (Bayer) dither, indexed by ABSOLUTE atlas pixel (px,py).
+					// Each face bakes its own atlas cell and rounds to 8-bit independently;
+					// on a smooth field the per-cell rounding mismatch along a shared edge is
+					// COHERENT and traces every triangle -> faint polygon outlines (the same
+					// root cause as the over-flatten "crazing"). Adding a sub-LSB dither keyed
+					// to the global pixel position de-correlates that rounding across the edge,
+					// so the residual mismatch becomes incoherent noise instead of a clean
+					// outline -> the tessellation stops reading. Normalised to [-0.5, 0.5).
+					static const float kBayer4[16] = {
+						 0.f,  8.f,  2.f, 10.f,
+						12.f,  4.f, 14.f,  6.f,
+						 3.f, 11.f,  1.f,  9.f,
+						15.f,  7.f, 13.f,  5.f
+					};
+					// each face writes its OWN M x M atlas cell + its own 3 texcoords ->
+					// disjoint outputs, safe to bake in parallel.
+#ifdef TEXOPT_USE_OPENMP
+					#pragma omp parallel for schedule(static)
+#endif
+					for (int i = 0; i < N; ++i) {
+						const FIndex f = noViewFaces[i];
+						const Face& face = faces[f];
+						const int cx = (i % cellsPerRow) * M;
+						const int cy = oldRows + (i / cellsPerRow) * M;
+						const float x0 = cx + G, y0 = cy + G;
+						const float x1 = cx + M - G, y1 = cy + G;
+						const float x2 = cx + G, y2 = cy + M - G;
+						const float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+						const float invDen = (fabsf(denom) > 1e-6f) ? 1.f / denom : 0.f;
+						const float R[3] = { vr[face[0]], vr[face[1]], vr[face[2]] };
+						const float G[3] = { vg[face[0]], vg[face[1]], vg[face[2]] };
+						const float B[3] = { vb[face[0]], vb[face[1]], vb[face[2]] };
+						// quadratic edge controls (e0=v0v1, e1=v1v2, e2=v2v0)
+						const size_t ei = (size_t)i * 3;
+						const float ER[3] = { ecR[ei + 0], ecR[ei + 1], ecR[ei + 2] };
+						const float EG[3] = { ecG[ei + 0], ecG[ei + 1], ecG[ei + 2] };
+						const float EB[3] = { ecB[ei + 0], ecB[ei + 1], ecB[ei + 2] };
+						for (int py = cy; py < cy + M; ++py)
+							for (int px = cx; px < cx + M; ++px) {
+								const float fx = px + 0.5f, fy = py + 0.5f;
+								float w0 = ((y1 - y2) * (fx - x2) + (x2 - x1) * (fy - y2)) * invDen;
+								float w1 = ((y2 - y0) * (fx - x2) + (x0 - x2) * (fy - y2)) * invDen;
+								float w2 = 1.f - w0 - w1;
+								if (w0 < 0) w0 = 0; if (w1 < 0) w1 = 0; if (w2 < 0) w2 = 0;
+								const float sum = w0 + w1 + w2; if (sum <= 1e-6f) continue;
+								const float iw = 1.f / sum;
+								w0 *= iw; w1 *= iw; w2 *= iw;
+								// quadratic Bezier triangle of the surface-propagated colour:
+								//   C = c0 w0^2 + c1 w1^2 + c2 w2^2
+								//     + 2 e01 w0 w1 + 2 e12 w1 w2 + 2 e20 w2 w0
+								// Continuous in value AND cross-edge slope (edge controls are
+								// shared between adjacent faces) -> no Gouraud facet banding.
+								const float b00 = w0 * w0, b11 = w1 * w1, b22 = w2 * w2;
+								const float b01 = 2.f * w0 * w1, b12 = 2.f * w1 * w2, b20 = 2.f * w2 * w0;
+								const float rr = R[0]*b00 + R[1]*b11 + R[2]*b22 + ER[0]*b01 + ER[1]*b12 + ER[2]*b20;
+								const float gg = G[0]*b00 + G[1]*b11 + G[2]*b22 + EG[0]*b01 + EG[1]*b12 + EG[2]*b20;
+								const float bb = B[0]*b00 + B[1]*b11 + B[2]*b22 + EB[0]*b01 + EB[1]*b12 + EB[2]*b20;
+								// sub-LSB ordered dither keyed to absolute atlas position so the
+								// per-cell 8-bit rounding mismatch along shared edges is incoherent
+								// (breaks the faint polygon outlines) rather than a clean seam.
+								const float dth = (kBayer4[(py & 3) * 4 + (px & 3)] + 0.5f) * (1.f / 16.f) - 0.5f;
+								int ir = (int)(rr + 0.5f + dth); ir = ir < 0 ? 0 : (ir > 255 ? 255 : ir);
+								int ig = (int)(gg + 0.5f + dth); ig = ig < 0 ? 0 : (ig > 255 ? 255 : ig);
+								int ib = (int)(bb + 0.5f + dth); ib = ib < 0 ? 0 : (ib > 255 ? 255 : ib);
+								newTex.at<cv::Vec3b>(py, px) = cv::Vec3b((uchar)ib, (uchar)ig, (uchar)ir);
+							}
+						TexCoord* texcoords = faceTexcoords.data() + f * 3;
+						texcoords[0] = TexCoord(x0, y0);
+						texcoords[1] = TexCoord(x1, y1);
+						texcoords[2] = TexCoord(x2, y2);
+					}
+					textureDiffuse = newTex;
+					DEBUG("Data-colored %d unobserved faces (surface-propagated quadratic patch, %d atlas rows, %d smooth iters)", N, extraRows, (int)TEXTURE_DATACOLOR_SMOOTH_ITERS);
+#endif // TEXTURE_DATACOLOR_COMPONENT_BAKE (per-face cell fallback)
+				}
+			}
+		}
+#endif // TEXTURE_DATACOLOR_UNOBSERVED && TEXTURE_DATACOLOR_BAKE
+
+		LogPeakMem("GenTex: after data-color bake");
+		TEX_PROFILE_BEGIN(_tGtFinalize);
+		// 4) Enforce max size BEFORE allocating huge texture
+		// (nMaxTextureSize == 0 means UNBOUNDED -> skip the cap entirely; < 0 was
+		// already resolved to GL_MAX_TEXTURE_SIZE at the top of GenerateTexture.)
+#if TEXTURE_FINAL_RESIZE
+		if (nMaxTextureSize > 0 && std::max(textureDiffuse.cols, textureDiffuse.rows) > nMaxTextureSize) {
 			double scale = double(nMaxTextureSize) /
 				double(std::max(textureDiffuse.cols, textureDiffuse.rows));
 
@@ -5138,7 +7185,9 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				uv.y *= float(scale);
 			}
 		}
+#endif // TEXTURE_FINAL_RESIZE
 
+#if TEXTURE_ENABLE_SHARPEN
 		// Optional sharpening (now safe, atlas is final size)
 		if (fSharpnessWeight > 0.0f) {
 			cv::Mat small;
@@ -5167,6 +7216,8 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				cv::INTER_LINEAR
 			);
 		}
+#endif // TEXTURE_ENABLE_SHARPEN
+		TEX_PROFILE_END(_tGtFinalize, "GenerateTexture: resize+sharpen");
 	}
 }
 
@@ -5177,7 +7228,9 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 	bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight,
 	int nMaxTextureSize, const IIndexArr& views)
 {
+	TEX_PROFILE_SCOPE("TextureMesh (grand total)");
 	MeshTexture texture(*this, nResolutionLevel, nMinResolution);
+	LogPeakMem("TextureMesh: start");
 
 	MeshTexture::LabelArr labels;
 
@@ -5188,6 +7241,7 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 			return false;
 		DEBUG_EXTRA("Assigning the best view to each face completed: %u faces (%s)", mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
+	LogPeakMem("after FaceViewSelection");
 
 	// generate the texture image and atlas
 	{
@@ -5195,6 +7249,7 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 		texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize);
 		DEBUG_EXTRA("Generating texture atlas and image completed: %u patches, %u image size (%s)", texture.texturePatches.GetSize(), mesh.textureDiffuse.width(), TD_TIMER_GET_FMT().c_str());
 	}
+	LogPeakMem("after GenerateTexture");
 
 	return true;
 } // TextureMesh

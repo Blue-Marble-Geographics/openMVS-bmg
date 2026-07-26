@@ -102,8 +102,27 @@ public:
 			VertexArr centroids(mesh.faces.size());
 			FOREACH(idx, mesh.faces)
 				centroids[idx] = mesh.ComputeCentroid(idx);
-			octree.Insert(centroids, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
-				return size > 32;
+			// Absolute minimum cell radius, used as a recursion floor.
+			// NOTE: do NOT use octree.GetRadius() here - m_radius is only set
+			// inside Insert(), so before insertion it is uninitialized and yields
+			// a garbage floor that corrupts the octree bounds.
+			// Without a floor, >32 coincident/degenerate centroids keep splitting
+			// until the cell radius underflows to 0 and _Insert recurses forever
+			// (each level does new CELL_TYPE[8]).
+			// The floor MUST be derived from the centroids that are actually
+			// inserted (not the mesh vertices): Insert() sizes the cell radius
+			// from the centroid bounding box, so the radius the split predicate
+			// receives is on that scale. Using the (always larger) vertex box
+			// can make minRadius exceed the octree's own child radius and collapse
+			// the whole tree to a few leaves. A non-positive/non-finite extent
+			// (e.g. a diverged NaN/Inf vertex) disables the floor instead.
+			Box box(true);
+			FOREACH(idx, centroids)
+				box.InsertFull(centroids[idx]);
+			const Octree::Type extent(box.GetSize().maxCoeff());
+			const Octree::Type minRadius(ISFINITE(extent) && extent > Octree::Type(0) ? extent / Octree::Type(1u << 20) : Octree::Type(0));
+			octree.Insert(centroids, [minRadius](Octree::IDX_TYPE size, Octree::Type radius) {
+				return size > 32 && radius > minRadius;
 			});
 			#if 0 && !defined(_RELEASE)
 			Octree::DEBUGINFO_TYPE info;
@@ -196,7 +215,7 @@ public:
 #else
 	bool FixNonManifold();
 #endif
-	void Clean(float fDecimate=0.7f, float fSpurious=10.f, bool bRemoveSpikes=true, unsigned nCloseHoles=30, unsigned nSmoothMesh=2, float fEdgeLength=0, bool bLastClean=true);
+	void Clean(float fDecimate=0.7f, float fSpurious=10.f, bool bRemoveSpikes=true, unsigned nCloseHoles=30, unsigned nSmoothMesh=2, float fEdgeLength=0, bool bLastClean=true, float fDecimateError=0);
 
 	void EnsureEdgeSize(float minEdge=-0.5f, float maxEdge=-4.f, float collapseRatio=0.2, float degenerate_angle_deg=150, int mode=1, int max_iters=50);
 
@@ -273,6 +292,8 @@ protected:
 	bool SavePLY(const String& fileName, const cList<String>& comments=cList<String>(), bool bBinary=true) const;
 	bool SaveOBJ(const String& fileName) const;
 	bool SaveGLTF(const String& fileName, bool bBinary=true) const;
+	// Global Mapper native binary mesh (.gmmesh) — per-vertex UVs, fast read
+	bool SaveGMMesh(const String& fileName) const;
 
 	#ifdef _USE_CUDA
 	static bool InitKernels(int device=-1);

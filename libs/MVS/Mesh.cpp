@@ -59,6 +59,7 @@ struct unary_function {
 #include <vcg/complex/algorithms/hole.h>
 #include <vcg/complex/algorithms/polygon_support.h>
 #include <vcg/complex/algorithms/isotropic_remeshing.h>
+#include <vcg/complex/algorithms/refine.h>
 // VCG: mesh simplification
 #include <vcg/complex/algorithms/update/position.h>
 #include <vcg/complex/algorithms/update/bounding.h>
@@ -97,6 +98,267 @@ using namespace MVS;
 #define USE_MESH_OCTREE 1 // octree (misses some triangles)
 #define USE_MESH_BVH 2 // BVH (misses some triangles)
 #define USE_MESH_INT USE_MESH_BVH
+
+// MESH_TOOTH_PEEL_ENABLED: enable the boundary-tooth peel in Mesh::Clean
+// (Phase 3.4), which iteratively removes "loose polygon slop" (single
+// triangles hanging off the silhouette by one edge, and 1-wide whisker
+// chains) from the graph-cut footprint edge. Disabled by default; set to 1
+// to enable.
+#ifndef MESH_TOOTH_PEEL_ENABLED
+#define MESH_TOOTH_PEEL_ENABLED 0
+#endif
+
+// MESH_SAIL_PEEL_ENABLED: near-vertical boundary "sail/curtain" peel
+// (Mesh::Clean Phase 3.45, right after the tooth peel, before decimation).
+// Poisson (and graph-cut) reconstruction drapes a near-VERTICAL skirt of
+// triangles off the surface silhouette where density falls away -- the
+// "appendages that hang vertically". Raising the Poisson --trim threshold
+// removes them but also erodes genuine low-density boundary (loss of
+// COMPLETENESS). This pass removes ONLY the drapes: iterative rings that delete
+// a face that (a) touches the OPEN boundary, (b) is near-vertical -- its unit
+// normal's |z| < MESH_SAIL_PEEL_MAX_NZ_X100/100 (normal nearly horizontal), and
+// (c) is elongated -- longest edge > (MESH_SAIL_PEEL_LEN_MULT_X100/100) x median
+// edge. Because it keys on VERTICALITY, flat low-density boundary faces (normal
+// ~vertical) are KEPT so completeness is preserved; interior building facades
+// are safe because they never touch the open boundary. The length gate is an
+// extra completeness guard -- set MESH_SAIL_PEEL_LEN_MULT_X100 to 0 to disable
+// it and peel on steepness alone. Assumes +Z is up (aerial/top-down scenes).
+//   LOWER MAX_NZ = only steeper drapes peeled (gentler); HIGHER = more aggressive.
+//   MESH_SAIL_PEEL_ENABLED 0 disables the whole pass (pure A/B off switch).
+#ifndef MESH_SAIL_PEEL_ENABLED
+#define MESH_SAIL_PEEL_ENABLED 0
+#endif
+#ifndef MESH_SAIL_PEEL_MAX_NZ_X100
+#define MESH_SAIL_PEEL_MAX_NZ_X100 45     // 0.45 -> peel boundary faces steeper than ~63deg
+#endif
+#ifndef MESH_SAIL_PEEL_LEN_MULT_X100
+#define MESH_SAIL_PEEL_LEN_MULT_X100 1200 // 12.0 x median edge (0 = steepness-only, no length gate)
+#endif
+#ifndef MESH_SAIL_PEEL_MAX_ITERS
+#define MESH_SAIL_PEEL_MAX_ITERS 20       // hard cap on erosion rings (self-terminating)
+#endif
+
+// Global down-facing cull (Mesh::Clean Phase 3.46, right after the sail peel).
+// The sail peel only reaches faces on an OPEN boundary; a watertight Poisson
+// envelope (top sheet + down-facing bottom sheet meeting at a manifold
+// silhouette fold) has no such boundary, so its underside survives
+// (sailRemoved==0). This pass deletes faces by ORIENTATION alone, regardless of
+// boundary: any face whose unit normal.z < MESH_DOWN_CULL_MAX_NZ_X100/100 is
+// removed. Keep the threshold NEGATIVE so only clearly-downward faces (the
+// underside billow) are culled and the top surface + near-vertical facades are
+// preserved. Assumes +Z up and coherent outward orientation (set by the
+// spurious-removal pass). CAVEAT: also removes legitimate down-facing surfaces
+// (eave/overhang undersides) -- acceptable for aerial 2.5D. 0 disables.
+#ifndef MESH_DOWN_CULL_ENABLED
+#define MESH_DOWN_CULL_ENABLED 0
+#endif
+#ifndef MESH_DOWN_CULL_MAX_NZ_X100
+#define MESH_DOWN_CULL_MAX_NZ_X100 (-10)  // cull faces with unit normal.z < -0.10
+#endif
+
+// Underside DEFLATE (Mesh::Clean Phase 3.48). Instead of DELETING the down-facing
+// Poisson underside lobes that hang below the terrain (leaving holes), PUSH them
+// UP to the surface -- terrain is a height field, so any vertex sitting below
+// OTHER surface at its XY is an artifact that should collapse onto the top. Build
+// a top-down max-Z grid; any vertex more than MARGIN*medianEdge below the local
+// grid top is lifted to (localTop - MARGIN*medianEdge), then the lifted band is
+// Laplacian-smoothed in Z to blend the seam. Connectivity is preserved (no
+// deletion -> no holes). A vertex with nothing above it (valley, open dip) is the
+// local top and is NEVER moved, so genuine low terrain is untouched. ASSUMES +Z up.
+//   CELL_MULT = grid cell in median edges (coarser = a downward bulge more reliably
+//               shares a cell with the higher surrounding terrain that lifts it).
+//   MARGIN_MULT = how far below local top a vertex may stay (median edges).
+//   SMOOTH_ITERS = Z-only Laplacian passes over lifted+ring verts to blend.
+//   0 disables the pass (A/B off switch).
+#ifndef MESH_DEFLATE_ENABLED
+#define MESH_DEFLATE_ENABLED 0
+#endif
+#ifndef MESH_DEFLATE_CELL_MULT_X100
+#define MESH_DEFLATE_CELL_MULT_X100 400   // grid cell = 4.00 x median edge
+#endif
+#ifndef MESH_DEFLATE_MARGIN_MULT_X100
+#define MESH_DEFLATE_MARGIN_MULT_X100 200 // lift verts hanging > 2.00 x median edge below local top
+#endif
+#ifndef MESH_DEFLATE_SMOOTH_ITERS
+#define MESH_DEFLATE_SMOOTH_ITERS 5       // Z-Laplacian blend passes over the lifted band
+#endif
+
+// Detached-debris removal (Mesh::Clean, "small connected components"),
+// RELATIVE-TO-LARGEST. A connected component is kept only if its face count is
+// at least this fraction of the LARGEST component's face count; everything
+// smaller (floating junk islands) is deleted. The main body is always the
+// largest component by a huge margin, so this auto-scales to any scene with no
+// hand-tuned absolute size -- robust across datasets. Stored as thousandths of
+// a percent: 20 = 0.020% of the largest. Higher removes more (and risks
+// dropping a genuinely-isolated real structure); lower keeps more. Only touches
+// DISCONNECTED components; attached peninsulas are never removed.
+#ifndef MESH_KEEP_COMPONENT_PCT_X1000
+#define MESH_KEEP_COMPONENT_PCT_X1000 100
+#endif
+
+// Hole-closing geometry gate (Mesh::Clean Phase 4 / Phase 8).
+// Edge count alone cannot tell a genuine INTERIOR hole from the outer
+// silhouette / a concave bay (both can be large), so filling by an edge-count
+// cap fans sheets across the footprint. The fan-preventer is GEOMETRIC: a
+// boundary loop is filled only if its 3D bounding-box diagonal is at most
+// MESH_HOLE_MAX_DIAG_FRAC of the whole-mesh bbox diagonal -- interior holes are
+// compact (small loop bbox) and pass; the footprint perimeter and the bays
+// that are part of it span a large fraction of the mesh and are left open.
+// The edge cap itself stays user-controlled via --close-holes (nCloseHoles):
+// raise it to close bigger interior holes. MESH_HOLE_MAX_EDGES is only a hard
+// runtime safety ceiling (per-hole ear-cutting is O(n^2)). The frac is stored
+// as int*1000 to stay preprocessor-friendly (100 = 0.10).
+#ifndef MESH_HOLE_MAX_DIAG_FRAC_X1000
+#define MESH_HOLE_MAX_DIAG_FRAC_X1000 100  // 0.10 of mesh diagonal
+#endif
+#ifndef MESH_HOLE_MAX_EDGES
+#define MESH_HOLE_MAX_EDGES 2000           // hard safety ceiling on loop edges
+#endif
+
+// Density-aware edge cap for --close-holes. A boundary loop of a FIXED physical
+// size has ~perimeter/median-edge edges, so the same edge count closes a
+// physically SMALLER hole as the mesh gets finer (e.g. lowering
+// --min-point-distance shrinks the median edge ~linearly). To keep --close-holes
+// meaning a CONSTANT physical hole size regardless of density, the effective
+// edge cap is scaled by the mesh fineness, measured scene-invariantly as
+// (mesh-bbox-diagonal / median-edge) = "edges across the mesh diagonal".
+// MESH_HOLE_REF_EDGES_ACROSS_DIAG is the fineness at which --close-holes is
+// calibrated: at that fineness the scale factor is 1.0 (backward-compatible);
+// a 2.5x-finer mesh gets a 2.5x-larger cap. Both terms scale with scene units,
+// so the ratio is dimensionless and works at any absolute scale. Set to 0 to
+// disable scaling (revert to the raw --close-holes edge cap).
+#ifndef MESH_HOLE_REF_EDGES_ACROSS_DIAG
+#define MESH_HOLE_REF_EDGES_ACROSS_DIAG 4000
+#endif
+
+// Fallback fill for the SMALL holes that SelfIntersectionEar refuses to fill
+// ("ear-rejected": real 3D tears between structures where a flat ear would
+// intersect nearby relief). TrivialEar closes them regardless of intersection,
+// making the mesh watertight -- but a non-planar hole may get a small flat
+// cap/fold. Gated to <= this many boundary edges AND <= 2x the
+// MESH_HOLE_MAX_DIAG_FRAC gate, so the outer footprint boundary and any wide
+// bay can never be trivially bridged (no large fans). Set to 0 to disable and
+// leave these holes open (zero fan risk, but visible gaps remain).
+#ifndef MESH_HOLE_FALLBACK_MAX_EDGES
+#define MESH_HOLE_FALLBACK_MAX_EDGES 80
+#endif
+
+// Alpha-shape perimeter tightening (Mesh::Clean Phase 9, AFTER hole-closing).
+// "Rolls a disk of radius alpha around the silhouette" the SAFE (erosion-only)
+// way: iteratively delete rim faces whose circumradius > alpha -- that is the
+// alpha-shape criterion (a triangle too big/thin for a radius-alpha disk to
+// certify is not part of the alpha-solid). This peels saw-tooth slivers and
+// spikes off the ragged edge while genuine bays (lined with normal faces)
+// survive. It ONLY deletes, never bridges, so it can never create a fan.
+//   alpha = (MESH_ALPHA_TIGHTEN_K_X100/100) * median edge length (auto-scales).
+//   LOWER K = more aggressive (nibbles more edge); HIGHER K = gentler.
+//   Iterations are capped (can never cascade into the decimated interior).
+// A/B: set MESH_ALPHA_TIGHTEN_ENABLED to 0 to skip the whole Phase 9 block.
+#ifndef MESH_ALPHA_TIGHTEN_ENABLED
+#define MESH_ALPHA_TIGHTEN_ENABLED 1
+#endif
+#ifndef MESH_ALPHA_TIGHTEN_K_X100
+#define MESH_ALPHA_TIGHTEN_K_X100 500   // was 300 3.00 * median edge
+#endif
+#ifndef MESH_ALPHA_TIGHTEN_ITERS
+#define MESH_ALPHA_TIGHTEN_ITERS 6      // hard cap on erosion rings (safety)
+#endif
+
+// Adaptive (error-bounded) decimation COMPILE-TIME DEFAULT for the strength k (= X100/100).
+// Normally this is driven at runtime by ReconstructMesh's --decimate-error; this macro is
+// only the fallback used when that CLI value is 0. When k>0, Phase 3.5 stops at a geometric
+// -error tolerance tau = scale*(k*medianEdge)^2 instead of a fixed face fraction: flat
+// regions collapse maximally, detail is preserved, and the final face count emerges from
+// the geometry. --decimate then acts as the KEEP FLOOR (never decimate below that
+// fraction). 0 = DISABLED (legacy fixed-ratio behavior, default). Raise k for lighter
+// meshes, lower for more detail.
+#ifndef MESH_DECIMATE_ERROR_K_X100
+#define MESH_DECIMATE_ERROR_K_X100 0    // 0 = off; e.g. 100 = k=1.0
+#endif
+
+// AGGRESSIVE perimeter straightening (Mesh::Clean Phase 8.5, AFTER hole-closing,
+// BEFORE alpha-tighten). Unlike the tooth-peel (only faces with >=2 open edges)
+// and alpha-tighten (only over-large circumradius slivers), this UNIFORMLY peels
+// MESH_RIM_ERODE_RINGS full rings of border faces off the whole silhouette. Any
+// fringe narrower than ~2R triangles (whisker tendrils, thin peninsulas, isthmus
+// necks bridging floating flecks) is completely consumed, and the jagged outline
+// recedes to a smoother R-rings-in contour. Because erosion can sever the thin
+// necks that connect floating junk to the body, the small-connected-component
+// filter is re-run afterwards to drop anything newly disconnected.
+//   HIGHER R = more aggressive straightening (loses more genuine edge detail).
+//   R = 0 disables the whole pass (pure A/B off switch).
+// Only touches BORDER faces, so it never reopens a sealed interior hole.
+#ifndef MESH_RIM_ERODE_RINGS
+#define MESH_RIM_ERODE_RINGS 0
+#endif
+
+// Boundary-only TAUBIN smoothing (Mesh::Clean Phase 10, LAST geometric pass).
+// Smooths the ragged silhouette polyline IN PLACE without receding it: only
+// open-boundary vertices that lie on a clean 2-neighbor border edge are moved;
+// interior geometry is never touched. Taubin's alternating shrink(lambda)/
+// inflate(mu) steps cancel the curve-shortening that plain Laplacian smoothing
+// causes, so the outline gets smoother WITHOUT losing coverage (unlike erosion).
+// Pinch/junction boundary vertices (>2 border neighbors) are skipped (safe).
+//   ITERS = number of lambda+mu Taubin pairs; LAMBDA/MU stored as *100.
+//   Set MESH_BOUNDARY_SMOOTH_ENABLED 0 to skip the whole pass (A/B off).
+#ifndef MESH_BOUNDARY_SMOOTH_ENABLED
+#define MESH_BOUNDARY_SMOOTH_ENABLED 1
+#endif
+#ifndef MESH_BOUNDARY_SMOOTH_ITERS
+#define MESH_BOUNDARY_SMOOTH_ITERS 10 // Was 40     // lambda+mu pairs (scale up with band density)
+#endif
+#ifndef MESH_BOUNDARY_SMOOTH_RINGS
+#define MESH_BOUNDARY_SMOOTH_RINGS 1 // Was 8      // band thickness: rings smoothed inward from the edge
+#endif
+#ifndef MESH_BOUNDARY_SMOOTH_LAMBDA_X100
+#define MESH_BOUNDARY_SMOOTH_LAMBDA_X100 50   // 0.50 shrink step
+#endif
+#ifndef MESH_BOUNDARY_SMOOTH_MU_X100
+#define MESH_BOUNDARY_SMOOTH_MU_X100 53       // 0.53 inflate step (magnitude)
+#endif
+
+// Boundary-band REFINEMENT (Mesh::Clean Phase 9.5, AFTER alpha-tighten, BEFORE
+// the boundary smooth). Decimation preserves the silhouette at full RECONSTRUCTION
+// density but never denser, so smoothing the edge can only do so much; this
+// midpoint-subdivides the faces within MESH_BAND_REFINE_RINGS rings of the open
+// boundary, adding NEW vertices around the edges (and on the silhouette line
+// itself) that the subsequent Taubin smooth then rounds far more finely. Only the
+// edge band is refined -- the decimated interior stays light, so texture/file cost
+// stays bounded. LEVELS=2 quadruples band density again (use sparingly).
+//   RINGS = band thickness refined; LEVELS = number of 1->4 midpoint splits.
+//   Set MESH_BAND_REFINE_ENABLED 0 to skip the whole pass (A/B off).
+#ifndef MESH_BAND_REFINE_ENABLED
+#define MESH_BAND_REFINE_ENABLED 1
+#endif
+#ifndef MESH_BAND_REFINE_RINGS
+#define MESH_BAND_REFINE_RINGS 4
+#endif
+#ifndef MESH_BAND_REFINE_LEVELS
+#define MESH_BAND_REFINE_LEVELS 2
+#endif
+
+// Edge DILATION / outward apron (Mesh::Clean Phase 9.7, AFTER band refine, BEFORE
+// the boundary smooth). ENLARGES coverage by extruding the open silhouette
+// OUTWARD: each ring offsets every boundary vertex along its (direction-smoothed)
+// in-plane outward normal by MESH_EDGE_DILATE_STEP_X100% of the median edge, at
+// the rim's own height, and stitches a triangle strip to the old edge. Repeats
+// for MESH_EDGE_DILATE_RINGS rings. The new apron faces are unobserved -> they
+// take approximate/flat color at texturing (the competitor's vertex-colored
+// outer margin). DIRSMOOTH passes blur the offset direction along the boundary to
+// reduce self-intersection at concave notches.
+//   CAVEAT: large margins on a ragged non-convex silhouette WILL self-intersect
+//   at canopy notches -- keep RINGS/STEP modest, or do dilation in the raster
+//   (orthophoto) domain for big, fold-free extensions.
+//   RINGS = 0 disables the whole pass (A/B off).
+#ifndef MESH_EDGE_DILATE_RINGS
+#define MESH_EDGE_DILATE_RINGS 0
+#endif
+#ifndef MESH_EDGE_DILATE_STEP_X100
+#define MESH_EDGE_DILATE_STEP_X100 150   // 1.50 x median edge per ring
+#endif
+#ifndef MESH_EDGE_DILATE_DIRSMOOTH
+#define MESH_EDGE_DILATE_DIRSMOOTH 4     // outward-direction blur passes per ring
+#endif
 
 #if USE_MESH_INT == USE_MESH_BVH
 #include <unsupported/Eigen/BVH>
@@ -1720,7 +1982,8 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 
 void Mesh::Clean(
 	float fDecimate, float fSpurious, bool bRemoveSpikes,
-	unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean)
+	unsigned nCloseHoles, unsigned nSmooth, float fEdgeLength, bool bLastClean,
+	float fDecimateError)
 {
 	if (vertices.IsEmpty() || faces.IsEmpty())
 		return;
@@ -1989,24 +2252,43 @@ void Mesh::Clean(
 		}
 #endif
 
-		// Small connected component removal
+		// Small connected component removal (RELATIVE-TO-LARGEST face count).
+		// Keep components with >= MESH_KEEP_COMPONENT_PCT_X1000/1000 percent of the
+		// largest component's face count; delete the rest. The main body is always
+		// the largest, so this drops floating junk on any scene without an absolute
+		// size. Only disconnected components are affected.
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-		vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
-		const float meshDiag = mesh.bbox.Diag();
-		// JPB: 0.001f (0.1% of diag) instead of 0.01f -- on wide aerial scenes
-		// 1% of diag was tens of meters and culled legitimate boundary peninsulas
-		// (driveways, isolated rooftops near edge), creating detached-island
-		// silhouettes.
-		const float componentThreshold = meshDiag * 0.001f;
+		{
+			std::vector<std::pair<int, CLEAN::Mesh::FacePointer>> CCV;
+			vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
+			int largest = 0;
+			for (auto& cc : CCV) largest = std::max(largest, cc.first);
 
-		const int fnBefore = mesh.fn;
-		vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsDiameter(
-			mesh, componentThreshold);
-		stats.removedComponents += (fnBefore - mesh.fn);
+			// DIAG: component face-count distribution (top 12). If the 2nd-
+			// largest is itself big, leftover junk is a LARGE component -> raise
+			// the %. If everything after the body is tiny, the remaining junk is
+			// CONNECTED to the body (a thin thread) and no size filter can drop
+			// it -- that needs a different fix.
+			{
+				std::vector<int> sz; sz.reserve(CCV.size());
+				for (auto& cc : CCV) sz.push_back(cc.first);
+				std::sort(sz.begin(), sz.end(), std::greater<int>());
+				char buf[256]; int off = 0;
+				for (size_t i = 0; i < sz.size() && i < 12 && off < 230; ++i)
+					off += snprintf(buf + off, sizeof(buf) - off, "%d ", sz[i]);
+				DEBUG("DIAG component sizes (top of %zu): %s", CCV.size(), buf);
+			}
 
-		if (fnBefore != mesh.fn) {
-			DEBUG("Removed %d faces in small components (threshold %f, mesh diag %f)",
-				fnBefore - mesh.fn, componentThreshold, meshDiag);
+			const int fnBefore = mesh.fn;
+			if (largest > 0 && CCV.size() > 1) {
+				const double frac = double(MESH_KEEP_COMPONENT_PCT_X1000) / 100000.0; // (pct/1000)/100
+				const int sizeThreshold = std::max(1, (int)(frac * (double)largest));
+				vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
+				stats.removedComponents += (fnBefore - mesh.fn);
+				if (fnBefore != mesh.fn)
+					DEBUG("Removed %d faces in small components (kept >= %.3g%% of largest=%d faces -> threshold %d faces, of %zu components)",
+						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, sizeThreshold, CCV.size());
+			}
 		}
 
 		CompactAndRefresh();
@@ -2028,6 +2310,251 @@ void Mesh::Clean(
 	}
 
 	// =============================================================
+	// Phase 3.4: Boundary-tooth peel -- removes "loose polygon slop"
+	// hanging off the silhouette.
+	//
+	// The graph-cut footprint edge leaves a sawtooth fringe: single
+	// triangles attached to the body by ONE edge (their other two edges
+	// open = "teeth"), and 1-triangle-wide whisker chains. Top-down they
+	// read as ragged, detached-looking polygon slop along the edges.
+	//
+	// We iteratively delete any face with >= 2 OPEN edges. A tooth (2 open
+	// edges) contributes nothing to the footprint -- removing it replaces
+	// two jagged outline edges with one straighter one. Whisker chains
+	// erode tip-inward as each removal exposes the next. CRITICAL: a face
+	// with only 1 open edge is NEVER touched, so the pass stops at the
+	// first solid (2D) ring and cannot recede the real silhouette or punch
+	// holes. Few iterations, tiny face counts, self-terminating.
+	// Compile-time gated by MESH_TOOTH_PEEL_ENABLED (default 0 = off).
+#if MESH_TOOTH_PEEL_ENABLED
+	{
+		constexpr int  TOOTH_MAX_ITERS    = 4;
+		{
+			int toothRemoved = 0, toothIters = 0;
+			for (; toothIters < TOOTH_MAX_ITERS; ++toothIters) {
+				vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+				std::vector<CLEAN::Mesh::FacePointer> toDelete;
+				for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+					if (fi->IsD()) continue;
+					int nOpen = 0;
+					for (int e = 0; e < 3; ++e) {
+						auto* adj = fi->FFp(e);
+						if (adj == &*fi || adj->IsD()) ++nOpen;
+					}
+					if (nOpen >= 2)
+						toDelete.push_back(&*fi);
+				}
+				if (toDelete.empty()) break;
+				for (auto* fp : toDelete)
+					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
+				toothRemoved += (int)toDelete.size();
+			}
+			if (toothRemoved > 0) {
+				stats.removedLongEdgeFaces += toothRemoved;
+				CompactAndRefresh();
+				DEBUG("DIAG boundary-tooth peel: removed %d sawtooth/whisker faces in %d rings",
+					toothRemoved, toothIters);
+			}
+		}
+	}
+#endif // MESH_TOOTH_PEEL_ENABLED
+
+	// JPB WIP P BUG Sail peel not needed for Poisson
+	// =============================================================
+	// Phase 3.45: Boundary sail/curtain/underside peel (orientation-based)
+	//
+	// Removes the Poisson/graph-cut skirt hanging off the silhouette AND the
+	// down-facing back sheet Poisson bills UNDER a top-only reconstruction
+	// (reverse/cyan normals). Iterative rings: delete a face that touches the
+	// OPEN boundary AND is NOT clearly upward-facing (unit normal.z < minUpZ)
+	// AND (if the length gate is on) is elongated (longest edge > lenThresh).
+	// The flat top surface (nz ~ +1) is KEPT so completeness is preserved;
+	// vertical drapes (nz ~ 0) and the down-facing underside (nz < 0) are peeled.
+	// Removing the outer ring exposes the next, so multi-triangle drapes/undersides
+	// erode inward; a clearly-upward ring stops the pass. Assumes +Z is up.
+	// Compile-time gated by MESH_SAIL_PEEL_ENABLED (see macro block).
+#if MESH_SAIL_PEEL_ENABLED
+	{
+		const float medianEdge = ComputeMedianEdgeLength(mesh);
+		const float lenThresh = (float(MESH_SAIL_PEEL_LEN_MULT_X100) / 100.f) * medianEdge;
+		const float minUpZ = float(MESH_SAIL_PEEL_MAX_NZ_X100) / 100.f;
+		int sailRemoved = 0, sailRings = 0;
+		if (medianEdge > 0.f) {
+			for (; sailRings < MESH_SAIL_PEEL_MAX_ITERS; ++sailRings) {
+				vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+				std::vector<CLEAN::Mesh::FacePointer> toDelete;
+				for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+					if (fi->IsD()) continue;
+					// (a) must touch the open boundary
+					bool onBoundary = false;
+					for (int e = 0; e < 3; ++e) {
+						auto* adj = fi->FFp(e);
+						if (adj == &*fi || adj->IsD()) { onBoundary = true; break; }
+					}
+					if (!onBoundary) continue;
+					const auto& p0 = fi->V(0)->cP();
+					const auto& p1 = fi->V(1)->cP();
+					const auto& p2 = fi->V(2)->cP();
+					// (c) length gate (optional: lenThresh <= 0 disables it)
+					if (lenThresh > 0.f) {
+						const float e0 = (p1 - p0).Norm();
+						const float e1 = (p2 - p1).Norm();
+						const float e2 = (p0 - p2).Norm();
+						const float lMax = std::max(e0, std::max(e1, e2));
+						if (lMax <= lenThresh) continue;
+					}
+					// (b) orientation: peel UNLESS the face is clearly UPWARD-facing.
+					// uz = unit normal.z (Z-up). Top surface uz~+1 (KEPT); vertical
+					// drape uz~0 and ballooned Poisson underside uz<0 (both PEELED).
+					const CLEAN::Mesh::CoordType nrm = (p1 - p0) ^ (p2 - p0);
+					const float nl = nrm.Norm();
+					if (nl <= 1e-12f) { toDelete.push_back(&*fi); continue; }
+					if (nrm[2] / nl < minUpZ)
+						toDelete.push_back(&*fi);
+				}
+				if (toDelete.empty()) break;
+				for (auto* fp : toDelete)
+					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
+				sailRemoved += (int)toDelete.size();
+			}
+		}
+		if (sailRemoved > 0) {
+			stats.removedLongEdgeFaces += sailRemoved;
+			CompactAndRefresh();
+			DEBUG("DIAG boundary-sail peel: removed %d non-upward drape/underside faces in %d rings (keep nz>=%.2f, len-gate %.2fx median %.3g)",
+				sailRemoved, sailRings, minUpZ, float(MESH_SAIL_PEEL_LEN_MULT_X100) / 100.f, medianEdge);
+		}
+		ValidateMesh(mesh, "after sail peel", true);
+	}
+#endif // MESH_SAIL_PEEL_ENABLED
+
+	// =============================================================
+	// Phase 3.46: Global down-facing cull (watertight-underside removal)
+	// See MESH_DOWN_CULL_ENABLED macro. Boundary-independent orientation cull.
+	// =============================================================
+#if MESH_DOWN_CULL_ENABLED
+	{
+		const float maxNZ = float(MESH_DOWN_CULL_MAX_NZ_X100) / 100.f;
+		std::vector<CLEAN::Mesh::FacePointer> toDelete;
+		for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+			if (fi->IsD()) continue;
+			const auto& p0 = fi->V(0)->cP();
+			const auto& p1 = fi->V(1)->cP();
+			const auto& p2 = fi->V(2)->cP();
+			const CLEAN::Mesh::CoordType nrm = (p1 - p0) ^ (p2 - p0);
+			const float nl = nrm.Norm();
+			if (nl <= 1e-12f) { toDelete.push_back(&*fi); continue; }
+			if (nrm[2] / nl < maxNZ)
+				toDelete.push_back(&*fi);
+		}
+		if (!toDelete.empty()) {
+			for (auto* fp : toDelete)
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
+			stats.removedLongEdgeFaces += (int)toDelete.size();
+			CompactAndRefresh();
+			DEBUG("DIAG down-cull: removed %d down-facing faces (nz < %.2f) -> %d fn",
+				(int)toDelete.size(), maxNZ, mesh.fn);
+		}
+		ValidateMesh(mesh, "after down-cull", true);
+	}
+#endif // MESH_DOWN_CULL_ENABLED
+
+	// =============================================================
+	// Phase 3.48: Underside deflate (push down-hanging lobes up to the surface)
+	// See MESH_DEFLATE_ENABLED macro. Height-field clamp + seam smooth; no deletes.
+	// =============================================================
+#if MESH_DEFLATE_ENABLED
+	{
+		const float medianEdge = ComputeMedianEdgeLength(mesh);
+		if (medianEdge > 0.f && mesh.vn > 0) {
+			vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
+			const auto& bbmin = mesh.bbox.min;
+			const auto& bbmax = mesh.bbox.max;
+			const float spanX = std::max(1e-6f, bbmax[0] - bbmin[0]);
+			const float spanY = std::max(1e-6f, bbmax[1] - bbmin[1]);
+			float cell = (float(MESH_DEFLATE_CELL_MULT_X100) / 100.f) * medianEdge;
+			if (cell <= 0.f) cell = std::max(spanX, spanY);
+			const int MAXDIM = 4096;
+			int gw = (int)(spanX / cell) + 2;
+			int gh = (int)(spanY / cell) + 2;
+			if (gw > MAXDIM || gh > MAXDIM) {
+				cell = std::max(spanX / (MAXDIM - 2), spanY / (MAXDIM - 2));
+				gw = (int)(spanX / cell) + 2;
+				gh = (int)(spanY / cell) + 2;
+			}
+			const float invCell = 1.f / cell;
+			const float margin = (float(MESH_DEFLATE_MARGIN_MULT_X100) / 100.f) * medianEdge;
+			auto cellIndex = [&](float x, float y) -> size_t {
+				int cx = (int)((x - bbmin[0]) * invCell); if (cx < 0) cx = 0; if (cx >= gw) cx = gw - 1;
+				int cy = (int)((y - bbmin[1]) * invCell); if (cy < 0) cy = 0; if (cy >= gh) cy = gh - 1;
+				return (size_t)cy * (size_t)gw + (size_t)cx;
+			};
+			std::vector<float> topZ((size_t)gw * (size_t)gh, -FLT_MAX);
+			for (auto& v : mesh.vert) {
+				if (v.IsD()) continue;
+				const auto& p = v.cP();
+				float& t = topZ[cellIndex(p[0], p[1])];
+				if (p[2] > t) t = p[2];
+			}
+			// Lift any vertex hanging > margin below the local top up to (top - margin).
+			const size_t NV = mesh.vert.size();
+			std::vector<uint8_t> lifted(NV, 0);
+			int nLifted = 0;
+			for (size_t i = 0; i < NV; ++i) {
+				auto& v = mesh.vert[i];
+				if (v.IsD()) continue;
+				const auto& p = v.cP();
+				const float t = topZ[cellIndex(p[0], p[1])];
+				if (t > -FLT_MAX && (t - p[2]) > margin) {
+					v.P()[2] = t - margin;
+					lifted[i] = 1;
+					++nLifted;
+				}
+			}
+			// Z-only Laplacian smoothing over lifted verts + their 1-ring to blend the seam.
+			if (nLifted > 0 && MESH_DEFLATE_SMOOTH_ITERS > 0) {
+				vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+				// build the smoothing set: lifted verts and their immediate neighbors
+				std::vector<uint8_t> inBand = lifted;
+				for (auto& f : mesh.face) {
+					if (f.IsD()) continue;
+					const int a = (int)vcg::tri::Index(mesh, f.V(0));
+					const int b = (int)vcg::tri::Index(mesh, f.V(1));
+					const int c = (int)vcg::tri::Index(mesh, f.V(2));
+					if (lifted[a] || lifted[b] || lifted[c]) { inBand[a] = inBand[b] = inBand[c] = 1; }
+				}
+				std::vector<float> zAccum(NV), zCnt(NV);
+				for (int it = 0; it < MESH_DEFLATE_SMOOTH_ITERS; ++it) {
+					std::fill(zAccum.begin(), zAccum.end(), 0.f);
+					std::fill(zCnt.begin(), zCnt.end(), 0.f);
+					for (auto& f : mesh.face) {
+						if (f.IsD()) continue;
+						const int idx[3] = {
+							(int)vcg::tri::Index(mesh, f.V(0)),
+							(int)vcg::tri::Index(mesh, f.V(1)),
+							(int)vcg::tri::Index(mesh, f.V(2)) };
+						for (int e = 0; e < 3; ++e) {
+							const int u = idx[e], w = idx[(e + 1) % 3];
+							zAccum[u] += mesh.vert[w].cP()[2]; zCnt[u] += 1.f;
+							zAccum[w] += mesh.vert[u].cP()[2]; zCnt[w] += 1.f;
+						}
+					}
+					for (size_t i = 0; i < NV; ++i)
+						if (inBand[i] && zCnt[i] > 0.f && !mesh.vert[i].IsD())
+							mesh.vert[i].P()[2] = 0.5f * mesh.vert[i].cP()[2] + 0.5f * (zAccum[i] / zCnt[i]);
+				}
+			}
+			if (nLifted > 0) {
+				CompactAndRefresh();
+				DEBUG("DIAG underside-deflate: lifted %d hanging verts to local top (grid %dx%d cell %.3g, margin %.3g) -> %d fn",
+					nLifted, gw, gh, cell, margin, mesh.fn);
+			}
+			ValidateMesh(mesh, "after underside deflate", true);
+		}
+	}
+#endif // MESH_DEFLATE_ENABLED
+
+	// =============================================================
 	// Phase 3.5: Decimation (deferred from Phase 1)
 	//
 	// Run AFTER spurious + spike removal so the quadric edge-collapse
@@ -2035,66 +2562,197 @@ void Mesh::Clean(
 	// edges, building outlines) that would otherwise be lost while the
 	// collapser "fixes" artifacts.
 	// =============================================================
-	if (fDecimate > 0 && fDecimate < 1.0f) {
+	if ((fDecimate > 0 && fDecimate < 1.0f) || fDecimateError > 0.f) {
 		const int removedArea = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
 		const int removedDup = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
 
 		if (removedArea > 0 || removedDup > 0)
 			LightRefresh();
 
-		vcg::tri::TriEdgeCollapseQuadricParameter pp;
-		pp.OptimalPlacement = true;
-		pp.PreserveBoundary = false;
-		pp.PreserveTopology = false;
+		// VCG quadric edge-collapse REQUIRES a clean, compacted mesh, and its
+		// Init() internally calls FaceBorderFromVF() to find the boundary that
+		// PreserveBoundary must lock.
+		//
+		// ROOT CAUSE (fixed 2026 in vcglib update/flag.h): the fork's optimized
+		// "seenGen" branch of FaceBorderFromVF was broken -- it set BORDERFLAG on
+		// the first time each neighbor was seen and never cleared it via parity,
+		// so EVERY edge (incl. interior 2-face edges) was flagged border. That
+		// made this diagnostic read "100% border", PreserveBoundary ClearW-locked
+		// every vertex, the collapse heap came up empty, and decimation silently
+		// did nothing. (Separately, PreserveBoundary=false on the resulting state
+		// crashed with 0xC0000005.) With the vcglib parity bug fixed, the border
+		// set is now the true silhouette/holes and PreserveBoundary=true works.
+		//
+		// We still Compact() here (the spike/tooth-peel passes DeleteFace()'d and
+		// only LightRefresh()'d, leaving stale storage) and we ONLY ever run the
+		// crash-safe PreserveBoundary=true mode.
+		Compact();
 
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromVF(mesh);
-
-		const int targetFaces = ROUND2INT(fDecimate * mesh.fn);
-		vcg::math::Quadric<double> QZero; QZero.SetZero();
-		CLEAN::QuadricTemp TD(mesh.vert, QZero);
-		CLEAN::QHelper::TDp() = &TD;
-
-		vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
-
-		auto oldNested = omp_get_nested();
-		auto oldDynamic = omp_get_dynamic();
-
-		deci.Init<CLEAN::TriEdgeCollapse>();
-		deci.SetTargetSimplices(targetFaces);
-		deci.SetTimeBudget(1.f);
-
-		const size_t numVertices = mesh.vert.size();
+		// Clamp the target so a degenerate fDecimate can never request 0 faces. In adaptive
+		// mode fDecimate (if in (0,1)) is the KEEP FLOOR; if decimation is otherwise disabled
+		// (fDecimate >= 1) only a minimal safety floor applies and the error metric drives it.
+		// Effective strength: runtime --decimate-error (fDecimateError) overrides the
+		// MESH_DECIMATE_ERROR_K_X100 compile-time default; 0 = legacy fixed-ratio decimation.
 		const int OriginalFaceNum(mesh.face.size());
+		const double kEff = (fDecimateError > 0.f) ? (double)fDecimateError : (MESH_DECIMATE_ERROR_K_X100 / 100.0);
+		int targetFaces = (fDecimate > 0 && fDecimate < 1.f)
+			? std::max<int>(4, ROUND2INT(fDecimate * mesh.fn))
+			: 4;
+		float medianEdgeLen = 0.f;
+		double errorDev = 0.0;
+		if (kEff > 0) {
+			// Adaptive (error-bounded) decimation: stop when the next quadric collapse's
+			// geometric error exceeds tau (from the scene scale, set per-pass below), so flat
+			// regions collapse maximally and detail is preserved.
+			medianEdgeLen = ComputeMedianEdgeLength(mesh);
+			errorDev = (double)medianEdgeLen * kEff;
+			DEBUG("Adaptive decimation ON: medianEdge=%.4g, k=%.2f, allowed-deviation~%.4g world units, keep-floor=%d faces",
+				medianEdgeLen, kEff, errorDev, targetFaces);
+		}
 		DEBUG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
-		Util::Progress progress(_T("Decimating"), OriginalFaceNum - targetFaces);
-		while (deci.DoOptimization(numVertices) && mesh.fn > targetFaces)
-			progress.display(OriginalFaceNum - mesh.fn);
-		deci.Finalize<CLEAN::TriEdgeCollapse>();
+
+		const auto oldNested = omp_get_nested();
+		const auto oldDynamic = omp_get_dynamic();
+
+		// One boundary-preserving quadric-collapse pass.
+		// NOTE: DoOptimization(size_t)'s argument is only a reserve() hint in
+		// this fork -- it does NOT bound collapses; a single call runs until
+		// the heap empties or the SetTargetSimplices() goal is reached.
+		// PreserveBoundary=true is the ONLY safe mode (PreserveBoundary=false
+		// crashes on any residual non-manifold edge). Returns faces collapsed.
+		auto runDecimate = [&](bool logDiag) -> int {
+			vcg::tri::TriEdgeCollapseQuadricParameter pp;
+			pp.OptimalPlacement = true;
+			pp.PreserveBoundary = true;
+			pp.PreserveTopology = false;
+			if (kEff > 0) {
+				// deterministic scene-normalized quadric so the error threshold below is in
+				// the collapse-priority's own units (Init sets g_ScaleFactor = 1e8/diag^6)
+				pp.ScaleIndependent = true;
+			}
+
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromVF(mesh);
+
+			// Diagnostic (read-only): how much of the mesh is border? Every
+			// border vertex is locked by PreserveBoundary, so if this is near
+			// 100% the heap comes up empty and decimation is a silent no-op.
+			if (logDiag) {
+				const auto* baseV = &mesh.vert[0];
+				std::vector<char> vb(mesh.vert.size(), 0);
+				size_t borderEdges = 0;
+				for (auto& f : mesh.face) {
+					if (f.IsD()) continue;
+					for (int j = 0; j < 3; ++j) {
+						if (f.IsB(j)) {
+							++borderEdges;
+							vb[(size_t)(f.V(j)  - baseV)] = 1;
+							vb[(size_t)(f.V1(j) - baseV)] = 1;
+						}
+					}
+				}
+				size_t borderVerts = 0, liveVerts = 0;
+				for (size_t i = 0; i < mesh.vert.size(); ++i) {
+					if (mesh.vert[i].IsD()) continue;
+					++liveVerts;
+					if (vb[i]) ++borderVerts;
+				}
+				DEBUG("DIAG decimate input: %u live verts, %u border verts (%.1f%%), %u border edges, fn=%d, target=%d, OptimalPlacement=1",
+					(unsigned)liveVerts, (unsigned)borderVerts,
+					liveVerts ? 100.0 * (double)borderVerts / (double)liveVerts : 0.0,
+					(unsigned)borderEdges, mesh.fn, targetFaces);
+			}
+
+			vcg::math::Quadric<double> QZero; QZero.SetZero();
+			CLEAN::QuadricTemp TD(mesh.vert, QZero);
+			CLEAN::QHelper::TDp() = &TD;
+
+			vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
+			deci.Init<CLEAN::TriEdgeCollapse>();
+			deci.SetTargetSimplices(targetFaces);
+			if (kEff > 0) {
+				// Express the deviation tolerance in the collapse-priority's units. Init just
+				// refreshed mesh.bbox and set g_ScaleFactor = 1e8/diag^6 (ScaleIndependent), so
+				// tau = g_ScaleFactor * deviation^2. SetTargetSimplices above stays active as
+				// the keep floor -- decimation stops at whichever goal triggers first.
+				const double diag = mesh.bbox.Diag();
+				if (diag > 0 && errorDev > 0) {
+					const double scale = 1e8 * std::pow(1.0 / diag, 6.0);
+					deci.SetTargetMetric((CLEAN::Mesh::ScalarType)(scale * errorDev * errorDev));
+				}
+			}
+			deci.SetTimeBudget(1.f);
+
+			const int faceBefore = mesh.fn;
+			Util::Progress progress(_T("Decimating"), faceBefore - targetFaces);
+			while (mesh.fn > targetFaces && deci.DoOptimization(mesh.vert.size()))
+				progress.display(faceBefore - mesh.fn);
+			deci.Finalize<CLEAN::TriEdgeCollapse>();
+			progress.close();
+			if (logDiag && kEff > 0) {
+				const bool hitFloor = (mesh.fn <= targetFaces);
+				const bool hitMetric = (deci.currMetric > deci.targetMetric);
+				DEBUG("DIAG decimate stop: %s | final-error=%.4g tau=%.4g (ratio=%.2f)",
+					hitFloor ? "FLOOR" : hitMetric ? "METRIC" : "HEAP-EMPTY",
+					(double)deci.currMetric, (double)deci.targetMetric,
+					deci.targetMetric > 0 ? (double)deci.currMetric / (double)deci.targetMetric : 0.0);
+			}
+			return faceBefore - mesh.fn;
+		};
+
+		int totalCollapsed = 0;
+		if (mesh.fn > targetFaces)
+			totalCollapsed += runDecimate(true);
+		DEBUG("Decimation pass 1 (PreserveBoundary=true): %d collapsed, fn=%d", totalCollapsed, mesh.fn);
+
+		// Fallback: if pass 1 collapsed nothing, the mesh is genuinely
+		// non-2-manifold even after compaction (every edge a true border).
+		// Repair manifoldness so the collapser has a real interior, then retry
+		// -- still PreserveBoundary=true (never the crashing boundary-free mode).
+		if (totalCollapsed == 0 && mesh.fn > targetFaces) {
+			using Tri = vcg::tri::Clean<CLEAN::Mesh>;
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			const int nmf = Tri::RemoveNonManifoldFace(mesh);
+			const int nmv = Tri::SplitNonManifoldVertex(mesh, 0);
+			const int unref = Tri::RemoveUnreferencedVertex(mesh);
+			Compact();
+			DEBUG("Decimation manifold-repair: removed %d non-manifold faces, split %d non-manifold verts, removed %d unref verts -> fn=%d",
+				nmf, nmv, unref, mesh.fn);
+
+			if (mesh.fn > targetFaces) {
+				const int again = runDecimate(true);
+				totalCollapsed += again;
+				DEBUG("Decimation pass 2 (after manifold repair): %d collapsed, fn=%d", again, mesh.fn);
+			}
+		}
+
 		omp_set_nested(oldNested);
 		omp_set_dynamic(oldDynamic);
-		progress.close();
 
 		// TIER 1: hole-closing phase below rebuilds both FF and VF as its first
 		// action, so the topology rebuild here would be wasted.
 		Compact();
 
-		DEBUG("DIAG after decimation: %d vn, %d fn", mesh.vn, mesh.fn);
+		DEBUG("DIAG after decimation: %d vn, %d fn (%d total collapsed)", mesh.vn, mesh.fn, totalCollapsed);
+		// Safety net: decimation must never empty a non-empty mesh. If it does
+		// (degenerate quadrics on pathological input), warn loudly — the
+		// guards above should prevent it, but this catches any residual case
+		// before the empty mesh propagates to the output file.
+		if (mesh.fn == 0 && OriginalFaceNum > 0)
+			DEBUG("warning: decimation emptied the mesh (was %d faces) — check input topology/flags", OriginalFaceNum);
 		ValidateMesh(mesh, "after decimation", true);
 	}
 
 	// =============================================================
 	// Phase 4: Hole closing
 	//
-	// Use EarCuttingIntersectionFill with SelfIntersectionEar only.
-	// The self-intersection test naturally prevents fan-sheet creation
-	// because fan triangles spanning a bridge gap WILL intersect
-	// existing geometry. No TrivialEar fallback means if the
-	// intersection test rejects all ears, the hole stays open —
-	// which is correct for bridge gaps.
-	//
-	// No geometric pre-filtering needed. The intersection test IS
-	// the filter.
+	// Fill INTERIOR holes only. Edge count cannot distinguish a real interior
+	// hole from the outer silhouette / a concave bay, so we gate on geometric
+	// extent: a loop is filled only if its bbox diagonal is within
+	// MESH_HOLE_MAX_DIAG_FRAC of the whole-mesh diagonal (compact = interior),
+	// up to MESH_HOLE_MAX_EDGES edges. The big outer/bay loops are left open so
+	// ear-cutting never fans a sheet across them. SelfIntersectionEar remains
+	// the per-ear backstop.
 	// =============================================================
 	if (nCloseHoles > 0) {
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
@@ -2102,12 +2760,73 @@ void Mesh::Clean(
 		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);
+		vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
+
+		const float meshDiag = mesh.bbox.Diag();
+		const float maxHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * meshDiag;
+		// --close-holes (nCloseHoles) is the edge cap, made DENSITY-AWARE so a
+		// given value closes the same PHYSICAL hole size at any mesh fineness
+		// (see MESH_HOLE_REF_EDGES_ACROSS_DIAG). Finer mesh -> more edges per
+		// hole -> proportionally larger cap. Clamped to the runtime ceiling.
+		int holeEdgeCap;
+		{
+			int scaledCloseHoles = (int)nCloseHoles;
+			if (MESH_HOLE_REF_EDGES_ACROSS_DIAG > 0) {
+				const float medianEdge = ComputeMedianEdgeLength(mesh);
+				if (medianEdge > 0.f && meshDiag > 0.f) {
+					const float edgesAcrossDiag = meshDiag / medianEdge;
+					const float densityScale = edgesAcrossDiag / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
+					scaledCloseHoles = std::max(1, ROUND2INT(nCloseHoles * densityScale));
+					DEBUG("DIAG holes density-scale: median-edge=%.4g, edges-across-diag=%.0f, scale=%.2f, --close-holes %u -> %d",
+						medianEdge, edgesAcrossDiag, densityScale, nCloseHoles, scaledCloseHoles);
+				}
+			}
+			holeEdgeCap = std::min<int>(scaledCloseHoles, MESH_HOLE_MAX_EDGES);
+		}
+
+#if 0 // JPB WIP BUG Diag
+		// DIAG: classify every boundary loop so we can see WHY interior holes
+		// remain open after filling -- gate-skipped (too wide / too many edges)
+		// vs ear-rejected (passes the gate but SelfIntersectionEar can't fill
+		// flat near nearby geometry). Compare `pass gate` here to the `Closed N`
+		// count below: if Closed << pass-gate, ear-rejection dominates; if many
+		// are skip-wide, raise MESH_HOLE_MAX_DIAG_FRAC_X1000; if skip-edges,
+		// raise --close-holes.
+		{
+			std::vector<vcg::tri::Hole<CLEAN::Mesh>::Info> loops;
+			vcg::tri::Hole<CLEAN::Mesh>::GetInfo(mesh, false, loops);
+			size_t nPass = 0, nWide = 0, nMany = 0;
+			float maxDiag = 0.f; int maxEdges = 0;
+			int wideBucket[5] = { 0,0,0,0,0 }; // diag as % of mesh: (g-20],(20-30],(30-50],(50-100],>100
+			for (auto& L : loops) {
+				if (L.size < 3) continue;
+				const float d = L.bb.Diag();
+				if (d > maxDiag) maxDiag = d;
+				if (L.size > maxEdges) maxEdges = L.size;
+				const bool wide = d > maxHoleDiag;
+				const bool many = L.size >= holeEdgeCap;
+				if (wide) {
+					++nWide;
+					const float pct = 100.f * d / meshDiag;
+					const int b = pct <= 20.f ? 0 : pct <= 30.f ? 1 : pct <= 50.f ? 2 : pct <= 100.f ? 3 : 4;
+					++wideBucket[b];
+				}
+				if (many) ++nMany;
+				if (!wide && !many) ++nPass;
+			}
+			DEBUG("DIAG holes pre-fill: %zu loops | %zu pass gate | %zu skip-wide | %zu skip-edges(>=%d) | largest diag=%.3g (%.0f%% mesh) edges=%d",
+				loops.size(), nPass, nWide, nMany, holeEdgeCap, maxDiag, meshDiag > 0 ? 100.f * maxDiag / meshDiag : 0.f, maxEdges);
+			DEBUG("DIAG wide-hole diag buckets (%% of mesh diag): (gate-20]=%d (20-30]=%d (30-50]=%d (50-100]=%d (>100]=%d",
+				wideBucket[0], wideBucket[1], wideBucket[2], wideBucket[3], wideBucket[4]);
+		}
+#endif
 
 		const int closed = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingIntersectionFill<
-			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, nCloseHoles, false);
+			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, holeEdgeCap, false, nullptr, maxHoleDiag);
 
 		if (closed > 0) {
-			DEBUG("Closed %d holes (max %u edges)", closed, nCloseHoles);
+			DEBUG("Closed %d interior holes (<= %.3g world units = %.0f%% of mesh diag %.3g, up to %d edges)",
+				closed, maxHoleDiag, float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 10.f, meshDiag, holeEdgeCap);
 			CompactAndRefresh();
 		}
 
@@ -2191,35 +2910,611 @@ void Mesh::Clean(
 		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);
+		vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
 
-		const unsigned finalHoleLimit = std::min(nCloseHoles * 2u, 60u);
-
-		// First pass: use self-intersection aware fill for larger holes
-		int closed = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingIntersectionFill<
-			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, finalHoleLimit, false);
-
-		// Second pass: use trivial ear fill for tiny remaining holes (<=8 edges)
-		// These are the 1-3 triangle gaps left by face removal that SelfIntersectionEar
-		// rejects due to proximity to existing geometry.
+		const float sealMeshDiag = mesh.bbox.Diag();
+		const float sealMaxHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * sealMeshDiag;
+		// Density-aware edge cap, matching Phase 4 (see MESH_HOLE_REF_EDGES_ACROSS_DIAG).
+		int sealHoleEdgeCap;
 		{
+			int scaledCloseHoles = (int)nCloseHoles;
+			if (MESH_HOLE_REF_EDGES_ACROSS_DIAG > 0) {
+				const float medianEdge = ComputeMedianEdgeLength(mesh);
+				if (medianEdge > 0.f && sealMeshDiag > 0.f) {
+					const float densityScale = (sealMeshDiag / medianEdge) / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
+					scaledCloseHoles = std::max(1, ROUND2INT(nCloseHoles * densityScale));
+				}
+			}
+			sealHoleEdgeCap = std::min<int>(scaledCloseHoles, MESH_HOLE_MAX_EDGES);
+		}
+
+		// First pass: geometry-gated interior-hole fill (same rule as Phase 4),
+		// so the final seal closes remaining compact holes without fanning the
+		// silhouette/bays.
+		int closed = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingIntersectionFill<
+			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, sealHoleEdgeCap, false, nullptr, sealMaxHoleDiag);
+
+		// Second pass: fallback fill for the small holes SelfIntersectionEar
+		// rejected (ear-rejected 3D tears). TrivialEar fills regardless of
+		// intersection. Gated by edge count AND a diag ceiling (2x the main gate)
+		// so the outer boundary / wide bays are never bridged. Per-hole loop with
+		// all loop face-pointers registered for AddFaces realloc-safety.
+		if (MESH_HOLE_FALLBACK_MAX_EDGES > 0) {
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
 			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
-			const int closedTiny = vcg::tri::Hole<CLEAN::Mesh>::EarCuttingFill<
-				vcg::tri::TrivialEar<CLEAN::Mesh>>(mesh, 8, false);
+
+			const float fallbackMaxDiag = 2.0f * sealMaxHoleDiag;
+			std::vector<vcg::tri::Hole<CLEAN::Mesh>::Info> loops;
+			vcg::tri::Hole<CLEAN::Mesh>::GetInfo(mesh, false, loops);
+			std::vector<CLEAN::Mesh::FacePointer*> upd;
+			upd.reserve(loops.size());
+			for (auto& L : loops) upd.push_back(&L.p.f);
+			int closedTiny = 0;
+			for (auto& L : loops) {
+				if (L.size < 3 || L.size > MESH_HOLE_FALLBACK_MAX_EDGES) continue;
+				if (L.bb.Diag() > fallbackMaxDiag) continue; // never bridge a wide loop
+				vcg::tri::Hole<CLEAN::Mesh>::FillHoleEar<vcg::tri::TrivialEar<CLEAN::Mesh>>(mesh, L.p, upd);
+				++closedTiny;
+			}
 			closed += closedTiny;
 			if (closedTiny > 0)
-				DEBUG("DIAG trivial seal: closed %d tiny holes", closedTiny);
+				DEBUG("DIAG fallback seal: trivially closed %d small holes (<=%d edges, <= %.3g-unit diag)",
+					closedTiny, MESH_HOLE_FALLBACK_MAX_EDGES, fallbackMaxDiag);
 		}
 
 		if (closed > 0) {
-			DEBUG("Final seal: closed %d small holes (max %u edges)", closed, finalHoleLimit);
+			DEBUG("Final seal: closed %d interior holes (<= %.0f%% of mesh diag, up to %d edges)",
+				closed, float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 10.f, sealHoleEdgeCap);
 			// TIER 1: nothing after this consumes FF/VF -- the export loop just
 			// iterates mesh.vert / mesh.face and skips IsD() entries.
 			Compact();
 		}
 
+#if 0 // JPB WIP BUG Diag
+		// DIAG: how many OPEN boundary loops actually remain after all sealing?
+		// The "Closed N" counters above count ATTEMPTS (holes that passed the
+		// gate), not full seals -- SelfIntersectionEar leaves a hole partially
+		// open when a flat ear would intersect nearby 3D geometry. This is the
+		// ground truth: if ~0 loops remain, the mesh is watertight and any white
+		// interior areas are filled-but-untextured patches (texturing issue). If
+		// many remain (and few are wider than the gate), they are ear-rejected
+		// holes that hug relief -- raising the size gate will NOT close them.
+		{
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+			std::vector<vcg::tri::Hole<CLEAN::Mesh>::Info> rem;
+			vcg::tri::Hole<CLEAN::Mesh>::GetInfo(mesh, false, rem);
+			size_t openLoops = 0, widerThanGate = 0;
+			float maxD = 0.f; int maxE = 0;
+			for (auto& L : rem) {
+				if (L.size < 3) continue;
+				++openLoops;
+				const float d = L.bb.Diag();
+				if (d > maxD) maxD = d;
+				if (L.size > maxE) maxE = L.size;
+				if (d > sealMaxHoleDiag) ++widerThanGate;
+			}
+			DEBUG("DIAG holes post-seal: %zu open loops remain (%zu wider than %.3g-unit gate), largest diag=%.3g (%.0f%% mesh) edges=%d",
+				openLoops, widerThanGate, sealMaxHoleDiag, maxD,
+				sealMeshDiag > 0 ? 100.f * maxD / sealMeshDiag : 0.f, maxE);
+			// Enumerate every remaining open loop so we can correlate it with the
+			// visible holes and tell WHY it survived: a loop whose diag > the gate
+			// was skipped (raise the gate); a loop with diag <= gate that is still
+			// open was ATTEMPTED and ear-rejected (SelfIntersectionEar refused
+			// every flat fill -- gate change won't help). Center locates it.
+			{
+				int shown = 0;
+				for (auto& L : rem) {
+					if (L.size < 3) continue;
+					if (++shown > 40) { DEBUG("   ... (%zu more)", rem.size() - 40); break; }
+					const float d = L.bb.Diag();
+					const auto c = L.bb.Center();
+					DEBUG("   open loop: diag=%.3g (%.0f%% mesh) edges=%d %s center=(%.1f,%.1f,%.1f)",
+						d, sealMeshDiag > 0 ? 100.f * d / sealMeshDiag : 0.f, L.size,
+						d > sealMaxHoleDiag ? "SKIPPED-wide" : "ear-rejected", c[0], c[1], c[2]);
+				}
+			}
+		}
+#endif
+
 		ValidateMesh(mesh, "after final seal", true);
 	}
+
+#if MESH_RIM_ERODE_RINGS > 0
+	// =============================================================
+	// Phase 8.5: Aggressive uniform rim erosion (perimeter straightening)
+	//
+	// Peel MESH_RIM_ERODE_RINGS complete rings of border faces off the whole
+	// silhouette. Each ring: mark border faces (FaceBorderFromFF) and delete
+	// every face that touches the boundary, then refresh topology so the next
+	// inward ring becomes the new border. Fringe narrower than ~2R triangles
+	// (whiskers, thin peninsulas, isthmus necks holding floating flecks) is
+	// fully consumed and the jagged outline recedes to a smoother contour;
+	// the solid body simply loses R rings (negligible vs the whole mesh).
+	//
+	// Because severing a neck can disconnect floating junk from the body, the
+	// small-connected-component filter is re-run afterwards to drop anything
+	// newly isolated. Only border faces are ever deleted, so a sealed interior
+	// hole (no border edges) is never reopened.
+	// =============================================================
+	{
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		int rimRemoved = 0, rimRings = 0;
+		for (; rimRings < MESH_RIM_ERODE_RINGS; ++rimRings) {
+			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+			std::vector<CLEAN::Mesh::FacePointer> toDelete;
+			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+				if (fi->IsD()) continue;
+				if (fi->IsB(0) || fi->IsB(1) || fi->IsB(2))
+					toDelete.push_back(&*fi);
+			}
+			if (toDelete.empty()) break;
+			for (auto* fp : toDelete)
+				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
+			rimRemoved += (int)toDelete.size();
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh); // expose next ring
+		}
+		if (rimRemoved > 0) {
+			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+			Compact();
+			DEBUG("DIAG rim-erode: peeled %d border faces in %d rings -> %d fn",
+				rimRemoved, rimRings, mesh.fn);
+
+			// Re-run small-component filter: erosion may have severed thin necks
+			// that connected floating junk to the body.
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			std::vector<std::pair<int, CLEAN::Mesh::FacePointer>> CCV;
+			vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
+			int largest = 0;
+			for (auto& cc : CCV) largest = std::max(largest, cc.first);
+			const int fnBefore = mesh.fn;
+			if (largest > 0 && CCV.size() > 1) {
+				const double frac = double(MESH_KEEP_COMPONENT_PCT_X1000) / 100000.0;
+				const int sizeThreshold = std::max(1, (int)(frac * (double)largest));
+				vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
+				stats.removedComponents += (fnBefore - mesh.fn);
+				if (fnBefore != mesh.fn) {
+					Compact();
+					DEBUG("DIAG rim-erode: dropped %d newly-disconnected faces (kept >= %.3g%% of largest=%d, %zu components)",
+						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, CCV.size());
+				}
+			}
+		}
+		ValidateMesh(mesh, "after rim erosion", true);
+	}
+#endif // MESH_RIM_ERODE_RINGS > 0
+
+#if MESH_ALPHA_TIGHTEN_ENABLED
+	// =============================================================
+	// Phase 9: Alpha-shape perimeter tightening (erosion-only)
+	//
+	// Roll a disk of radius alpha around the border: iteratively delete rim
+	// faces whose circumradius > alpha (the alpha-shape criterion), peeling the
+	// saw-tooth sliver/spike fringe off the silhouette while leaving genuine
+	// bays (lined with normal-size faces) intact. Deletes only -> no fans.
+	// alpha auto-scales from the median edge length; iterations capped so it
+	// can never cascade into the coarse decimated interior. A/B via the
+	// MESH_ALPHA_TIGHTEN_ENABLED macro.
+	// =============================================================
+	{
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+
+		// alpha = K * median edge length (sampled over all live faces).
+		std::vector<float> elen;
+		elen.reserve(60000);
+		for (auto& f : mesh.face) {
+			if (f.IsD()) continue;
+			const auto& p0 = f.V(0)->cP();
+			const auto& p1 = f.V(1)->cP();
+			elen.push_back((p1 - p0).Norm());
+			if (elen.size() >= 60000) break;
+		}
+		float medianEdge = 0.f;
+		if (!elen.empty()) {
+			std::nth_element(elen.begin(), elen.begin() + elen.size() / 2, elen.end());
+			medianEdge = elen[elen.size() / 2];
+		}
+		const float alpha = (float(MESH_ALPHA_TIGHTEN_K_X100) / 100.f) * medianEdge;
+
+		int totalPeeled = 0;
+		if (alpha > 0.f) {
+			for (int iter = 0; iter < MESH_ALPHA_TIGHTEN_ITERS; ++iter) {
+				vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+				int peeled = 0;
+				for (auto& f : mesh.face) {
+					if (f.IsD()) continue;
+					if (!(f.IsB(0) || f.IsB(1) || f.IsB(2))) continue; // rim faces only
+					const auto& p0 = f.V(0)->cP();
+					const auto& p1 = f.V(1)->cP();
+					const auto& p2 = f.V(2)->cP();
+					const float a = (p1 - p0).Norm();
+					const float b = (p2 - p1).Norm();
+					const float c = (p0 - p2).Norm();
+					const float cross2 = ((p1 - p0) ^ (p2 - p0)).Norm(); // = 2*Area
+					// circumradius R = abc/(4A) = abc/(2*cross2); R > alpha  <=>
+					// abc > alpha*2*cross2. Degenerate sliver (cross2 ~ 0) -> peel.
+					if (cross2 <= 1e-9f || (a * b * c) > alpha * 2.f * cross2) {
+						vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, f);
+						++peeled;
+					}
+				}
+				if (peeled == 0) break;
+				totalPeeled += peeled;
+				vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh); // refresh border
+			}
+		}
+
+		if (totalPeeled > 0) {
+			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
+			Compact();
+			DEBUG("Alpha-tighten: peeled %d rim faces (alpha=%.3g = %.2f x median edge %.3g, <=%d iters) -> %d fn",
+				totalPeeled, alpha, float(MESH_ALPHA_TIGHTEN_K_X100) / 100.f, medianEdge,
+				MESH_ALPHA_TIGHTEN_ITERS, mesh.fn);
+		} else {
+			DEBUG("Alpha-tighten: nothing to peel (alpha=%.3g, median edge %.3g)", alpha, medianEdge);
+		}
+		ValidateMesh(mesh, "after alpha tighten", true);
+	}
+#endif
+
+	// =============================================================
+	// Phase 9.1: Post-tighten small-component removal
+	//
+	// Alpha-tighten and tooth-peel can sever thin bridges that previously
+	// connected small Poisson fragments to the main body. Re-run the
+	// relative-to-largest component filter to drop any newly-orphaned blobs.
+	// =============================================================
+	{
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		std::vector<std::pair<int, CLEAN::Mesh::FacePointer>> CCV;
+		vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
+		int largest = 0;
+		for (auto& cc : CCV) largest = std::max(largest, cc.first);
+		if (largest > 0 && CCV.size() > 1) {
+			const double frac = double(MESH_KEEP_COMPONENT_PCT_X1000) / 100000.0;
+			const int sizeThreshold = std::max(1, (int)(frac * (double)largest));
+			const int fnBefore = mesh.fn;
+			vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
+			if (fnBefore != mesh.fn) {
+				CompactAndRefresh();
+				DEBUG("DIAG post-tighten component filter: removed %d faces in %zu orphaned blobs (threshold %d faces)",
+					fnBefore - mesh.fn, CCV.size() - 1, sizeThreshold);
+			}
+		}
+	}
+
+#if MESH_BAND_REFINE_ENABLED
+	// =============================================================
+	// Phase 9.5: Boundary-band refinement (more polygons around the edges)
+	//
+	// Midpoint-subdivide the faces within MESH_BAND_REFINE_RINGS rings of the
+	// open boundary. PreserveBoundary decimation keeps the silhouette only at
+	// reconstruction density; this adds NEW vertices in the edge band (and on
+	// the silhouette line itself) so the following Taubin smooth has finer
+	// control. Only the band is refined -> interior stays decimated. vcg
+	// RefineMidpoint handles T-junctions at the band's inner edge (manifold).
+	// =============================================================
+	{
+		// Edge predicate: split an edge if either endpoint is a band vertex.
+		struct BandEdgePred {
+			const uint8_t* band;
+			const CLEAN::Mesh::VertexType* base;
+			size_t nv;
+			bool operator()(vcg::face::Pos<CLEAN::Mesh::FaceType> ep) const {
+				const size_t a = (size_t)(ep.f->V(ep.z) - base);
+				const size_t b = (size_t)(ep.f->V1(ep.z) - base);
+				return (a < nv && band[a]) || (b < nv && band[b]);
+			}
+		};
+
+		const int RINGS = MESH_BAND_REFINE_RINGS < 1 ? 1 : MESH_BAND_REFINE_RINGS;
+		const int RING_UNSET = 0x3fffffff;
+		int totalAddedV = 0, totalAddedF = 0;
+		for (int level = 0; level < MESH_BAND_REFINE_LEVELS; ++level) {
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+			const size_t NV = mesh.vert.size();
+			if (NV == 0) break;
+
+			std::vector<int> ringDist(NV, RING_UNSET);
+			for (auto& f : mesh.face) {
+				if (f.IsD()) continue;
+				for (int e = 0; e < 3; ++e)
+					if (f.IsB(e)) {
+						ringDist[(int)vcg::tri::Index(mesh, f.V(e))] = 0;
+						ringDist[(int)vcg::tri::Index(mesh, f.V((e + 1) % 3))] = 0;
+					}
+			}
+			for (int k = 0; k < RINGS; ++k) {
+				bool any = false;
+				for (auto& f : mesh.face) {
+					if (f.IsD()) continue;
+					int rmin = RING_UNSET;
+					for (int i = 0; i < 3; ++i)
+						rmin = std::min(rmin, ringDist[(int)vcg::tri::Index(mesh, f.V(i))]);
+					if (rmin == RING_UNSET || rmin + 1 > RINGS) continue;
+					for (int i = 0; i < 3; ++i) {
+						const int vi = (int)vcg::tri::Index(mesh, f.V(i));
+						if (ringDist[vi] > rmin + 1) { ringDist[vi] = rmin + 1; any = true; }
+					}
+				}
+				if (!any) break;
+			}
+			std::vector<uint8_t> band(NV, 0);
+			for (size_t v = 0; v < NV; ++v)
+				if (ringDist[v] <= RINGS) band[v] = 1;
+
+			BandEdgePred pred{ band.data(), &mesh.vert[0], NV };
+			const int vBefore = (int)mesh.vert.size(), fBefore = (int)mesh.face.size();
+			vcg::tri::RefineMidpoint<CLEAN::Mesh, BandEdgePred>(mesh, pred, false);
+			vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
+			totalAddedV += (int)mesh.vert.size() - vBefore;
+			totalAddedF += (int)mesh.face.size() - fBefore;
+		}
+		if (totalAddedF > 0) {
+			CompactAndRefresh();
+			DEBUG("Band refine: subdivided edge band (%d rings, %d levels) -> +%d verts, +%d faces (now %d fn)",
+				RINGS, MESH_BAND_REFINE_LEVELS, totalAddedV, totalAddedF, mesh.fn);
+		}
+		ValidateMesh(mesh, "after band refine", true);
+	}
+#endif // MESH_BAND_REFINE_ENABLED
+
+#if MESH_EDGE_DILATE_RINGS > 0
+	// =============================================================
+	// Phase 9.7: Edge dilation / outward apron (enlarge coverage)
+	//
+	// Extrude the open silhouette OUTWARD to approximate more area than was
+	// reconstructed. Per ring: for every open-boundary vertex compute its
+	// in-plane outward normal (perpendicular to incident border edges, pointing
+	// away from the interior), blur that direction along the boundary to limit
+	// folding, offset a new vertex outward at the rim's height, and stitch a
+	// triangle strip to the old edge. Apron faces are unobserved -> approximate
+	// color at texturing. Modest margins only (concave notches self-intersect
+	// for large extensions -> raster-domain dilation is the fold-free route).
+	// =============================================================
+	{
+		std::vector<float> el; el.reserve(60000);
+		for (auto& f : mesh.face) {
+			if (f.IsD()) continue;
+			el.push_back((f.V(1)->cP() - f.V(0)->cP()).Norm());
+			if (el.size() >= 60000) break;
+		}
+		float medE = 0.f;
+		if (!el.empty()) {
+			std::nth_element(el.begin(), el.begin() + el.size() / 2, el.end());
+			medE = el[el.size() / 2];
+		}
+		const float step = (float(MESH_EDGE_DILATE_STEP_X100) / 100.f) * medE;
+
+		int totalAddedV = 0, totalAddedF = 0;
+		if (step > 0.f) for (int ring = 0; ring < MESH_EDGE_DILATE_RINGS; ++ring) {
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+			const size_t NV = mesh.vert.size();
+			if (NV == 0) break;
+
+			std::vector<CLEAN::Mesh::CoordType> outDir(NV, CLEAN::Mesh::CoordType(0, 0, 0));
+			std::vector<int> nbr0(NV, -1), nbr1(NV, -1);
+			std::vector<uint8_t> nbrCnt(NV, 0), isB(NV, 0);
+			std::vector<std::pair<int, int>> bedges;
+			for (auto& f : mesh.face) {
+				if (f.IsD()) continue;
+				for (int e = 0; e < 3; ++e) {
+					if (!f.IsB(e)) continue;
+					const int a = (int)vcg::tri::Index(mesh, f.V(e));
+					const int b = (int)vcg::tri::Index(mesh, f.V((e + 1) % 3));
+					const int c = (int)vcg::tri::Index(mesh, f.V((e + 2) % 3));
+					bedges.emplace_back(a, b);
+					CLEAN::Mesh::CoordType edge = mesh.vert[b].cP() - mesh.vert[a].cP(); edge[2] = 0;
+					CLEAN::Mesh::CoordType perp(edge[1], -edge[0], 0);
+					const float pn = perp.Norm();
+					if (pn <= 1e-12f) continue;
+					perp /= pn;
+					CLEAN::Mesh::CoordType mid = (mesh.vert[a].cP() + mesh.vert[b].cP()) * 0.5f;
+					CLEAN::Mesh::CoordType toC = mesh.vert[c].cP() - mid; toC[2] = 0;
+					if (perp * toC > 0) perp = -perp; // point AWAY from interior
+					outDir[a] += perp; outDir[b] += perp; isB[a] = isB[b] = 1;
+					auto add = [&](int u, int w) {
+						if (nbrCnt[u] == 0) { nbr0[u] = w; nbrCnt[u] = 1; }
+						else if (nbrCnt[u] == 1) { if (nbr0[u] != w) { nbr1[u] = w; nbrCnt[u] = 2; } }
+					};
+					add(a, b); add(b, a);
+				}
+			}
+			// blur outward direction along the boundary to reduce concave folding
+			for (int s = 0; s < MESH_EDGE_DILATE_DIRSMOOTH; ++s) {
+				std::vector<CLEAN::Mesh::CoordType> tmp = outDir;
+				for (size_t v = 0; v < NV; ++v)
+					if (nbrCnt[v] == 2)
+						tmp[v] = outDir[v] + outDir[nbr0[v]] + outDir[nbr1[v]];
+				outDir.swap(tmp);
+			}
+			for (size_t v = 0; v < NV; ++v) {
+				if (!isB[v]) continue;
+				const float n = outDir[v].Norm();
+				if (n > 1e-12f) outDir[v] /= n; else isB[v] = 0;
+			}
+
+			std::vector<int> bvList; bvList.reserve(NV);
+			std::vector<int> newIdx(NV, -1);
+			for (size_t v = 0; v < NV; ++v)
+				if (isB[v]) { newIdx[v] = (int)bvList.size(); bvList.push_back((int)v); }
+			if (bvList.empty()) break;
+
+			std::vector<CLEAN::Mesh::CoordType> newPos(bvList.size());
+			for (size_t k = 0; k < bvList.size(); ++k) {
+				const int v = bvList[k];
+				CLEAN::Mesh::CoordType p = mesh.vert[v].cP() + outDir[v] * step;
+				p[2] = mesh.vert[v].cP()[2]; // keep rim height (flat extrapolation)
+				newPos[k] = p;
+			}
+			const size_t oldNV = NV;
+			auto vit = vcg::tri::Allocator<CLEAN::Mesh>::AddVertices(mesh, (int)bvList.size());
+			for (size_t k = 0; k < bvList.size(); ++k, ++vit)
+				vit->P() = newPos[k];
+
+			// drop edges whose endpoints did not both get an apron vertex
+			std::vector<std::pair<int, int>> validEdges;
+			validEdges.reserve(bedges.size());
+			for (auto& be : bedges)
+				if (newIdx[be.first] >= 0 && newIdx[be.second] >= 0)
+					validEdges.push_back(be);
+
+			auto fit = vcg::tri::Allocator<CLEAN::Mesh>::AddFaces(mesh, (int)validEdges.size() * 2);
+			auto setTri = [&](CLEAN::Mesh::FaceIterator& it, int i0, int i1, int i2) {
+				it->V(0) = &mesh.vert[i0]; it->V(1) = &mesh.vert[i1]; it->V(2) = &mesh.vert[i2];
+				const CLEAN::Mesh::CoordType nrm =
+					(mesh.vert[i1].cP() - mesh.vert[i0].cP()) ^ (mesh.vert[i2].cP() - mesh.vert[i0].cP());
+				if (nrm[2] < 0) std::swap(it->V(1), it->V(2)); // force +z (top-facing)
+				++it;
+			};
+			for (auto& be : validEdges) {
+				const int a = be.first, b = be.second;
+				const int ap = (int)oldNV + newIdx[a];
+				const int bp = (int)oldNV + newIdx[b];
+				setTri(fit, a, b, bp);
+				setTri(fit, a, bp, ap);
+			}
+			totalAddedV += (int)bvList.size();
+			totalAddedF += (int)validEdges.size() * 2;
+		}
+		if (totalAddedF > 0) {
+			CompactAndRefresh();
+			DEBUG("Edge dilate: extended boundary outward (%d rings, step %.3g) -> +%d verts, +%d faces (now %d fn)",
+				MESH_EDGE_DILATE_RINGS, step, totalAddedV, totalAddedF, mesh.fn);
+		}
+		ValidateMesh(mesh, "after edge dilate", true);
+	}
+#endif // MESH_EDGE_DILATE_RINGS > 0
+
+#if MESH_BOUNDARY_SMOOTH_ENABLED
+	// =============================================================
+	// Phase 10: Boundary-only Taubin smoothing (silhouette polishing)
+	//
+	// Smooths the ragged open-boundary polyline in place. For each boundary
+	// vertex with exactly two border neighbors, target = midpoint of those two
+	// neighbors; move toward it by +lambda (shrink) then -mu (inflate) per
+	// Taubin pair so the curve smooths WITHOUT net recession. Interior vertices
+	// and pinch/junction boundary vertices (>2 border neighbors) are never
+	// moved. No topology change -> no Compact needed. A/B via the macro.
+	// =============================================================
+	{
+		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
+
+		const size_t NV = mesh.vert.size();
+		if (NV > 0) {
+			const int RINGS = MESH_BOUNDARY_SMOOTH_RINGS < 1 ? 1 : MESH_BOUNDARY_SMOOTH_RINGS;
+			const int RING_UNSET = 0x3fffffff;
+			std::vector<int> nbr0(NV, -1), nbr1(NV, -1);
+			std::vector<uint8_t> nbrCnt(NV, 0);
+			std::vector<int> ringDist(NV, RING_UNSET);
+
+			// ring 0 = open-boundary vertices; also record their two border-curve
+			// neighbors (used to keep the silhouette line itself clean).
+			for (auto& f : mesh.face) {
+				if (f.IsD()) continue;
+				for (int e = 0; e < 3; ++e) {
+					if (!f.IsB(e)) continue;
+					const int a = (int)vcg::tri::Index(mesh, f.V(e));
+					const int b = (int)vcg::tri::Index(mesh, f.V((e + 1) % 3));
+					ringDist[a] = 0; ringDist[b] = 0;
+					auto add = [&](int u, int w) {
+						if (nbrCnt[u] == 0) { nbr0[u] = w; nbrCnt[u] = 1; }
+						else if (nbrCnt[u] == 1) { if (nbr0[u] != w) { nbr1[u] = w; nbrCnt[u] = 2; } }
+						else if (nbrCnt[u] == 2) { if (nbr0[u] != w && nbr1[u] != w) nbrCnt[u] = 3; }
+					};
+					add(a, b);
+					add(b, a);
+				}
+			}
+
+			// BFS ring distance inward (face propagation, capped at RINGS).
+			for (int k = 0; k < RINGS; ++k) {
+				bool any = false;
+				for (auto& f : mesh.face) {
+					if (f.IsD()) continue;
+					int rmin = RING_UNSET;
+					for (int i = 0; i < 3; ++i)
+						rmin = std::min(rmin, ringDist[(int)vcg::tri::Index(mesh, f.V(i))]);
+					if (rmin == RING_UNSET || rmin + 1 > RINGS) continue;
+					for (int i = 0; i < 3; ++i) {
+						const int vi = (int)vcg::tri::Index(mesh, f.V(i));
+						if (ringDist[vi] > rmin + 1) { ringDist[vi] = rmin + 1; any = true; }
+					}
+				}
+				if (!any) break;
+			}
+
+			// 1-ring adjacency for the inner band (rings 1..RINGS) = umbrella smoothing.
+			std::vector<std::vector<int>> adj(NV);
+			for (auto& f : mesh.face) {
+				if (f.IsD()) continue;
+				const int v[3] = {
+					(int)vcg::tri::Index(mesh, f.V(0)),
+					(int)vcg::tri::Index(mesh, f.V(1)),
+					(int)vcg::tri::Index(mesh, f.V(2)) };
+				for (int i = 0; i < 3; ++i) {
+					const int u = v[i];
+					if (ringDist[u] >= 1 && ringDist[u] <= RINGS) {
+						adj[u].push_back(v[(i + 1) % 3]);
+						adj[u].push_back(v[(i + 2) % 3]);
+					}
+				}
+			}
+			for (size_t v = 0; v < NV; ++v)
+				if (!adj[v].empty()) {
+					std::sort(adj[v].begin(), adj[v].end());
+					adj[v].erase(std::unique(adj[v].begin(), adj[v].end()), adj[v].end());
+				}
+
+			// movable = boundary-curve vertices (ring 0, exactly 2 border nbrs) OR
+			// inner-band vertices (ring 1..RINGS with neighbors). Beyond RINGS fixed.
+			auto isCurve = [&](size_t v) { return ringDist[v] == 0 && nbrCnt[v] == 2; };
+			auto isBand  = [&](size_t v) { return ringDist[v] >= 1 && ringDist[v] <= RINGS && !adj[v].empty(); };
+
+			const float lambda = float(MESH_BOUNDARY_SMOOTH_LAMBDA_X100) / 100.f;
+			const float mu = -float(MESH_BOUNDARY_SMOOTH_MU_X100) / 100.f;
+			std::vector<CLEAN::Mesh::CoordType> buf(NV);
+			int nCurve = 0, nBand = 0;
+			for (size_t v = 0; v < NV; ++v) {
+				if (mesh.vert[v].IsD()) continue;
+				if (isCurve(v)) ++nCurve;
+				else if (isBand(v)) ++nBand;
+			}
+
+			for (int it = 0; it < MESH_BOUNDARY_SMOOTH_ITERS * 2; ++it) {
+				const float step = (it & 1) ? mu : lambda; // Taubin alternation
+				for (size_t v = 0; v < NV; ++v) {
+					if (mesh.vert[v].IsD()) continue;
+					if (isCurve(v)) {
+						const auto& p = mesh.vert[v].cP();
+						const auto& pa = mesh.vert[nbr0[v]].cP();
+						const auto& pb = mesh.vert[nbr1[v]].cP();
+						const CLEAN::Mesh::CoordType avg = (pa + pb) * 0.5f;
+						buf[v] = p + (avg - p) * step;
+					} else if (isBand(v)) {
+						const auto& p = mesh.vert[v].cP();
+						CLEAN::Mesh::CoordType sum(0, 0, 0);
+						for (int w : adj[v]) sum += mesh.vert[w].cP();
+						const CLEAN::Mesh::CoordType avg = sum / (float)adj[v].size();
+						buf[v] = p + (avg - p) * step;
+					}
+				}
+				for (size_t v = 0; v < NV; ++v) {
+					if (mesh.vert[v].IsD()) continue;
+					if (isCurve(v) || isBand(v)) mesh.vert[v].P() = buf[v];
+				}
+			}
+			if (nCurve + nBand > 0)
+				DEBUG("Boundary smooth: Taubin-smoothed %d edge + %d band vertices (%d rings, %d iters, lambda=%.2f mu=%.2f)",
+					nCurve, nBand, RINGS, MESH_BOUNDARY_SMOOTH_ITERS, lambda, mu);
+		}
+		ValidateMesh(mesh, "after boundary smooth", true);
+	}
+#endif // MESH_BOUNDARY_SMOOTH_ENABLED
 
 	// =============================================================
 	// Export
@@ -2342,6 +3637,35 @@ namespace BasicPLY {
 	static const PLY::PlyProperty face_tex_props[] = {
 		{"vertex_indices", PLY::Uint32, PLY::Uint32, offsetof(FaceTex,face.pFace), 1, PLY::Uint8, PLY::Uint8, offsetof(FaceTex,face.num)},
 		{"texcoord", PLY::Float32, PLY::Float32, offsetof(FaceTex,tex.pTex), 1, PLY::Uint8, PLY::Uint8, offsetof(FaceTex,tex.num)}
+	};
+	// vertex carrying a per-vertex texture coordinate (written as standard
+	// "s"/"t" properties so any importer reads UVs through its safe
+	// per-vertex path instead of scattering per-face texcoords)
+	struct VertexTex {
+		Mesh::Vertex v;
+		Mesh::TexCoord t;
+	};
+	static const PLY::PlyProperty vert_tex_props[] = {
+		{"x", PLY::Float32, PLY::Float32, offsetof(VertexTex,v.x), 0, 0, 0, 0},
+		{"y", PLY::Float32, PLY::Float32, offsetof(VertexTex,v.y), 0, 0, 0, 0},
+		{"z", PLY::Float32, PLY::Float32, offsetof(VertexTex,v.z), 0, 0, 0, 0},
+		{"s", PLY::Float32, PLY::Float32, offsetof(VertexTex,t.x), 0, 0, 0, 0},
+		{"t", PLY::Float32, PLY::Float32, offsetof(VertexTex,t.y), 0, 0, 0, 0}
+	};
+	struct VertexNormalTex {
+		Mesh::Vertex v;
+		Mesh::Normal n;
+		Mesh::TexCoord t;
+	};
+	static const PLY::PlyProperty vert_normal_tex_props[] = {
+		{ "x", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,v.x), 0, 0, 0, 0},
+		{ "y", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,v.y), 0, 0, 0, 0},
+		{ "z", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,v.z), 0, 0, 0, 0},
+		{"nx", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,n.x), 0, 0, 0, 0},
+		{"ny", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,n.y), 0, 0, 0, 0},
+		{"nz", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,n.z), 0, 0, 0, 0},
+		{"s", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,t.x), 0, 0, 0, 0},
+		{"t", PLY::Float32, PLY::Float32, offsetof(VertexNormalTex,t.y), 0, 0, 0, 0}
 	};
 	// list of the kinds of elements in the PLY
 	static const char* elem_names[] = {
@@ -2707,6 +4031,9 @@ bool Mesh::Save(const String& fileName, const cList<String>& comments, bool bBin
 	if (ext == _T(".gltf") || ext == _T(".glb"))
 		ret = SaveGLTF(fileName, ext == _T(".glb"));
 	else
+	if (ext == _T(".gmmesh"))
+		ret = SaveGMMesh(fileName);
+	else
 		ret = SavePLY(ext != _T(".ply") ? String(fileName+_T(".ply")) : fileName, comments, bBinary);
 	if (!ret)
 		return false;
@@ -2734,39 +4061,42 @@ bool Mesh::SavePLY(const String& fileName, const cList<String>& comments, bool b
 	// export texture file name as comment if needed
 	String textureFileName;
 	if (!faceTexcoords.empty() && !textureDiffuse.empty()) {
-		textureFileName = Util::getFileFullName(fileName)+_T(".png");
+		// Use JPEG (fast TurboJPEG encode) rather than PNG (zlib level 6),
+		// which is catastrophically slow on multi-gigapixel texture atlases.
+		textureFileName = Util::getFileFullName(fileName)+_T(".jpg");
 		ply.append_comment((_T("TextureFile ")+Util::getFileNameExt(textureFileName)).c_str());
 	}
 
-	if (vertexNormals.empty()) {
-		// describe what properties go into the vertex elements
-		ply.describe_property(BasicPLY::elem_names[0], 3, BasicPLY::vert_props);
-
-		// export the array of vertices
-		FOREACHPTR(pVert, vertices)
-			ply.put_element(pVert);
-	} else {
-		ASSERT(vertices.size() == vertexNormals.size());
-
-		// describe what properties go into the vertex elements
-		ply.describe_property(BasicPLY::elem_names[0], 6, BasicPLY::vert_normal_props);
-
-		// export the array of vertices
-		BasicPLY::VertexNormal vn;
-		FOREACH(i, vertices) {
-			vn.v = vertices[i];
-			vn.n = vertexNormals[i];
-			ply.put_element(&vn);
-		}
-	}
-	if (ply.get_current_element_count() == 0)
-		return false;
-
 	if (faceTexcoords.empty()) {
-		// describe what properties go into the vertex elements
+		// no texture coordinates: export plain vertices then faces
+		if (vertexNormals.empty()) {
+			// describe what properties go into the vertex elements
+			ply.describe_property(BasicPLY::elem_names[0], 3, BasicPLY::vert_props);
+
+			// export the array of vertices
+			FOREACHPTR(pVert, vertices)
+				ply.put_element(pVert);
+		} else {
+			ASSERT(vertices.size() == vertexNormals.size());
+
+			// describe what properties go into the vertex elements
+			ply.describe_property(BasicPLY::elem_names[0], 6, BasicPLY::vert_normal_props);
+
+			// export the array of vertices
+			BasicPLY::VertexNormal vn;
+			FOREACH(i, vertices) {
+				vn.v = vertices[i];
+				vn.n = vertexNormals[i];
+				ply.put_element(&vn);
+			}
+		}
+		if (ply.get_current_element_count() == 0)
+			return false;
+
+		// describe what properties go into the face elements
 		ply.describe_property(BasicPLY::elem_names[1], 1, BasicPLY::face_props);
 
-	// export the array of faces
+		// export the array of faces
 		BasicPLY::Face face = {3};
 		FOREACHPTR(pFace, faces) {
 			face.pFace = pFace;
@@ -2775,18 +4105,81 @@ bool Mesh::SavePLY(const String& fileName, const cList<String>& comments, bool b
 	} else {
 		ASSERT(faceTexcoords.size() == faces.size()*3);
 
+		// OpenMVS stores texture coordinates per face-corner (3 per triangle).
+		// Exporting them as the PLY face "texcoord" list forces importers to
+		// scatter per-wedge UVs into a per-vertex array, which loses UVs at
+		// chart seams (last-writer-wins) and, after primitive-type splitting,
+		// can desync from the vertex count and crash the consumer. Instead we
+		// split shared vertices at UV seams (so each unique vertex/UV pair is
+		// its own vertex) and write standard per-vertex "s"/"t" properties,
+		// matching what the OBJ exporter effectively produces.
+
 		// translate, normalize and flip Y axis of the texture coordinates
 		TexCoordArr normFaceTexcoords;
 		FaceTexcoordsNormalize(normFaceTexcoords, true);
 
-		// describe what properties go into the vertex elements
-		ply.describe_property(BasicPLY::elem_names[1], 2, BasicPLY::face_tex_props);
-
-		// export the array of faces
-		BasicPLY::FaceTex face = {{3},{6}};
+		// build vertex-split arrays and re-indexed faces
+		const bool bNormals = !vertexNormals.empty();
+		ASSERT(!bNormals || vertices.size() == vertexNormals.size());
+		std::vector< std::vector<std::pair<TexCoord,VIndex>> > vertUVMap(vertices.size());
+		std::vector<Vertex> splitVerts;
+		std::vector<Normal> splitNorms;
+		std::vector<TexCoord> splitUVs;
+		std::vector<Face> splitFaces(faces.size());
+		splitVerts.reserve(vertices.size());
+		splitUVs.reserve(vertices.size());
+		if (bNormals)
+			splitNorms.reserve(vertices.size());
 		FOREACH(f, faces) {
-			face.face.pFace = faces.data()+f;
-			face.tex.pTex = normFaceTexcoords.data()+f*3;
+			for (int i = 0; i < 3; ++i) {
+				const VIndex ov = faces[f][i];
+				const TexCoord& uv = normFaceTexcoords[f*3+i];
+				VIndex ni = NO_ID;
+				for (const std::pair<TexCoord,VIndex>& it : vertUVMap[ov]) {
+					if (it.first.x == uv.x && it.first.y == uv.y) {
+						ni = it.second;
+						break;
+					}
+				}
+				if (ni == NO_ID) {
+					ni = (VIndex)splitVerts.size();
+					splitVerts.push_back(vertices[ov]);
+					splitUVs.push_back(uv);
+					if (bNormals)
+						splitNorms.push_back(vertexNormals[ov]);
+					vertUVMap[ov].emplace_back(uv, ni);
+				}
+				splitFaces[f][i] = ni;
+			}
+		}
+
+		// export the split vertices with per-vertex texture coordinates
+		if (!bNormals) {
+			ply.describe_property(BasicPLY::elem_names[0], 5, BasicPLY::vert_tex_props);
+			BasicPLY::VertexTex vt;
+			FOREACH(i, splitVerts) {
+				vt.v = splitVerts[i];
+				vt.t = splitUVs[i];
+				ply.put_element(&vt);
+			}
+		} else {
+			ply.describe_property(BasicPLY::elem_names[0], 8, BasicPLY::vert_normal_tex_props);
+			BasicPLY::VertexNormalTex vnt;
+			FOREACH(i, splitVerts) {
+				vnt.v = splitVerts[i];
+				vnt.n = splitNorms[i];
+				vnt.t = splitUVs[i];
+				ply.put_element(&vnt);
+			}
+		}
+		if (ply.get_current_element_count() == 0)
+			return false;
+
+		// export the array of faces (vertex indices only)
+		ply.describe_property(BasicPLY::elem_names[1], 1, BasicPLY::face_props);
+		BasicPLY::Face face = {3};
+		FOREACH(f, splitFaces) {
+			face.pFace = splitFaces.data()+f;
 			ply.put_element(&face);
 		}
 
@@ -2799,6 +4192,248 @@ bool Mesh::SavePLY(const String& fileName, const cList<String>& comments, bool b
 
 	// write to file
 	return ply.header_complete();
+}
+// write the diffuse texture as a Global Mapper native multi-strip JPEG
+// container (.gmtex). A single multi-gigapixel atlas JPEG can only be
+// decoded single-threaded by libjpeg-turbo, which dominates Global
+// Mapper's mesh-load time. Splitting the atlas into N independent
+// horizontal-strip JPEGs lets the reader decode one strip per core.
+//
+// Container layout (all little-endian):
+//   char   magic[4]   = "GMTX"
+//   uint32 version    = 1
+//   uint32 width
+//   uint32 height
+//   uint32 numStrips
+//   uint32 flags      (reserved, 0)
+//   { uint32 stripHeight; uint32 jpegLen; } [numStrips]   // top-to-bottom
+//   <numStrips JPEG blobs concatenated, in strip order>
+static bool SaveTextureStripsGMTex(const Image8U3& image, const String& fileName)
+{
+	const int W = image.cols;
+	const int H = image.rows;
+	if (W <= 0 || H <= 0)
+		return false;
+
+	// Aim for ~512 rows per strip, capped at 64 strips, so a tall atlas
+	// exposes enough independent JPEGs to saturate the reader's cores
+	// while keeping per-strip JPEG-header overhead negligible.
+	int numStrips = (H + 511) / 512;
+	if (numStrips < 1)   numStrips = 1;
+	if (numStrips > 64)  numStrips = 64;
+
+	// Even split, remainder spread over the first strips.
+	std::vector<int> stripHeight(numStrips), topRow(numStrips);
+	const int baseH = H / numStrips;
+	const int remH  = H % numStrips;
+	int y = 0;
+	for (int i = 0; i < numStrips; ++i) {
+		stripHeight[i] = baseH + (i < remH ? 1 : 0);
+		topRow[i] = y;
+		y += stripHeight[i];
+	}
+	ASSERT(y == H);
+
+	// Encode each horizontal strip to an in-memory JPEG in parallel.
+	std::vector<std::vector<uint8_t>> blobs(numStrips);
+	std::vector<int> ok(numStrips, 0);
+	const std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, 90 };
+	#pragma omp parallel for schedule(dynamic)
+	for (int i = 0; i < numStrips; ++i) {
+		const cv::Mat strip = image.rowRange(topRow[i], topRow[i] + stripHeight[i]);
+		try {
+			ok[i] = cv::imencode(_T(".jpg"), strip, blobs[i], params) ? 1 : 0;
+		} catch (...) {
+			ok[i] = 0;
+		}
+	}
+	for (int i = 0; i < numStrips; ++i) {
+		if (!ok[i]) {
+			DEBUG_EXTRA("error: failed to JPEG-encode .gmtex strip %d/%d", i, numStrips);
+			return false;
+		}
+	}
+
+	// Write the container.
+	File f(fileName, File::WRITE, File::CREATE | File::TRUNCATE);
+	if (!f.isOpen()) {
+		DEBUG_EXTRA("error: can not create the .gmtex file");
+		return false;
+	}
+	const uint32_t version  = 1;
+	const uint32_t width    = (uint32_t)W;
+	const uint32_t height   = (uint32_t)H;
+	const uint32_t nStrips  = (uint32_t)numStrips;
+	const uint32_t flags    = 0;
+	f.write("GMTX", 4);
+	f.write(&version, sizeof(version));
+	f.write(&width,   sizeof(width));
+	f.write(&height,  sizeof(height));
+	f.write(&nStrips, sizeof(nStrips));
+	f.write(&flags,   sizeof(flags));
+	for (int i = 0; i < numStrips; ++i) {
+		const uint32_t sh  = (uint32_t)stripHeight[i];
+		const uint32_t len = (uint32_t)blobs[i].size();
+		f.write(&sh,  sizeof(sh));
+		f.write(&len, sizeof(len));
+	}
+	for (int i = 0; i < numStrips; ++i)
+		f.write(blobs[i].data(), blobs[i].size());
+	return true;
+}
+// export the mesh as a Global Mapper native binary mesh (.gmmesh)
+//
+// Layout (all little-endian; Windows x86/x64 native byte order):
+//   char    magic[4]            = "GMM1"
+//   uint32  version             = 1
+//   uint32  flags               bit0=normals, bit1=texCoords, bit2=vertexColors
+//   uint32  textureNameLen      UTF-8 byte length, no NUL
+//   uint64  numVertices
+//   uint64  numFaces
+//   char    textureName[textureNameLen]   UTF-8, relative to mesh file
+//   float   vertices[3 * numVertices]      x,y,z
+//   float   normals[3 * numVertices]       (only if bit0)
+//   float   texCoords[2 * numVertices]     u,v  (only if bit1)
+//   float   vertexColors[4 * numVertices]  r,g,b,a 0..1 (only if bit2; not emitted here)
+//   uint32  faces[3 * numFaces]            vertex indices
+//
+// Mirrors the SavePLY texture path: OpenMVS stores UVs per face-corner, so we
+// split shared vertices at UV seams to produce a clean per-vertex UV array that
+// the Global Mapper reader consumes directly (no Assimp parse).
+bool Mesh::SaveGMMesh(const String& fileName) const
+{
+	ASSERT(!fileName.empty());
+	Util::ensureFolder(fileName);
+
+	// these packed layouts are what the GM reader assumes (bulk fwrite)
+	static_assert(sizeof(Vertex) == 3*sizeof(float), "Vertex must be 3 packed floats");
+	static_assert(sizeof(Normal) == 3*sizeof(float), "Normal must be 3 packed floats");
+	static_assert(sizeof(TexCoord) == 2*sizeof(float), "TexCoord must be 2 packed floats");
+	static_assert(sizeof(Face) == 3*sizeof(uint32_t), "Face must be 3 packed uint32");
+
+	const bool bTexture = !faceTexcoords.empty() && !textureDiffuse.empty();
+	const bool bNormals = !vertexNormals.empty();
+
+	// vertex/face arrays actually written (split at UV seams when textured)
+	const Vertex* pVerts;
+	const Normal* pNorms;
+	const TexCoord* pUVs;
+	const Face* pFaces;
+	uint64_t numVertices, numFaces;
+
+	std::vector<Vertex> splitVerts;
+	std::vector<Normal> splitNorms;
+	std::vector<TexCoord> splitUVs;
+	std::vector<Face> splitFaces;
+
+	String textureFileName;
+	if (bTexture) {
+		// translate, normalize and flip Y axis of the texture coordinates
+		// (same convention the PLY exporter / Assimp path produced)
+		TexCoordArr normFaceTexcoords;
+		FaceTexcoordsNormalize(normFaceTexcoords, true);
+		ASSERT(normFaceTexcoords.size() == faces.size()*3);
+		ASSERT(!bNormals || vertices.size() == vertexNormals.size());
+
+		std::vector< std::vector<std::pair<TexCoord,VIndex>> > vertUVMap(vertices.size());
+		splitVerts.reserve(vertices.size());
+		splitUVs.reserve(vertices.size());
+		if (bNormals)
+			splitNorms.reserve(vertices.size());
+		splitFaces.resize(faces.size());
+		FOREACH(f, faces) {
+			for (int i = 0; i < 3; ++i) {
+				const VIndex ov = faces[f][i];
+				const TexCoord& uv = normFaceTexcoords[f*3+i];
+				VIndex ni = NO_ID;
+				for (const std::pair<TexCoord,VIndex>& it : vertUVMap[ov]) {
+					if (it.first.x == uv.x && it.first.y == uv.y) {
+						ni = it.second;
+						break;
+					}
+				}
+				if (ni == NO_ID) {
+					ni = (VIndex)splitVerts.size();
+					splitVerts.push_back(vertices[ov]);
+					splitUVs.push_back(uv);
+					if (bNormals)
+						splitNorms.push_back(vertexNormals[ov]);
+					vertUVMap[ov].emplace_back(uv, ni);
+				}
+				splitFaces[f][i] = ni;
+			}
+		}
+		pVerts = splitVerts.data();
+		pNorms = bNormals ? splitNorms.data() : NULL;
+		pUVs   = splitUVs.data();
+		pFaces = splitFaces.data();
+		numVertices = splitVerts.size();
+		numFaces    = splitFaces.size();
+
+		// reference (and, if needed, write) the diffuse texture alongside the
+		// mesh, matching the PLY exporter's JPEG naming so a co-located .ply
+		// save can share the same image instead of re-encoding it.
+		textureFileName = Util::getFileFullName(fileName)+_T(".jpg");
+		if (!File::isFile(textureFileName))
+			textureDiffuse.Save(textureFileName);
+
+		// Also emit a multi-strip container (<base>.gmtex) beside the .jpg.
+		// Global Mapper prefers it and decodes the strips in parallel; the
+		// .jpg remains for the .ply fallback and as a graceful degrade path.
+		SaveTextureStripsGMTex(textureDiffuse, Util::getFileFullName(fileName)+_T(".gmtex"));
+	} else {
+		pVerts = vertices.data();
+		pNorms = bNormals ? vertexNormals.data() : NULL;
+		pUVs   = NULL;
+		pFaces = faces.data();
+		numVertices = vertices.size();
+		numFaces    = faces.size();
+	}
+
+	if (numVertices == 0 || numFaces == 0) {
+		DEBUG_EXTRA("error: refusing to write empty .gmmesh file");
+		return false;
+	}
+
+	// open the output file (buffered, truncating)
+	File f(fileName, File::WRITE, File::CREATE | File::TRUNCATE);
+	if (!f.isOpen()) {
+		DEBUG_EXTRA("error: can not create the mesh file");
+		return false;
+	}
+
+	// header
+	const uint32_t version = 1;
+	uint32_t flags = 0;
+	if (pNorms) flags |= 0x1;
+	if (pUVs)   flags |= 0x2;
+	// vertex colors (bit2) are not exported by the texturing pipeline
+
+	// store texture name relative to the mesh file (name + extension only)
+	const String texName(textureFileName.empty() ? String() : Util::getFileNameExt(textureFileName));
+	const uint32_t textureNameLen = (uint32_t)texName.size();
+
+	f.write("GMM1", 4);
+	f.write(&version, sizeof(version));
+	f.write(&flags, sizeof(flags));
+	f.write(&textureNameLen, sizeof(textureNameLen));
+	f.write(&numVertices, sizeof(numVertices));
+	f.write(&numFaces, sizeof(numFaces));
+	if (textureNameLen)
+		f.write(texName.c_str(), textureNameLen);
+
+	// vertex positions
+	f.write(pVerts, (size_t)numVertices*sizeof(Vertex));
+	// optional per-vertex normals
+	if (pNorms)
+		f.write(pNorms, (size_t)numVertices*sizeof(Normal));
+	// optional per-vertex texture coordinates
+	if (pUVs)
+		f.write(pUVs, (size_t)numVertices*sizeof(TexCoord));
+	// face indices
+	f.write(pFaces, (size_t)numFaces*sizeof(Face));
+
+	return true;
 }
 // export the mesh as a OBJ file
 bool Mesh::SaveOBJ(const String& fileName) const

@@ -301,6 +301,13 @@ ADD_SUBDIRECTORY(libs)
 if(OpenMVS_BUILD_TOOLS)
 	ADD_SUBDIRECTORY(apps)
 endif()
+# Optional: build the bundled Kazhdan PoissonRecon + SurfaceTrimmer tools
+# (used by ReconstructMesh --poisson). OFF by default so the existing build is
+# unchanged; enable to fold the tools into the OpenMVS solution. MSVC-only.
+option(OpenMVS_BUILD_POISSON_TOOLS "Build bundled PoissonRecon + SurfaceTrimmer tools (MSVC only)" OFF)
+if(OpenMVS_BUILD_POISSON_TOOLS AND MSVC AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/PoissonRecon/PoissonRecon.vcxproj")
+	ADD_SUBDIRECTORY(PoissonRecon)
+endif()
 ADD_SUBDIRECTORY(docs)
 
 if (OpenMVS_ENABLE_TESTS)

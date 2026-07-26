@@ -135,6 +135,7 @@ extern unsigned nSubResolutionLevels;
 extern unsigned nMinViews;
 extern unsigned nMaxViews;
 extern unsigned nMinViewsFuse;
+extern unsigned nMaxViewsFuse;
 extern unsigned nMinViewsFilter;
 extern unsigned nMinViewsFilterAdjust;
 extern unsigned nMinViewsTrustPoint;
@@ -161,10 +162,20 @@ extern unsigned nSpeckleSize;
 extern unsigned nIpolGapSize;
 extern int nIgnoreMaskLabel;
 extern unsigned nOptimize;
+extern float fOutlierFilterStdDev;
+extern unsigned nOutlierFilterKNN;
+extern unsigned nLowViewSupportCut;
+extern float fLowViewSupportRadius;
+extern float fLowViewPlanarityMax;
+extern bool bFlattenWater;
+extern float fFlattenWaterBandPct;
+extern float fFlattenWaterRoughness;
+extern float fFlattenWaterMaxFrac;
 extern unsigned nEstimateColors;
 extern unsigned nEstimateNormals;
 extern float fNCCThresholdKeep;
 extern unsigned nEstimationIters;
+extern float fGeomConsistencyMaxChange;
 extern unsigned nEstimationGeometricIters;
 extern float fEstimationGeometricWeight;
 extern unsigned nRandomIters;
@@ -1247,6 +1258,28 @@ MVS_API bool ImportDepthDataRaw(const String&, String& imageFileName,
 	KMatrix&, RMatrix&, CMatrix&,
 	Depth& dMin, Depth& dMax,
 	DepthMap&, NormalMap&, ConfidenceMap&, ViewsMap&, unsigned flags=15);
+// overwrite ONLY the depth and confidence sections of an existing raw depth-data file
+// in place (filter/adjust phase, where only those two maps changed); hasNormal/hasViews
+// describe the sections a full ExportDepthDataRaw() would emit. Returns false (so the
+// caller can fall back to a full Save()) if the on-disk magic/sections/dimensions/size do
+// not exactly match, so the result is byte-identical when it succeeds, never wrong.
+MVS_API bool PatchDepthConfRaw(const String& fileName,
+	const DepthMap& depthMap, const ConfidenceMap& confMap,
+	bool hasNormal, bool hasViews);
+// fast, allocation-free measurement of the mean relative depth change between two raw
+// depth-data files: reads ONLY the depth section and subsamples rows/columns with the
+// given stride (>=1), avoiding the full-image allocation + copy ImportDepthDataRaw does.
+// Accumulates sum(|dNew-dOld|/dOld) over commonly-valid sampled pixels into the return
+// value and their count into validCount; returns 0 / validCount=0 on error or mismatch.
+MVS_API double MeasureDepthMapRelChange(const String& oldPath, const String& newPath,
+	size_t& validCount, int stride=4);
+// overwrite ONLY the depth, normal and confidence sections of an existing raw depth-data
+// file in place (used by the geometric-consistency early-exit optimize-only pass, where
+// those maps changed but the views/header/camera did not); returns false (so the caller
+// can fall back to a full Save()) if the on-disk layout does not exactly match.
+MVS_API bool PatchDepthNormalConfRaw(const String& fileName,
+	const DepthMap& depthMap, const NormalMap& normalMap, const ConfidenceMap& confMap,
+	bool hasViews);
 
 MVS_API void CompareDepthMaps(const DepthMap& depthMap, const DepthMap& depthMapGT, uint32_t idxImage, float threshold=0.01f);
 MVS_API void CompareNormalMaps(const NormalMap& normalMap, const NormalMap& normalMapGT, uint32_t idxImage);

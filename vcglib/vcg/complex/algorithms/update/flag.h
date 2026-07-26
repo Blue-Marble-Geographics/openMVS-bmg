@@ -265,7 +265,17 @@ public:
         }
         else
         {
-#if 1 // JPB WIP BUG
+        // JPB WIP BUG (disabled 2026): the seenGen "optimization" below is
+        // INCORRECT. It sets BORDERFLAG the first time each neighbor vertex is
+        // encountered in v0's VF star and never clears it. Border detection
+        // requires PARITY (an edge is a border iff its opposite vertex is seen
+        // an ODD number of times); an interior edge shared by 2 faces is seen
+        // twice = even = NOT border, but this code marks it border on the first
+        // face and leaves it set. Result: ~100% of edges flagged border, which
+        // silently breaks every consumer (e.g. PreserveBoundary quadric
+        // decimation locks the whole mesh). Use the correct original parity
+        // algorithm in the #else.
+#if 0 // JPB WIP BUG -- broken, see note above
           thread_local std::vector<uint32_t> seenGen;
           thread_local uint32_t seenCounter = 1;
 

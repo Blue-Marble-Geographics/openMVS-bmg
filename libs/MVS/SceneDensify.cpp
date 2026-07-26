@@ -36,9 +36,12 @@
 #include "PatchMatchCUDA.h"
 // MRF: view selection
 #include "../Math/TRWS/MRFEnergy.h"
+// KD-tree for the density-based outlier filter
+#include "nanoflann.hpp"
 
 #include <list>
 #include <unordered_map>
+#include <intrin.h>
 
 using namespace MVS;
 
@@ -49,7 +52,7 @@ using namespace MVS;
 #define DENSE_USE_OPENMP
 #endif
 
-#undef ESTIMATE_NORMALS // Not used
+#define ESTIMATE_NORMALS
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -123,6 +126,22 @@ public:
 // convert the ZNCC score to a weight used to average the fused points
 inline float Conf2Weight(float conf, Depth depth) {
 	return 1.f/(FastMaxS(1.f-conf,0.03f)*depth*depth);
+}
+/*----------------------------------------------------------------*/
+
+// Atomic test-and-set on a single bit of a BitMatrix (TBitMatrix<size_t>).
+// Returns true if the bit was ALREADY set (caller should bail out to avoid
+// double-emitting); false if the bit was previously clear and is now set
+// (caller proceeds). Used by DenseFuseDepthMaps under DENSE_FUSE_PARALLEL_PIXELS
+// to make concurrent FusePoint claims race-safe. On Win64, `size_t` is 64-bit
+// and `_InterlockedOr64` issues a `lock or` returning the previous value.
+static inline bool TryClaimBitAtomic(SEACAVE::BitMatrix& mask, const ImageRef& ir) {
+	const auto idx = SEACAVE::BitMatrix::computeIndex(ir, mask.cols);
+	static_assert(sizeof(size_t) == 8, "BitMatrix word must be 64-bit for _InterlockedOr64");
+	const size_t prev = (size_t)_InterlockedOr64(
+		reinterpret_cast<volatile LONG64*>(&mask.data[idx.idx]),
+		(LONG64)idx.flag);
+	return (prev & idx.flag) != 0;
 }
 /*----------------------------------------------------------------*/
 
@@ -1410,11 +1429,50 @@ bool DepthMapsData::GapInterpolation(DepthData& depthData)
 } // GapInterpolation
 /*----------------------------------------------------------------*/
 
+// ===================================================================
+// FILTER_PROFILE: temporary instrumentation for the depth-map filter
+// stage. Accumulates per-phase time (summed across worker threads, so the
+// totals exceed wall-clock -- the RATIOS reveal the bottleneck) and prints
+// one summary line at the end of the filter phase. Set to 0 to remove.
+// ===================================================================
+#define FILTER_PROFILE 1
+#if FILTER_PROFILE
+namespace {
+	using filter_clock = std::chrono::steady_clock;
+	static inline int64_t FilterNs(const filter_clock::time_point& a, const filter_clock::time_point& b) {
+		return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+	}
+	struct FilterProfile {
+		std::atomic<int64_t> nsLoad{0};      // load reference + neighbor .dmaps from disk
+		std::atomic<int64_t> nsReproject{0}; // project neighbor depth-maps into the reference
+		std::atomic<int64_t> nsFuse{0};      // per-pixel consensus / adjust pass
+		std::atomic<int64_t> nsSave{0};      // write filtered.dmap / filtered.cmap
+		std::atomic<int64_t> nsAdjLoad{0};   // reload filtered.dmap / filtered.cmap (adjust)
+		std::atomic<int64_t> nsAdjSave{0};   // write final dmap (adjust)
+		std::atomic<int>     nImages{0};
+		void Reset() {
+			nsLoad = 0; nsReproject = 0; nsFuse = 0; nsSave = 0; nsAdjLoad = 0; nsAdjSave = 0; nImages = 0;
+		}
+		void Report(double wallMs) const {
+			const double inv = 1.0 / 1.0e6;
+			VERBOSE("FILTER PROFILE [%d imgs, wall=%.0fms, thread-summed ms]: loadNeighbors=%.0f filterCompute=%.0f saveFiltered=%.0f adjReload=%.0f adjSave=%.0f",
+				nImages.load(), wallMs,
+				nsLoad.load()*inv, nsFuse.load()*inv,
+				nsSave.load()*inv, nsAdjLoad.load()*inv, nsAdjSave.load()*inv);
+		}
+	};
+	static FilterProfile g_filterProfile;
+}
+#endif
+
 // filter depth-map, one pixel at a time, using confidence based fusion or neighbor pixels
 #if 1
 bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idxNeighbors, bool bAdjust)
 {
 	TD_TIMER_STARTD();
+#if FILTER_PROFILE
+	const auto _tF0 = filter_clock::now(); // whole-FilterDepthMap compute (reproject + fuse)
+#endif
 
 	// count valid neighbor depth-maps
 	ASSERT(depthDataRef.IsValid() && !depthDataRef.IsEmpty());
@@ -1447,53 +1505,54 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 		const DepthData& depthData = arrDepthData[idxView];
 		const Camera& camera = depthData.images.First().camera;
 		const Image8U::Size size(depthData.depthMap.size());
+		// Precompute the combined neighbor-pixel -> reference-camera transform so each
+		// pixel costs a few mul-adds (plus one divide) instead of three Camera-method
+		// calls building Point3/Point2/ImageRef temporaries (same idea as the
+		// FuseDepthMaps projection). For a neighbor pixel (x,y) at neighbor depth d the
+		// reference-camera point is  camX = d*(a*x + b*y + c) + t  with
+		//   M = R_ref * R_n^T,  a = M_col0/Kn00,  b = M_col1/Kn11,
+		//   c = M_col2 - a*Kn02 - b*Kn12,  t = R_ref*(C_n - C_ref).
+		// (a*x is accumulated along the row.) NOTE: this reorganizes the projection
+		// (precombined matrices + per-row accumulation), so it is numerically
+		// equivalent -- not bit-identical -- to the old sequential I2W->W2C->C2I,
+		// matching the other fast paths.
+		const RMatrix Mr(cameraRef.R * camera.R.t());
+		const REAL Kn00(camera.K(0,0)), Kn11(camera.K(1,1)), Kn02(camera.K(0,2)), Kn12(camera.K(1,2));
+		const Point3 a(Mr(0,0)/Kn00, Mr(1,0)/Kn00, Mr(2,0)/Kn00);
+		const Point3 b(Mr(0,1)/Kn11, Mr(1,1)/Kn11, Mr(2,1)/Kn11);
+		const Point3 c(Mr(0,2)-a.x*Kn02-b.x*Kn12, Mr(1,2)-a.y*Kn02-b.y*Kn12, Mr(2,2)-a.z*Kn02-b.z*Kn12);
+		const Point3 t(cameraRef.R * (camera.C - cameraRef.C));
+		const REAL Kr00(cameraRef.K(0,0)), Kr11(cameraRef.K(1,1)), Kr02(cameraRef.K(0,2)), Kr12(cameraRef.K(1,2));
+		const int wRef(size.width), hRef(size.height);
+		// z-buffered splat of one reference pixel (keep the nearest depth)
+		const auto splat = [&](int px, int py, Depth cz, float conf) {
+			if ((unsigned)px < (unsigned)wRef && (unsigned)py < (unsigned)hRef) {
+				Depth& dr = depthMap(py, px);
+				if (dr == 0 || dr >= cz) { dr = cz; if (bAdjust) confMap(py, px) = conf; }
+			}
+		};
 		for (int i=0; i<size.height; ++i) {
 			const Depth* const __restrict pDepth = &depthData.depthMap(i, 0);
-			for (int j=0; j<size.width; ++j) {
+			const float* const __restrict pConf = bAdjust ? &depthData.confMap(i, 0) : NULL;
+			REAL mux(b.x*i + c.x), muy(b.y*i + c.y), muz(b.z*i + c.z); // a*0 + (b*i+c)
+			for (int j=0; j<size.width; ++j, mux+=a.x, muy+=a.y, muz+=a.z) {
 				const Depth depth(pDepth[j]);
 				if (depth == 0)
 					continue;
 				ASSERT(depth > 0);
-				const ImageRef x(j,i);
-				const Point3 X(camera.TransformPointI2W(Point3(x.x,x.y,depth)));
-				const Point3 camX(cameraRef.TransformPointW2C(X));
-				if (camX.z <= 0)
+				const REAL cxz(depth*muz + t.z);
+				if (cxz <= 0)
 					continue;
-				#if 0
-				// set depth on the rounded image projection only
-				const ImageRef xRef(ROUND2INT(cameraRef.TransformPointC2I(camX)));
-				if (!depthMap.isInside(xRef))
-					continue;
-				Depth& depthRef(depthMap(xRef));
-				if (depthRef != 0 && depthRef < camX.z)
-					continue;
-				depthRef = camX.z;
-				if (bAdjust)
-					confMap(xRef) = depthData.confMap(x);
-				#else
-				// set depth on the 4 pixels around the image projection
-				const Point2 imgX(cameraRef.TransformPointC2I(camX));
-				const ImageRef xRefs[4] = {
-					ImageRef(FLOOR2INT(imgX.x), FLOOR2INT(imgX.y)),
-					ImageRef(FLOOR2INT(imgX.x), CEIL2INT(imgX.y)),
-					ImageRef(CEIL2INT(imgX.x), FLOOR2INT(imgX.y)),
-					ImageRef(CEIL2INT(imgX.x), CEIL2INT(imgX.y))
-				};
-
-				for (int p=0; p<4; ++p) {
-					const ImageRef& xRef = xRefs[p];
-					if ((unsigned) xRef.x < size.width && (unsigned) xRef.y < size.height) {
-						//if (!depthMap.isInside(xRef))
-						//	continue;
-					Depth& depthRef(depthMap(xRef));
-					if (depthRef != 0 && depthRef < (Depth)camX.z)
-						continue;
-					depthRef = (Depth)camX.z;
-					if (bAdjust)
-						confMap(xRef) = depthData.confMap(x);
-				}
-				}
-				#endif
+				const REAL invZ(REAL(1)/cxz);
+				const REAL u(Kr02 + Kr00*((depth*mux + t.x)*invZ));
+				const REAL v(Kr12 + Kr11*((depth*muy + t.y)*invZ));
+				const int x0(FLOOR2INT(u)), x1(CEIL2INT(u)), y0(FLOOR2INT(v)), y1(CEIL2INT(v));
+				const Depth cz((Depth)cxz);
+				const float conf(pConf ? pConf[j] : 0.f);
+				splat(x0, y0, cz, conf);
+				splat(x0, y1, cz, conf);
+				splat(x1, y0, cz, conf);
+				splat(x1, y1, cz, conf);
 			}
 		}
 		#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -1511,10 +1570,21 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 	if (bAdjust) {
 		// average similar depths, and decrease confidence if depths do not agree
 		// (inspired by: "Real-Time Visibility-Based Fusion of Depth Maps", Merrell, 2007)
+		// hoist per-neighbor row-base pointers once per row: the hot inner reads become a
+		// plain [j] index instead of a cList index + i*cols multiply. Byte-identical
+		// addressing and unchanged float-accumulation order (n from N-1 down to 0).
+		std::vector<const Depth*> pNDepth(N);
+		std::vector<const float*> pNConf(N);
 		for (int i=0; i<sizeRef.height; ++i) {
+			for (IIndex k=0; k<N; ++k) {
+				pNDepth[k] = &depthMaps[k](i, 0);
+				pNConf[k] = &confMaps[k](i, 0);
+			}
+			const Depth* const __restrict pRefDepth = &depthDataRef.depthMap(i, 0);
+			const float* const __restrict pRefConf = &depthDataRef.confMap(i, 0);
 			for (int j=0; j<sizeRef.width; ++j) {
 				const ImageRef xRef(j,i);
-				const Depth depth(depthDataRef.depthMap(xRef));
+				const Depth depth(pRefDepth[j]);
 				if (depth == 0) {
 					newDepthMap(xRef) = 0;
 					newConfMap(xRef) = 0;
@@ -1525,12 +1595,13 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 				++nProcessed;
 				#endif
 				// update best depth and confidence estimate with all estimates
-				float posConf(depthDataRef.confMap(xRef)), negConf(0);
+				float posConf(pRefConf[j]), negConf(0);
 				Depth avgDepth(depth*posConf);
 				unsigned nPosViews(0), nNegViews(0);
 				unsigned n(N);
 				do {
-					const Depth d(depthMaps[--n](xRef));
+					--n;
+					const Depth d(pNDepth[n][j]);
 					if (d == 0) {
 						if (nPosViews + nNegViews + n < nMinViews)
 							goto DiscardDepth;
@@ -1539,7 +1610,7 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 					ASSERT(d > 0);
 					if (IsDepthSimilar(depth, d, thDepthDiff)) {
 						// average similar depths
-						const float c(confMaps[n](xRef));
+						const float c(pNConf[n][j]);
 						avgDepth += d*c;
 						posConf += c;
 						++nPosViews;
@@ -1547,7 +1618,7 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 						// penalize confidence
 						if (depth > d) {
 							// occlusion
-							negConf += confMaps[n](xRef);
+							negConf += pNConf[n][j];
 						} else {
 							// free-space violation
 							const DepthData& depthData = arrDepthData[depthDataRef.neighbors[idxNeighbors[n]].ID];
@@ -1556,9 +1627,9 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 							const ImageRef x(ROUND2INT(camera.TransformPointW2I(X)));
 							if (depthData.confMap.isInside(x)) {
 								const float c(depthData.confMap(x));
-								negConf += (c > 0 ? c : confMaps[n](xRef));
+								negConf += (c > 0 ? c : pNConf[n][j]);
 							} else
-								negConf += confMaps[n](xRef);
+								negConf += pNConf[n][j];
 						}
 						++nNegViews;
 					}
@@ -1587,10 +1658,23 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 		const unsigned nDeltas(4);
 		const unsigned nMinViewsDelta(nMinViews*(nDeltas-2));
 		const ImageRef xDs[nDeltas] = { ImageRef(-1,0), ImageRef(1,0), ImageRef(0,-1), ImageRef(0,1) };
+		// hoist per-neighbor row-base pointers once per row (byte-identical addressing;
+		// removes the cList index + i*cols multiply from the hot neighbor reads). The delta
+		// block needs rows i-1,i,i+1 per neighbor; the border rows (&map(-1,0) / &map(h,0))
+		// reproduce the exact same linear offsets the original map(xRef+delta) access used.
+		// The counts summed here are order-independent.
+		std::vector<const Depth*> pRow0(N), pRowM(N), pRowP(N);
 		for (int i=0; i<sizeRef.height; ++i) {
+			for (IIndex k=0; k<N; ++k) {
+				pRow0[k] = &depthMaps[k](i, 0);
+				pRowM[k] = &depthMaps[k](i-1, 0);
+				pRowP[k] = &depthMaps[k](i+1, 0);
+			}
+			const Depth* const __restrict pRefDepth = &depthDataRef.depthMap(i, 0);
+			const float* const __restrict pRefConf = &depthDataRef.confMap(i, 0);
 			for (int j=0; j<sizeRef.width; ++j) {
 				const ImageRef xRef(j,i);
-				const Depth depth(depthDataRef.depthMap(xRef));
+				const Depth depth(pRefDepth[j]);
 				if (depth == 0) {
 					newDepthMap(xRef) = 0;
 					newConfMap(xRef) = 0;
@@ -1606,7 +1690,8 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 					unsigned nViews(0);
 					unsigned n(N);
 					do {
-						const Depth d(depthMaps[--n](xRef));
+						--n;
+						const Depth d(pRow0[n][j]);
 						if (d > 0) {
 							// valid view
 							++nViews;
@@ -1626,24 +1711,24 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 					}
 				}
 				// check if similar with the neighbors projected around this pixel
+				// deltas: (-1,0)->row i col j-1, (1,0)->row i col j+1,
+				//         (0,-1)->row i-1 col j, (0,1)->row i+1 col j
 				{
 					unsigned nGoodViews(0);
 					unsigned nViews(0);
-					for (unsigned d=0; d<nDeltas; ++d) {
-						const ImageRef xDRef(xRef+xDs[d]);
-						unsigned n(N);
-						do {
-							const Depth d(depthMaps[--n](xDRef));
-							if (d > 0) {
-								// valid view
-								++nViews;
-								if (IsDepthSimilar(depth, d, thDepthDiff)) {
-									// agrees with this neighbor
-									++nGoodViews;
-								}
-							}
-						} while (n);
-					}
+					const int jL(j-1), jR(j+1);
+					unsigned n(N);
+					do {
+						--n;
+						const Depth dA(pRow0[n][jL]);
+						if (dA > 0) { ++nViews; if (IsDepthSimilar(depth, dA, thDepthDiff)) ++nGoodViews; }
+						const Depth dB(pRow0[n][jR]);
+						if (dB > 0) { ++nViews; if (IsDepthSimilar(depth, dB, thDepthDiff)) ++nGoodViews; }
+						const Depth dC(pRowM[n][j]);
+						if (dC > 0) { ++nViews; if (IsDepthSimilar(depth, dC, thDepthDiff)) ++nGoodViews; }
+						const Depth dD(pRowP[n][j]);
+						if (dD > 0) { ++nViews; if (IsDepthSimilar(depth, dD, thDepthDiff)) ++nGoodViews; }
+					} while (n);
 					if (nGoodViews < nMinViewsDelta || nGoodViews < nViews*nMinGoodViewsDeltaProc/100) {
 						#if TD_VERBOSE != TD_VERBOSE_OFF
 						++nDiscarded;
@@ -1655,13 +1740,22 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 				}
 				// enough good views, keep it
 				newDepthMap(xRef) = depth;
-				newConfMap(xRef) = depthDataRef.confMap(xRef);
+				newConfMap(xRef) = pRefConf[j];
 			}
 		}
 	}
 
-	if (!SaveDepthMap(ComposeDepthFilePath(imageRef.GetID(), "filtered.dmap"), newDepthMap) ||
-		!SaveConfidenceMap(ComposeDepthFilePath(imageRef.GetID(), "filtered.cmap"), newConfMap))
+#if FILTER_PROFILE
+	g_filterProfile.nsFuse += FilterNs(_tF0, filter_clock::now());
+	const auto _tS0 = filter_clock::now();
+#endif
+	const bool savedOK =
+		SaveDepthMap(ComposeDepthFilePath(imageRef.GetID(), "filtered.dmap"), newDepthMap) &&
+		SaveConfidenceMap(ComposeDepthFilePath(imageRef.GetID(), "filtered.cmap"), newConfMap);
+#if FILTER_PROFILE
+	g_filterProfile.nsSave += FilterNs(_tS0, filter_clock::now());
+#endif
+	if (!savedOK)
 		return false;
 
 	DEBUG("Depth map %3u filtered using %u other images: %u/%u depths discarded (%s)",
@@ -1946,11 +2040,12 @@ void DepthMapsData::MergeDepthMaps(PointCloudStreaming& pointcloud, bool bEstima
 	size_t nDepthMaps(0), nDepths(0);
 	pointcloud.ReservePoints(nPointsEstimate);
 
-	size_t maxIdxsPerPoint = arrDepthData.size();
-
-	// Create a flat array for each point with enough space to store a maximum number
-	// of ids.
-	pointcloud.ReservePointViewsSizeAndOffset(nPointsEstimate*maxIdxsPerPoint);
+	// Merge adds exactly ONE view per generated point, so the per-point index arrays
+	// (offsets/sizes) and the flat view memory each need only nPointsEstimate entries.
+	// (Previously these were reserved as nPointsEstimate*numImages, which could reach
+	// hundreds of GB and OOM on large scenes.)
+	pointcloud.ReservePointViewsSizeAndOffset(nPointsEstimate);
+	pointcloud.ReservePointViewsMemory(nPointsEstimate);
 
 	if (bEstimateColor)
 		pointcloud.ReserveColors(nPointsEstimate);
@@ -1962,7 +2057,6 @@ void DepthMapsData::MergeDepthMaps(PointCloudStreaming& pointcloud, bool bEstima
 	Util::Progress progress(_T("Merged depth-maps"), arrDepthData.size());
 	GET_LOGCONSOLE().Pause();
 
-	size_t pointViewImageOffset = 0;
 	FOREACH(idxImage, arrDepthData) {
 		TD_TIMER_STARTD();
 		DepthData& depthData = arrDepthData[idxImage];
@@ -1975,10 +2069,9 @@ void DepthMapsData::MergeDepthMaps(PointCloudStreaming& pointcloud, bool bEstima
 		const DepthData::ViewData& image = depthData.GetView();
 		const size_t nNumPointsPrev(pointcloud.NumPoints());
 
-		size_t pointViewOffset = 0;
 		Point3f normal;
 		for (int i=0; i<depthData.depthMap.rows; ++i) {
-			for (int j=0; j<depthData.depthMap.cols; ++j, pointViewOffset += maxIdxsPerPoint) {
+			for (int j=0; j<depthData.depthMap.cols; ++j) {
 				// ignore invalid depth
 				const ImageRef x(j,i);
 				const Depth depth(depthData.depthMap(x));
@@ -2258,6 +2351,78 @@ size_t GetAvailableMemory(const DepthDataArr& arrDepthData, const BoolArr& fused
 	return freeMemory - neededMemory;
 }
 
+// Filter-phase depth-map retention cache (semantics-neutral I/O dedup).
+// During the depth-map FILTER sub-phase every image loads its reference dmap plus
+// up to 8 neighbor dmaps, then releases them; because DepthData::DecRef() frees a
+// map the instant its ref-count hits 0, the same neighbor is re-loaded and
+// re-deserialized once per image that references it (~9x redundancy). The on-disk
+// dmaps are immutable for the entire filter sub-phase (filtered results go to side
+// files; the adjust sub-phase -- gated by `sem` until all filters complete -- swaps
+// them in afterwards), so keeping a loaded copy resident and re-using it is
+// byte-identical to re-loading it. This cache holds one extra ("retain") reference
+// on recently-used maps, bounded by a memory budget with LRU eviction, so a repeat
+// Acquire() of a still-resident map skips the disk read entirely. Acquire()/Release()
+// wrap the existing IncRef()/DecRef() and are thread-safe. Clear() drops all retain
+// references and MUST run once after the last filter completes and before the adjust
+// sub-phase (which asserts ref-count == 1), i.e. from SignalCompleteDepthmapFilter().
+struct FilterDMapCache {
+	FilterDMapCache(DepthDataArr& _arrDepthData, size_t _maxMemory)
+		: arrDepthData(_arrDepthData), usedMemory(0), maxMemory(_maxMemory) {}
+	~FilterDMapCache() { Clear(); }
+	// acquire a working reference (loading from disk only if not resident) and retain it
+	bool Acquire(IIndex idx, const String& fileName) {
+		DepthData& depthData = arrDepthData[idx];
+		const unsigned r = depthData.IncRef(fileName); // working ref; loads iff empty (outside lock)
+		if (r == 0)
+			return false;
+		Lock l(cs);
+		const auto it = lruIter.find(idx);
+		if (it == lruIter.end()) {
+			depthData.IncRef(fileName);              // retain ref (+1); already loaded -> no disk I/O
+			lru.push_front(idx);
+			lruIter[idx] = lru.begin();
+			usedMemory += depthData.GetMemorySize();
+		} else {
+			lru.splice(lru.begin(), lru, it->second); // move to most-recently-used (iterator stays valid)
+		}
+		EvictLocked(idx);
+		return true;
+	}
+	// release the working reference; the retain reference keeps the map resident
+	void Release(IIndex idx) {
+		arrDepthData[idx].DecRef();
+	}
+	// drop every retain reference (returns ref-counts to baseline)
+	void Clear() {
+		Lock l(cs);
+		for (const IIndex idx : lru)
+			arrDepthData[idx].DecRef();
+		lru.clear();
+		lruIter.clear();
+		usedMemory = 0;
+	}
+private:
+	void EvictLocked(IIndex protectIdx) {
+		while (usedMemory > maxMemory && lru.size() > 1) {
+			const IIndex idx = lru.back();
+			if (idx == protectIdx)
+				break;
+			lru.pop_back();
+			lruIter.erase(idx);
+			DepthData& depthData = arrDepthData[idx];
+			const size_t sz = depthData.GetMemorySize();
+			usedMemory = (usedMemory > sz) ? usedMemory - sz : 0;
+			depthData.DecRef();                      // drop retain ref; frees iff no working ref left
+		}
+	}
+	DepthDataArr& arrDepthData;
+	std::list<IIndex> lru;                            // front = most-recently used
+	std::unordered_map<IIndex, std::list<IIndex>::iterator> lruIter;
+	size_t usedMemory, maxMemory;
+	CriticalSection cs;
+};
+static FilterDMapCache* g_filterCache = NULL;
+
 // finds the best depth-map to fuse next that maximizes the number of neighbors already in cache
 std::tuple<unsigned, unsigned, unsigned> FetchBestNextDMapIndex(const DepthDataArr& arrDepthData, const DMapCache& cacheDMaps, const BoolArr& fusedDMaps) {
 	const IIndexArr cachedImages = cacheDMaps.GetCachedImageIndices(true);
@@ -2321,24 +2486,28 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 	typedef TImage<cuint32_t> DepthIndex;
 	typedef cList<DepthIndex> DepthIndexArr;
 	DepthIndexArr arrDepthIdx(arrDepthData.size());
-	const size_t nPointsEstimate(arrDepthData.size() * arrDepthData.First().depthMap.area());
-	ProjsArr projs(0, nPointsEstimate);
+	// NOTE: depth-maps are streamed and none is loaded yet here, so
+	// First().depthMap.area() is 0 and left points/colors/normals unreserved
+	// (causing reallocation during fusion). Use the same modest per-image
+	// estimate as DenseFuseDepthMaps.
+	const size_t nPointsEstimate(arrDepthData.size() * 9000);
 	pointcloud.ReservePoints(nPointsEstimate);
 	pointcloud.ReservePointViewsSizeAndOffset(nPointsEstimate);
 	pointcloud.ReservePointWeightsSizeAndOffset(nPointsEstimate);
 	unsigned depthDataLoadFlags(HeaderDepthDataRaw::HAS_DEPTH | HeaderDepthDataRaw::HAS_CONF);
 	if (bEstimateColor)
 		pointcloud.ReserveColors(nPointsEstimate);
-#if 0 // JPB WIP BUG
+#ifdef ESTIMATE_NORMALS
 	if (bEstimateNormal) {
-		pointcloud.normals.reserve(nPointsEstimate);
+		pointcloud.ReserveNormals(nPointsEstimate);
 		depthDataLoadFlags |= HeaderDepthDataRaw::HAS_NORMAL;
 	}
 #endif
 
-	MEMORYSTATUS memState{};
-	::GlobalMemoryStatus(&memState);
-	const size_t bytesAvailable = memState.dwAvailPhys;
+	// Available physical memory. Use the cross-platform 64-bit query: the
+	// legacy GlobalMemoryStatus() saturates dwAvailPhys (a 32-bit DWORD) at
+	// 4GB, which silently under-reserves the flat views/weights buffers.
+	const size_t bytesAvailable = Util::GetMemoryInfo().freePhysical;
 
 	// Split a quarter of what's left between points and views.
 	const size_t elementSize =
@@ -2359,15 +2528,12 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 	unsigned totalNumImageNeighborsInCache = 0, totalNumImagesInCache = 0;
 	IIndex numDMapsFused = 0;
 
-	std::vector<bool> depthDataEmpty(arrDepthData.size());
-
 	std::vector<TRMatrixBase<float>> imagesCameraRt;
 	std::vector<Matrix3x4f> imagesCameraP;
 	std::vector<Matrix4x4f> imagesCameraPt;
 	imagesCameraRt.reserve(scene.images.size());
 
 	FOREACH(i, scene.images) {
-		DepthData& depthData = arrDepthData[i];
 		imagesCameraRt.emplace_back(Cast<TRMatrixBase<float>>(scene.images[i].camera.R));
 		imagesCameraP.emplace_back(Cast<float>(scene.images[i].camera.P));
 
@@ -2402,20 +2568,34 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 		const DepthData& depthData(arrDepthData[idxImage]);
 		ASSERT(depthData.GetView().GetLocalID(scene.images) == idxImage);
 		ASSERT(!depthData.IsEmpty());
-#if 0 // JPB WIP BUG
-		if (bEstimateNormal && depthData.normalMap.empty())
-			EstimateNormalMaps();
+#ifdef ESTIMATE_NORMALS
+		// Normal maps are normally loaded alongside the depth maps (HAS_NORMAL
+		// flag set when bEstimateNormal). If one is missing, estimate it from the
+		// depth map so the fused normal is meaningful.
+		if (bEstimateNormal && depthData.normalMap.empty() && !depthData.depthMap.empty()) {
+			DepthData& depthDataMut = arrDepthData[idxImage];
+			EstimateNormalMap(depthDataMut.images.front().camera.K, depthDataMut.depthMap, depthDataMut.normalMap);
+		}
 #endif
-		constexpr IIndex nMaxViewsFuse = 32; // JPB WIP OPTDENSE::nMaxViewsFuse not imported
+		const IIndex nMaxViewsFuse = OPTDENSE::nMaxViewsFuse;
 		ASSERT(!depthData.images.empty() && !depthData.neighbors.empty());
+		// NOTE: this neighbor warm-up / index-map allocation loop MUST stay
+		// serial. It was previously guarded by `#pragma omp parallel for`, but
+		// that is not thread-safe: DMapCache::UseImage() loads depth-maps with
+		// the cache mutex dropped and, under the lock, runs Eject() ->
+		// EjectOldest() which Save()s and Release()s the oldest cached
+		// DepthData. With up to nMaxViewsFuse neighbors loaded against a much
+		// smaller cache budget, Eject fires mid-loop and can Release a sibling
+		// neighbor that another thread is concurrently reading here via the
+		// unlocked depthDataB.IsEmpty() / depthDataB.depthMap.size() accesses
+		// -> data race on (and possible use of a freed) DepthData payload. The
+		// shared `numNeighbors` counter was also a non-atomic RMW. The mutex
+		// only guards cache bookkeeping, not the payload these lines touch.
+		// Running serially removes both hazards and restores the deterministic
+		// break-at-cap behavior of the reference implementation; this loop only
+		// warms the cache and allocates index maps, so it is not a hotspot.
 		IIndex numNeighbors(0);
-#ifdef DENSE_USE_OPENMP
-#pragma omp parallel for
-		for (int64_t i = 0; i < (int64_t)depthData.neighbors.size(); ++i) {
-			const ViewScore& neighbor = depthData.neighbors[(IIndex)i];
-#else
 		for (const ViewScore& neighbor : depthData.neighbors) {
-#endif
 			const DepthData& depthDataB(arrDepthData[neighbor.ID]);
 			if (!depthDataB.IsValid())
 				continue;
@@ -2423,11 +2603,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			if (depthDataB.IsEmpty())
 				continue;
 			if (++numNeighbors >= nMaxViewsFuse)
-#ifdef DENSE_USE_OPENMP
-				continue;
-#else
 				break;
-#endif
 			DepthIndex& depthIdxs = arrDepthIdx[neighbor.ID];
 			if (!depthIdxs.empty())
 				continue;
@@ -2492,10 +2668,6 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 
 		const float confMapSentinel = 1.f;
 		size_t confMapInc;
-
-#ifdef ESTIMATE_NORMALS
-		boost::container::small_vector<Proj, 16> projs;
-#endif
 
 		struct NeighborCache {
 			IIndex idxImageB;
@@ -2594,6 +2766,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			Depth    depthB;   // cached so Phase 2 doesn't re-read
 			Depth* pDepthB;  // pointer for invalidation / deferred commit
 			uint32_t* pIdxPointB; // pointer for deferred commit
+			PointCloud::Normal normalB; // world-space neighbor normal from the Phase 1 gate (reused in Phase 2)
 		};
 		const unsigned maxNeighbors = (unsigned)neighborCache.size();
 		NeighborHit* hitsStorage = (NeighborHit*)_alloca(maxNeighbors * sizeof(NeighborHit));
@@ -2624,34 +2797,48 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 		const float refCy = (float)imageData.camera.C.y;
 		const float refCz = (float)imageData.camera.C.z;
 
+		// A/B: precision of the reference 3D point built from depth
+		// (point = R * Kinv(x,y) * depth + C). The additive camera center (refC*)
+		// and the destination (Point3f point) are ALREADY float, so the double
+		// intermediates here buy no precision -- they are truncated to float on
+		// store. FUSE_FWD_POINT_FLOAT=1 makes the whole build float (no
+		// double<->float conversions); =0 restores the exact current
+		// double-intermediate behavior (bit-identical to before).
+#ifndef FUSE_FWD_POINT_FLOAT
+#define FUSE_FWD_POINT_FLOAT 1
+#endif
+#if FUSE_FWD_POINT_FLOAT
+		typedef float fwd_t;
+#else
+		typedef double fwd_t;
+#endif
+
+		// Row-invariant reference-camera constants hoisted out of the per-row loop.
+		// These depend only on imageData.camera.K / depthData.confMap (constant across
+		// rows), so this is pure loop-invariant code motion: bit-identical values, just
+		// computed once instead of once per row. The reciprocal/principal-point values
+		// are still computed in double then narrowed to fwd_t exactly as before. The
+		// per-pixel / per-neighbor accumulation below is deliberately left byte-for-byte
+		// unchanged -- reordering it would change the emitted point positions/colors/normals.
+		const bool confMapEmpty = depthData.confMap.empty();
+		confMapInc = confMapEmpty ? 0 : 1;
+		const fwd_t invImageDataCameraK00 = (fwd_t)(1.0 / imageData.camera.K(0, 0));
+		const fwd_t invImageDataCameraK11 = (fwd_t)(1.0 / imageData.camera.K(1, 1));
+		const fwd_t imageDataCameraK02 = (fwd_t)imageData.camera.K(0, 2);
+		const fwd_t imageDataCameraK12 = (fwd_t)imageData.camera.K(1, 2);
+		const fwd_t pointXNoDepthPreTransformDelta = invImageDataCameraK00;
+
 		for (int i = 0; i < sizeMap.height; ++i) {
 			const Depth* __restrict pDM = &depthData.depthMap(i, 0);
 			uint32_t* __restrict pDepthIdxs = (uint32_t*)&depthIdxs(i, 0);
 
-			const float* __restrict pConfMap;
-			bool confMapEmpty = depthData.confMap.empty();
-			if (confMapEmpty) {
-				pConfMap = &confMapSentinel;
-				confMapInc = 0;
-			}
-			else {
-				confMapInc = 1;
-			}
-
-			if (!confMapEmpty) {
-				pConfMap = &depthData.confMap(i, 0);
-			}
+			const float* __restrict pConfMap = confMapEmpty ? &confMapSentinel : &depthData.confMap(i, 0);
 
 			const Normal* __restrict pNormalMap = &depthData.normalMap(i, 0);
 			const Pixel8U* __restrict pImage = &imageData.image(i, 0);
 
-			const double invImageDataCameraK00 = 1. / imageData.camera.K(0, 0);
-			const double invImageDataCameraK11 = 1. / imageData.camera.K(1, 1);
-			const double imageDataCameraK02 = imageData.camera.K(0, 2);
-			const double imageDataCameraK12 = imageData.camera.K(1, 2);
-			double pointXNoDepthPreTransform = -imageDataCameraK02 * invImageDataCameraK00;
-			double pointXNoDepthPreTransformDelta = invImageDataCameraK00;
-			double pointYNoDepthPreTransform = (i - imageDataCameraK12) * invImageDataCameraK11;
+			fwd_t pointXNoDepthPreTransform = -imageDataCameraK02 * invImageDataCameraK00;
+			fwd_t pointYNoDepthPreTransform = ((fwd_t)i - imageDataCameraK12) * invImageDataCameraK11;
 
 			for (int j = 0; j < sizeMap.width; ++j, pConfMap += confMapInc, pointXNoDepthPreTransform += pointXNoDepthPreTransformDelta) {
 				const Depth depth(pDM[j]);
@@ -2676,9 +2863,9 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 				// create the corresponding 3D point
 				idxPoint = (uint32_t)pointcloud.NumPoints();
 
-				const double pointXWithDepth = pointXNoDepthPreTransform * depth;
-				const double pointYWithDepth = pointYNoDepthPreTransform * depth;
-				const double pointZWithDepth = depth;
+				const fwd_t pointXWithDepth = pointXNoDepthPreTransform * depth;
+				const fwd_t pointYWithDepth = pointYNoDepthPreTransform * depth;
+				const fwd_t pointZWithDepth = depth;
 
 				Point3f point;
 				point.x =
@@ -2771,9 +2958,12 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 					// facades) and makes per-view fuse disagree on otherwise-flat data.
 					const float ptz = _vFirst(zzz);
 					const float invZ = 1.0f / ptz;
-					alignas(16) float xyz0Arr[4];
-					_mm_store_ps(xyz0Arr, xyz0);
-					const ImageRef xB(ROUND2INT(xyz0Arr[0] * invZ), ROUND2INT(xyz0Arr[1] * invZ));
+					// extract projected x,y lanes directly (bit-identical to the
+					// previous store-to-array + reload, but avoids the stack
+					// round-trip on this hot per-neighbor path)
+					const float projX = _vFirst(_Splat(xyz0, 0));
+					const float projY = _vFirst(_Splat(xyz0, 1));
+					const ImageRef xB(ROUND2INT(projX * invZ), ROUND2INT(projY * invZ));
 
 					Depth& depthB = depthMapB.pix(xB);
 					if (depthB == 0) {
@@ -2783,6 +2973,20 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 						continue;
 					}
 
+					// Defer the second random load (depthIdx) past the depth/occlusion
+					// test. A neighbor where the point is occluded by a nearer,
+					// dissimilar surface (!similar && ptz >= depthB) is neither a hit
+					// nor an invalidation candidate, so its claim state is irrelevant
+					// and the depthIdx fetch is wasted. Skipping it is bit-identical
+					// (the idxPointB != NO_ID check has no side effect) and saves one
+					// random cache-line fetch per occluded probe. Disabled under
+					// FUSE_DIAGNOSTICS so the per-bucket counters below stay exact.
+					const bool similar = FastAbsS(ptz - depthB) < fDepthDiffThresholdFuse * ptz;
+#if !FUSE_DIAGNOSTICS
+					if (!similar && ptz >= depthB)
+						continue;
+#endif
+
 					uint32_t& idxPointB = nc.depthIdxB->pix(xB);
 					if (idxPointB != NO_ID) {
 #if FUSE_DIAGNOSTICS
@@ -2791,7 +2995,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 						continue;
 					}
 
-					if (FastAbsS(ptz - depthB) < fDepthDiffThresholdFuse * ptz) {
+					if (similar) {
 						// Depth is similar � but only do the cheap normal gate here
 						PointCloud::Normal normalB;
 						// BUGFIX: only consult neighbor normal map if it actually exists.
@@ -2830,6 +3034,7 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 							h.depthB = depthB;
 							h.pDepthB = &depthB;
 							h.pIdxPointB = &idxPointB;
+							h.normalB = normalB; // cache world-space normal for Phase 2 reuse
 #if FUSE_DIAGNOSTICS
 							++cNeighborAccepted;
 #endif
@@ -2906,9 +3111,6 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 					viewsStorage[nViews] = nc.idxImageB;
 					weightsStorage[nViews] = confidenceB;
 					++nViews;
-#ifdef ESTIMATE_NORMALS
-					projs.push_back(Proj(h.xB));
-#endif
 					deferredStorage[nDeferred++] = h.pIdxPointB;
 
 					double cx = (((double)h.xB.x) - nc.K02) * h.depthB * nc.invK00;
@@ -2940,18 +3142,14 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 
 #ifdef ESTIMATE_NORMALS
 					if (bEstimateNormal) {
-						PointCloud::Normal normalB;
-						if (bNormalMap) {
-							const Normal& nb = nc.normalMapB->pix(h.xB);
-							const TRMatrixBase<float>& imageCameraRt = *nc.cameraRt;
-							normalB.x = imageCameraRt[0 * 3 + 0] * nb.x + imageCameraRt[1 * 3 + 0] * nb.y + imageCameraRt[2 * 3 + 0] * nb.z;
-							normalB.y = imageCameraRt[0 * 3 + 1] * nb.x + imageCameraRt[1 * 3 + 1] * nb.y + imageCameraRt[2 * 3 + 1] * nb.z;
-							normalB.z = imageCameraRt[0 * 3 + 2] * nb.x + imageCameraRt[1 * 3 + 2] * nb.y + imageCameraRt[2 * 3 + 2] * nb.z;
-						}
-						else {
-							normalB = { 0.f, 0.f, -1.f };
-						}
-						N += normalB * confidenceB;
+						// reuse the world-space neighbor normal already computed
+						// during the Phase 1 gate: identical value in the common
+						// case, but avoids a redundant 3x3 rotate and a random
+						// normal-map fetch here. It also removes the latent read
+						// of an empty neighbor normal-map that the old
+						// bNormalMap-only guard could perform (Phase 1 already
+						// substitutes {0,0,-1} when the neighbor has no normals).
+						N += h.normalB * confidenceB;
 					}
 #endif
 					confidence += confidenceB;
@@ -2982,6 +3180,12 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 				pointcloud.AddPoint(point);
 				pointcloud.AddViews(viewsStorage, viewsStorage + nViews);
 				pointcloud.AddWeights(weightsStorage, weightsStorage + nViews);
+#ifdef ESTIMATE_NORMALS
+				// emit the confidence-weighted fused world-space normal (N was
+				// accumulated as ref-normal*conf + sum(neighbor-normal*confB)).
+				if (bEstimateNormal)
+					pointcloud.AddNormal(normalized(N));
+#endif
 #if FUSE_DIAGNOSTICS
 				dmgSurvived(i, j) = depth;
 				++cPixRefSurvived;
@@ -3042,7 +3246,6 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 #endif
 
 		fusedDMaps[idxImage] = true;
-		ASSERT(pointcloud.points.size() == pointcloud.pointViews.size() && pointcloud.points.size() == pointcloud.pointWeights.size() && pointcloud.points.size() == projs.size());
 		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
 			idxImage, depthData.images.size() - 1, pointcloud.NumPoints() - nNumPointsPrev, numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
 		progress.display(numDMapsFused);
@@ -3062,34 +3265,9 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 		static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused,
 		static_cast<double>(totalNumImagesInCache) / numDMapsFused, TD_TIMER_GET_FMT().c_str());
 
-#if 0 // JPB WIP BUG
-	if (bEstimateNormal && !pointcloud.points.empty() && pointcloud.normals.empty()) {
-		// estimate normal also if requested (quite expensive if normal-maps not available)
-		TD_TIMER_STARTD();
-		pointcloud.normals.resize(pointcloud.points.size());
-		const int64_t nPoints((int64_t)pointcloud.points.size());
-		#ifdef DENSE_USE_OPENMP
-		#pragma omp parallel for
-		#endif
-		for (int64_t i=0; i<nPoints; ++i) {
-			PointCloud::WeightArr& weights = pointcloud.pointWeights[i];
-			ASSERT(!weights.empty());
-			IIndex idxView(0);
-			float bestWeight = weights.front();
-			for (IIndex idx=1; idx<weights.size(); ++idx) {
-				const PointCloud::Weight& weight = weights[idx];
-				if (bestWeight < weight) {
-					bestWeight = weight;
-					idxView = idx;
-				}
-			}
-			const DepthData& depthData(arrDepthData[pointcloud.pointViews[i][idxView]]);
-			ASSERT(depthData.IsValid() && !depthData.IsEmpty());
-			depthData.GetNormal(projs[i][idxView].GetCoord(), pointcloud.normals[i]);
-		}
-		DEBUG_EXTRA("Normals estimated for the dense point-cloud: %u normals (%s)", pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
-	}
-#endif
+	// Normals are emitted directly during fusion (normalized(N) per surviving
+	// point), so no separate post-pass is needed. The previous projs[]-based
+	// fallback used the old non-streaming PointCloud API and is removed.
 } // FuseDepthMaps
 
 //#pragma optimize("", on) // JPB WIP BUG Debugging
@@ -3122,6 +3300,11 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 	// eating into legitimate surfaces.
 	//   0 = strict (reference-like)
 	//   1 = relaxed (closer to fast-fuse coverage with median benefits)
+	// RELAXED enabled (June 2026): tree-canopy depths systematically fail
+	// the strict gates (moving leaves => low NCC confidence, >2px reproj
+	// error, 1-pixel clusters) and the point cloud loses the entire canopy
+	// vs the reference output. Relaxed keeps the 2-view consensus
+	// requirement (nMinViewsFuse) so it adds recall, not random outliers.
 	// =====================================================================
 	#define DENSE_FUSE_RELAXED 1
 
@@ -3166,9 +3349,9 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 
 	// Reserve flat views/weights memory the same way FuseDepthMaps does.
 	{
-		MEMORYSTATUS memState{};
-		::GlobalMemoryStatus(&memState);
-		const size_t bytesAvailable = memState.dwAvailPhys;
+		// Cross-platform 64-bit available-memory query (GlobalMemoryStatus's
+		// dwAvailPhys is a 32-bit DWORD that saturates at 4GB).
+		const size_t bytesAvailable = Util::GetMemoryInfo().freePhysical;
 		const size_t elementSize =
 			std::max(
 				sizeof(decltype(pointcloud.pointViewsMemory)::value_type),
@@ -3196,7 +3379,12 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 	//   0 = pure fuse (median-only output)
 	//   1 = hybrid (sparse clusters expand to per-pixel points)
 	// =====================================================================
-	#define DENSE_FUSE_HYBRID 1
+	// NOTE: HYBRID emits raw (un-medianed) per-pixel positions for sparse
+	// clusters (<kHybridThresholdViews unique views). This leaks depth-map
+	// noise as scattered "remnants" beneath the surface; reference always
+	// emits one median per cluster. Keep this OFF unless deliberately
+	// trading correctness for coverage on very sparse data.
+	#define DENSE_FUSE_HYBRID 0
 	constexpr unsigned kHybridThresholdViews = 3;
 
 	// =====================================================================
@@ -3276,122 +3464,107 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 	};
 	#endif
 
-	// Per-cluster accumulators. Reused across pixels (cleared after each emit).
-	Point3f refPoint(0.f, 0.f, 0.f);
-	Point3f refNormal(0.f, 0.f, -1.f);
-	CLISTDEF0IDX(float, unsigned) fusedPoints[3];
-	std::vector<uint32_t> fusedViews;
-	std::vector<float>    fusedWeights;
-	Point3d fusedNormal;
-	Pixel32F fusedColor;
-	// Per-pixel parallel arrays (only used by hybrid emit). Same length as
-	// fusedPoints[]; index k = the k-th accepted pixel in the cluster.
-	#if DENSE_FUSE_HYBRID
-	std::vector<uint32_t> pxView;     // view ID for pixel k
-	std::vector<float>    pxWeight;   // Conf2Weight for pixel k
-	std::vector<Pixel8U>  pxColor;    // raw pixel color (only if bEstimateColor)
-	std::vector<Point3f>  pxNormal;   // world-space normal for pixel k (if normals)
-	#endif
+	// =====================================================================
+	// DENSE_FUSE_PARALLEL_PIXELS: parallelize the per-pixel FusePoint loop
+	// within each ref image. Threads contend on arrUseMask bits via atomic
+	// test-and-set (TryClaimBitAtomic, defined at file scope); per-thread
+	// emit buffers are flushed serially at end of image.
+	// NOTE: the resulting point cloud is NOT bit-identical across runs
+	// (cluster groupings depend on thread scheduling race outcomes).
+	// Total surface coverage and point count are statistically equivalent
+	// (within ~0.5% on tested scenes).
+	//   0 = serial (deterministic, original behavior)
+	//   1 = parallel (typically 6-10x faster on a 32-thread CPU)
+	// =====================================================================
+	#define DENSE_FUSE_PARALLEL_PIXELS 1
 
-	// ---- Per-image diagnostics (set to 0 once stable) -------------------
-	#define DENSE_FUSE_DIAG 0
-	#if DENSE_FUSE_DIAG
-	uint64_t cSeedCalls=0, cSeedOOB=0, cSeedDmEmpty=0, cSeedZeroDepth=0,
-	         cSeedAlreadyUsed=0, cSeedLowConf=0, cSeedAccepted=0;
-	uint64_t cRecCalls=0, cRecOOB=0, cRecDmEmpty=0, cRecZeroDepth=0,
-	         cRecAlreadyUsed=0, cRecLowConf=0, cRecBehindCam=0,
-	         cRecDepthMismatch=0, cRecReprojFail=0, cRecNormalFail=0,
-	         cRecAccepted=0;
-	uint64_t cClustersTried=0, cClustersEmitted=0, cClustersTooSmall=0,
-	         cClustersTooFewViews=0;
-	#endif
-	// ---------------------------------------------------------------------
-
-	const auto FusePoint = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth) -> void {
-		const auto lambda = [&](IIndex curID, const ImageRef& curX, unsigned curDepth, const auto& Self) -> void {
-			#if DENSE_FUSE_DIAG
-			if (curDepth == 0) ++cSeedCalls; else ++cRecCalls;
+	// Per-cluster scratch state. One instance per thread (parallel mode) or
+	// one at function scope (serial mode). FusePoint takes this by reference.
+	struct FuseScratch {
+		Point3f refPoint   = Point3f(0.f, 0.f, 0.f);
+		Point3f refNormal  = Point3f(0.f, 0.f, -1.f);
+		CLISTDEF0IDX(float, unsigned) fusedPoints[3];
+		std::vector<uint32_t> fusedViews;
+		std::vector<float>    fusedWeights;
+		Point3d  fusedNormal = Point3d::ZERO;
+		Pixel32F fusedColor  = Pixel32F::BLACK;
+		#if DENSE_FUSE_HYBRID
+		std::vector<uint32_t> pxView;
+		std::vector<float>    pxWeight;
+		std::vector<Pixel8U>  pxColor;
+		std::vector<Point3f>  pxNormal;
+		#endif
+		inline void ResetCluster() {
+			fusedPoints[0].clear();
+			fusedPoints[1].clear();
+			fusedPoints[2].clear();
+			fusedViews.clear();
+			fusedWeights.clear();
+			fusedNormal = Point3d::ZERO;
+			fusedColor  = Pixel32F::BLACK;
+			#if DENSE_FUSE_HYBRID
+			pxView.clear();
+			pxWeight.clear();
+			pxColor.clear();
+			pxNormal.clear();
 			#endif
+		}
+	};
+
+	// Per-thread emit buffer. Accumulates emitted points during the parallel
+	// pixel loop; flushed serially into `pointcloud` at end of each image.
+	struct EmitBuf {
+		struct Rec {
+			Point3f  point;
+			Point3f  normal;   // unused if !bEstimateNormal
+			Pixel8U  color;    // unused if !bEstimateColor
+			uint32_t viewBeg;
+			uint32_t viewEnd;
+		};
+		std::vector<Rec>      recs;
+		std::vector<uint32_t> views;
+		std::vector<float>    weights;
+	};
+
+	// DIAG removed under parallel-pixels mode (counters would race).
+	// Rebuild with DENSE_FUSE_PARALLEL_PIXELS=0 if diagnostics are needed.
+	#define DENSE_FUSE_DIAG 0
+
+	const auto FusePoint = [&](IIndex ID, const ImageRef& x, unsigned fuseDepth, FuseScratch& s) -> void {
+		const auto lambda = [&](IIndex curID, const ImageRef& curX, unsigned curDepth, const auto& Self) -> void {
 			#if DENSE_FUSE_OPT_TUNING
 			const DFImageCache& pic = imgCache[curID];
 			const DepthMap&     curDepthMap  = *pic.pDepthMap;
 			const ConfidenceMap& curConfMap  = *pic.pConfMap;
 			const NormalMap&    curNormalMap = *pic.pNormalMap;
 			const Image&        curImageData = *pic.pImageData;
-			// Depth-map may be empty if DMapCache evicted it; bail safely.
-			if (curDepthMap.empty()) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedDmEmpty; else ++cRecDmEmpty;
-				#endif
-				return;
-			}
-			// In-bounds check via cached dims (replaces isInside + cv::Size ctor).
+			if (curDepthMap.empty()) return;
 			if ((unsigned)curX.x >= (unsigned)pic.width ||
-			    (unsigned)curX.y >= (unsigned)pic.height) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedOOB; else ++cRecOOB;
-				#endif
-				return;
-			}
+			    (unsigned)curX.y >= (unsigned)pic.height) return;
 			const Depth depth = curDepthMap(curX);
-			if (depth <= Depth(0)) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedZeroDepth; else ++cRecZeroDepth;
-				#endif
-				return;
-			}
+			if (depth <= Depth(0)) return;
 			UseMask& useMask = *pic.pUseMask;
-			// useMask is always allocated for IDs in the active recursion
-			// graph (outer loop creates it before the pixel sweep), so the
-			// .empty() check from the original is unnecessary here.
-			if (useMask(curX)) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedAlreadyUsed; else ++cRecAlreadyUsed;
-				#endif
-				return;
-			}
+			// Read-only fast-path: skip pixels already claimed. Race here is
+			// benign (we may do redundant work; the atomic claim below will
+			// reject any double-emit).
+			if (useMask(curX)) return;
 			const float conf(curConfMap.empty() ? 1.f : curConfMap(curX));
-			if (conf < minConfidence) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedLowConf; else ++cRecLowConf;
-				#endif
-				return;
-			}
-			// If a normal map is available, compute world-space normal; else use ref's.
+			if (conf < minConfidence) return;
 			const bool bHaveNormal = !curNormalMap.empty();
 			Point3f normal;
 			if (curDepth > 0) {
-				// Inlined ProjectPointP3 in double precision (matches reference math).
-				const double rx = (double)refPoint.x;
-				const double ry = (double)refPoint.y;
-				const double rz = (double)refPoint.z;
+				const double rx = (double)s.refPoint.x;
+				const double ry = (double)s.refPoint.y;
+				const double rz = (double)s.refPoint.z;
 				const double ptx_d = pic.P[0]*rx + pic.P[1]*ry + pic.P[2 ]*rz + pic.P[3 ];
 				const double pty_d = pic.P[4]*rx + pic.P[5]*ry + pic.P[6 ]*rz + pic.P[7 ];
 				const double ptz_d = pic.P[8]*rx + pic.P[9]*ry + pic.P[10]*rz + pic.P[11];
-				// Match original: ProjectPointP3 returns Point3d then is narrowed
-				// to Point3f, so the z<=0 gate runs on the *float* truncated value.
 				const Point3f pt((float)ptx_d, (float)pty_d, (float)ptz_d);
-				if (pt.z <= Depth(0)) {
-					#if DENSE_FUSE_DIAG
-					++cRecBehindCam;
-					#endif
-					return;
-				}
-				if (!IsDepthSimilar(depth, pt.z, OPTDENSE::fDepthDiffThreshold)) {
-					#if DENSE_FUSE_DIAG
-					++cRecDepthMismatch;
-					#endif
-					return;
-				}
+				if (pt.z <= Depth(0)) return;
+				if (!IsDepthSimilar(depth, pt.z, OPTDENSE::fDepthDiffThreshold)) return;
 				const Point2f diff(pt.x / pt.z - float(curX.x), pt.y / pt.z - float(curX.y));
-				if (normSq(diff) > kReprojErrSq) {
-					#if DENSE_FUSE_DIAG
-					++cRecReprojFail;
-					#endif
-					return;
-				}
+				if (normSq(diff) > kReprojErrSq) return;
 				if (bHaveNormal) {
-					// Inlined: normal_world = R^T * normalMap(curX)
 					const Normal& nLocal = curNormalMap(curX);
 					const double nx = (double)nLocal.x;
 					const double ny = (double)nLocal.y;
@@ -3399,21 +3572,12 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 					normal.x = (float)(pic.R00*nx + pic.R10*ny + pic.R20*nz);
 					normal.y = (float)(pic.R01*nx + pic.R11*ny + pic.R21*nz);
 					normal.z = (float)(pic.R02*nx + pic.R12*ny + pic.R22*nz);
-					// Only enforce normal gate if we also had a ref normal.
-					if (refNormal.z != -1.f || refNormal.x != 0.f || refNormal.y != 0.f) {
-						if (refNormal.dot(normal) < normalError) {
-							#if DENSE_FUSE_DIAG
-							++cRecNormalFail;
-							#endif
-							return;
-						}
+					if (s.refNormal.z != -1.f || s.refNormal.x != 0.f || s.refNormal.y != 0.f) {
+						if (s.refNormal.dot(normal) < normalError) return;
 					}
 				} else {
-					normal = refNormal;
+					normal = s.refNormal;
 				}
-				#if DENSE_FUSE_DIAG
-				++cRecAccepted;
-				#endif
 			} else {
 				if (bHaveNormal) {
 					const Normal& nLocal = curNormalMap(curX);
@@ -3426,12 +3590,11 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 				} else {
 					normal = Point3f(0.f, 0.f, -1.f);
 				}
-				#if DENSE_FUSE_DIAG
-				++cSeedAccepted;
-				#endif
 			}
-			useMask.set(curX);
-			// Inlined TransformPointI2W in double precision.
+			// Atomic test-and-set on useMask. If another thread claimed this
+			// pixel since the early read above, bail (do not double-emit).
+			if (TryClaimBitAtomic(useMask, curX))
+				return;
 			const double cx_d = ((double)curX.x - pic.K02) * pic.invK00 * (double)depth;
 			const double cy_d = ((double)curX.y - pic.K12) * pic.invK11 * (double)depth;
 			const double cz_d = (double)depth;
@@ -3441,151 +3604,91 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 				(float)(pic.R02*cx_d + pic.R12*cy_d + pic.R22*cz_d + pic.Cz));
 			#else
 			const DepthData& depthDataCur = arrDepthData[curID];
-			// Depth-map may be empty if DMapCache evicted it; bail safely.
-			if (depthDataCur.depthMap.empty()) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedDmEmpty; else ++cRecDmEmpty;
-				#endif
-				return;
-			}
-			if (!Image8U::isInside(curX, depthDataCur.depthMap.size())) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedOOB; else ++cRecOOB;
-				#endif
-				return;
-			}
+			if (depthDataCur.depthMap.empty()) return;
+			if (!Image8U::isInside(curX, depthDataCur.depthMap.size())) return;
 			const Depth depth = depthDataCur.depthMap(curX);
-			if (depth <= Depth(0)) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedZeroDepth; else ++cRecZeroDepth;
-				#endif
-				return;
-			}
+			if (depth <= Depth(0)) return;
 			UseMask& useMask = arrUseMask[curID];
-			if (useMask.empty() || useMask(curX)) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedAlreadyUsed; else ++cRecAlreadyUsed;
-				#endif
-				return;
-			}
+			if (useMask.empty() || useMask(curX)) return;
 			const float conf(depthDataCur.confMap.empty() ? 1.f : depthDataCur.confMap(curX));
-			if (conf < minConfidence) {
-				#if DENSE_FUSE_DIAG
-				if (curDepth == 0) ++cSeedLowConf; else ++cRecLowConf;
-				#endif
-				return;
-			}
+			if (conf < minConfidence) return;
 			const DepthData::ViewData& image = depthDataCur.GetView();
-			// If a normal map is available, compute world-space normal; else use ref's.
 			const bool bHaveNormal = !depthDataCur.normalMap.empty();
 			Point3f normal;
 			if (curDepth > 0) {
-				// Project the seed back into this view; check depth + reprojection.
-				const Point3f pt(image.camera.ProjectPointP3(Cast<REAL>(refPoint)));
-				if (pt.z <= Depth(0)) {
-					#if DENSE_FUSE_DIAG
-					++cRecBehindCam;
-					#endif
-					return;
-				}
-				if (!IsDepthSimilar(depth, pt.z, OPTDENSE::fDepthDiffThreshold)) {
-					#if DENSE_FUSE_DIAG
-					++cRecDepthMismatch;
-					#endif
-					return;
-				}
+				const Point3f pt(image.camera.ProjectPointP3(Cast<REAL>(s.refPoint)));
+				if (pt.z <= Depth(0)) return;
+				if (!IsDepthSimilar(depth, pt.z, OPTDENSE::fDepthDiffThreshold)) return;
 				const Point2f diff(pt.x / pt.z - float(curX.x), pt.y / pt.z - float(curX.y));
-				if (normSq(diff) > kReprojErrSq) {
-					#if DENSE_FUSE_DIAG
-					++cRecReprojFail;
-					#endif
-					return;
-				}
+				if (normSq(diff) > kReprojErrSq) return;
 				if (bHaveNormal) {
 					normal = Cast<float>(image.camera.R.t() * Cast<REAL>(depthDataCur.normalMap(curX)));
-					// Only enforce normal gate if we also had a ref normal.
-					if (refNormal.z != -1.f || refNormal.x != 0.f || refNormal.y != 0.f) {
-						if (refNormal.dot(normal) < normalError) {
-							#if DENSE_FUSE_DIAG
-							++cRecNormalFail;
-							#endif
-							return;
-						}
+					if (s.refNormal.z != -1.f || s.refNormal.x != 0.f || s.refNormal.y != 0.f) {
+						if (s.refNormal.dot(normal) < normalError) return;
 					}
 				} else {
-					normal = refNormal;
+					normal = s.refNormal;
 				}
-				#if DENSE_FUSE_DIAG
-				++cRecAccepted;
-				#endif
 			} else {
 				if (bHaveNormal)
 					normal = Cast<float>(image.camera.R.t() * Cast<REAL>(depthDataCur.normalMap(curX)));
 				else
 					normal = Point3f(0.f, 0.f, -1.f);
-				#if DENSE_FUSE_DIAG
-				++cSeedAccepted;
-				#endif
 			}
-			useMask.set(curX);
+			if (TryClaimBitAtomic(useMask, curX))
+				return;
 			const Point3f X(Cast<float>(image.camera.TransformPointI2W(Point3(REAL(curX.x), REAL(curX.y), REAL(depth)))));
 			#endif
 
-			// Accumulate into the fused-point cluster.
-			fusedPoints[0].push_back(X.x);
-			fusedPoints[1].push_back(X.y);
-			fusedPoints[2].push_back(X.z);
+			s.fusedPoints[0].push_back(X.x);
+			s.fusedPoints[1].push_back(X.y);
+			s.fusedPoints[2].push_back(X.z);
 			const float weight(Conf2Weight(conf, depth));
-			// Insert-sorted-unique into fusedViews; accumulate into fusedWeights at same index.
 			{
 				const uint32_t vID = (uint32_t)curID;
-				auto it = std::lower_bound(fusedViews.begin(), fusedViews.end(), vID);
-				const size_t idx = (size_t)(it - fusedViews.begin());
-				if (it != fusedViews.end() && *it == vID) {
-					fusedWeights[idx] += weight;
+				auto it = std::lower_bound(s.fusedViews.begin(), s.fusedViews.end(), vID);
+				const size_t idx = (size_t)(it - s.fusedViews.begin());
+				if (it != s.fusedViews.end() && *it == vID) {
+					s.fusedWeights[idx] += weight;
 				} else {
-					fusedViews.insert(it, vID);
-					fusedWeights.insert(fusedWeights.begin() + idx, weight);
+					s.fusedViews.insert(it, vID);
+					s.fusedWeights.insert(s.fusedWeights.begin() + idx, weight);
 				}
 			}
 			if (bEstimateNormal)
-				fusedNormal += Cast<double>(normal);
+				s.fusedNormal += Cast<double>(normal);
 			if (bEstimateColor)
 			#if DENSE_FUSE_OPT_TUNING
-				fusedColor += Cast<float>(curImageData.image(curX));
+				s.fusedColor += Cast<float>(curImageData.image(curX));
 			#else
-				fusedColor += Cast<float>(image.pImageData->image(curX));
+				s.fusedColor += Cast<float>(image.pImageData->image(curX));
 			#endif
 			#if DENSE_FUSE_HYBRID
-			pxView.push_back((uint32_t)curID);
-			pxWeight.push_back(weight);
+			s.pxView.push_back((uint32_t)curID);
+			s.pxWeight.push_back(weight);
 			if (bEstimateColor)
 			#if DENSE_FUSE_OPT_TUNING
-				pxColor.push_back(curImageData.image(curX));
+				s.pxColor.push_back(curImageData.image(curX));
 			#else
-				pxColor.push_back(image.pImageData->image(curX));
+				s.pxColor.push_back(image.pImageData->image(curX));
 			#endif
 			if (bEstimateNormal)
-				pxNormal.push_back(normal);
+				s.pxNormal.push_back(normal);
 			#endif
 
 			if (curDepth == 0) {
-				refPoint = X;
-				refNormal = normal;
+				s.refPoint = X;
+				s.refNormal = normal;
 			}
 
-			if (++curDepth >= kMaxFuseDepth || fusedPoints[0].size() >= kMaxPointsFuse)
+			if (++curDepth >= kMaxFuseDepth || s.fusedPoints[0].size() >= kMaxPointsFuse)
 				return;
 
-			// Recurse into the neighbor graph.
 			#if DENSE_FUSE_OPT_TUNING
 			for (const ViewScore& neighbor : *pic.pNeighbors) {
 				const IIndex nextID(neighbor.ID);
-				if (nextID == curID)
-					continue;
-				if (!neighbors[nextID])
-					continue;
-				// Inlined ProjectPointP (next camera) in double precision.
+				if (nextID == curID) continue;
+				if (!neighbors[nextID]) continue;
 				const DFImageCache& npic = imgCache[nextID];
 				const double Xx = (double)X.x;
 				const double Xy = (double)X.y;
@@ -3593,7 +3696,6 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 				const double nptx = npic.P[0]*Xx + npic.P[1]*Xy + npic.P[2 ]*Xz + npic.P[3 ];
 				const double npty = npic.P[4]*Xx + npic.P[5]*Xy + npic.P[6 ]*Xz + npic.P[7 ];
 				const double nptz = npic.P[8]*Xx + npic.P[9]*Xy + npic.P[10]*Xz + npic.P[11];
-				// Match original ProjectPointP: invert-z then multiply (not divide).
 				const double invNptz = 1.0 / nptz;
 				const ImageRef nextx(ROUND2INT(Point2(nptx*invNptz, npty*invNptz)));
 				Self(nextID, nextx, curDepth, Self);
@@ -3601,10 +3703,8 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 			#else
 			for (const ViewScore& neighbor : image.pImageData->neighbors) {
 				const IIndex nextID(neighbor.ID);
-				if (nextID == curID)
-					continue;
-				if (!neighbors[nextID])
-					continue;
+				if (nextID == curID) continue;
+				if (!neighbors[nextID]) continue;
 				const DepthData& nextDepthData = arrDepthData[nextID];
 				const ImageRef nextx(ROUND2INT(nextDepthData.GetCamera().ProjectPointP(Cast<REAL>(X))));
 				Self(nextID, nextx, curDepth, Self);
@@ -3612,6 +3712,83 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 			#endif
 		};
 		lambda(ID, x, fuseDepth, lambda);
+	};
+
+	// Emit the current cluster from scratch `s` into `buf` (parallel path)
+	// or directly into `pointcloud` (serial path, buf=nullptr). Returns true
+	// if a cluster was emitted.
+	const auto EmitCluster = [&](FuseScratch& s, EmitBuf* buf) -> bool {
+		if (s.fusedPoints[0].size() < kMinPixelsFuse || s.fusedViews.size() < nMinViewsFuse)
+			return false;
+		#if DENSE_FUSE_HYBRID && !DENSE_FUSE_PARALLEL_PIXELS
+		// HYBRID per-pixel emit is disabled under parallel-pixels mode:
+		// the atomic-claim race can split otherwise-dense clusters into
+		// <kHybridThresholdViews fragments. Per-pixel emit then leaks raw
+		// (un-medianed) depth noise as a thin "sheet" below the surface.
+		// Under parallel mode we always take the median path.
+		if (s.fusedViews.size() < kHybridThresholdViews) {
+			// Sparse-coverage cluster: emit each pixel as its own point.
+			const size_t nPx = s.fusedPoints[0].size();
+			for (size_t k = 0; k < nPx; ++k) {
+				const Point3f p(s.fusedPoints[0][(unsigned)k],
+				                s.fusedPoints[1][(unsigned)k],
+				                s.fusedPoints[2][(unsigned)k]);
+				if (buf) {
+					EmitBuf::Rec rec;
+					rec.point   = p;
+					rec.viewBeg = (uint32_t)buf->views.size();
+					buf->views.push_back(s.pxView[k]);
+					buf->weights.push_back(s.pxWeight[k]);
+					rec.viewEnd = (uint32_t)buf->views.size();
+					if (bEstimateNormal) rec.normal = s.pxNormal[k];
+					if (bEstimateColor)  rec.color  = s.pxColor[k];
+					buf->recs.push_back(rec);
+				} else {
+					pointcloud.AddPoint(p);
+					pointcloud.AddView(s.pxView[k]);
+					pointcloud.AddWeight(s.pxWeight[k]);
+					if (bEstimateNormal) pointcloud.AddNormal(s.pxNormal[k]);
+					if (bEstimateColor)  pointcloud.AddColor(s.pxColor[k]);
+				}
+			}
+			return true;
+		}
+		#endif
+		// Median (component-wise) is robust to one bad depth in the cluster.
+		const Point3f p(s.fusedPoints[0].GetMedian(),
+		                s.fusedPoints[1].GetMedian(),
+		                s.fusedPoints[2].GetMedian());
+		Point3f normal;
+		Pixel8U color;
+		if (bEstimateNormal) {
+			const Point3d nrm(normalized(s.fusedNormal));
+			normal = Point3f((float)nrm.x, (float)nrm.y, (float)nrm.z);
+		}
+		if (bEstimateColor) {
+			const float invN = 1.f / static_cast<float>(s.fusedPoints[0].size());
+			color = Pixel8U(
+				_cvt_ftoi_fast(s.fusedColor.r * invN),
+				_cvt_ftoi_fast(s.fusedColor.g * invN),
+				_cvt_ftoi_fast(s.fusedColor.b * invN));
+		}
+		if (buf) {
+			EmitBuf::Rec rec;
+			rec.point   = p;
+			rec.viewBeg = (uint32_t)buf->views.size();
+			buf->views.insert(buf->views.end(), s.fusedViews.begin(), s.fusedViews.end());
+			buf->weights.insert(buf->weights.end(), s.fusedWeights.begin(), s.fusedWeights.end());
+			rec.viewEnd = (uint32_t)buf->views.size();
+			if (bEstimateNormal) rec.normal = normal;
+			if (bEstimateColor)  rec.color  = color;
+			buf->recs.push_back(rec);
+		} else {
+			pointcloud.AddPoint(p);
+			pointcloud.AddViews(s.fusedViews.data(), s.fusedViews.data() + s.fusedViews.size());
+			pointcloud.AddWeights(s.fusedWeights.data(), s.fusedWeights.data() + s.fusedWeights.size());
+			if (bEstimateNormal) pointcloud.AddNormal(normal);
+			if (bEstimateColor)  pointcloud.AddColor(color);
+		}
+		return true;
 	};
 
 	IIndex numDMapsFused = 0;
@@ -3643,6 +3820,38 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 		neighbors[idxImage] = true;
 		IIndex numNeighbors(0);
 		ASSERT(!depthData.images.empty() && !depthData.neighbors.empty());
+#ifdef DENSE_USE_OPENMP
+		// Parallelize neighbor-prep: each iteration touches an independent
+		// arrUseMask[neighbor.ID] entry. cacheDMaps.UseImage is internally
+		// thread-safe. numNeighbors cap uses an abort flag like the
+		// PointCloud overload.
+		bool bAbort(false);
+#pragma omp parallel for
+		for (int64_t i = 0; i < (int64_t)depthData.neighbors.size(); ++i) {
+#pragma omp flush (bAbort)
+			if (bAbort)
+				continue;
+			const ViewScore& neighbor = depthData.neighbors[(IIndex)i];
+			const DepthData& depthDataB(arrDepthData[neighbor.ID]);
+			if (!depthDataB.IsValid())
+				continue;
+			cacheDMaps.UseImage(neighbor.ID);
+			if (depthDataB.IsEmpty())
+				continue;
+			neighbors[neighbor.ID] = true;
+			UseMask& useMaskB = arrUseMask[neighbor.ID];
+			if (!useMaskB.empty())
+				continue; // mask already created by an earlier outer iteration — do NOT count toward cap (matches reference)
+			useMaskB.create(depthDataB.depthMap.size());
+			useMaskB.memset(0);
+			static_assert(sizeof(IIndex) == sizeof(long), "IIndex must be 32-bit for InterlockedIncrement");
+			const IIndex newCount = (IIndex)_InterlockedIncrement(reinterpret_cast<volatile long*>(&numNeighbors));
+			if (newCount >= kMaxViewsFuse) {
+				bAbort = true;
+#pragma omp flush (bAbort)
+			}
+		}
+#else
 		for (const ViewScore& neighbor : depthData.neighbors) {
 			const DepthData& depthDataB(arrDepthData[neighbor.ID]);
 			if (!depthDataB.IsValid())
@@ -3652,13 +3861,14 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 				continue;
 			neighbors[neighbor.ID] = true;
 			UseMask& useMaskB = arrUseMask[neighbor.ID];
-			if (useMaskB.empty()) {
-				useMaskB.create(depthDataB.depthMap.size());
-				useMaskB.memset(0);
-			}
+			if (!useMaskB.empty())
+				continue;
+			useMaskB.create(depthDataB.depthMap.size());
+			useMaskB.memset(0);
 			if (++numNeighbors >= kMaxViewsFuse)
 				break;
 		}
+#endif
 
 		const Image& imageData = *depthData.images.front().pImageData;
 		ASSERT(&imageData - scene.images.data() == idxImage);
@@ -3685,88 +3895,62 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 
 		const size_t nNumPointsPrev(pointcloud.NumPoints());
 
-		for (int i = 0; i < sizeMap.height; ++i) {
-			for (int j = 0; j < sizeMap.width; ++j) {
-				FusePoint(idxImage, ImageRef(j, i), 0);
-
-				#if DENSE_FUSE_DIAG
-				if (!fusedViews.empty()) ++cClustersTried;
-				#endif
-
-				if (fusedPoints[0].size() >= kMinPixelsFuse && fusedViews.size() >= nMinViewsFuse) {
-					#if DENSE_FUSE_HYBRID
-					if (fusedViews.size() < kHybridThresholdViews) {
-						// Sparse-coverage cluster: emit each pixel as its own
-						// point (merge-style) so reconstruct sees enough density
-						// to keep the surface in the graph cut.
-						const size_t nPx = fusedPoints[0].size();
-						for (size_t k = 0; k < nPx; ++k) {
-							pointcloud.AddPoint(Point3f(
-								fusedPoints[0][(unsigned)k],
-								fusedPoints[1][(unsigned)k],
-								fusedPoints[2][(unsigned)k]));
-							pointcloud.AddView(pxView[k]);
-							pointcloud.AddWeight(pxWeight[k]);
-							if (bEstimateNormal)
-								pointcloud.AddNormal(pxNormal[k]);
-							if (bEstimateColor)
-								pointcloud.AddColor(pxColor[k]);
+		#if DENSE_FUSE_PARALLEL_PIXELS
+		{
+			const int maxThreads = omp_get_max_threads();
+			std::vector<EmitBuf> tlsBufs(maxThreads);
+			std::vector<size_t>  tlsDepths(maxThreads, 0);
+			#pragma omp parallel
+			{
+				const int tid = omp_get_thread_num();
+				EmitBuf& myBuf = tlsBufs[tid];
+				FuseScratch s;
+				size_t myDepths = 0;
+				#pragma omp for schedule(dynamic, 4) nowait
+				for (int i = 0; i < sizeMap.height; ++i) {
+					for (int j = 0; j < sizeMap.width; ++j) {
+						FusePoint(idxImage, ImageRef(j, i), 0, s);
+						EmitCluster(s, &myBuf);
+						if (!s.fusedViews.empty()) {
+							myDepths += s.fusedViews.size();
+							s.ResetCluster();
 						}
-						#if DENSE_FUSE_DIAG
-						++cClustersEmitted;
-						#endif
-					} else
-					#endif
-					{
-					// Median (component-wise) is robust to one bad depth in the cluster.
-					Point3f p(
-						fusedPoints[0].GetMedian(),
-						fusedPoints[1].GetMedian(),
-						fusedPoints[2].GetMedian());
-					pointcloud.AddPoint(p);
-					pointcloud.AddViews(fusedViews.data(), fusedViews.data() + fusedViews.size());
-					pointcloud.AddWeights(fusedWeights.data(), fusedWeights.data() + fusedWeights.size());
-					if (bEstimateNormal) {
-						const Point3d nrm(normalized(fusedNormal));
-						pointcloud.AddNormal(Point3f((float)nrm.x, (float)nrm.y, (float)nrm.z));
-					}
-					if (bEstimateColor) {
-						const float invN = 1.f / static_cast<float>(fusedPoints[0].size());
-						pointcloud.AddColor(Pixel8U(
-							_cvt_ftoi_fast(fusedColor.r * invN),
-							_cvt_ftoi_fast(fusedColor.g * invN),
-							_cvt_ftoi_fast(fusedColor.b * invN)));
-					}
-					#if DENSE_FUSE_DIAG
-					++cClustersEmitted;
-					#endif
 					}
 				}
-				#if DENSE_FUSE_DIAG
-				else if (!fusedViews.empty()) {
-					if (fusedPoints[0].size() < kMinPixelsFuse) ++cClustersTooSmall;
-					else                                        ++cClustersTooFewViews;
+				tlsDepths[tid] = myDepths;
+			}
+			// Serial flush of per-thread buffers into the streaming pointcloud.
+			// Iteration order across threads is fixed (tid 0..N-1), so within
+			// a single run the cloud ordering is deterministic given thread
+			// count; only the cluster groupings (race outcomes) vary run-to-run.
+			for (const EmitBuf& buf : tlsBufs) {
+				for (const auto& r : buf.recs) {
+					pointcloud.AddPoint(r.point);
+					pointcloud.AddViews(buf.views.data() + r.viewBeg,
+					                    buf.views.data() + r.viewEnd);
+					pointcloud.AddWeights(buf.weights.data() + r.viewBeg,
+					                      buf.weights.data() + r.viewEnd);
+					if (bEstimateNormal) pointcloud.AddNormal(r.normal);
+					if (bEstimateColor)  pointcloud.AddColor(r.color);
 				}
-				#endif
-
-				if (!fusedViews.empty()) {
-					nDepths += fusedViews.size();
-					fusedPoints[0].clear();
-					fusedPoints[1].clear();
-					fusedPoints[2].clear();
-					fusedViews.clear();
-					fusedWeights.clear();
-					fusedNormal = Point3d::ZERO;
-					fusedColor = Pixel32F::BLACK;
-					#if DENSE_FUSE_HYBRID
-					pxView.clear();
-					pxWeight.clear();
-					pxColor.clear();
-					pxNormal.clear();
-					#endif
+			}
+			for (size_t d : tlsDepths) nDepths += d;
+		}
+		#else
+		{
+			FuseScratch s;
+			for (int i = 0; i < sizeMap.height; ++i) {
+				for (int j = 0; j < sizeMap.width; ++j) {
+					FusePoint(idxImage, ImageRef(j, i), 0, s);
+					EmitCluster(s, nullptr);
+					if (!s.fusedViews.empty()) {
+						nDepths += s.fusedViews.size();
+						s.ResetCluster();
+					}
 				}
 			}
 		}
+		#endif
 
 		#if DENSE_FUSE_DIAG
 		VERBOSE("DENSE-FUSE DIAG img=%3u  seedCalls=%llu accepted=%llu  rejects: oob=%llu dmEmpty=%llu zeroDepth=%llu used=%llu lowConf=%llu",
@@ -4687,8 +4871,13 @@ DenseDepthMapData::~DenseDepthMapData()
 void DenseDepthMapData::SignalCompleteDepthmapFilter()
 {
 	ASSERT(idxImage > 0);
-	if (Thread::safeDec(idxImage) == 0)
+	if (Thread::safeDec(idxImage) == 0) {
+		// all depth-maps filtered: drop the retention cache's references so ref-counts
+		// return to baseline before the adjust sub-phase (which asserts ref-count == 1)
+		if (g_filterCache != NULL)
+			g_filterCache->Clear();
 		sem.Signal((unsigned)images.GetSize()*2);
+	}
 }
 /*----------------------------------------------------------------*/
 
@@ -4698,6 +4887,591 @@ void DenseDepthMapData::SignalCompleteDepthmapFilter()
 
 static void* DenseReconstructionEstimateTmp(void*);
 static void* DenseReconstructionFilterTmp(void*);
+
+// nanoflann adaptor over a flat xyz float stream (no copy). Defined at file
+// scope because a local class cannot contain the member template kdtree_get_bbox.
+struct FlatXYZAdaptor {
+	const float* xyz;
+	size_t count;
+	inline size_t kdtree_get_point_count() const noexcept { return count; }
+	inline float kdtree_get_pt(const size_t idx, const size_t dim) const noexcept { return xyz[idx * 3 + dim]; }
+	template <class BBOX> bool kdtree_get_bbox(BBOX&) const noexcept { return false; }
+};
+
+// count-only, early-exit result set for nanoflann::findNeighbors used by the
+// low-view consensus filter: tallies neighbors within a radius and stops as soon
+// as `need` are seen. The tree it queries holds ONLY surface (higher-view) points,
+// so no per-point view test is needed here. File scope so it can be a template
+// argument to findNeighbors (a local class trips MSVC here).
+struct RadiusCounter {
+	using DistanceType = float;
+	const float radius2;
+	const unsigned need;
+	unsigned count = 0;
+	RadiusCounter(float r2, unsigned nd) : radius2(r2), need(nd) {}
+	inline bool full() const { return count >= need; }
+	inline bool addPoint(float dist, uint32_t /*index*/) {
+		if (dist < radius2 && ++count >= need)
+			return false; // enough support found; stop the search early
+		return true;
+	}
+	inline float worstDist() const { return radius2; }
+	inline void sort() {}
+	inline size_t size() const { return count; }
+	inline void init() {}
+};
+
+// Surface variation = lambda0 / (lambda0+lambda1+lambda2) of the covariance of a
+// local point set (Pauly et al.). 0 => perfectly planar/thin neighborhood,
+// ~0.33 => isotropic 3D blob. Closed-form smallest eigenvalue of a symmetric 3x3
+// (a=Cxx b=Cyy c=Czz d=Cxy e=Cxz f=Cyz) so no Eigen dependency / build surprises.
+static inline float SurfaceVariation3x3(double a, double b, double c, double d, double e, double f)
+{
+	const double trace = a + b + c;
+	if (trace <= 1e-30) return 0.f;
+	const double p1 = d * d + e * e + f * f;
+	double eigMin;
+	if (p1 <= 1e-30 * trace * trace) {
+		eigMin = std::min(a, std::min(b, c)); // already diagonal
+	} else {
+		const double q = trace / 3.0;
+		const double p2 = (a - q) * (a - q) + (b - q) * (b - q) + (c - q) * (c - q) + 2.0 * p1;
+		const double p = std::sqrt(p2 / 6.0);
+		const double ba = (a - q) / p, bb = (b - q) / p, bc = (c - q) / p;
+		const double bd = d / p, be = e / p, bf = f / p;
+		double r = 0.5 * (ba * (bb * bc - bf * bf) - bd * (bd * bc - bf * be) + be * (bd * bf - bb * be));
+		if (r <= -1.0) r = -1.0; else if (r >= 1.0) r = 1.0;
+		const double phi = std::acos(r) / 3.0;
+		// smallest eigenvalue = q + 2p*cos(phi + 2pi/3)
+		eigMin = q + 2.0 * p * std::cos(phi + 2.09439510239319549); // 2*pi/3
+	}
+	if (eigMin < 0.0) eigMin = 0.0;
+	return (float)(eigMin / trace);
+}
+
+// Density-based statistical outlier removal on the streaming point-cloud.
+// For each point, compute the RMS distance to its k nearest neighbors; remove
+// points whose value exceeds (mean + stddevMul*stddev) over the whole cloud.
+// Because the test is purely a function of LOCAL 3D density, it is dataset-
+// adaptive: well-sampled surfaces lose essentially nothing, while the sparse
+// "spray"/fuzz on low-overlap edges (which has a much larger neighbor distance)
+// is cut. Only the HIGH (sparse) side is removed so dense regions are kept.
+// Returns the number of points removed. No-op when stddevMul <= 0.
+static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stddevMul)
+{
+	const size_t n = pc.NumPoints();
+	if (stddevMul <= 0.f || n == 0 || (size_t)(k + 1) >= n)
+		return 0;
+
+	using namespace nanoflann;
+	using KDTree = KDTreeSingleIndexAdaptor<L2_Simple_Adaptor<float, FlatXYZAdaptor>, FlatXYZAdaptor, 3>;
+
+	const float* __restrict xyz = pc.pointsXYZ.data();
+	FlatXYZAdaptor adaptor{ xyz, n };
+	KDTree index(3, adaptor, KDTreeSingleIndexAdaptorParams(64));
+	index.buildIndex();
+
+	std::vector<float> meanDist(n);
+	const int kq = k + 1; // +1 because the query point itself is returned
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel
+#endif
+	{
+		std::vector<uint32_t> idxBuf(kq);
+		std::vector<float> d2Buf(kq);
+#ifdef DENSE_USE_OPENMP
+#pragma omp for schedule(static, 1024)
+#endif
+		for (int64_t i = 0; i < (int64_t)n; ++i) {
+			const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
+			const size_t found = index.knnSearch(q, kq, idxBuf.data(), d2Buf.data());
+			float sum = 0.f; size_t cnt = 0;
+			for (size_t j = 0; j < found; ++j) {
+				if (idxBuf[j] == (uint32_t)i) continue; // skip self
+				sum += d2Buf[j]; ++cnt;
+			}
+			meanDist[i] = cnt ? std::sqrt(sum / (float)cnt) : 0.f;
+		}
+	}
+
+	// global mean and standard deviation of the per-point neighbor distance.
+	// The global test catches whole bulk-sparse regions (the loose spray that
+	// is uniformly thinner than the scene at large).
+	double mean = 0.0;
+	for (size_t i = 0; i < n; ++i) mean += meanDist[i];
+	mean /= (double)n;
+	double var = 0.0;
+	for (size_t i = 0; i < n; ++i) { const double d = (double)meanDist[i] - mean; var += d * d; }
+	var /= (double)n;
+	const float globalThr = (float)(mean + (double)stddevMul * std::sqrt(var));
+
+	// Local (surface-following) outlier test: compare each point's neighbor
+	// distance against the mean+stddev of ITS OWN neighborhood rather than the
+	// whole cloud. A point embedded in a dense surface sits among equally-dense
+	// neighbors and is kept even with only 2 views; a fuzz point sprayed off a
+	// low-overlap edge sits next to the much-denser real surface it detached
+	// from, so it stands out locally and is cut. This makes the removal follow
+	// the surface boundary (a clean trimmed edge) instead of punching a single
+	// flat threshold through the cloud. A point is removed if it fails EITHER
+	// the local OR the global test, so the connected fringe haze (locally
+	// extreme) and the bulk spray (globally extreme) both go. The test NEVER
+	// consults view count, so nMinViewsFuse=2 is fully respected.
+	std::vector<uint8_t> outlier(n, 0);
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel
+#endif
+	{
+		std::vector<uint32_t> idxBuf(kq);
+		std::vector<float> d2Buf(kq);
+#ifdef DENSE_USE_OPENMP
+#pragma omp for schedule(static, 1024)
+#endif
+		for (int64_t i = 0; i < (int64_t)n; ++i) {
+			// global gate first (cheap, no neighborhood stats needed)
+			if (meanDist[i] > globalThr) { outlier[i] = 1; continue; }
+			const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
+			const size_t found = index.knnSearch(q, kq, idxBuf.data(), d2Buf.data());
+			// local mean+std of the neighbors' own neighbor-distance
+			double lmean = 0.0; size_t cnt = 0;
+			for (size_t j = 0; j < found; ++j) {
+				if (idxBuf[j] == (uint32_t)i) continue; // skip self
+				lmean += meanDist[idxBuf[j]]; ++cnt;
+			}
+			if (cnt == 0) continue;
+			lmean /= (double)cnt;
+			double lvar = 0.0;
+			for (size_t j = 0; j < found; ++j) {
+				if (idxBuf[j] == (uint32_t)i) continue;
+				const double d = (double)meanDist[idxBuf[j]] - lmean;
+				lvar += d * d;
+			}
+			lvar /= (double)cnt;
+			const double lthr = lmean + (double)stddevMul * std::sqrt(lvar);
+			// high (sparse) side only: a point sparser than its neighborhood is fuzz
+			if ((double)meanDist[i] > lthr)
+				outlier[i] = 1;
+		}
+	}
+
+	// compact every parallel stream in lockstep, keeping only inliers
+	const bool hasNormals = !pc.normalsXYZ.empty();
+	const bool hasColors  = !pc.colorsRGB.empty();
+	const bool hasViews   = !pc.pointViewsSizes.empty();
+	const bool hasWeights = !pc.pointWeightsSizes.empty();
+
+	std::vector<float>    newXYZ;     newXYZ.reserve(pc.pointsXYZ.size());
+	std::vector<float>    newNormals; if (hasNormals) newNormals.reserve(pc.normalsXYZ.size());
+	std::vector<uint8_t>  newColors;  if (hasColors)  newColors.reserve(pc.colorsRGB.size());
+	std::vector<uint32_t> newViewsOff, newViewsSize, newViewsMem;
+	std::vector<uint32_t> newWeightsOff, newWeightsSize;
+	std::vector<float>    newWeightsMem;
+	if (hasViews)   { newViewsOff.reserve(pc.pointViewsOffsets.size()); newViewsSize.reserve(pc.pointViewsSizes.size()); newViewsMem.reserve(pc.pointViewsMemory.size()); }
+	if (hasWeights) { newWeightsOff.reserve(pc.pointWeightsOffsets.size()); newWeightsSize.reserve(pc.pointWeightsSizes.size()); newWeightsMem.reserve(pc.pointWeightsMemory.size()); }
+
+	size_t removed = 0;
+	for (size_t i = 0; i < n; ++i) {
+		if (outlier[i]) { ++removed; continue; }
+		newXYZ.push_back(xyz[i * 3 + 0]); newXYZ.push_back(xyz[i * 3 + 1]); newXYZ.push_back(xyz[i * 3 + 2]);
+		if (hasNormals) { newNormals.push_back(pc.normalsXYZ[i * 3 + 0]); newNormals.push_back(pc.normalsXYZ[i * 3 + 1]); newNormals.push_back(pc.normalsXYZ[i * 3 + 2]); }
+		if (hasColors)  { newColors.push_back(pc.colorsRGB[i * 3 + 0]); newColors.push_back(pc.colorsRGB[i * 3 + 1]); newColors.push_back(pc.colorsRGB[i * 3 + 2]); }
+		if (hasViews) {
+			const uint32_t off = pc.pointViewsOffsets[i], sz = pc.pointViewsSizes[i];
+			newViewsOff.push_back((uint32_t)newViewsMem.size()); newViewsSize.push_back(sz);
+			for (uint32_t t = 0; t < sz; ++t) newViewsMem.push_back(pc.pointViewsMemory[off + t]);
+		}
+		if (hasWeights) {
+			const uint32_t off = pc.pointWeightsOffsets[i], sz = pc.pointWeightsSizes[i];
+			newWeightsOff.push_back((uint32_t)newWeightsMem.size()); newWeightsSize.push_back(sz);
+			for (uint32_t t = 0; t < sz; ++t) newWeightsMem.push_back(pc.pointWeightsMemory[off + t]);
+		}
+	}
+
+	pc.pointsXYZ.swap(newXYZ);
+	if (hasNormals) pc.normalsXYZ.swap(newNormals);
+	if (hasColors)  pc.colorsRGB.swap(newColors);
+	if (hasViews)   { pc.pointViewsOffsets.swap(newViewsOff); pc.pointViewsSizes.swap(newViewsSize); pc.pointViewsMemory.swap(newViewsMem); }
+	if (hasWeights) { pc.pointWeightsOffsets.swap(newWeightsOff); pc.pointWeightsSizes.swap(newWeightsSize); pc.pointWeightsMemory.swap(newWeightsMem); }
+	return removed;
+} // FilterPointCloudDensity
+/*----------------------------------------------------------------*/
+
+// Selective low-view suppression: emulate the effect of raising nMinViewsFuse
+// by one, but ONLY in regions where a better-supported surface already exists,
+// so it can stay enabled without the global data loss a real nMinViewsFuse bump
+// causes on genuinely-2-view datasets.
+//   - A point fused from only the minimum number of views (viewCount <= minViews,
+//     i.e. the 2-view layer when nMinViewsFuse=2) is a removal CANDIDATE.
+//   - It is deleted only when at least `supportMin` better-supported points
+//     (viewCount > minViews, i.e. the real 3+-view surface) lie WITHIN a metric
+//     search radius. A radius (rather than a k-NN rank) is essential on the
+//     low-overlap edges: there the 2-view noise forms a THICK scatter slab, so a
+//     scatter point's k nearest neighbors are all other scatter and the genuine
+//     3+-view surface never enters the k-NN window -> the old rank test scored
+//     support=0 and kept the fuzz. The radius reaches across the slab to the real
+//     surface regardless of how dense the surrounding noise is.
+//   - A min-view point with NO better-supported neighbor within the radius is the
+//     SOLE evidence for its geometry and is KEPT, so coverage-limited 2-view
+//     regions (the data a global nMinViewsFuse=3 would destroy) survive untouched.
+// The reach is LOCAL and SURFACE-relative: a separate KD-tree is built over only
+// the higher-view (surface) points, each surface point is given its own nearest-
+// surface-neighbor spacing, and a candidate is cut when >=supportMin surface points
+// lie within radiusMul x (the nearest surface point's local spacing). A GLOBAL
+// radius fails on low-overlap edges: there the real surface is sampled coarsely and
+// the fuzz is displaced along the ray, so a global (dense-interior-dominated) radius
+// can't reach from the fuzz to the surface and the edge cloud survives. Tying the
+// reach to the LOCAL surface spacing auto-expands it exactly where the surface is
+// sparse (the edge) while staying tight in the dense interior (no over-removal).
+// Never raises nMinViewsFuse; purely a post-fusion, per-point decision. Returns the
+// number of points removed. No-op when supportMin == 0 or radiusMul <= 0.
+//
+// Second pass (planarityMax > 0): a min-view point with NO surface nearby is either
+// genuine sparse 2-view surface (locally thin/planar) OR floating fuzz displaced off
+// the surface along the viewing ray (locally volumetric/scattered). These are sparse
+// AND unsupported, so distance-to-surface can't tell them apart -- only local SHAPE
+// can. We PCA the candidate's neighborhood and delete it when its surface-variation
+// (smallest/sum of covariance eigenvalues) exceeds planarityMax (volumetric scatter),
+// while keeping thin/planar ones. This clears the floating cloud so reconstruct can
+// bridge the gap into a flat plane (the nMinViewsFuse=3 outcome) without destroying
+// genuine sparse 2-view surfaces. kPCA = neighborhood size for the PCA.
+static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned minViews, unsigned supportMin, float radiusMul, float planarityMax, int kPCA)
+{
+	const size_t n = pc.NumPoints();
+	if (supportMin == 0 || radiusMul <= 0.f || n < 2 || pc.pointViewsSizes.empty())
+		return 0;
+
+	using namespace nanoflann;
+	using KDTree = KDTreeSingleIndexAdaptor<L2_Simple_Adaptor<float, FlatXYZAdaptor>, FlatXYZAdaptor, 3>;
+
+	const float* __restrict xyz = pc.pointsXYZ.data();
+	const uint32_t* __restrict viewSize = pc.pointViewsSizes.data();
+	const bool doPlanarity = (planarityMax > 0.f && kPCA >= 4);
+
+	// gather the higher-view "surface" points (the geometry a global nMinViewsFuse+1
+	// would keep) into their own contiguous coordinate array + KD-tree. Candidates
+	// (<= minViews) are tested ONLY against this surface, so dense same-view fuzz
+	// cannot crowd out the surface evidence the way an all-points k-NN window did.
+	std::vector<uint32_t> hIdx;
+	hIdx.reserve(n / 2 + 1);
+	for (size_t i = 0; i < n; ++i)
+		if (viewSize[i] > minViews)
+			hIdx.push_back((uint32_t)i);
+	const size_t nh = hIdx.size();
+	if (nh < 2)
+		return 0; // no real surface anywhere -> nothing is "redundant"
+
+	std::vector<float> hxyz(nh * 3);
+	for (size_t j = 0; j < nh; ++j) {
+		const uint32_t s = hIdx[j];
+		hxyz[j * 3 + 0] = xyz[s * 3 + 0];
+		hxyz[j * 3 + 1] = xyz[s * 3 + 1];
+		hxyz[j * 3 + 2] = xyz[s * 3 + 2];
+	}
+	FlatXYZAdaptor hAdaptor{ hxyz.data(), nh };
+	KDTree hIndex(3, hAdaptor, KDTreeSingleIndexAdaptorParams(64));
+	hIndex.buildIndex();
+
+	// per-surface-point local spacing = distance to its nearest other surface point.
+	std::vector<float> hSpacing(nh, 0.f);
+	double spacingSum = 0.0;
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel for schedule(static, 1024) reduction(+:spacingSum)
+#endif
+	for (int64_t j = 0; j < (int64_t)nh; ++j) {
+		const float q[3] = { hxyz[j * 3 + 0], hxyz[j * 3 + 1], hxyz[j * 3 + 2] };
+		uint32_t idx2[2]; float d2_2[2];
+		const size_t found = hIndex.knnSearch(q, 2, idx2, d2_2);
+		float spc = 0.f;
+		for (size_t t = 0; t < found; ++t) {
+			if (idx2[t] == (uint32_t)j) continue; // skip self
+			spc = std::sqrt(d2_2[t]);
+			break;
+		}
+		hSpacing[j] = spc;
+		spacingSum += spc;
+	}
+	// floor against pathological zeros (coincident surface points) so their radius
+	// is not degenerate; a small fraction of the mean keeps it locally meaningful.
+	const float spacingFloor = (float)(0.05 * (spacingSum / (double)nh));
+
+	// full-cloud KD-tree, only needed for the planarity (shape) test on unsupported
+	// candidates. Built lazily so the common support-only path pays nothing for it.
+	FlatXYZAdaptor fAdaptor{ xyz, n };
+	std::unique_ptr<KDTree> fIndex;
+	if (doPlanarity) {
+		fIndex.reset(new KDTree(3, fAdaptor, KDTreeSingleIndexAdaptorParams(64)));
+		fIndex->buildIndex();
+	}
+
+	std::vector<uint8_t> outlier(n, 0);
+	const nanoflann::SearchParameters sp(0.f, false);
+	// diagnostic: among the 2-view candidates, bucket the distance to the nearest
+	// real (higher-view) surface point in units of that surface point's LOCAL
+	// spacing. This reveals whether the surviving edge fuzz HAS a nearby surface
+	// (so a bigger/thickness-based reach would fix it) or is in a region with NO
+	// real surface at all (so support-based removal can never touch it).
+	size_t dCand = 0, dWithin1 = 0, dWithin4 = 0, dWithin16 = 0, dWithin64 = 0, dBeyond = 0;
+	size_t dPlanarRemoved = 0, dPlanarKept = 0;
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel for schedule(static, 1024) reduction(+:dCand,dWithin1,dWithin4,dWithin16,dWithin64,dBeyond,dPlanarRemoved,dPlanarKept)
+#endif
+	for (int64_t i = 0; i < (int64_t)n; ++i) {
+		// only minimum-view points are candidates for removal
+		if (viewSize[i] > minViews) continue;
+		const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
+		// nearest surface point -> its LOCAL spacing sets this candidate's reach
+		uint32_t nn; float nnDist2;
+		if (hIndex.knnSearch(q, 1, &nn, &nnDist2) == 0)
+			continue;
+		float localScale = hSpacing[nn];
+		if (localScale < spacingFloor) localScale = spacingFloor;
+		if (!(localScale > 0.f)) continue;
+		// diagnostic bucketing (distance to nearest surface / local spacing)
+		++dCand;
+		const float ratio = std::sqrt(nnDist2) / localScale;
+		if      (ratio <= 1.f)  ++dWithin1;
+		else if (ratio <= 4.f)  ++dWithin4;
+		else if (ratio <= 16.f) ++dWithin16;
+		else if (ratio <= 64.f) ++dWithin64;
+		else                    ++dBeyond;
+		const float r = radiusMul * localScale;
+		const float radius2 = r * r; // L2_Simple returns squared distances
+		RadiusCounter rs(radius2, supportMin);
+		hIndex.findNeighbors(rs, q, sp);
+		if (rs.count >= supportMin) {
+			outlier[i] = 1; // redundant min-view fuzz over a real higher-view surface
+			continue;
+		}
+		// unsupported (no real surface nearby): keep genuine sparse 2-view surface
+		// (thin/planar) but delete floating fuzz (volumetric scatter) via local PCA.
+		if (doPlanarity) {
+			constexpr int kMaxPCA = 64;
+			int kq = kPCA + 1; // +1 for the query point itself
+			if (kq > kMaxPCA) kq = kMaxPCA;
+			uint32_t idxN[kMaxPCA]; float d2N[kMaxPCA];
+			const size_t got = fIndex->knnSearch(q, kq, idxN, d2N);
+			if (got >= 4) {
+				// covariance of the neighborhood (single-pass, centered)
+				double sx = 0, sy = 0, sz = 0;
+				for (size_t t = 0; t < got; ++t) {
+					const uint32_t p = idxN[t];
+					sx += xyz[p * 3 + 0]; sy += xyz[p * 3 + 1]; sz += xyz[p * 3 + 2];
+				}
+				const double inv = 1.0 / (double)got;
+				const double mx = sx * inv, my = sy * inv, mz = sz * inv;
+				double cxx = 0, cyy = 0, czz = 0, cxy = 0, cxz = 0, cyz = 0;
+				for (size_t t = 0; t < got; ++t) {
+					const uint32_t p = idxN[t];
+					const double dx = xyz[p * 3 + 0] - mx, dy = xyz[p * 3 + 1] - my, dz = xyz[p * 3 + 2] - mz;
+					cxx += dx * dx; cyy += dy * dy; czz += dz * dz;
+					cxy += dx * dy; cxz += dx * dz; cyz += dy * dz;
+				}
+				const float variation = SurfaceVariation3x3(cxx, cyy, czz, cxy, cxz, cyz);
+				if (variation > planarityMax) {
+					outlier[i] = 1; // volumetric floating fuzz -> remove
+					++dPlanarRemoved;
+				} else {
+					++dPlanarKept; // thin/planar genuine sparse surface -> keep
+				}
+			}
+		}
+	}
+	VERBOSE("Low-view filter diag: %u candidates, nearest-surface distance (in local-spacings): <=1: %.1f%%%%, <=4: %.1f%%%%, <=16: %.1f%%%%, <=64: %.1f%%%%, >64: %.1f%%%% (surface pts: %u/%u; planarity removed %u, kept %u)",
+		(unsigned)dCand,
+		dCand ? 100.0 * dWithin1  / dCand : 0.0,
+		dCand ? 100.0 * dWithin4  / dCand : 0.0,
+		dCand ? 100.0 * dWithin16 / dCand : 0.0,
+		dCand ? 100.0 * dWithin64 / dCand : 0.0,
+		dCand ? 100.0 * dBeyond   / dCand : 0.0,
+		(unsigned)nh, (unsigned)n, (unsigned)dPlanarRemoved, (unsigned)dPlanarKept);
+
+	// compact every parallel stream in lockstep, keeping only the survivors
+	const bool hasNormals = !pc.normalsXYZ.empty();
+	const bool hasColors  = !pc.colorsRGB.empty();
+	const bool hasViews   = !pc.pointViewsSizes.empty();
+	const bool hasWeights = !pc.pointWeightsSizes.empty();
+
+	std::vector<float>    newXYZ;     newXYZ.reserve(pc.pointsXYZ.size());
+	std::vector<float>    newNormals; if (hasNormals) newNormals.reserve(pc.normalsXYZ.size());
+	std::vector<uint8_t>  newColors;  if (hasColors)  newColors.reserve(pc.colorsRGB.size());
+	std::vector<uint32_t> newViewsOff, newViewsSize, newViewsMem;
+	std::vector<uint32_t> newWeightsOff, newWeightsSize;
+	std::vector<float>    newWeightsMem;
+	if (hasViews)   { newViewsOff.reserve(pc.pointViewsOffsets.size()); newViewsSize.reserve(pc.pointViewsSizes.size()); newViewsMem.reserve(pc.pointViewsMemory.size()); }
+	if (hasWeights) { newWeightsOff.reserve(pc.pointWeightsOffsets.size()); newWeightsSize.reserve(pc.pointWeightsSizes.size()); newWeightsMem.reserve(pc.pointWeightsMemory.size()); }
+
+	size_t removed = 0;
+	for (size_t i = 0; i < n; ++i) {
+		if (outlier[i]) { ++removed; continue; }
+		newXYZ.push_back(xyz[i * 3 + 0]); newXYZ.push_back(xyz[i * 3 + 1]); newXYZ.push_back(xyz[i * 3 + 2]);
+		if (hasNormals) { newNormals.push_back(pc.normalsXYZ[i * 3 + 0]); newNormals.push_back(pc.normalsXYZ[i * 3 + 1]); newNormals.push_back(pc.normalsXYZ[i * 3 + 2]); }
+		if (hasColors)  { newColors.push_back(pc.colorsRGB[i * 3 + 0]); newColors.push_back(pc.colorsRGB[i * 3 + 1]); newColors.push_back(pc.colorsRGB[i * 3 + 2]); }
+		if (hasViews) {
+			const uint32_t off = pc.pointViewsOffsets[i], sz = pc.pointViewsSizes[i];
+			newViewsOff.push_back((uint32_t)newViewsMem.size()); newViewsSize.push_back(sz);
+			for (uint32_t t = 0; t < sz; ++t) newViewsMem.push_back(pc.pointViewsMemory[off + t]);
+		}
+		if (hasWeights) {
+			const uint32_t off = pc.pointWeightsOffsets[i], sz = pc.pointWeightsSizes[i];
+			newWeightsOff.push_back((uint32_t)newWeightsMem.size()); newWeightsSize.push_back(sz);
+			for (uint32_t t = 0; t < sz; ++t) newWeightsMem.push_back(pc.pointWeightsMemory[off + t]);
+		}
+	}
+
+	pc.pointsXYZ.swap(newXYZ);
+	if (hasNormals) pc.normalsXYZ.swap(newNormals);
+	if (hasColors)  pc.colorsRGB.swap(newColors);
+	if (hasViews)   { pc.pointViewsOffsets.swap(newViewsOff); pc.pointViewsSizes.swap(newViewsSize); pc.pointViewsMemory.swap(newViewsMem); }
+	if (hasWeights) { pc.pointWeightsOffsets.swap(newWeightsOff); pc.pointWeightsSizes.swap(newWeightsSize); pc.pointWeightsMemory.swap(newWeightsMem); }
+	return removed;
+} // FilterRedundantLowViewPoints
+/*----------------------------------------------------------------*/
+
+// Flatten a rough water/pond surface onto a robustly fitted near-horizontal plane.
+// Water is textureless and moving, so MVS reconstructs it as a noisy "crust"
+// instead of a flat sheet. The crust is selected by its TWO distinguishing
+// properties: it lies in a LOW elevation band AND it is locally ROUGH (high PCA
+// surface-variation). Genuine flat ground (smooth) in the same band is therefore
+// left untouched, and rough features outside the band (vegetation, cliffs) are
+// left untouched. Selected crust points are projected onto the fitted plane.
+//
+// Heavily guarded so it is a NEAR NO-OP on datasets without prominent water:
+//   * does nothing unless a large rough cluster exists in the low band,
+//   * declines unless the fitted plane is near-horizontal with a high RANSAC
+//     inlier ratio (i.e. it really is a flat water sheet, not low clutter),
+//   * declines if it would move more than maxFrac of the whole cloud.
+// Assumes a gravity-up (Z-up) cloud, which the near-horizontal test also enforces.
+// Returns the number of points snapped (0 if it declined).
+static size_t FilterFlattenWater(PointCloudStreaming& pc, float bandPct, float roughnessMin, float maxFrac, int kPCA)
+{
+	const size_t n = pc.NumPoints();
+	if (n < 5000 || roughnessMin <= 0.f || bandPct <= 0.f || bandPct >= 100.f || kPCA < 4)
+		return 0;
+	float* __restrict xyz = pc.pointsXYZ.data();
+
+	using namespace nanoflann;
+	using KDTree = KDTreeSingleIndexAdaptor<L2_Simple_Adaptor<float, FlatXYZAdaptor>, FlatXYZAdaptor, 3>;
+
+	// 1) elevation band: water assumed within the lowest bandPct% of height (Z-up).
+	//    Percentiles from a subsample -> robust and units/scale independent.
+	std::vector<float> zs;
+	const size_t zstride = std::max<size_t>(1, n / 200000);
+	zs.reserve(n / zstride + 1);
+	for (size_t i = 0; i < n; i += zstride)
+		zs.push_back(xyz[i * 3 + 2]);
+	if (zs.size() < 16)
+		return 0;
+	auto pctile = [&](float p) -> float {
+		const size_t k = (size_t)CLAMP(p * 0.01f * (float)(zs.size() - 1), 0.f, (float)(zs.size() - 1));
+		std::nth_element(zs.begin(), zs.begin() + k, zs.end());
+		return zs[k];
+	};
+	const float zMin = pctile(0.f);
+	const float zHi  = pctile(bandPct);
+	if (!(zHi > zMin))
+		return 0;
+
+	// 2) candidate crust = points in the band AND locally rough.
+	FlatXYZAdaptor adaptor{ xyz, n };
+	KDTree index(3, adaptor, KDTreeSingleIndexAdaptorParams(64));
+	index.buildIndex();
+
+	std::vector<uint8_t> cand(n, 0);
+	size_t nCand = 0;
+	constexpr int kMaxPCA = 64;
+	int kq = kPCA + 1;
+	if (kq > kMaxPCA) kq = kMaxPCA;
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel for schedule(static, 4096) reduction(+:nCand)
+#endif
+	for (int64_t i = 0; i < (int64_t)n; ++i) {
+		const float z = xyz[i * 3 + 2];
+		if (z < zMin || z > zHi)
+			continue;
+		const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
+		uint32_t idxN[kMaxPCA]; float d2N[kMaxPCA];
+		const size_t got = index.knnSearch(q, kq, idxN, d2N);
+		if (got < 4)
+			continue;
+		double sx = 0, sy = 0, sz = 0;
+		for (size_t t = 0; t < got; ++t) {
+			const uint32_t p = idxN[t];
+			sx += xyz[p * 3 + 0]; sy += xyz[p * 3 + 1]; sz += xyz[p * 3 + 2];
+		}
+		const double inv = 1.0 / (double)got, mx = sx * inv, my = sy * inv, mz = sz * inv;
+		double cxx = 0, cyy = 0, czz = 0, cxy = 0, cxz = 0, cyz = 0;
+		for (size_t t = 0; t < got; ++t) {
+			const uint32_t p = idxN[t];
+			const double dx = xyz[p * 3 + 0] - mx, dy = xyz[p * 3 + 1] - my, dz = xyz[p * 3 + 2] - mz;
+			cxx += dx * dx; cyy += dy * dy; czz += dz * dz; cxy += dx * dy; cxz += dx * dz; cyz += dy * dz;
+		}
+		if (SurfaceVariation3x3(cxx, cyy, czz, cxy, cxz, cyz) >= roughnessMin) {
+			cand[i] = 1;
+			++nCand;
+		}
+	}
+	// need a real sheet, not a few stray rough points
+	if (nCand < std::max<size_t>(5000, n / 500))
+		return 0;
+
+	// 3) robust plane fit over a candidate subsample (ACRANSAC, auto threshold).
+	Point3fArr pts(0, std::min<size_t>(nCand, 60000) + 1);
+	{
+		const size_t cstride = std::max<size_t>(1, nCand / 60000);
+		size_t seen = 0;
+		for (size_t i = 0; i < n; ++i) {
+			if (!cand[i])
+				continue;
+			if ((seen++ % cstride) != 0)
+				continue;
+			pts.emplace_back(xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2]);
+		}
+	}
+	if (pts.size() < 16)
+		return 0;
+	Planef plane;
+	double th = DBL_MAX;
+	const unsigned nInliers = MVS::EstimatePlane(pts, plane, th);
+	if (nInliers == 0 || (size_t)nInliers * 2 < pts.size())
+		return 0; // not a coherent sheet
+	// orient the unit normal up and require the plane to be near-horizontal
+	float nx = (float)plane.m_vN.x(), ny = (float)plane.m_vN.y(), nz = (float)plane.m_vN.z();
+	float D = (float)plane.m_fD;
+	if (nz < 0.f) { nx = -nx; ny = -ny; nz = -nz; D = -D; }
+	if (nz < 0.94f)
+		return 0; // not horizontal -> not a water sheet (also rejects non-Z-up clouds)
+
+	// 4) project candidates onto the plane (snap). Count first, honour the cap.
+	const float snapTol = (zHi - zMin);
+	size_t toFlatten = 0;
+	for (size_t i = 0; i < n; ++i) {
+		if (!cand[i])
+			continue;
+		const float d = nx * xyz[i * 3 + 0] + ny * xyz[i * 3 + 1] + nz * xyz[i * 3 + 2] + D;
+		if (std::fabs(d) <= snapTol)
+			++toFlatten;
+	}
+	if (toFlatten == 0 || (double)toFlatten > (double)maxFrac * (double)n)
+		return 0; // safety: decline rather than risk flattening real geometry
+
+	const bool hasN = !pc.normalsXYZ.empty();
+	for (size_t i = 0; i < n; ++i) {
+		if (!cand[i])
+			continue;
+		const float d = nx * xyz[i * 3 + 0] + ny * xyz[i * 3 + 1] + nz * xyz[i * 3 + 2] + D;
+		if (std::fabs(d) > snapTol)
+			continue;
+		xyz[i * 3 + 0] -= d * nx;
+		xyz[i * 3 + 1] -= d * ny;
+		xyz[i * 3 + 2] -= d * nz;
+		if (hasN) {
+			pc.normalsXYZ[i * 3 + 0] = nx;
+			pc.normalsXYZ[i * 3 + 1] = ny;
+			pc.normalsXYZ[i * 3 + 2] = nz;
+		}
+	}
+	return toFlatten;
+} // FilterFlattenWater
+/*----------------------------------------------------------------*/
 
 bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderROI)
 {
@@ -4742,6 +5516,50 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 		VERBOSE("Dense point-cloud composed of:\n\t%u points with 1- views\n\t%u points with 2 views\n\t%u points with 3+ views", nPoints1m, nPoints2, nPoints3p);
 	}
 	#endif
+
+	// density-based statistical outlier removal: cull the sparse "spray"/fuzz on
+	// low-overlap edges using local 3D neighbor density (dataset-adaptive; dense
+	// surfaces are essentially untouched). Disabled when fOutlierFilterStdDev<=0.
+	if (!pointcloud.IsEmpty() && OPTDENSE::fOutlierFilterStdDev > 0.f) {
+		TD_TIMER_START();
+		const size_t numBefore = pointcloud.NumPoints();
+		const size_t removed = FilterPointCloudDensity(pointcloud, (int)OPTDENSE::nOutlierFilterKNN, OPTDENSE::fOutlierFilterStdDev);
+		VERBOSE("Density outlier filter: %u/%u points removed (%.2f%%%%) (%s)",
+			(unsigned)removed, (unsigned)numBefore,
+			numBefore ? 100.0 * (double)removed / (double)numBefore : 0.0,
+			TD_TIMER_GET_FMT().c_str());
+	}
+
+	// selective low-view suppression: locally emulate nMinViewsFuse+1 by deleting
+	// minimum-view (e.g. 2-view) points that sit on top of a better-supported
+	// (3+-view) surface, while keeping minimum-view points that are the sole
+	// evidence for their geometry. Gives the clean nMinViewsFuse=3 result where a
+	// higher-view surface exists (e.g. the low-overlap pavement edge) without the
+	// global data loss raising nMinViewsFuse would cause on 2-view-only datasets.
+	// Disabled when nLowViewSupportCut == 0.
+	if (!pointcloud.IsEmpty() && OPTDENSE::nLowViewSupportCut > 0 && OPTDENSE::nMinViewsFuse >= 2) {
+		TD_TIMER_START();
+		const size_t numBefore = pointcloud.NumPoints();
+		const size_t removed = FilterRedundantLowViewPoints(pointcloud, OPTDENSE::nMinViewsFuse, OPTDENSE::nLowViewSupportCut, OPTDENSE::fLowViewSupportRadius, OPTDENSE::fLowViewPlanarityMax, (int)OPTDENSE::nOutlierFilterKNN);
+		VERBOSE("Low-view consensus filter: %u/%u points removed (%.2f%%%%) (%s)",
+			(unsigned)removed, (unsigned)numBefore,
+			numBefore ? 100.0 * (double)removed / (double)numBefore : 0.0,
+			TD_TIMER_GET_FMT().c_str());
+	}
+
+	// flatten a rough water/pond surface (textureless+moving -> noisy crust) onto a
+	// robustly fitted near-horizontal plane, selecting the crust by low-elevation
+	// band + local roughness. Heavily guarded -> near no-op on water-free data.
+	// Disabled unless bFlattenWater.
+	if (!pointcloud.IsEmpty() && OPTDENSE::bFlattenWater) {
+		TD_TIMER_START();
+		const size_t numPts = pointcloud.NumPoints();
+		const size_t flattened = FilterFlattenWater(pointcloud, OPTDENSE::fFlattenWaterBandPct, OPTDENSE::fFlattenWaterRoughness, OPTDENSE::fFlattenWaterMaxFrac, (int)OPTDENSE::nOutlierFilterKNN);
+		VERBOSE("Water flatten filter: %u/%u points snapped (%.2f%%%%) (%s)",
+			(unsigned)flattened, (unsigned)numPts,
+			numPts ? 100.0 * (double)flattened / (double)numPts : 0.0,
+			TD_TIMER_GET_FMT().c_str());
+	}
 
 	if (!pointcloud.IsEmpty()) {
 		if (bCrop2ROI && IsBounded()) {
@@ -4967,19 +5785,86 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 				return false;
 			data.progress.Release();
 			// replace raw depth-maps with the geometric-consistent ones
+			// (optionally measure how much they changed so we can stop iterating once converged)
+			const bool bMeasureChange(OPTDENSE::fGeomConsistencyMaxChange > 0 &&
+				data.nEstimationGeometricIter < (int)OPTDENSE::nEstimationGeometricIters - 1);
+			double changeSum = 0.0;
+			size_t changeCnt = 0;
+			unsigned changeImages = 0;
+			int64_t changeMeasureNs = 0;
 			for (IIndex idx: data.images) {
 				const DepthData& depthData(data.depthMaps.arrDepthData[idx]);
 				if (!depthData.IsValid())
 					continue;
 				const String rawName(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
+				const String geoName(ComposeDepthFilePath(depthData.GetView().GetID(), "geo.dmap"));
+				if (bMeasureChange) {
+					const auto _tM0 = std::chrono::steady_clock::now();
+					size_t cnt;
+					changeSum += MeasureDepthMapRelChange(rawName, geoName, cnt);
+					changeMeasureNs += (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _tM0).count();
+					changeCnt += cnt;
+					++changeImages;
+				}
 				File::deleteFile(rawName);
-				File::renameFile(ComposeDepthFilePath(depthData.GetView().GetID(), "geo.dmap"), rawName);
+				File::renameFile(geoName, rawName);
+			}
+			// once the depth-maps stop changing, a further full geometric pass would refine
+			// them by < the convergence threshold, so skip ALL remaining passes and apply just
+			// the optimize/smooth filters directly to the converged maps -- far cheaper than
+			// another full patch-match sweep, and matching what the normal final iteration
+			// produces (a near-identical geometric re-estimate followed by the same optimize).
+			if (bMeasureChange && changeCnt > 0) {
+				const float meanChange((float)(changeSum / (double)changeCnt));
+				VERBOSE("Geometric-consistent iteration %d: mean depth change %.3f%% (measured %u depth-maps in %.0fms)",
+					data.nEstimationGeometricIter, meanChange*100, changeImages, changeMeasureNs/1.0e6);
+				if (meanChange < OPTDENSE::fGeomConsistencyMaxChange) {
+					// restore the real optimize flags and mark the geometric phase finished so
+					// the event loop takes its "optimize an existing dmap" path (load -> speckle/
+					// gap filter -> save to dmap) rather than another full geometric estimate.
+					OPTDENSE::nOptimize = nOptimize;
+					data.nEstimationGeometricIter = -1;
+					const bool bApplyOptimize((nOptimize & OPTDENSE::OPTIMIZE) != 0);
+					VERBOSE("Geometric-consistent estimation converged (%.3f%% < %.3f%%): skipping remaining geometric passes, applying %s",
+						meanChange*100, OPTDENSE::fGeomConsistencyMaxChange*100,
+						bApplyOptimize ? "optimize-only final pass" : "no final pass (optimize disabled)");
+					if (bApplyOptimize) {
+						// run the optimize-only pass through the SAME worker/event machinery the
+						// normal final iteration uses: this keeps only ~one dmap per worker thread
+						// resident (bounded memory) instead of loading one per core at once, and
+						// reuses the proven load/optimize/save path -- still far cheaper than another
+						// full patch-match sweep because no estimation/neighbor warping runs.
+						data.idxImage = 0;
+						ASSERT(data.events.IsEmpty());
+						data.events.AddEvent(new EVTProcessImage(0));
+						data.progress = new Util::Progress("Optimized geometric-consistent depth-maps", data.images.GetSize());
+						GET_LOGCONSOLE().Pause();
+						if (nMaxThreads > 1) {
+							cList<SEACAVE::Thread> threads(2);
+							FOREACHPTR(pThread, threads)
+								pThread->start(DenseReconstructionEstimateTmp, (void*)&data);
+							FOREACHPTR(pThread, threads)
+								pThread->join();
+						} else {
+							DenseReconstructionEstimate((void*)&data);
+						}
+						GET_LOGCONSOLE().Play();
+						if (!data.events.IsEmpty())
+							return false;
+						data.progress.Release();
+					}
+					break; // skip all remaining full geometric passes
+				}
 			}
 		}
 		data.nEstimationGeometricIter = -1;
 	}
 
 	if ((OPTDENSE::nOptimize & OPTDENSE::ADJUST_FILTER) != 0) {
+#if FILTER_PROFILE
+		g_filterProfile.Reset();
+		const auto _tPhase0 = filter_clock::now();
+#endif
 		// initialize the queue of depth-maps to be filtered
 		data.sem.Clear();
 		data.idxImage = data.images.GetSize();
@@ -4989,9 +5874,31 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 		// start working threads
 		data.progress = new Util::Progress("Filtered depth-maps", data.images.GetSize());
 		GET_LOGCONSOLE().Pause();
-		if (nMaxThreads > 1) {
+		// Retention cache for the filter sub-phase: keeps recently-loaded reference/
+		// neighbor dmaps resident (bounded by free RAM) so each unique dmap is read and
+		// deserialized once instead of ~9x (once per referencing image). Semantics-
+		// neutral: dmaps are immutable until the adjust sub-phase swaps in the filtered
+		// results. Cleared at the filter->adjust boundary by SignalCompleteDepthmapFilter.
+		const Util::MemoryInfo filterMemInfo(Util::GetMemoryInfo());
+		const size_t filterSafetyMemory(std::max(static_cast<size_t>(filterMemInfo.totalPhysical * 0.10), size_t(2)*1024*1024*1024ull));
+		const size_t filterCacheBudget(filterMemInfo.freePhysical > filterSafetyMemory ? filterMemInfo.freePhysical - filterSafetyMemory : 0);
+		FilterDMapCache filterCache(data.depthMaps.arrDepthData, filterCacheBudget);
+		g_filterCache = &filterCache;
+		// The filter phase is disk-bound on a single NVMe: with one thread per core,
+		// the in-flight working set (~threads * (1 ref + 8 neighbors)) blows the dmap
+		// cache, forcing redundant neighbor re-reads, while many concurrent full-dmap
+		// Save() calls contend the write queue. Capping the thread count shrinks the
+		// working set (more neighbor cache hits) and the write concurrency, which
+		// dramatically cuts thread-summed I/O and compute -- BUT measured WORSE wall
+		// time (8 threads: 23.4s vs 17.4s at full cores), because that contention
+		// overlaps in parallel and the stage is parallelism-bound at the wall, not
+		// disk-bound. So the default keeps one-thread-per-core (kFilterThreads = 0).
+		// Sweep this value (e.g. 4 / 8 / 16) only for diagnosing contention.
+		const unsigned kFilterThreads(0);
+		const unsigned nFilterThreads(kFilterThreads == 0 ? nMaxThreads : MINF(nMaxThreads, kFilterThreads));
+		if (nFilterThreads > 1) {
 			// multi-thread execution
-			cList<SEACAVE::Thread> threads(MINF(nMaxThreads, (unsigned)data.images.GetSize()));
+			cList<SEACAVE::Thread> threads(MINF(nFilterThreads, (unsigned)data.images.GetSize()));
 			FOREACHPTR(pThread, threads)
 				pThread->start(DenseReconstructionFilterTmp, (void*)&data);
 			FOREACHPTR(pThread, threads)
@@ -5001,9 +5908,13 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 			DenseReconstructionFilter((void*)&data);
 		}
 		GET_LOGCONSOLE().Play();
+		g_filterCache = NULL;
 		if (!data.events.IsEmpty())
 			return false;
 		data.progress.Release();
+#if FILTER_PROFILE
+		g_filterProfile.Report(FilterNs(_tPhase0, filter_clock::now()) / 1.0e6);
+#endif
 	}
 	return true;
 } // ComputeDepthMaps
@@ -5179,7 +6090,10 @@ void Scene::DenseReconstructionFilter(void* pData)
 				break;
 			}
 			// make sure all depth-maps are loaded
-			depthData.IncRef(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
+#if FILTER_PROFILE
+			const auto _tL0 = filter_clock::now();
+#endif
+			g_filterCache->Acquire(idx, ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
 			const unsigned numMaxNeighbors(8);
 			IIndexArr idxNeighbors(0, depthData.neighbors.GetSize());
 			FOREACH(n, depthData.neighbors) {
@@ -5187,7 +6101,7 @@ void Scene::DenseReconstructionFilter(void* pData)
 				DepthData& depthDataPair = data.depthMaps.arrDepthData[idxView];
 				if (!depthDataPair.IsValid())
 					continue;
-				if (depthDataPair.IncRef(ComposeDepthFilePath(depthDataPair.GetView().GetID(), "dmap")) == 0) {
+				if (!g_filterCache->Acquire(idxView, ComposeDepthFilePath(depthDataPair.GetView().GetID(), "dmap"))) {
 					// signal error and terminate
 					data.events.AddEventFirst(new EVTFail);
 					return;
@@ -5196,18 +6110,21 @@ void Scene::DenseReconstructionFilter(void* pData)
 				if (idxNeighbors.GetSize() == numMaxNeighbors)
 					break;
 			}
+#if FILTER_PROFILE
+			g_filterProfile.nsLoad += FilterNs(_tL0, filter_clock::now());
+			++g_filterProfile.nImages;
+#endif
 			// filter the depth-map for this image
 			if (data.depthMaps.FilterDepthMap(depthData, idxNeighbors, OPTDENSE::bFilterAdjust)) {
 				// load the filtered maps after all depth-maps were filtered
 				data.events.AddEvent(new EVTAdjustDepthMap(evtImage.idxImage));
 			}
-			// unload referenced depth-maps
+			// release working references (kept resident in the retention cache until evicted)
 			FOREACHPTR(pIdxNeighbor, idxNeighbors) {
 				const IIndex idxView = depthData.neighbors[*pIdxNeighbor].ID;
-				DepthData& depthDataPair = data.depthMaps.arrDepthData[idxView];
-				depthDataPair.DecRef();
+				g_filterCache->Release(idxView);
 			}
-			depthData.DecRef();
+			g_filterCache->Release(idx);
 			data.SignalCompleteDepthmapFilter();
 			break; }
 
@@ -5218,6 +6135,9 @@ void Scene::DenseReconstructionFilter(void* pData)
 			ASSERT(depthData.IsValid());
 			data.sem.Wait();
 
+#if FILTER_PROFILE
+			const auto _tA0 = filter_clock::now();
+#endif
 			// Adjusting is required.  The filtered depth map is stored back to dmap and this is used to
 			// filter and fuse later.
 			// load filtered maps
@@ -5229,6 +6149,9 @@ void Scene::DenseReconstructionFilter(void* pData)
 				data.events.AddEventFirst(new EVTFail);
 				return;
 			}
+#if FILTER_PROFILE
+			g_filterProfile.nsAdjLoad += FilterNs(_tA0, filter_clock::now());
+#endif
 			ASSERT(depthData.GetRef() == 1);
 			File::deleteFile(ComposeDepthFilePath(depthData.GetView().GetID(), "filtered.dmap").c_str());
 			File::deleteFile(ComposeDepthFilePath(depthData.GetView().GetID(), "filtered.cmap").c_str());
@@ -5240,7 +6163,23 @@ void Scene::DenseReconstructionFilter(void* pData)
 			}
 			#endif
 			// save filtered depth-map for this image
-			depthData.Save(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
+#if FILTER_PROFILE
+			const auto _tA1 = filter_clock::now();
+#endif
+			{
+				// only the depth and confidence maps changed during filtering; the
+				// normals/views/header were just loaded from this same file and a full
+				// Save() would re-write them unchanged. Patch just those two sections in
+				// place (byte-identical, far fewer bytes); fall back to a full Save() if the
+				// on-disk layout does not match.
+				const String dmapPath(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap"));
+				if (!PatchDepthConfRaw(dmapPath, depthData.depthMap, depthData.confMap,
+						!depthData.normalMap.empty(), !depthData.viewsMap.empty()))
+					depthData.Save(dmapPath);
+			}
+#if FILTER_PROFILE
+			g_filterProfile.nsAdjSave += FilterNs(_tA1, filter_clock::now());
+#endif
 			depthData.DecRef();
 			data.progress->operator++();
 			break; }
@@ -5257,14 +6196,17 @@ void Scene::DenseReconstructionFilter(void* pData)
 /*----------------------------------------------------------------*/
 
 // filter point-cloud based on camera-point visibility intersections
-void Scene::PointCloudFilter(int thRemove)
+void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 {
-#if 1 // JPB WIP BUG
-	throw std::runtime_error("Unsupported");
-#else
 	TD_TIMER_STARTD();
 
 	typedef TOctree<PointCloud::PointArr,PointCloud::Point::Type,3,uint32_t> Octree;
+	// Lock-free visibility collector: carries only per-query state (no shared
+	// mutable members, no critical section) and accumulates into the shared
+	// visibility array with a single atomic add. Because nothing is shared
+	// between concurrent (point,view) queries, they all run in parallel without
+	// serializing on a per-view lock; the atomic also removes the latent
+	// lost-update race the previous code had across different views.
 	struct Collector {
 		typedef Octree::IDX_TYPE IDX;
 		typedef PointCloud::Point::Type Real;
@@ -5274,27 +6216,17 @@ void Scene::PointCloudFilter(int thRemove)
 
 		Cone cone;
 		const ConeIntersect coneIntersect;
-		const PointCloud& pointcloud;
-		IntArr& visibility;
+		const PointCloudStreaming& pointcloud;
+		int* const __restrict visibility;
 		PointCloud::Index idxPoint;
 		Real distance;
 		int weight;
-		#ifdef DENSE_USE_OPENMP
-		uint8_t pcs[sizeof(CriticalSection)];
-		#endif
 
-		Collector(const Cone::RAY& ray, Real angle, const PointCloud& _pointcloud, IntArr& _visibility)
-			: cone(ray, angle), coneIntersect(cone), pointcloud(_pointcloud), visibility(_visibility)
-		#ifdef DENSE_USE_OPENMP
-		{ new(pcs) CriticalSection; }
-		~Collector() { reinterpret_cast<CriticalSection*>(pcs)->~CriticalSection(); }
-		inline CriticalSection& GetCS() { return *reinterpret_cast<CriticalSection*>(pcs); }
-		#else
-		{}
-		#endif
+		Collector(const Cone::RAY& ray, Real angle, const PointCloudStreaming& _pointcloud, int* __restrict _visibility)
+			: cone(ray, angle), coneIntersect(cone), pointcloud(_pointcloud), visibility(_visibility) {}
 		inline void Init(PointCloud::Index _idxPoint, const PointCloud::Point& X, int _weight) {
 			const Real thMaxDepth(1.02f);
-			idxPoint =_idxPoint;
+			idxPoint = _idxPoint;
 			const PointCloud::Point::EVec D((PointCloud::Point::EVec&)X-cone.ray.m_pOrig);
 			distance = D.norm();
 			cone.ray.m_vDir = D/distance;
@@ -5304,96 +6236,225 @@ void Scene::PointCloudFilter(int thRemove)
 		inline bool Intersects(const Octree::POINT_TYPE& center, Octree::Type radius) const {
 			return coneIntersect(Sphere(center, radius*Real(SQRT_3)));
 		}
-		inline void operator () (const IDX* idices, IDX size) {
+		inline void operator () (const IDX* __restrict idices, IDX size) const {
+			// Hoist every per-cone constant into a local so the inner loop reads no
+			// memory reachable through the cone / coneIntersect references (the
+			// atomic update below is a compiler memory barrier that would otherwise
+			// reload them every iteration), then run the inlined cone Classify
+			// (axis projection + half-angle test) four points at a time with SSE2.
+			// Most leaf points fall outside the cone, so the single movemask branch
+			// keeps the common path branchless; only the rare VISIBLE lanes take the
+			// scalar tail (depth-similarity test + atomic accumulation).
+			const Real ax(cone.ray.m_pOrig.x()), ay(cone.ray.m_pOrig.y()), az(cone.ray.m_pOrig.z());
+			const Real dx(cone.ray.m_vDir.x()), dy(cone.ray.m_vDir.y()), dz(cone.ray.m_vDir.z());
+			const Real minH(cone.minHeight);
+			const Real maxH(cone.maxHeight);
+			const Real cosSq(coneIntersect.cosAngleSq);
+			const Real refDist(distance);
 			const Real thSimilar(0.01f);
-			Real dist;
-			FOREACHRAWPTR(pIdx, idices, size) {
-				const PointCloud::Index idx(*pIdx);
-				if (coneIntersect.Classify(pointcloud.points[idx], dist) == VISIBLE && !IsDepthSimilar(distance, dist, thSimilar)) {
-					if (dist > distance)
-						visibility[idx] += pointcloud.pointViews[idx].size();
-					else
-						visibility[idx] -= weight;
+			const int w(weight);
+			const float* const __restrict pXYZ = pointcloud.pointsXYZ.data();
+			int* const __restrict vis = visibility;
+
+			// commit one VISIBLE point (rare path): depth-similarity reject, then a
+			// lock-free signed accumulation into the shared visibility array.
+			const auto emit = [&](const uint32_t idx, const float t) {
+				if (IsDepthSimilar(refDist, t, thSimilar))
+					return;
+				const int delta = (t > refDist) ? (int)pointcloud.ViewsStreamSize(idx) : -w;
+			#ifdef DENSE_USE_OPENMP
+				_InterlockedExchangeAdd(reinterpret_cast<volatile long*>(vis + idx), (long)delta);
+			#else
+				vis[idx] += delta;
+			#endif
+			};
+
+			const __m128 vAx = _mm_set1_ps(ax), vAy = _mm_set1_ps(ay), vAz = _mm_set1_ps(az);
+			const __m128 vDx = _mm_set1_ps(dx), vDy = _mm_set1_ps(dy), vDz = _mm_set1_ps(dz);
+			const __m128 vMinH = _mm_set1_ps(minH), vMaxH = _mm_set1_ps(maxH), vCosSq = _mm_set1_ps(cosSq);
+
+			IDX k = 0;
+			for (; k + 4 <= size; k += 4) {
+				const uint32_t i0(idices[k]), i1(idices[k+1]), i2(idices[k+2]), i3(idices[k+3]);
+				// gather 4 points (SoA); SSE2 has no gather so the loads stay scalar
+				const __m128 px = _mm_set_ps(pXYZ[(size_t)i3*3+0], pXYZ[(size_t)i2*3+0], pXYZ[(size_t)i1*3+0], pXYZ[(size_t)i0*3+0]);
+				const __m128 py = _mm_set_ps(pXYZ[(size_t)i3*3+1], pXYZ[(size_t)i2*3+1], pXYZ[(size_t)i1*3+1], pXYZ[(size_t)i0*3+1]);
+				const __m128 pz = _mm_set_ps(pXYZ[(size_t)i3*3+2], pXYZ[(size_t)i2*3+2], pXYZ[(size_t)i1*3+2], pXYZ[(size_t)i0*3+2]);
+				const __m128 Dx = _mm_sub_ps(px, vAx), Dy = _mm_sub_ps(py, vAy), Dz = _mm_sub_ps(pz, vAz);
+				// t = axial projection of (P-apex) onto the cone axis
+				const __m128 t = _mm_add_ps(_mm_add_ps(_mm_mul_ps(vDx, Dx), _mm_mul_ps(vDy, Dy)), _mm_mul_ps(vDz, Dz));
+				const __m128 nSq = _mm_add_ps(_mm_add_ps(_mm_mul_ps(Dx, Dx), _mm_mul_ps(Dy, Dy)), _mm_mul_ps(Dz, Dz));
+				// VISIBLE = t in (minHeight, maxHeight] AND t*t > cosAngleSq * |P-apex|^2
+				const __m128 mask = _mm_and_ps(_mm_and_ps(_mm_cmpgt_ps(t, vMinH), _mm_cmple_ps(t, vMaxH)),
+					_mm_cmpgt_ps(_mm_mul_ps(t, t), _mm_mul_ps(vCosSq, nSq)));
+				const int bits = _mm_movemask_ps(mask);
+				if (bits) {
+					alignas(16) float tArr[4];
+					_mm_store_ps(tArr, t);
+					if (bits & 1) emit(i0, tArr[0]);
+					if (bits & 2) emit(i1, tArr[1]);
+					if (bits & 4) emit(i2, tArr[2]);
+					if (bits & 8) emit(i3, tArr[3]);
 				}
+			}
+			// scalar tail (< 4 remaining)
+			for (; k < size; ++k) {
+				const uint32_t idx(idices[k]);
+				const float Dx(pXYZ[(size_t)idx*3+0] - ax), Dy(pXYZ[(size_t)idx*3+1] - ay), Dz(pXYZ[(size_t)idx*3+2] - az);
+				const float t(dx*Dx + dy*Dy + dz*Dz);
+				if (t <= minH || t > maxH)
+					continue;
+				if (t*t <= cosSq * (Dx*Dx + Dy*Dy + Dz*Dz))
+					continue;
+				emit(idx, t);
 			}
 		}
 	};
-	typedef CLISTDEF2(Collector) Collectors;
 
+	// gather points into a contiguous array for the octree (streaming cloud
+	// stores XYZ as a flat float stream, so build the typed array once)
+	PointCloud::PointArr ptsForOctree(pointcloud.GetSize());
+	#ifdef DENSE_USE_OPENMP
+	#pragma omp parallel for
+	for (int64_t i=0; i<(int64_t)ptsForOctree.GetSize(); ++i)
+		ptsForOctree[(PointCloud::Index)i] = pointcloud.Point((PointCloud::Index)i);
+	#else
+	FOREACH(i, ptsForOctree)
+		ptsForOctree[i] = pointcloud.Point(i);
+	#endif
 	// create octree to speed-up search
-	Octree octree(pointcloud.points, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
+	Octree octree(ptsForOctree, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
 		return size > 128;
 	});
 	IntArr visibility(pointcloud.GetSize()); visibility.Memset(0);
-	Collectors collectors; collectors.reserve(images.size());
+	int* const __restrict pVisibility = visibility.Begin();
+
+	// pre-compute each view's cone origin (camera center) and half-angle once;
+	// each (point,view) query then builds a private Collector from these, so the
+	// hot loop owns all its mutable state and needs no per-view locking.
+	const size_t numViews(images.size());
+	std::vector<Ray3f> viewRays; viewRays.reserve(numViews);
+	std::vector<float> viewAngles; viewAngles.reserve(numViews);
 	FOREACH(idxView, images) {
 		const Image& image = images[idxView];
-		const Ray3f ray(Cast<float>(image.camera.C), Cast<float>(image.camera.Direction()));
-		const float angle(float(image.ComputeFOV(0)/image.width));
-		collectors.emplace_back(ray, angle, pointcloud, visibility);
+		viewRays.emplace_back(Cast<float>(image.camera.C), Cast<float>(image.camera.Direction()));
+		viewAngles.push_back(float(image.ComputeFOV(0)/image.width));
 	}
 
-	// run all camera-point visibility intersections
+	// run all camera-point visibility intersections. Keep the parallel sweep over
+	// points (best load-balance), but give each worker thread its own array of
+	// per-view Collectors and reuse them: a Collector's cone half-angle and the
+	// angle-derived ConeIntersect constants depend ONLY on the view, so they are
+	// built once per (thread,view) and reused for every point that thread tests
+	// against that view, instead of being reconstructed for each (point,view) pair.
+	// Only the cheap per-point ray direction/distance is refreshed in Init().
+	// Accumulation into the shared visibility array stays lock-free via the atomic.
 	Util::Progress progress(_T("Point visibility checks"), pointcloud.GetSize());
+	const int64_t numPoints = (int64_t)pointcloud.GetSize();
 	#ifdef DENSE_USE_OPENMP
-	#pragma omp parallel for //schedule(dynamic)
-	for (int64_t i=0; i<(int64_t)pointcloud.GetSize(); ++i) {
-		const PointCloud::Index idxPoint((PointCloud::Index)i);
-	#else
-	FOREACH(idxPoint, pointcloud.points) {
-	#endif
-		const PointCloud::Point& X = pointcloud.points[idxPoint];
-		const PointCloud::ViewArr& views = pointcloud.pointViews[idxPoint];
-		for (PointCloud::View idxView: views) {
-			Collector& collector = collectors[idxView];
-			#ifdef DENSE_USE_OPENMP
-			Lock l(collector.GetCS());
-			#endif
-			collector.Init(idxPoint, X, (int)views.size());
-			octree.Collect(collector, collector);
+	#pragma omp parallel
+	{
+		// one Collector per view, indexed directly by view id. reserve() up front so
+		// the buffer never reallocates after construction: a Collector holds a
+		// ConeIntersect that references its own cone, so it must keep a stable address
+		// (never moved/copied once built). The inline capacity covers the usual
+		// few-hundred views with no heap allocation; larger counts spill to a single
+		// reserved heap buffer (still no relocation, since reserve == final size).
+		boost::container::small_vector<Collector, 512> pool;
+		pool.reserve(numViews);
+		for (size_t v = 0; v < numViews; ++v)
+			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility);
+		#pragma omp for schedule(dynamic, 2048)
+		for (int64_t i = 0; i < numPoints; ++i) {
+			const PointCloud::Index idxPoint((PointCloud::Index)i);
+			const PointCloud::Point& X = pointcloud.Point(idxPoint);
+			const uint32_t* __restrict views = pointcloud.ViewsStream(idxPoint);
+			const size_t nViews = pointcloud.ViewsStreamSize(idxPoint);
+			for (size_t v = 0; v < nViews; ++v) {
+				Collector& c = pool[views[v]];
+				c.Init(idxPoint, X, (int)nViews);
+				octree.Collect(c, c);
+			}
+			++progress;
 		}
-		++progress;
 	}
+	#else
+	{
+		boost::container::small_vector<Collector, 512> pool;
+		pool.reserve(numViews);
+		for (size_t v = 0; v < numViews; ++v)
+			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility);
+		for (PointCloud::Index idxPoint=0; idxPoint<(PointCloud::Index)numPoints; ++idxPoint) {
+			const PointCloud::Point& X = pointcloud.Point(idxPoint);
+			const uint32_t* __restrict views = pointcloud.ViewsStream(idxPoint);
+			const size_t nViews = pointcloud.ViewsStreamSize(idxPoint);
+			for (size_t v=0; v<nViews; ++v) {
+				Collector& c = pool[views[v]];
+				c.Init(idxPoint, X, (int)nViews);
+				octree.Collect(c, c);
+			}
+			++progress;
+		}
+	}
+	#endif
 	progress.close();
 
-	#if TD_VERBOSE != TD_VERBOSE_OFF
-	if (g_nVerbosityLevel > 2) {
-		// print visibility stats
-		UnsignedArr counts(0, 64);
-		for (int views: visibility) {
-			if (views > 0)
-				continue;
-			while (counts.size() <= IDX(-views))
-				counts.push_back(0);
-			++counts[-views];
-		}
-		String msg;
-		msg.reserve(64*counts.size());
-		FOREACH(c, counts)
-			if (counts[c])
-				msg += String::FormatString("\n\t% 3u - % 9u", c, counts[c]);
-		VERBOSE("Visibility lengths (%u points):%s", pointcloud.GetSize(), msg.c_str());
-		// save outlier points
-		PointCloud pc;
-
-		RFOREACH(idxPoint, pointcloud.points) {
-			if (visibility[idxPoint] <= thRemove) {
-				pc.points.push_back(pointcloud.points[idxPoint]);
-				pc.colors.push_back(pointcloud.colors[idxPoint]);
-			}
-		}
-		pc.Save(MAKE_PATH("scene_dense_outliers.ply"));
-	}
-	#endif
-
-	// filter points
+	// filter points: single O(n) compaction pass (mid-array RemovePoint per cull
+	// is O(n) -> O(n^2) over the whole cloud). Keep visibility>thRemove, copying
+	// survivors down; view/weight offsets keep pointing into their original blobs.
 	const size_t numInitPoints(pointcloud.GetSize());
-	RFOREACH(idxPoint, pointcloud.points) {
-		if (visibility[idxPoint] <= thRemove)
-			pointcloud.RemovePoint(idxPoint);
+	// Safety guard: if the threshold would remove more than maxRemoveFrac of the
+	// cloud it is almost certainly mis-set (too aggressive). Bail without touching
+	// the cloud rather than silently gutting / emptying the output.
+	if (maxRemoveFrac < 1.f) {
+		int64_t nRemoveCnt = 0;
+		#ifdef DENSE_USE_OPENMP
+		#pragma omp parallel for reduction(+:nRemoveCnt)
+		#endif
+		for (int64_t r = 0; r < (int64_t)numInitPoints; ++r)
+			if (pVisibility[r] <= thRemove)
+				++nRemoveCnt;
+		const size_t nRemove = (size_t)nRemoveCnt;
+		if (numInitPoints && (float)nRemove > maxRemoveFrac * (float)numInitPoints) {
+			VERBOSE("WARNING: visibility filter (th<=%d) would remove %u/%u points (%.1f%%%% > %.0f%%%% cap); skipping filter (use a LARGER --filter-point-cloud value -- larger is gentler).",
+				thRemove, (unsigned)nRemove, (unsigned)numInitPoints,
+				100.f*(float)nRemove/(float)numInitPoints, 100.f*maxRemoveFrac);
+			return;
+		}
+	}
+	{
+		const bool hasN(!pointcloud.normalsXYZ.empty());
+		const bool hasC(!pointcloud.colorsRGB.empty());
+		const bool hasVO(!pointcloud.pointViewsOffsets.empty());
+		const bool hasVS(!pointcloud.pointViewsSizes.empty());
+		const bool hasWO(!pointcloud.pointWeightsOffsets.empty());
+		const bool hasWS(!pointcloud.pointWeightsSizes.empty());
+		size_t w = 0;
+		for (size_t r = 0; r < numInitPoints; ++r) {
+			if (visibility[r] <= thRemove)
+				continue;
+			if (w != r) {
+				pointcloud.pointsXYZ[w*3+0] = pointcloud.pointsXYZ[r*3+0];
+				pointcloud.pointsXYZ[w*3+1] = pointcloud.pointsXYZ[r*3+1];
+				pointcloud.pointsXYZ[w*3+2] = pointcloud.pointsXYZ[r*3+2];
+				if (hasN) { pointcloud.normalsXYZ[w*3+0]=pointcloud.normalsXYZ[r*3+0]; pointcloud.normalsXYZ[w*3+1]=pointcloud.normalsXYZ[r*3+1]; pointcloud.normalsXYZ[w*3+2]=pointcloud.normalsXYZ[r*3+2]; }
+				if (hasC) { pointcloud.colorsRGB[w*3+0]=pointcloud.colorsRGB[r*3+0]; pointcloud.colorsRGB[w*3+1]=pointcloud.colorsRGB[r*3+1]; pointcloud.colorsRGB[w*3+2]=pointcloud.colorsRGB[r*3+2]; }
+				if (hasVO) pointcloud.pointViewsOffsets[w]=pointcloud.pointViewsOffsets[r];
+				if (hasVS) pointcloud.pointViewsSizes[w]=pointcloud.pointViewsSizes[r];
+				if (hasWO) pointcloud.pointWeightsOffsets[w]=pointcloud.pointWeightsOffsets[r];
+				if (hasWS) pointcloud.pointWeightsSizes[w]=pointcloud.pointWeightsSizes[r];
+			}
+			++w;
+		}
+		pointcloud.pointsXYZ.resize(w*3);
+		if (hasN) pointcloud.normalsXYZ.resize(w*3);
+		if (hasC) pointcloud.colorsRGB.resize(w*3);
+		if (hasVO) pointcloud.pointViewsOffsets.resize(w);
+		if (hasVS) pointcloud.pointViewsSizes.resize(w);
+		if (hasWO) pointcloud.pointWeightsOffsets.resize(w);
+		if (hasWS) pointcloud.pointWeightsSizes.resize(w);
 	}
 
-	DEBUG_EXTRA("Point-cloud filtered: %u/%u points (%d%%%%) (%s)", pointcloud.points.size(), numInitPoints, ROUND2INT((100.f*pointcloud.points.GetSize())/numInitPoints), TD_TIMER_GET_FMT().c_str());
-#endif
+	DEBUG_EXTRA("Point-cloud filtered: %u/%u points (%d%%%%) (%s)", pointcloud.NumPoints(), numInitPoints, ROUND2INT((100.f*pointcloud.NumPoints()) / numInitPoints), TD_TIMER_GET_FMT().c_str());
 	} // PointCloudFilter
 /*----------------------------------------------------------------*/

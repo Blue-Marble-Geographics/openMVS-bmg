@@ -79,9 +79,10 @@ MDEFVAR_OPTDENSE_uint32(nMaxResolution, "Max Resolution", "Do not scale images l
 MDEFVAR_OPTDENSE_uint32(nMinResolution, "Min Resolution", "Do not scale images lower than this resolution", "640")
 DEFVAR_OPTDENSE_uint32(nSubResolutionLevels, "SubResolution levels", "Number of lower resolution levels to estimate the depth and normals", "2")
 DEFVAR_OPTDENSE_uint32(nMinViews, "Min Views", "minimum number of agreeing views to validate a depth", "2")
-MDEFVAR_OPTDENSE_uint32(nMaxViews, "Max Views", "maximum number of neighbor images used to compute the depth-map for the reference image", "12")
+MDEFVAR_OPTDENSE_uint32(nMaxViews, "Max Views", "maximum number of neighbor images used to compute the depth-map for the reference image", "18") // JPB WIP BUG "12")
 DEFVAR_OPTDENSE_uint32(nMinViewsFuse, "Min Views Fuse", "minimum number of images that agrees with an estimate during fusion in order to consider it inlier (<2 - only merge depth-maps)", "2")
-DEFVAR_OPTDENSE_uint32(nMinViewsFilter, "Min Views Filter", "minimum number of images that agrees with an estimate in order to consider it inlier", "2")
+MDEFVAR_OPTDENSE_uint32(nMaxViewsFuse, "Max Views Fuse", "maximum number of neighbor depth-maps fused per point", "32")
+DEFVAR_OPTDENSE_uint32(nMinViewsFilter, "Min Views Filter", "minimum number of images that agrees with an estimate in order to consider it inlier", "2") //JPB WIP BUG "2")
 MDEFVAR_OPTDENSE_uint32(nMinViewsFilterAdjust, "Min Views Filter Adjust", "minimum number of images that agrees with an estimate in order to consider it inlier (0 - disabled)", "1")
 MDEFVAR_OPTDENSE_uint32(nMinViewsTrustPoint, "Min Views Trust Point", "min-number of views so that the point is considered for approximating the depth-maps (<2 - random initialization)", "2")
 MDEFVAR_OPTDENSE_uint32(nNumViews, "Num Views", "Number of views used for depth-map estimation (0 - all views available)", "0", "1", "4")
@@ -90,28 +91,38 @@ MDEFVAR_OPTDENSE_bool(bFilterAdjust, "Filter Adjust", "adjust depth estimates du
 MDEFVAR_OPTDENSE_bool(bAddCorners, "Add Corners", "add support points at image corners with nearest neighbor disparities", "0")
 MDEFVAR_OPTDENSE_bool(bInitSparse, "Init Sparse", "init depth-map only with the sparse points (no interpolation)", "1")
 MDEFVAR_OPTDENSE_bool(bRemoveDmaps, "Remove Dmaps", "remove depth-maps after fusion", "0")
-MDEFVAR_OPTDENSE_bool(bDenseFuse, "Dense Fuse", "use Merrell-style recursive dense fusion (median-based, more outlier-resistant; slower than fast fuse)", "1" /* JPB WIP BUG "0" */)
+MDEFVAR_OPTDENSE_bool(bDenseFuse, "Dense Fuse", "use Merrell-style recursive dense fusion (median-based, more outlier-resistant; slower than fast fuse)", "0")
 MDEFVAR_OPTDENSE_float(fViewMinScore, "View Min Score", "Min score to consider a neighbor images (0 - disabled)", "2.0")
 MDEFVAR_OPTDENSE_float(fViewMinScoreRatio, "View Min Score Ratio", "Min score ratio to consider a neighbor images", "0.03")
 MDEFVAR_OPTDENSE_float(fMinArea, "Min Area", "Min shared area for accepting the depth triangulation", "0.05")
 MDEFVAR_OPTDENSE_float(fMinAngle, "Min Angle", "Min angle for accepting the depth triangulation", "3.0")
 MDEFVAR_OPTDENSE_float(fOptimAngle, "Optim Angle", "Optimal angle for computing the depth triangulation", "12.0")
 MDEFVAR_OPTDENSE_float(fMaxAngle, "Max Angle", "Max angle for accepting the depth triangulation", "65.0")
-MDEFVAR_OPTDENSE_float(fDescriptorMinMagnitudeThreshold, "Descriptor Min Magnitude Threshold", "minimum patch texture variance accepted when matching two patches (0 - disabled)", "0.02") // 0.02: pixels with patch texture variance below 0.0004 (0.02^2) will be removed from depthmap; 0.12: patch texture variance below 0.02 (0.12^2) is considered texture-less
-MDEFVAR_OPTDENSE_float(fDepthDiffThreshold, "Depth Diff Threshold", "maximum variance allowed for the depths during refinement", "0.01")
+MDEFVAR_OPTDENSE_float(fDescriptorMinMagnitudeThreshold, "Descriptor Min Magnitude Threshold", "minimum patch texture variance accepted when matching two patches (0 - disabled)", "0.04") // 0.02: pixels with patch texture variance below 0.0004 (0.02^2) will be removed from depthmap; 0.12: patch texture variance below 0.02 (0.12^2) is considered texture-less
+MDEFVAR_OPTDENSE_float(fDepthDiffThreshold, "Depth Diff Threshold", "maximum variance allowed for the depths during refinement", "0.015") // JPB WIP BUG Testin "0.008") // JPB WIP BUG"0.01")
 MDEFVAR_OPTDENSE_float(fNormalDiffThreshold, "Normal Diff Threshold", "maximum variance allowed for the normal during fusion (degrees)", "25")
 MDEFVAR_OPTDENSE_float(fPairwiseMul, "Pairwise Mul", "pairwise cost scale to match the unary cost", "0.3")
 MDEFVAR_OPTDENSE_float(fOptimizerEps, "Optimizer Eps", "MRF optimizer stop epsilon", "0.001")
 MDEFVAR_OPTDENSE_int32(nOptimizerMaxIters, "Optimizer Max Iters", "MRF optimizer max number of iterations", "80")
-MDEFVAR_OPTDENSE_uint32(nSpeckleSize, "Speckle Size", "maximal size of a speckle (small speckles get removed)", "100")
+MDEFVAR_OPTDENSE_uint32(nSpeckleSize, "Speckle Size", "maximal size of a speckle (small speckles get removed)", "40") // JPB WIP BUG Testing "100")
 MDEFVAR_OPTDENSE_uint32(nIpolGapSize, "Interpolate Gap Size", "interpolate small gaps (left<->right, top<->bottom)", "7")
 MDEFVAR_OPTDENSE_int32(nIgnoreMaskLabel, "Ignore Mask Label", "label id used during ignore mask filter (<0 - disabled)", "-1")
+MDEFVAR_OPTDENSE_float(fOutlierFilterStdDev, "Outlier Filter StdDev", "remove fused-cloud points whose kNN mean distance exceeds mean + N*stddev (0 - disabled); cleans the sparse spray on low-overlap edges, dataset-adaptive", "0")
+MDEFVAR_OPTDENSE_uint32(nOutlierFilterKNN, "Outlier Filter KNN", "number of nearest neighbors used by the density/low-view outlier filters", "16")
+MDEFVAR_OPTDENSE_uint32(nLowViewSupportCut, "Low View Support Cut", "delete a fused point that has only the minimum views (nMinViewsFuse) when at least N better-supported (more-view) points lie within fLowViewSupportRadius (0 - disabled); emulates nMinViewsFuse+1 ONLY where a higher-view surface already exists, leaving sole-evidence min-view regions intact (1 = remove every min-view point that touches a real surface = closest to a global nMinViewsFuse+1; raise to be more conservative)", "0")
+MDEFVAR_OPTDENSE_float(fLowViewSupportRadius, "Low View Support Radius", "search radius for nLowViewSupportCut, as a multiple of the LOCAL surface (higher-view) point spacing near each candidate; larger reaches across a thicker low-overlap scatter slab to find the real higher-view surface", "4.0")
+MDEFVAR_OPTDENSE_float(fLowViewPlanarityMax, "Low View Planarity Max", "for min-view points that have NO higher-view surface nearby (floating, unsupported): delete the point when its local neighborhood is volumetric/scattered rather than thin/planar, i.e. surface-variation (smallest/sum of PCA eigenvalues, 0=flat plane ~0.33=isotropic blob) EXCEEDS this; removes floating fuzz while keeping genuine sparse 2-view surfaces. 0 - disable (keep all unsupported min-view points)", "0.2"/* JPB WIP BUG "0.1"*/)
+MDEFVAR_OPTDENSE_bool(bFlattenWater, "Flatten Water", "snap a rough water/pond surface onto a robustly fitted near-horizontal plane; the crust is selected by a LOW elevation band AND local roughness, so genuine flat ground and out-of-band features are left untouched; heavily guarded (declines unless a large, near-horizontal, well-fit rough sheet exists and the change stays under Flatten Water Max Frac) so it is a near no-op on datasets without prominent water (0 - disabled)", "0")
+MDEFVAR_OPTDENSE_float(fFlattenWaterBandPct, "Flatten Water Band Pct", "elevation band for water-surface detection: candidates must lie within the lowest N percent of the cloud height (gravity-up Z assumed); larger reaches higher up the banks (more aggressive)", "15.0")
+MDEFVAR_OPTDENSE_float(fFlattenWaterRoughness, "Flatten Water Roughness", "minimum local PCA surface-variation (0=flat plane ~0.33=isotropic blob) for a band point to be treated as noisy water crust; raise to be more selective (only very rough), lower to catch gently rippled water", "0.04")
+MDEFVAR_OPTDENSE_float(fFlattenWaterMaxFrac, "Flatten Water Max Frac", "safety cap: if flattening would move more than this fraction of the whole cloud, the filter declines and changes nothing (guards against mis-detection on water-free scenes)", "0.35")
 DEFVAR_OPTDENSE_uint32(nOptimize, "Optimize", "should we filter the extracted depth-maps?", "7") // see DepthFlags
 MDEFVAR_OPTDENSE_uint32(nEstimateColors, "Estimate Colors", "should we estimate the colors for the dense point-cloud?", "2", "0", "1")
 MDEFVAR_OPTDENSE_uint32(nEstimateNormals, "Estimate Normals", "should we estimate the normals for the dense point-cloud?", "0", "1", "2")
-MDEFVAR_OPTDENSE_float(fNCCThresholdKeep, "NCC Threshold Keep", "Maximum 1-NCC score accepted for a match", "0.9", "0.5")
+MDEFVAR_OPTDENSE_float(fNCCThresholdKeep, "NCC Threshold Keep", "Maximum 1-NCC score accepted for a match", "0.7", "0.5")
 DEFVAR_OPTDENSE_uint32(nEstimationIters, "Estimation Iters", "Number of patch-match iterations", "3")
-DEFVAR_OPTDENSE_uint32(nEstimationGeometricIters, "Estimation Geometric Iters", "Number of geometric consistent patch-match iterations (0 - disabled)", "2")
+DEFVAR_OPTDENSE_uint32(nEstimationGeometricIters, "Estimation Geometric Iters", "Number of geometric consistent patch-match iterations (0 - disabled)", "4")
+MDEFVAR_OPTDENSE_float(fGeomConsistencyMaxChange, "Geom Consistency Max Change", "stop the geometric-consistent iterations early once the mean relative depth change between successive iterations drops below this fraction, then jump straight to the final (optimize) iteration; keeps essentially the same result while skipping already-converged passes (0 - disabled, run all iterations)", "0.005")
 MDEFVAR_OPTDENSE_float(fEstimationGeometricWeight, "Estimation Geometric Weight", "pairwise geometric consistency cost weight", "0.1")
 MDEFVAR_OPTDENSE_uint32(nRandomIters, "Random Iters", "Number of iterations for random assignment per pixel", "6")
 MDEFVAR_OPTDENSE_uint32(nRandomMaxScale, "Random Max Scale", "Maximum number of iterations to skip during random assignment", "2")
@@ -3352,8 +3363,15 @@ void MVS::EstimatePointNormals(const ImageArr& images, PointCloudStreaming& poin
 		Normal normal = Normal((float) pointvectors[i].second.x(), (float) pointvectors[i].second.y(), (float) pointvectors[i].second.z());
 		// correct normal orientation
 		//ASSERT(!views.IsEmpty());
-		const Image& imageData = images[*pViews];
-		if (normal.dot(Cast<float>(imageData.camera.C)-point) < 0)
+		// Orient toward the mean direction of ALL observing cameras rather than
+		// only the first view. A single (often oblique) camera can flip the sign
+		// wrong on grazing surfaces, producing inconsistent normals that make
+		// Poisson wobble/hole at boundaries; averaging is far more robust.
+		const uint32_t numViews = pointcloud.ViewsStreamSize(i);
+		Point3f meanDir(0.f, 0.f, 0.f);
+		for (uint32_t v = 0; v < numViews; ++v)
+			meanDir += Cast<float>(images[pViews[v]].camera.C) - point;
+		if (normal.dot(meanDir) < 0)
 			normal = -normal;
 		// You can't AddNormal.  You have to use stream placement.
 		((Normal&) *(pointcloud.NormalStream()+i*3)) = normal;
@@ -4220,6 +4238,266 @@ bool MVS::ImportDepthDataRaw(const String& fileName, String& imageFileName,
 	return bRet;
 } // ImportDepthDataRaw
 #endif
+/*----------------------------------------------------------------*/
+
+// Overwrite ONLY the depth and confidence sections of an existing raw depth-data file
+// in place. Used by the filter/adjust sub-phase, where the depth and confidence maps were
+// replaced by the filtered side-files but the normals, views, camera and header were just
+// loaded from this same file and a full DepthData::Save() would re-write them UNCHANGED;
+// skipping those (often dominant) bytes makes the write much smaller while producing a
+// BYTE-IDENTICAL file. Returns false -- so the caller falls back to a full Save() -- if
+// the on-disk layout does not exactly match what a full Save() would produce, so the
+// output is never wrong, only conditionally faster.
+// NOTE: this writes in place (no temp+rename), trading crash-atomicity of this one file
+// for fewer bytes; the completed content is identical to Save().
+bool MVS::PatchDepthConfRaw(
+	const String& fileName,
+	const DepthMap& depthMap,
+	const ConfidenceMap& confMap,
+	bool hasNormal,
+	bool hasViews)
+{
+	if (depthMap.empty() || confMap.empty())
+		return false;
+	const size_t depthArea = depthMap.area();
+	if (depthArea == 0 || (size_t)confMap.area() != depthArea)
+		return false;
+
+	FILE* f = fopen(fileName.c_str(), "r+b");
+	if (f == NULL)
+		return false;
+
+	bool ok = false;
+	do {
+		// read + validate the header
+		HeaderDepthDataRaw header;
+		if (fread(&header, sizeof(header), 1, f) != 1)
+			break;
+		if (header.name != HeaderDepthDataRaw::HeaderDepthDataRawName())
+			break;
+		if (!(header.type & HeaderDepthDataRaw::HAS_DEPTH))
+			break;
+		// the file's optional sections must match exactly what a full Save() would emit
+		const bool fileHasNormal = (header.type & HeaderDepthDataRaw::HAS_NORMAL) != 0;
+		const bool fileHasConf   = (header.type & HeaderDepthDataRaw::HAS_CONF) != 0;
+		const bool fileHasViews  = (header.type & HeaderDepthDataRaw::HAS_VIEWS) != 0;
+		if (!fileHasConf || fileHasNormal != hasNormal || fileHasViews != hasViews)
+			break;
+		// dimensions must match the maps we are about to write
+		if ((size_t)header.depthWidth != (size_t)depthMap.cols ||
+			(size_t)header.depthHeight != (size_t)depthMap.rows)
+			break;
+
+		// read the variable-length name length and ID count to locate the data sections
+		uint16_t nameLen = 0;
+		if (fread(&nameLen, sizeof(nameLen), 1, f) != 1)
+			break;
+		if (_fseeki64(f, (int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen, SEEK_SET) != 0)
+			break;
+		uint32_t nIDs = 0;
+		if (fread(&nIDs, sizeof(nIDs), 1, f) != 1)
+			break;
+		if (nIDs == 0 || nIDs >= 256)
+			break;
+
+		// section offsets, exactly as ExportDepthDataRaw lays them out
+		const int64_t metaBytes =
+			(int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen +
+			(int64_t)sizeof(uint32_t) + (int64_t)nIDs * (int64_t)sizeof(IIndex) +
+			(int64_t)sizeof(REAL) * (9 + 9 + 3);
+		const int64_t depthBytes  = (int64_t)sizeof(float) * (int64_t)depthArea;
+		const int64_t normalBytes = fileHasNormal ? (int64_t)sizeof(float) * 3 * (int64_t)depthArea : 0;
+		const int64_t confBytes   = (int64_t)sizeof(float) * (int64_t)depthArea;
+		const int64_t viewsBytes  = fileHasViews ? (int64_t)4 * (int64_t)depthArea : 0;
+		const int64_t depthOffset = metaBytes;
+		const int64_t confOffset  = depthOffset + depthBytes + normalBytes;
+		const int64_t expectedSize = depthOffset + depthBytes + normalBytes + confBytes + viewsBytes;
+
+		// verify the file is exactly the size of the full expected layout
+		if (_fseeki64(f, 0, SEEK_END) != 0 || _ftelli64(f) != expectedSize)
+			break;
+
+		// overwrite the depth section
+		if (_fseeki64(f, depthOffset, SEEK_SET) != 0)
+			break;
+		if (fwrite(depthMap.getData(), 1, (size_t)depthBytes, f) != (size_t)depthBytes)
+			break;
+		// overwrite the confidence section
+		if (_fseeki64(f, confOffset, SEEK_SET) != 0)
+			break;
+		if (fwrite(confMap.getData(), 1, (size_t)confBytes, f) != (size_t)confBytes)
+			break;
+		ok = true;
+	} while (false);
+
+	fclose(f);
+	return ok;
+} // PatchDepthConfRaw
+
+bool MVS::PatchDepthNormalConfRaw(
+	const String& fileName,
+	const DepthMap& depthMap,
+	const NormalMap& normalMap,
+	const ConfidenceMap& confMap,
+	bool hasViews)
+{
+	if (depthMap.empty() || confMap.empty())
+		return false;
+	const size_t depthArea = depthMap.area();
+	if (depthArea == 0 || (size_t)confMap.area() != depthArea)
+		return false;
+	const bool hasNormal = !normalMap.empty();
+	if (hasNormal && (size_t)normalMap.area() != depthArea)
+		return false;
+
+	FILE* f = fopen(fileName.c_str(), "r+b");
+	if (f == NULL)
+		return false;
+
+	bool ok = false;
+	do {
+		// read + validate the header
+		HeaderDepthDataRaw header;
+		if (fread(&header, sizeof(header), 1, f) != 1)
+			break;
+		if (header.name != HeaderDepthDataRaw::HeaderDepthDataRawName())
+			break;
+		if (!(header.type & HeaderDepthDataRaw::HAS_DEPTH))
+			break;
+		// the file's optional sections must match exactly what a full Save() would emit
+		const bool fileHasNormal = (header.type & HeaderDepthDataRaw::HAS_NORMAL) != 0;
+		const bool fileHasConf   = (header.type & HeaderDepthDataRaw::HAS_CONF) != 0;
+		const bool fileHasViews  = (header.type & HeaderDepthDataRaw::HAS_VIEWS) != 0;
+		if (!fileHasConf || fileHasNormal != hasNormal || fileHasViews != hasViews)
+			break;
+		// dimensions must match the maps we are about to write
+		if ((size_t)header.depthWidth != (size_t)depthMap.cols ||
+			(size_t)header.depthHeight != (size_t)depthMap.rows)
+			break;
+
+		// read the variable-length name length and ID count to locate the data sections
+		uint16_t nameLen = 0;
+		if (fread(&nameLen, sizeof(nameLen), 1, f) != 1)
+			break;
+		if (_fseeki64(f, (int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen, SEEK_SET) != 0)
+			break;
+		uint32_t nIDs = 0;
+		if (fread(&nIDs, sizeof(nIDs), 1, f) != 1)
+			break;
+		if (nIDs == 0 || nIDs >= 256)
+			break;
+
+		// section offsets, exactly as ExportDepthDataRaw lays them out
+		const int64_t metaBytes =
+			(int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen +
+			(int64_t)sizeof(uint32_t) + (int64_t)nIDs * (int64_t)sizeof(IIndex) +
+			(int64_t)sizeof(REAL) * (9 + 9 + 3);
+		const int64_t depthBytes  = (int64_t)sizeof(float) * (int64_t)depthArea;
+		const int64_t normalBytes = fileHasNormal ? (int64_t)sizeof(float) * 3 * (int64_t)depthArea : 0;
+		const int64_t confBytes   = (int64_t)sizeof(float) * (int64_t)depthArea;
+		const int64_t viewsBytes  = fileHasViews ? (int64_t)4 * (int64_t)depthArea : 0;
+		const int64_t depthOffset  = metaBytes;
+		const int64_t normalOffset = depthOffset + depthBytes;
+		const int64_t confOffset    = normalOffset + normalBytes;
+		const int64_t expectedSize = depthOffset + depthBytes + normalBytes + confBytes + viewsBytes;
+
+		// verify the file is exactly the size of the full expected layout
+		if (_fseeki64(f, 0, SEEK_END) != 0 || _ftelli64(f) != expectedSize)
+			break;
+
+		// overwrite the depth section
+		if (_fseeki64(f, depthOffset, SEEK_SET) != 0)
+			break;
+		if (fwrite(depthMap.getData(), 1, (size_t)depthBytes, f) != (size_t)depthBytes)
+			break;
+		// overwrite the normal section (if present)
+		if (hasNormal) {
+			if (_fseeki64(f, normalOffset, SEEK_SET) != 0)
+				break;
+			if (fwrite(normalMap.getData(), 1, (size_t)normalBytes, f) != (size_t)normalBytes)
+				break;
+		}
+		// overwrite the confidence section
+		if (_fseeki64(f, confOffset, SEEK_SET) != 0)
+			break;
+		if (fwrite(confMap.getData(), 1, (size_t)confBytes, f) != (size_t)confBytes)
+			break;
+		ok = true;
+	} while (false);
+
+	fclose(f);
+	return ok;
+} // PatchDepthNormalConfRaw
+
+double MVS::MeasureDepthMapRelChange(const String& oldPath, const String& newPath, size_t& validCount, int stride)
+{
+	validCount = 0;
+	if (stride < 1)
+		stride = 1;
+
+	// locate the depth section (byte offset + dimensions) of a raw depth-data file,
+	// parsing the header exactly as ExportDepthDataRaw lays it out (see PatchDepthConfRaw)
+	struct DepthSection {
+		FILE* f = NULL;
+		int width = 0, height = 0;
+		int64_t offset = 0;
+		~DepthSection() { if (f) fclose(f); }
+	};
+	const auto openDepth = [](const String& path, DepthSection& s) -> bool {
+		s.f = fopen(path.c_str(), "rb");
+		if (s.f == NULL)
+			return false;
+		HeaderDepthDataRaw header;
+		if (fread(&header, sizeof(header), 1, s.f) != 1 ||
+			header.name != HeaderDepthDataRaw::HeaderDepthDataRawName() ||
+			!(header.type & HeaderDepthDataRaw::HAS_DEPTH) ||
+			header.depthWidth <= 0 || header.depthHeight <= 0)
+			return false;
+		uint16_t nameLen = 0;
+		if (fread(&nameLen, sizeof(nameLen), 1, s.f) != 1)
+			return false;
+		if (_fseeki64(s.f, (int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen, SEEK_SET) != 0)
+			return false;
+		uint32_t nIDs = 0;
+		if (fread(&nIDs, sizeof(nIDs), 1, s.f) != 1 || nIDs == 0 || nIDs >= 256)
+			return false;
+		s.offset =
+			(int64_t)sizeof(header) + (int64_t)sizeof(uint16_t) + (int64_t)nameLen +
+			(int64_t)sizeof(uint32_t) + (int64_t)nIDs * (int64_t)sizeof(IIndex) +
+			(int64_t)sizeof(REAL) * (9 + 9 + 3);
+		s.width = header.depthWidth;
+		s.height = header.depthHeight;
+		return true;
+	};
+
+	DepthSection so, sn;
+	if (!openDepth(oldPath, so) || !openDepth(newPath, sn) ||
+		so.width != sn.width || so.height != sn.height || so.width == 0)
+		return 0.0;
+
+	const int width = so.width, height = so.height;
+	const size_t rowBytes = sizeof(float) * (size_t)width;
+	std::vector<float> rowOld(width), rowNew(width);
+	double sum = 0.0;
+	size_t cnt = 0;
+	for (int r = 0; r < height; r += stride) {
+		const int64_t rowOff = (int64_t)r * (int64_t)rowBytes;
+		if (_fseeki64(so.f, so.offset + rowOff, SEEK_SET) != 0 ||
+			fread(rowOld.data(), 1, rowBytes, so.f) != rowBytes ||
+			_fseeki64(sn.f, sn.offset + rowOff, SEEK_SET) != 0 ||
+			fread(rowNew.data(), 1, rowBytes, sn.f) != rowBytes)
+			break;
+		for (int c = 0; c < width; c += stride) {
+			const float a = rowOld[c], b = rowNew[c];
+			if (a > 0 && b > 0) {
+				sum += std::abs(b - a) / a;
+				++cnt;
+			}
+		}
+	}
+	validCount = cnt;
+	return sum;
+} // MeasureDepthMapRelChange
 /*----------------------------------------------------------------*/
 
 

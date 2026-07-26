@@ -1076,16 +1076,15 @@ bool PointCloudStreaming::SaveNViews(const String& fileName, uint32_t minViews, 
 
 void PointCloudStreaming::RemovePoint(IDX idx)
 {
-	// This does not remove the memory used by pointViewsMemory and pointWeightsMemory.
+	// This does not remove the memory used by pointViewsMemory and pointWeightsMemory;
+	// offsets/sizes of the surviving points still reference their original blobs.
+	if (idx < pointViewsOffsets.size()) pointViewsOffsets.erase(std::begin(pointViewsOffsets) + idx);
+	if (idx < pointViewsSizes.size())   pointViewsSizes.erase(std::begin(pointViewsSizes) + idx);
+	if (idx < pointWeightsOffsets.size()) pointWeightsOffsets.erase(std::begin(pointWeightsOffsets) + idx);
+	if (idx < pointWeightsSizes.size())   pointWeightsSizes.erase(std::begin(pointWeightsSizes) + idx);
 
-	pointViewsOffsets.erase(std::begin(pointWeightsSizes) + idx);
-	pointViewsSizes.erase(std::begin(pointWeightsSizes) + idx);
-
-	pointWeightsOffsets.erase(std::begin(pointWeightsSizes) + idx);
-	pointWeightsSizes.erase(std::begin(pointWeightsSizes) + idx);
-
-	normalsXYZ.erase(std::begin(normalsXYZ) + idx*3, std::begin(normalsXYZ) + (idx+1)*3);
-	colorsRGB.erase(std::begin(colorsRGB) + idx*3, std::begin(colorsRGB) + (idx+1)*3);
+	if (!normalsXYZ.empty()) normalsXYZ.erase(std::begin(normalsXYZ) + idx*3, std::begin(normalsXYZ) + (idx+1)*3);
+	if (!colorsRGB.empty())  colorsRGB.erase(std::begin(colorsRGB) + idx*3, std::begin(colorsRGB) + (idx+1)*3);
 	pointsXYZ.erase(std::begin(pointsXYZ) + idx*3, std::begin(pointsXYZ) + (idx+1)*3);
 }
 

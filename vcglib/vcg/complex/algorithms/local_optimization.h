@@ -206,6 +206,7 @@ public:
     nTargetSimplices=0;
     nTargetOps=0;
     targetMetric=0;
+    currMetric=0;
     timeBudget=0;
     nTargetVertices=0;
   }
@@ -701,6 +702,8 @@ public:
 
     startTime = Clock::now();
     nPerformedOps = 0;
+    currMetric = 0;                                     // reset error tracker for this pass
+    const bool useMetric = IsTerminationFlag(LOMetric); // error-bounded stop enabled?
 
     // JPB WIP BUG Double check this.
     // Faster to use all the threads and not worry about pinning. 43.213
@@ -725,8 +728,10 @@ public:
       }
       
       Leaf* locMod;
+      uint64_t selCode = 0;                       // packed code of the selected min (error in hi 32b)
       if (minIsInBuffer) {
-        locMod = CodeToPtr<Leaf>(hBuffer.front().code);
+        selCode = hBuffer.front().code;
+        locMod = CodeToPtr<Leaf>(selCode);
         hBuffer.erase(hBuffer.begin());
 
         if (!hBuffer.empty()) {
@@ -739,7 +744,8 @@ public:
         }
       } else {
         // Min is in the heap, ignore the buffer
-        locMod = CodeToPtr<Leaf>(h.front().code);
+        selCode = h.front().code;
+        locMod = CodeToPtr<Leaf>(selCode);
         auto* v0 = locMod->pos.V(0);
         auto* v1 = locMod->pos.V(1);
 
@@ -764,6 +770,12 @@ public:
         }
       }
 
+      // track the geometric error of the collapse about to be applied so the
+      // LOMetric goal (error-bounded decimation) can stop at a tolerance
+      if (useMetric && selCode != 0) {
+        uint32_t priBits = (uint32_t)(selCode >> 32);
+        currMetric = (ScalarType)(float&)priBits; // priority is the float error bit-packed in hi 32b
+      }
       ++heapPopCount;
       if (!locMod->IsUpToDate()) {
         ++stalePopCount;
@@ -828,7 +840,14 @@ public:
       }
     }
 
-    return !h.empty() || !hBuffer.empty();
+    // Stop the outer decimation loop when a HARD goal (target simplices or error
+    // metric) is reached; keep going (return true) if we merely yielded on the time
+    // budget with work still queued.
+    const bool workLeft = !h.empty() || !hBuffer.empty();
+    const bool hardGoal =
+        (IsTerminationFlag(LOnSimplices) && m.SimplexNumber() <= nTargetSimplices) ||
+        (IsTerminationFlag(LOMetric)     && currMetric > targetMetric);
+    return workLeft && !hardGoal;
   }
 #endif
 
@@ -871,6 +890,7 @@ public:
     // Unused if ( IsTerminationFlag(LOnVertices)  &&  ( m.VertexNumber() <= nTargetVertices)) return true;
     // Unused if ( IsTerminationFlag(LOnOps)		   && (nPerformedOps	== nTargetOps)) return true;
     // Unused if ( IsTerminationFlag(LOMetric)		 &&  ( currMetric		> targetMetric)) return true;
+    if ( IsTerminationFlag(LOMetric) && ( currMetric > targetMetric)) return true;
     if ( IsTerminationFlag(LOTime) )
     {
       static int cntr = 1;

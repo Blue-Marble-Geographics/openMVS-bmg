@@ -107,6 +107,20 @@ If you require another license, please contact the above.
 #define IBFS_OPT_ARC_SORT 1
 #endif
 
+// Move Node::label out of the Node struct into a separate SoA array on
+// IBFSGraph (`labels[i]` holds the label for `nodes[i]`). Node stays 64 B
+// (4 B of `label` becomes 4 B of pad); labels[] is a separate 4 B × N array.
+// During BFS hop tests the inner loop reads only `labels[neighborIdx]`
+// (4 B in a 64 B line of dense labels) rather than the neighbor's full
+// 64 B Node — the neighbor's Node is only fetched when its label matches.
+// Most label checks fail (most neighbors are in label==N or label==0
+// states), so the conditional Node fetch is the savings.
+//
+// Set to 0 to revert to in-Node label storage (byte-identical to pre-knob).
+#ifndef IBFS_OPT_SOA_LABEL
+#define IBFS_OPT_SOA_LABEL 1
+#endif
+
 
 namespace IBFS {
 
@@ -199,6 +213,9 @@ public:
 	void setVerbose(bool a_verbose) {
 		verbose = a_verbose;
 	}
+
+	static __forceinline bool arcUsable   (EdgeCap c) { return c >  EdgeCap(0); }
+	static __forceinline bool arcSaturated(EdgeCap c) { return c == EdgeCap(0); }
 
 	void initSize(int numNodes, int numEdges);
 	void addEdge(int nodeIndexFrom, int nodeIndexTo, EdgeCap capacity, EdgeCap reverseCapacity);
@@ -440,7 +457,11 @@ public:
 
 		// ---- hot path ----
 		EdgeCap   excess;            // 4
+#if IBFS_OPT_SOA_LABEL
+		int32_t   _labelPad;         // 4   (label moved to IBFSGraph::labels[]; this is pure padding)
+#else
 		int       label;             // 4
+#endif
 
 		ParentRef parentRef;         // 4   (was Arc* parent)
 		NodeIdx   firstSonIdx;       // 4   (was Node* firstSon)
@@ -493,9 +514,20 @@ public:
 	class Buckets
 	{
 	public:
-		inline Buckets() { maxBucket = 0; nodes = NULL; numNodesTotal = 0; }
-		inline void init(Node *a_nodes, int numNodes) {
+		inline Buckets() { maxBucket = 0; nodes = NULL; numNodesTotal = 0;
+#if IBFS_OPT_SOA_LABEL
+			labels = nullptr;
+#endif
+		}
+		inline void init(Node *a_nodes,
+#if IBFS_OPT_SOA_LABEL
+			int32_t* a_labels,
+#endif
+			int numNodes) {
 			nodes = a_nodes;
+#if IBFS_OPT_SOA_LABEL
+			labels = a_labels;
+#endif
 			numNodesTotal = numNodes;
 			maxBucket = 0;
 			// prevPtrs is indexed by node offset (x - nodes), so it must
@@ -513,8 +545,15 @@ public:
 			std::vector<NodeIdx>().swap(buckets);
 			std::vector<NodeIdx>().swap(prevPtrs);
 		}
+		__forceinline int bucketLabel(Node* x) const {
+#if IBFS_OPT_SOA_LABEL
+			return labels[x - nodes];
+#else
+			return x->label;
+#endif
+		}
 		template <bool sTree> inline void add(Node* x) {
-			int bucket = (sTree ? (x->label) : (-x->label));
+			int bucket = (sTree ? (bucketLabel(x)) : (-bucketLabel(x)));
 			ensureSize(bucket);
 			NodeIdx headI = buckets[bucket];
 			NodeIdx xi    = static_cast<NodeIdx>(x - nodes);
@@ -536,7 +575,7 @@ public:
 			return x;
 		}
 		template <bool sTree> inline void remove(Node *x) {
-			int bucket = (sTree ? (x->label) : (-x->label));
+			int bucket = (sTree ? (bucketLabel(x)) : (-bucketLabel(x)));
 			if (bucket >= (int)buckets.size()) return;
 			NodeIdx xi = static_cast<NodeIdx>(x - nodes);
 			if (buckets[bucket] == xi) {
@@ -552,6 +591,9 @@ public:
 		std::vector<NodeIdx> buckets;
 		std::vector<NodeIdx> prevPtrs;
 		Node *nodes;
+#if IBFS_OPT_SOA_LABEL
+		int32_t* labels;
+#endif
 		int numNodesTotal;
 		int maxBucket;
 	};
@@ -560,6 +602,11 @@ public:
 	IBFSStats stats;
   Node* nodes;
   Node* nodeEnd;
+#if IBFS_OPT_SOA_LABEL
+	// SoA label storage: labels[i] is the label for nodes[i]. See
+	// IBFS_OPT_SOA_LABEL doc block at top of header.
+	int32_t* labels;
+#endif
 	int 	numNodes;
 	EdgeCap	flow;
 
@@ -588,6 +635,29 @@ public:
 	}
 	inline Node* parentOwner(ParentRef r) const noexcept {
 		return (r == kNullParent) ? nullptr : &nodes[r >> 2];
+	}
+
+	// ---- label helpers (SoA via IBFS_OPT_SOA_LABEL) ----
+	__forceinline int  getLabel(const Node* x) const noexcept {
+#if IBFS_OPT_SOA_LABEL
+		return labels[x - nodes];
+#else
+		return x->label;
+#endif
+	}
+	__forceinline void setLabel(Node* x, int v) noexcept {
+#if IBFS_OPT_SOA_LABEL
+		labels[x - nodes] = v;
+#else
+		x->label = v;
+#endif
+	}
+	__forceinline void addLabel(Node* x, int delta) noexcept {
+#if IBFS_OPT_SOA_LABEL
+		labels[x - nodes] += delta;
+#else
+		x->label += delta;
+#endif
 	}
 
 	void augment(Arc* __restrict bridge);
@@ -682,19 +752,25 @@ inline void IBFSGraph::addEdge(int from, int to, EdgeCap cap, EdgeCap revCap) {
 	// forward arc
 	uv->initFields(static_cast<NodeIdx>(to), static_cast<uint8_t>(vArcIdx));
 	uv->rCap = cap;
-	if (revCap > 0) u->residBits |= (1u << uArcIdx);
+	if (arcUsable(revCap)) u->residBits |= (1u << uArcIdx);
 
 	// reverse arc
 	vu->initFields(static_cast<NodeIdx>(from), static_cast<uint8_t>(uArcIdx));
 	vu->rCap = revCap;
-	if (cap > 0) v->residBits |= (1u << vArcIdx);
+	if (arcUsable(cap)) v->residBits |= (1u << vArcIdx);
 }
 
 inline bool IBFSGraph::isNodeOnSrcSide(int nodeIndex) const
 {
+#if IBFS_OPT_SOA_LABEL
+	const int32_t lbl = labels[nodeIndex];
+	if (lbl == numNodes || lbl == 0) return activeT1.len == 0;
+	return lbl > 0;
+#else
 	const Node& x = nodes[nodeIndex];
 	if (x.label == numNodes || x.label == 0) return activeT1.len == 0;
 	return x.label > 0;
+#endif
 }
 
 } // namespace IBFS

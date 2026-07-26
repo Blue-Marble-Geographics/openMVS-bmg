@@ -96,12 +96,17 @@ void TOctree<ITEMARR_TYPE,TYPE,DIMS,DATA_TYPE>::CELL_TYPE::ComputeCenter(POINT_T
 template <typename ITEMARR_TYPE, typename TYPE, int DIMS, typename DATA_TYPE>
 inline typename TOctree<ITEMARR_TYPE,TYPE,DIMS,DATA_TYPE>::POINT_TYPE TOctree<ITEMARR_TYPE,TYPE,DIMS,DATA_TYPE>::CELL_TYPE::ComputeChildCenter(const POINT_TYPE& center, TYPE radius, unsigned idxChild)
 {
-	struct CENTERARR_TYPE {
-		POINT_TYPE child[CELL_TYPE::numChildren];
-		inline CENTERARR_TYPE() { CELL_TYPE::ComputeCenter(child); }
-	};
-	static const CENTERARR_TYPE centers;
-	return center + centers.child[idxChild] * radius;
+	// The child-octant sign on each axis is exactly the corresponding bit of
+	// idxChild (bit d set => positive side on axis d), matching ComputeChild()
+	// and ComputeCenter(). Compute it inline with scalar adds: this avoids the
+	// function-local `static` (a per-call thread-safe-init guard under MSVC) and
+	// the Eigen scale+add temporary the table form produced -- this routine is
+	// called once per visited leaf child in the _Collect traversal, a hot path.
+	POINT_TYPE c(center);
+	c[0] += (idxChild & 1u) ? radius : -radius;
+	if (DIMS > 1) c[1] += (idxChild & 2u) ? radius : -radius;
+	if (DIMS > 2) c[2] += (idxChild & 4u) ? radius : -radius;
+	return c;
 } // ComputeChildCenter
 /*----------------------------------------------------------------*/
 
@@ -343,11 +348,18 @@ void TOctree<ITEMARR_TYPE,TYPE,DIMS,DATA_TYPE>::_Collect(const CELL_TYPE& cell, 
 {
 	ASSERT(!cell.IsLeaf());
 	const TYPE childRadius = radius / TYPE(2);
+	const POINT_TYPE& parentCenter = cell.GetCenter();
+	const CELL_TYPE* const __restrict children = cell.m_child;
+	const IDX_TYPE* const __restrict indices = m_indices.data();
 	for (int i=0; i<CELL_TYPE::numChildren; ++i) {
-		const CELL_TYPE& childCell = cell.m_child[i];
+		const CELL_TYPE& childCell = children[i];
 		if (childCell.IsLeaf()) {
-			if (collector.Intersects(CELL_TYPE::ComputeChildCenter(cell.GetCenter(), childRadius, i), childRadius))
-				inserter(m_indices.data()+childCell.GetFirstItemIdx(), childCell.GetNumItems());
+			// leaves do not store a center; derive it from the parent. Skip the
+			// (common) empty octants before the cone test -- they would insert
+			// nothing anyway, so the intersection math on them is pure waste.
+			const SIZE_TYPE numItems = childCell.GetNumItems();
+			if (numItems != 0 && collector.Intersects(CELL_TYPE::ComputeChildCenter(parentCenter, childRadius, i), childRadius))
+				inserter(indices + childCell.GetFirstItemIdx(), numItems);
 		} else {
 			if (collector.Intersects(childCell.Node().center, childRadius))
 				_Collect(childCell, childRadius, collector, inserter);

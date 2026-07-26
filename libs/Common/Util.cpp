@@ -22,6 +22,8 @@
 #endif
 #include <pwd.h>
 #endif
+#include <sys/stat.h>
+#include <ctime>
 
 using namespace SEACAVE;
 
@@ -534,11 +536,48 @@ void Util::LogBuild()
 		_T("x32"),
 		#endif
 		OpenMVS_MAJOR_VERSION, OpenMVS_MINOR_VERSION, OpenMVS_PATCH_VERSION);
-	#if TD_VERBOSE == TD_VERBOSE_OFF
-	LOG(_T("Build date: ") __DATE__);
-	#else
-	LOG(_T("Build date: ") __DATE__ _T(", ") __TIME__);
-	#endif
+	// Report the actual build time of the running executable, NOT the compile
+	// time of this translation unit. __DATE__/__TIME__ only capture when Util.cpp
+	// itself was last compiled, so they go stale whenever a change to any other
+	// component relinks the binary without recompiling this file. Reading the
+	// executable's own last-write time reflects when the binary was actually
+	// produced, updating on every relink. Falls back to __DATE__/__TIME__ if the
+	// timestamp cannot be read.
+	{
+		String buildTime;
+		const String exePath(getAppName());
+		#ifdef _MSC_VER
+		struct _stat64 st;
+		const bool ok = (!exePath.empty() && _stat64(exePath.c_str(), &st) == 0);
+		#else
+		struct stat st;
+		const bool ok = (!exePath.empty() && stat(exePath.c_str(), &st) == 0);
+		#endif
+		if (ok) {
+			const time_t mtime = (time_t)st.st_mtime;
+			struct tm tmBuf;
+			#ifdef _MSC_VER
+			localtime_s(&tmBuf, &mtime);
+			#else
+			localtime_r(&mtime, &tmBuf);
+			#endif
+			char timeStr[64];
+			#if TD_VERBOSE == TD_VERBOSE_OFF
+			if (strftime(timeStr, sizeof(timeStr), "%b %d %Y", &tmBuf))
+			#else
+			if (strftime(timeStr, sizeof(timeStr), "%b %d %Y, %H:%M:%S", &tmBuf))
+			#endif
+				buildTime = timeStr;
+		}
+		if (buildTime.empty()) {
+			#if TD_VERBOSE == TD_VERBOSE_OFF
+			buildTime = __DATE__;
+			#else
+			buildTime = String(__DATE__) + _T(", ") + __TIME__;
+			#endif
+		}
+		LOG(_T("Build date: %s"), buildTime.c_str());
+	}
 	LOG(_T("CPU: %s (%u cores)"), Util::GetCPUInfo().c_str(), Thread::hardwareConcurrency());
 	LOG((_T("RAM: ") + Util::GetRAMInfo()).c_str());
 	LOG((_T("OS: ") + Util::GetOSInfo()).c_str());

@@ -41,6 +41,13 @@
 
 // D E F I N E S ///////////////////////////////////////////////////
 
+// Manual build number for this OpenMVS-bmg fork. Bump it by hand when asked.
+// It is logged by the ReconstructMesh app and the Poisson reconstruction path
+// so any log we produce identifies exactly which build was run.
+#ifndef OPENMVS_BMG_BUILD
+#define OPENMVS_BMG_BUILD 13
+#endif
+
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -118,13 +125,17 @@ public:
 	bool ComputeDepthMaps(DenseDepthMapData& data);
 	void DenseReconstructionEstimate(void*);
 	void DenseReconstructionFilter(void*);
-	void PointCloudFilter(int thRemove=-1);
+	void PointCloudFilter(int thRemove=-1, float maxRemoveFrac=1.f);
 
 	// Mesh reconstruction
 	bool ReconstructMesh(float distInsert=2, bool bUseFreeSpaceSupport=true, bool bUseOnlyROI=false, unsigned nItersFixNonManifold=4,
 						 float kSigma=2.f, float kQual=1.f, float kb=4.f,
 						 float kf=3.f, float kRel=0.1f/*max 0.3*/, float kAbs=1000.f/*min 500*/, float kOutl=400.f/*max 700.f*/,
 						 float kInf=(float)(INT_MAX/8));
+
+	// Poisson (Kazhdan PoissonRecon + SurfaceTrimmer, external tools) mesh
+	// reconstruction — gated A/B alternative to the graph-cut
+	bool ReconstructMeshPoisson(int depth=0, float trimThreshold=7.f, float samplesPerNode=1.5f, float pointWeight=2.f, float islandRatio=0.f);
 
 	// Mesh refinement
 	bool RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsigned nMaxViews, float fDecimateMesh, unsigned nCloseHoles, unsigned nEnsureEdgeSize,

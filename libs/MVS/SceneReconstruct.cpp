@@ -32,7 +32,7 @@
 #define FIX_MANIFOLD // No manifold repair at all
 #define MANIFOLD_FIXUP
 #undef PRE_OPENMVS21
-#define EARLY_OUT_WEIGHTING
+#undef EARLY_OUT_WEIGHTING
 #define PARALLEL_GRAPH_CUT_EXTRACTION
 
 // --- Optional point-cloud pre-filter (applied AFTER StatisticalOutlierRemoval,
@@ -199,7 +199,7 @@
 //
 // Set to 0 to use the original BFS-refined path.
 #ifndef RECONSTRUCT_FAST_DISTINSERT
-#define RECONSTRUCT_FAST_DISTINSERT 0
+#define RECONSTRUCT_FAST_DISTINSERT 1
 #endif
 
 // RECONSTRUCT_PARALLEL_PASS5: Parallelize the Morton-cell Pass 5 compaction
@@ -270,6 +270,103 @@
 #define RECONSTRUCT_RADIX_MORTON 1
 #endif
 
+// RECONSTRUCT_SKIP_SOR: Skip Statistical Outlier Removal in ReconstructMesh.
+// When 1, all points pass (mask filled with 1); saves ~1.3s on 18M-point
+// clouds + the 72MB verticesf kd-tree build. Set to 0 (default) to keep SOR.
+#ifndef RECONSTRUCT_SKIP_SOR
+#define RECONSTRUCT_SKIP_SOR 0
+#endif
+
+// POISSON_BOUNDARY_SMOOTH: Number of Laplacian relaxation iterations applied
+// to boundary (open-edge) vertices of the Poisson mesh after trimming.
+// Smooths the octree-aligned staircase left by SurfaceTrimmer. Interior
+// vertices are never touched. 0 = disable. 3-5 = subtle, 8-12 = aggressive.
+#ifndef POISSON_BOUNDARY_SMOOTH
+#define POISSON_BOUNDARY_SMOOTH 48 // Was 96, 24 creates more pseudo edge.
+#endif
+
+// POISSON_DISTANCE_CULL: Distance-to-cloud face cull applied to the Poisson
+// surface AFTER reconstruction + density trim + NaN sanitize, BEFORE returning
+// from ReconstructMeshPoisson. Orthogonal to SurfaceTrimmer's density trim:
+// trim removes low-confidence surface, this removes surface that floats too far
+// from the actual input samples (Poisson's invented membranes / skirts /
+// balloons over cars, water, sky, etc.). Poisson only invents geometry AWAY
+// from real points, so "is this triangle near real data?" deletes exactly the
+// crazy stuff and leaves everything built ON the cloud untouched.
+//
+// Mechanism: build a nanoflann kd-tree on the same finite input cloud written
+// to the Poisson PLY, query the nearest input point for every mesh vertex, and
+// cull a face when ALL THREE of its vertices are farther than
+//     POISSON_CULL_FACTOR_X100/100 * medianSpacing
+// from the cloud (medianSpacing = median nearest-neighbour spacing, the same
+// statistic EstimatePoissonDepth computes). "All three" is the conservative
+// policy: it keeps boundary faces that straddle the data edge (one or two far
+// vertices) and only deletes faces fully detached from the data. Vertices and
+// faces are then compacted exactly like the NaN-removal block.
+//
+// DEFAULT OFF: a single global threshold tied to the median (densest-region)
+// NN spacing over-culls real surface. Point density varies enormously across a
+// scene (obliquely-viewed walls, distant ground, canopy fringe), so legitimate
+// surface in sparse-but-real regions sits many median-spacings from the nearest
+// sample and is indistinguishable from invented skirts/balloons by a global
+// distance test. Measured on an aerial scene: ~13.5% of faces removed at 3.5x,
+// most of them good geometry. Density trimming (SurfaceTrimmer --trim) already
+// handles the invented-balloon case far more reliably. Leave this at 0 unless
+// you have a local-density-adaptive replacement for the threshold.
+// Set to 1 to re-enable (and tune POISSON_CULL_FACTOR_X100, expect 8-10x+).
+#ifndef POISSON_DISTANCE_CULL
+#define POISSON_DISTANCE_CULL 0
+#endif
+
+// POISSON_CULL_FACTOR_X100: distance threshold as a multiple of the median NN
+// spacing, stored x100 (preprocessor-friendly). 350 = 3.5x. Higher = more
+// conservative (only clearly-invented surface removed); lower = more aggressive
+// (can start eating real boundary). Safe starting range 300-400.
+#ifndef POISSON_CULL_FACTOR_X100
+#define POISSON_CULL_FACTOR_X100 350
+#endif
+
+// POISSON_ADAPTIVE_TRIM: spatially-varying replacement for SurfaceTrimmer's
+// single global density threshold. When enabled, the standard SurfaceTrimmer
+// call is skipped and a custom trim is applied to the (untrimmed) Poisson mesh
+// using each vertex's screened-Poisson density value together with its position
+// in the input cloud's XY footprint:
+//   - DEEP INTERIOR of the footprint -> threshold = trimThreshold (e.g. 5.5) so
+//     low-density interior fill (water) is retained.
+//   - NEAR / BEYOND the footprint PERIMETER -> threshold ramps up to
+//     trimThreshold * (POISSON_TRIM_EDGE_MULT_X100/100) so Poisson's balloon /
+//     extrapolation past the edge of the data is removed.
+// Footprint = coarse XY occupancy grid (cell = POISSON_TRIM_CELL_FACTOR_X100/100
+// * median NN spacing), dilated by POISSON_TRIM_CLOSE_CELLS to bridge shoreline
+// gaps, then hole-filled via an exterior flood-fill so interior water bodies
+// count as interior regardless of size. A 2-pass chamfer distance transform
+// gives distance-to-perimeter; the per-vertex edge factor
+// e = clamp(1 - dist/POISSON_TRIM_RAMP_CELLS, 0, 1) maps 0 (deep interior) -> 1
+// (perimeter). A face is culled when its average vertex density is below the
+// average local threshold of its 3 vertices. trimThreshold is still the
+// interior baseline. Set to 0 to disable (use the stock SurfaceTrimmer).
+#ifndef POISSON_ADAPTIVE_TRIM
+#define POISSON_ADAPTIVE_TRIM 0
+#endif
+// Edge threshold as a multiple of the interior (passed) trimThreshold, x100.
+// 160 = edge threshold is 1.60x the interior threshold (e.g. 5.5 -> 8.8).
+#ifndef POISSON_TRIM_EDGE_MULT_X100
+#define POISSON_TRIM_EDGE_MULT_X100 160
+#endif
+// Ramp width (in grid cells) over which the threshold blends interior->edge.
+#ifndef POISSON_TRIM_RAMP_CELLS
+#define POISSON_TRIM_RAMP_CELLS 6
+#endif
+// Footprint grid cell size as a multiple of median NN spacing, x100. 300 = 3x.
+#ifndef POISSON_TRIM_CELL_FACTOR_X100
+#define POISSON_TRIM_CELL_FACTOR_X100 300
+#endif
+// Morphological dilation radius (cells) to bridge thin shoreline gaps before
+// the interior-hole flood fill. 0 disables.
+#ifndef POISSON_TRIM_CLOSE_CELLS
+#define POISSON_TRIM_CLOSE_CELLS 2
+#endif
+
 // Easier to configure this here.
 #pragma comment(linker, "/STACK:0x400000,0x400000")
 
@@ -295,8 +392,24 @@
 #include <CGAL/Spatial_sort_traits_adapter_3.h>
 #include <CGAL/spatial_sort.h>
 
+// Tier 2 Poisson is integrated in-process via the isolated PoissonReconLib
+// static library (Kazhdan PoissonRecon + SurfaceTrimmer), so NO CGAL Poisson
+// headers are pulled in — CGAL's deprecated Surface_mesher fails to instantiate
+// under MSVC.
+#include <fstream>
+#include <sstream>
+#include <iterator>
+#include <cstring>
+#include <cstdio>
+#include <filesystem>
+#include <cstdlib>
+
 #define NANOFANN_USE_OMP 1   // optional, but good hint
 #include "nanoflann.hpp"
+// In-process Kazhdan PoissonRecon + SurfaceTrimmer (replaces the external-exe
+// shell-out). Plain (template-free) interface; the templated machinery lives in
+// the isolated PoissonReconLib static library.
+#include "../../PoissonRecon/Src/PoissonReconLib.h"
 
 #if defined(_MSC_VER)
 #define DEBUG_BREAK() __debugbreak()
@@ -2680,10 +2793,10 @@ static void BuildGraphNodesAndEdges(
 			a3.initFields((uint32_t)cj3, (uint8_t)j3);
 			a3.rCap = fwd3;
 			u.residBits = (uint8_t)(
-				((rev0 > 0) << 0) |
-				((rev1 > 0) << 1) |
-				((rev2 > 0) << 2) |
-				((rev3 > 0) << 3));
+				((rev0 > 0.0f) << 0) |
+				((rev1 > 0.0f) << 1) |
+				((rev2 > 0.0f) << 2) |
+				((rev3 > 0.0f) << 3));
 			u.arcCount = 4;
 		}
 	}
@@ -3190,6 +3303,1151 @@ static __forceinline bool is_canonical_edge(const DELAUNAY::cell_handle_t c, int
 	return c->info() < n->info();
 }
 
+// Load a binary-little-endian triangle-mesh PLY (as written by PoissonRecon /
+// SurfaceTrimmer) directly into an MVS::Mesh. Unlike Mesh::LoadPLY this is robust
+// to EXTRA per-vertex properties — PoissonRecon emits a 'value' (density) float
+// that the fixed-layout Mesh::LoadPLY mis-reads (misaligning the binary stream).
+// We keep x/y/z and the triangle indices and skip everything else.
+static bool LoadPoissonMeshPLY(const String& path, Mesh& mesh)
+{
+	std::ifstream f(path.c_str(), std::ios::binary);
+	if (!f.is_open())
+		return false;
+	const auto GetLine = [&](std::string& s) -> bool {
+		if (!std::getline(f, s)) return false;
+		if (!s.empty() && s.back() == '\r') s.pop_back();
+		return true;
+	};
+	const auto TypeSize = [](const std::string& t) -> int {
+		if (t=="char"||t=="uchar"||t=="int8"||t=="uint8") return 1;
+		if (t=="short"||t=="ushort"||t=="int16"||t=="uint16") return 2;
+		if (t=="int"||t=="uint"||t=="int32"||t=="uint32"||t=="float"||t=="float32") return 4;
+		if (t=="double"||t=="float64"||t=="int64"||t=="uint64") return 8;
+		return 4;
+	};
+	std::string line;
+	if (!GetLine(line) || line.compare(0, 3, "ply") != 0)
+		return false;
+	bool binary = false, little = true;
+	size_t numVerts = 0, numFaces = 0;
+	enum { NONE, VERT, FACE } cur = NONE;
+	struct Prop { int size; int axis; }; // axis: 0=x,1=y,2=z,-1=other
+	std::vector<Prop> vprops;
+	int faceCountSize = 4, faceIdxSize = 4;
+	while (GetLine(line)) {
+		std::istringstream ss(line);
+		std::string tok; ss >> tok;
+		if (tok == "format") {
+			std::string fmt; ss >> fmt;
+			binary = (fmt.find("binary") != std::string::npos);
+			little = (fmt != "binary_big_endian");
+		} else if (tok == "element") {
+			std::string name; size_t cnt = 0; ss >> name >> cnt;
+			if (name == "vertex") { cur = VERT; numVerts = cnt; }
+			else if (name == "face") { cur = FACE; numFaces = cnt; }
+			else cur = NONE;
+		} else if (tok == "property") {
+			if (cur == VERT) {
+				std::string type, name; ss >> type >> name;
+				Prop p; p.size = TypeSize(type);
+				p.axis = (name=="x") ? 0 : (name=="y") ? 1 : (name=="z") ? 2 : -1;
+				vprops.push_back(p);
+			} else if (cur == FACE) {
+				std::string kind; ss >> kind;
+				if (kind == "list") {
+					std::string ct, it, nm; ss >> ct >> it >> nm;
+					faceCountSize = TypeSize(ct);
+					faceIdxSize = TypeSize(it);
+				}
+			}
+		} else if (tok == "end_header") {
+			break;
+		}
+	}
+	if (!binary || !little || numVerts == 0 || numFaces == 0)
+		return false;
+	int stride = 0, ox = -1, oy = -1, oz = -1;
+	for (const Prop& p : vprops) {
+		if (p.axis == 0) ox = stride; else if (p.axis == 1) oy = stride; else if (p.axis == 2) oz = stride;
+		stride += p.size;
+	}
+	if (ox < 0 || oy < 0 || oz < 0)
+		return false;
+	mesh.vertices.Resize((Mesh::VIndex)numVerts);
+	{
+		// Bulk-read the entire fixed-stride vertex block in one I/O, then extract
+		// x/y/z in parallel by direct index. Direct indexing preserves file order
+		// (face indices reference vertices positionally), unlike append/Insert.
+		std::vector<char> vblock((size_t)stride * numVerts);
+		f.read(vblock.data(), (std::streamsize)vblock.size());
+		if (!f) return false;
+		const char* __restrict src = vblock.data();
+		Mesh::Vertex* __restrict dst = mesh.vertices.GetData();
+		const int sox = ox, soy = oy, soz = oz, sstride = stride;
+#ifdef _USE_OPENMP
+		#pragma omp parallel for schedule(static)
+#endif
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)numVerts; ++i) {
+			const char* __restrict r = src + (size_t)i*sstride;
+			float x, y, z;
+			memcpy(&x, r+sox, 4); memcpy(&y, r+soy, 4); memcpy(&z, r+soz, 4);
+			dst[i] = Mesh::Vertex(x, y, z);
+		}
+	}
+	// Bulk-read the remaining (face) section in one I/O, then parse from memory.
+	// Faces are variable-stride lists so the parse stays serial, but it walks an
+	// in-RAM buffer instead of issuing a stream read per face/index.
+	{
+		std::vector<char> fblock((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		const char* __restrict fp = fblock.data();
+		const char* const fend = fp + fblock.size();
+		mesh.faces.Reserve((Mesh::FIndex)numFaces);
+		for (size_t i = 0; i < numFaces; ++i) {
+			if (fp + faceCountSize > fend) break;
+			uint32_t n = 0;
+			memcpy(&n, fp, faceCountSize); fp += faceCountSize;
+			if (n != 3) {
+				fp += (size_t)faceIdxSize * n;
+				if (fp > fend) break;
+				continue;
+			}
+			if (fp + (size_t)faceIdxSize * 3 > fend) break;
+			uint32_t idx[3] = { 0, 0, 0 };
+			memcpy(&idx[0], fp, faceIdxSize); fp += faceIdxSize;
+			memcpy(&idx[1], fp, faceIdxSize); fp += faceIdxSize;
+			memcpy(&idx[2], fp, faceIdxSize); fp += faceIdxSize;
+			mesh.faces.Insert(Mesh::Face(idx[0], idx[1], idx[2]));
+		}
+	}
+	return !mesh.faces.IsEmpty();
+} // LoadPoissonMeshPLY
+/*----------------------------------------------------------------*/
+
+// Estimate a sensible Poisson octree depth from the cloud itself. The useful
+// depth is the one whose finest voxel matches the cloud's actual point spacing:
+// PoissonRecon builds its octree over a cube of side scale*maxExtent divided into
+// 2^depth cells per axis, so the finest cell width = scale*maxExtent / 2^depth.
+// Setting that equal to the median nearest-neighbour spacing s gives
+//     depth = round( log2( scale * maxExtent / s ) ).
+// Beyond this the octree cells contain no new samples and Poisson only amplifies
+// noise (a heavier, bumpier mesh for no real detail), so the result is clamped to
+// [minDepth, maxDepth] to also bound memory. minDepth/maxDepth keep absurd inputs
+// (sparse or huge scenes) from picking a runaway depth.
+static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
+	float scaleFactor = 1.1f, int minDepth = 8, int maxDepth = 10)
+{
+	if (numPoints < 100)
+		return (minDepth + maxDepth) / 2;
+	const Point3f* __restrict pts = reinterpret_cast<const Point3f*>(ptsRaw);
+
+	// 1) axis-aligned bounding box -> largest axis extent. Serial single pass.
+	// Input is pre-filtered (all finite), so no ISFINITE check needed.
+	float minx = FLT_MAX, miny = FLT_MAX, minz = FLT_MAX;
+	float maxx = -FLT_MAX, maxy = -FLT_MAX, maxz = -FLT_MAX;
+	for (size_t i = 0; i < numPoints; ++i) {
+		const Point3f& p = pts[i];
+		if (p.x < minx) minx = p.x;  if (p.x > maxx) maxx = p.x;
+		if (p.y < miny) miny = p.y;  if (p.y > maxy) maxy = p.y;
+		if (p.z < minz) minz = p.z;  if (p.z > maxz) maxz = p.z;
+	}
+	const float ext = std::max(std::max(maxx - minx, maxy - miny), maxz - minz);
+	if (!(ext > 0.f))
+		return (minDepth + maxDepth) / 2;
+
+	// 2) median nearest-neighbour spacing on a deterministic stride-sampled subset,
+	// each queried against the FULL cloud (so the spacing is the true local one).
+	// The kd-tree build dominates; the per-query 1-NN lookups are independent.
+	using namespace nanoflann;
+	using KDTree = KDTreeSingleIndexAdaptor<
+		L2_Simple_Adaptor<float, PointCloudAdapter>, PointCloudAdapter, 3>;
+	PointCloudAdapter cloud{ pts, numPoints };
+	KDTree index(3, cloud, KDTreeSingleIndexAdaptorParams(64));
+	index.buildIndex();
+
+	const size_t kSamples = std::min<size_t>(numPoints, 50000);
+	const size_t stride = std::max<size_t>(1, numPoints / kSamples);
+	const size_t nq = (numPoints + stride - 1) / stride;
+	std::vector<float> spacing(nq, -1.f);
+	float* __restrict pSp = spacing.data();
+#ifdef _USE_OPENMP
+	#pragma omp parallel for schedule(static)
+#endif
+	for (ptrdiff_t q = 0; q < (ptrdiff_t)nq; ++q) {
+		const size_t i = (size_t)q * stride;
+		uint32_t idx[2]; float d2[2];
+		const size_t found = index.knnSearch((const float*)&pts[i], 2, idx, d2);
+		if (found >= 2 && d2[1] > 0.f)
+			pSp[q] = std::sqrt(d2[1]); // d2[0] is the query point itself
+	}
+	std::vector<float> valid;
+	valid.reserve(nq);
+	for (size_t q = 0; q < nq; ++q)
+		if (pSp[q] > 0.f) valid.push_back(pSp[q]);
+	if (valid.empty())
+		return (minDepth + maxDepth) / 2;
+	std::nth_element(valid.begin(), valid.begin() + valid.size() / 2, valid.end());
+	const float s = valid[valid.size() / 2];
+	if (!(s > 0.f))
+		return (minDepth + maxDepth) / 2;
+
+	// 3) depth whose finest voxel matches the median spacing, clamped.
+	int depth = (int)std::lround(std::log2((scaleFactor * ext) / s));
+	if (depth < minDepth) depth = minDepth;
+	if (depth > maxDepth) depth = maxDepth;
+	VERBOSE("Poisson: cloud extent %.4g, median point spacing %.4g -> auto depth %d",
+		ext, s, depth);
+	return depth;
+} // EstimatePoissonDepth
+/*----------------------------------------------------------------*/
+
+// Tier 2 Poisson surface reconstruction via Kazhdan's PoissonRecon +
+// SurfaceTrimmer (external tools, shell-out). This avoids CGAL's deprecated
+// Surface_mesher (which fails to instantiate under MSVC) and adds the density
+// TRIMMING the CGAL convenience function lacks — so on an open scene it yields
+// the trimmed, complete, competitor-style surface instead of a closed balloon.
+//
+// PoissonRecon.exe and SurfaceTrimmer.exe must sit next to the running
+// executable, or in the folder named by the OPENMVS_POISSONRECON_DIR environment
+// variable. Build them once from the bundled repo at <tree>/PoissonRecon
+// (AdaptiveSolvers.sln, MIT-licensed).
+//   depth          : octree depth (detail). <=0 => auto-select from the cloud's
+//                    own point density (EstimatePoissonDepth); ~11 for aerial.
+//   trimThreshold  : SurfaceTrimmer density threshold (>0 trims the low-confidence
+//                    extrapolated balloon; 0 disables trimming). ~7 typical.
+//   samplesPerNode : PoissonRecon smoothing (higher = smoother). default 1.5.
+//   pointWeight    : screened-Poisson interpolation weight. default 2.
+//   islandRatio    : SurfaceTrimmer --aRatio (+ --removeIslands); after trimming,
+//                    delete isolated components whose area is below this fraction
+//                    of the whole mesh (removes small floating blobs). 0 (default)
+//                    = OFF, i.e. the tool's stock behavior (native aRatio 0.001).
+bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samplesPerNode, float pointWeight, float islandRatio)
+{
+	TD_TIMER_STARTD();
+	ASSERT(!pointcloud.IsEmpty());
+	mesh.Release();
+	VERBOSE("Poisson reconstruction (OpenMVS-bmg build %d)", OPENMVS_BMG_BUILD);
+
+	// Poisson requires oriented normals; estimate them if the cloud has none.
+	if (!pointcloud.NormalStream()) {
+		VERBOSE("Poisson: cloud has no normals, estimating them...");
+		// Larger neighborhood (32 vs default 16) yields smoother, more stable
+		// PCA normals on flat surfaces, reducing Poisson waviness (e.g. bumpy road).
+		EstimatePointNormals(images, pointcloud, 32);
+		if (!pointcloud.NormalStream()) {
+			VERBOSE("error: Poisson reconstruction requires normals; estimation failed");
+			return false;
+		}
+	}
+
+	// Gather the finite oriented points for Poisson FIRST, so that
+	// EstimatePoissonDepth (when depth<=0) operates on clean data without
+	// per-point ISFINITE branches or NaN-polluted kd-tree queries.
+	const float* poissonPts;
+	const float* poissonNrm;
+	size_t poissonCount;
+	std::vector<float> pts, nrm; // only populated if filtering is needed
+	{
+		const size_t numPoints = pointcloud.NumPoints();
+		const float* __restrict pPts = pointcloud.PointStream();
+		const float* __restrict pNrm = pointcloud.NormalStream();
+
+		// Fast check: are ALL points finite? (parallel, early-exit per thread impossible
+		// with OMP reduction, but the branch-free check is cheap on 18M points ~2ms)
+		ptrdiff_t numBad = 0;
+#ifdef _USE_OPENMP
+		#pragma omp parallel for schedule(static) reduction(+:numBad)
+#endif
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)numPoints; ++i) {
+			const float* __restrict p = pPts + i*3;
+			const float* __restrict n = pNrm + i*3;
+			if (!(ISFINITE(p[0]) && ISFINITE(p[1]) && ISFINITE(p[2]) &&
+			      ISFINITE(n[0]) && ISFINITE(n[1]) && ISFINITE(n[2])))
+				++numBad;
+		}
+
+		if (numBad == 0) {
+			// All finite — pass streams directly, zero copy.
+			poissonPts = pPts;
+			poissonNrm = pNrm;
+			poissonCount = numPoints;
+		} else {
+			// Some non-finite — filter into contiguous arrays.
+			VERBOSE("Poisson: skipping %u/%u points with non-finite position/normal",
+				(unsigned)numBad, (unsigned)numPoints);
+			std::vector<uint32_t> validIdx;
+			validIdx.reserve(numPoints - numBad);
+			for (size_t i = 0; i < numPoints; ++i) {
+				const float* __restrict p = pPts + i*3;
+				const float* __restrict n = pNrm + i*3;
+				if (ISFINITE(p[0]) && ISFINITE(p[1]) && ISFINITE(p[2]) &&
+				    ISFINITE(n[0]) && ISFINITE(n[1]) && ISFINITE(n[2]))
+					validIdx.push_back((uint32_t)i);
+			}
+			const size_t numValid = validIdx.size();
+			if (numValid == 0) {
+				VERBOSE("error: no finite oriented points for Poisson reconstruction");
+				return false;
+			}
+			pts.resize(numValid * 3);
+			nrm.resize(numValid * 3);
+			float* __restrict pP = pts.data();
+			float* __restrict pN = nrm.data();
+			const uint32_t* __restrict pIdx = validIdx.data();
+#ifdef _USE_OPENMP
+			#pragma omp parallel for schedule(static)
+#endif
+			for (ptrdiff_t j = 0; j < (ptrdiff_t)numValid; ++j) {
+				const size_t i = (size_t)pIdx[j];
+				const float* __restrict p = pPts + i*3;
+				const float* __restrict n = pNrm + i*3;
+				pP[(size_t)j*3+0]=p[0]; pP[(size_t)j*3+1]=p[1]; pP[(size_t)j*3+2]=p[2];
+				pN[(size_t)j*3+0]=n[0]; pN[(size_t)j*3+1]=n[1]; pN[(size_t)j*3+2]=n[2];
+			}
+			poissonPts = pts.data();
+			poissonNrm = nrm.data();
+			poissonCount = numValid;
+		}
+	}
+
+	// auto-select the octree depth from the cloud's actual point spacing when the
+	// caller passes depth <= 0 -- let the data, not a fixed guess, set the detail.
+	// Uses the already-filtered poissonPts (all finite, no NaN in kd-tree).
+	if (depth <= 0)
+		depth = EstimatePoissonDepth(poissonPts, poissonCount);
+
+	// 1) In-process screened-Poisson reconstruction (replaces PoissonRecon.exe),
+	// with per-vertex density so the trimmer can threshold by it.
+	PoissonReconLib::Mesh pmesh;
+	{
+		PoissonReconLib::ReconParams rp;
+		rp.depth          = depth;
+		rp.samplesPerNode = samplesPerNode;
+		rp.pointWeight    = pointWeight;
+		rp.density        = true;
+		rp.verbose        = true;
+		VERBOSE("Poisson: running PoissonRecon (depth=%d)...", depth);
+		if (!PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp, pmesh) || pmesh.TriangleCount() == 0) {
+			VERBOSE("error: Poisson reconstruction failed");
+			return false;
+		}
+	}
+
+	// 2) Optional in-process density trimming (replaces SurfaceTrimmer.exe;
+	// removes the open-boundary balloon). Matches the previous tool invocation:
+	// the trim threshold is always applied; aRatio defaults to the trimmer's
+	// native 0.001 (which drives the trim-boundary component merge even without
+	// island removal), and only when islandRatio>0 do we raise aRatio AND enable
+	// removeIslands (which actually deletes the isolated small components).
+#if !POISSON_ADAPTIVE_TRIM
+	if (trimThreshold > 0.f) {
+		PoissonReconLib::TrimParams tp;
+		tp.trim          = trimThreshold;
+		tp.aRatio        = (islandRatio > 0.f) ? islandRatio : 0.001f;
+		tp.removeIslands = (islandRatio > 0.f);
+		tp.verbose       = true;
+		VERBOSE("Poisson: running SurfaceTrimmer (--trim %g%s)...", (double)trimThreshold,
+			(islandRatio > 0.f) ? String::FormatString(" --aRatio %g --removeIslands", (double)islandRatio).c_str() : "");
+		PoissonReconLib::Mesh tmesh;
+		if (PoissonReconLib::Trim(pmesh, tp, tmesh) && tmesh.TriangleCount() > 0)
+			pmesh = std::move(tmesh);
+		else
+			VERBOSE("warning: SurfaceTrimmer produced no output; using untrimmed Poisson mesh");
+	}
+#endif // !POISSON_ADAPTIVE_TRIM
+
+	// Copy the in-memory result into the MVS mesh (positions + triangles; the
+	// per-vertex density is not needed by downstream stages).
+	mesh.Release();
+	{
+		const size_t nv = pmesh.VertexCount(), nt = pmesh.TriangleCount();
+		const float* __restrict pv = pmesh.vertices.data();
+		const uint32_t* __restrict ptri = pmesh.triangles.data();
+
+		// Vertices: source is stride-4 (x,y,z,density), dest is stride-3 (x,y,z).
+		// Resize + parallel 12-byte memcpy per vertex (skips density float).
+		mesh.vertices.Resize((Mesh::VIndex)nv);
+		Mesh::Vertex* __restrict dst = mesh.vertices.GetData();
+#ifdef _USE_OPENMP
+		#pragma omp parallel for schedule(static)
+#endif
+		for (ptrdiff_t i = 0; i < (ptrdiff_t)nv; ++i)
+			memcpy(&dst[i], pv + i * 4, 3 * sizeof(float));
+
+		// Faces: source is packed uint32_t triples, same layout as Mesh::Face.
+		static_assert(sizeof(Mesh::Face) == 3 * sizeof(Mesh::VIndex), "Face layout mismatch");
+		mesh.faces.Resize((Mesh::FIndex)nt);
+		memcpy(mesh.faces.GetData(), ptri, nt * sizeof(Mesh::Face));
+	}
+
+#if POISSON_ADAPTIVE_TRIM
+	// ADAPTIVE FOOTPRINT TRIM (replaces SurfaceTrimmer; see macro comment).
+	// Runs HERE, while mesh vertex order still matches pmesh 1:1 (before the
+	// NaN-sanitize compaction below), so per-vertex density can be read
+	// directly from pmesh (stride-4: x,y,z,density).
+	if (trimThreshold > 0.f && pmesh.VertexCount() > 0 && poissonCount >= 100 &&
+	    (size_t)mesh.vertices.GetSize() == pmesh.VertexCount() && !mesh.faces.IsEmpty()) {
+		TD_TIMER_STARTD();
+		const Mesh::VIndex numV = mesh.vertices.GetSize();
+		const float* __restrict pv = pmesh.vertices.data(); // stride-4: x,y,z,density
+		const Point3f* __restrict cloud = reinterpret_cast<const Point3f*>(poissonPts);
+
+		// --- median NN spacing of the input cloud (stride-sampled) ---
+		float medianSpacing = 0.f;
+		{
+			using namespace nanoflann;
+			using KDTree = KDTreeSingleIndexAdaptor<
+				L2_Simple_Adaptor<float, PointCloudAdapter>, PointCloudAdapter, 3>;
+			PointCloudAdapter pc{ cloud, poissonCount };
+			KDTree kidx(3, pc, KDTreeSingleIndexAdaptorParams(64));
+			kidx.buildIndex();
+			const size_t kS = std::min<size_t>(poissonCount, 50000);
+			const size_t st = std::max<size_t>(1, poissonCount / kS);
+			const size_t nq = (poissonCount + st - 1) / st;
+			std::vector<float> sp; sp.reserve(nq);
+			for (size_t q = 0; q < nq; ++q) {
+				const size_t i = q * st;
+				uint32_t id2[2]; float d2[2];
+				if (kidx.knnSearch((const float*)&cloud[i], 2, id2, d2) >= 2 && d2[1] > 0.f)
+					sp.push_back(std::sqrt(d2[1]));
+			}
+			if (!sp.empty()) {
+				std::nth_element(sp.begin(), sp.begin() + sp.size() / 2, sp.end());
+				medianSpacing = sp[sp.size() / 2];
+			}
+		}
+
+		if (medianSpacing > 0.f) {
+			// --- XY footprint occupancy grid over the input cloud ---
+			float minx = FLT_MAX, miny = FLT_MAX, maxx = -FLT_MAX, maxy = -FLT_MAX;
+			for (size_t i = 0; i < poissonCount; ++i) {
+				const Point3f& p = cloud[i];
+				if (p.x < minx) minx = p.x;  if (p.x > maxx) maxx = p.x;
+				if (p.y < miny) miny = p.y;  if (p.y > maxy) maxy = p.y;
+			}
+			const float cellSz = (POISSON_TRIM_CELL_FACTOR_X100 / 100.f) * medianSpacing;
+			const float invCell = 1.f / cellSz;
+			int gw = (int)((maxx - minx) * invCell) + 3;
+			int gh = (int)((maxy - miny) * invCell) + 3;
+			gw = std::min(std::max(gw, 16), 4096);
+			gh = std::min(std::max(gh, 16), 4096);
+			const float ox = minx - cellSz; // 1-cell empty border
+			const float oy = miny - cellSz;
+			auto cellOf = [&](float x, float y, int& cx, int& cy) {
+				cx = (int)((x - ox) * invCell); cy = (int)((y - oy) * invCell);
+				if (cx < 0) cx = 0; else if (cx >= gw) cx = gw - 1;
+				if (cy < 0) cy = 0; else if (cy >= gh) cy = gh - 1;
+			};
+			const size_t nCells = (size_t)gw * gh;
+			std::vector<uint8_t> occ(nCells, 0);
+			for (size_t i = 0; i < poissonCount; ++i) {
+				int cx, cy; cellOf(cloud[i].x, cloud[i].y, cx, cy);
+				occ[(size_t)cy * gw + cx] = 1;
+			}
+			// dilate to bridge thin shoreline gaps
+			std::vector<uint8_t> occD = occ;
+			const int dr = POISSON_TRIM_CLOSE_CELLS;
+			if (dr > 0) {
+				for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
+					if (!occ[(size_t)cy * gw + cx]) continue;
+					for (int dy = -dr; dy <= dr; ++dy) { int ny = cy + dy; if (ny < 0 || ny >= gh) continue;
+						for (int dx = -dr; dx <= dr; ++dx) { int nx = cx + dx; if (nx < 0 || nx >= gw) continue;
+							occD[(size_t)ny * gw + nx] = 1; } }
+				}
+			}
+			// exterior = flood fill of empty cells from the border; footprint
+			// (interior, incl. enclosed water holes) = NOT exterior.
+			std::vector<uint8_t> ext(nCells, 0);
+			std::vector<int> stk;
+			auto pushIf = [&](int cx, int cy) {
+				const size_t k = (size_t)cy * gw + cx;
+				if (!occD[k] && !ext[k]) { ext[k] = 1; stk.push_back((int)k); }
+			};
+			for (int cx = 0; cx < gw; ++cx) { pushIf(cx, 0); pushIf(cx, gh - 1); }
+			for (int cy = 0; cy < gh; ++cy) { pushIf(0, cy); pushIf(gw - 1, cy); }
+			while (!stk.empty()) {
+				const int k = stk.back(); stk.pop_back();
+				const int cx = k % gw, cy = k / gw;
+				if (cx > 0) pushIf(cx - 1, cy);  if (cx < gw - 1) pushIf(cx + 1, cy);
+				if (cy > 0) pushIf(cx, cy - 1);  if (cy < gh - 1) pushIf(cx, cy + 1);
+			}
+			// 2-pass chamfer distance-to-perimeter over footprint (exterior = 0).
+			constexpr float BIG = 1e9f, d1 = 1.f, d2c = 1.41421356f;
+			std::vector<float> dist(nCells, BIG);
+			for (size_t k = 0; k < nCells; ++k) if (ext[k]) dist[k] = 0.f;
+			for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
+				const size_t k = (size_t)cy * gw + cx; float m = dist[k];
+				if (cx > 0)                 m = std::min(m, dist[k - 1] + d1);
+				if (cy > 0)                 m = std::min(m, dist[k - gw] + d1);
+				if (cx > 0 && cy > 0)       m = std::min(m, dist[k - gw - 1] + d2c);
+				if (cx < gw - 1 && cy > 0)  m = std::min(m, dist[k - gw + 1] + d2c);
+				dist[k] = m;
+			}
+			for (int cy = gh - 1; cy >= 0; --cy) for (int cx = gw - 1; cx >= 0; --cx) {
+				const size_t k = (size_t)cy * gw + cx; float m = dist[k];
+				if (cx < gw - 1)                 m = std::min(m, dist[k + 1] + d1);
+				if (cy < gh - 1)                 m = std::min(m, dist[k + gw] + d1);
+				if (cx < gw - 1 && cy < gh - 1)  m = std::min(m, dist[k + gw + 1] + d2c);
+				if (cx > 0 && cy < gh - 1)       m = std::min(m, dist[k + gw - 1] + d2c);
+				dist[k] = m;
+			}
+
+			const float ramp = (float)POISSON_TRIM_RAMP_CELLS;
+			const float trimInterior = trimThreshold;
+			const float trimEdge = trimThreshold * (POISSON_TRIM_EDGE_MULT_X100 / 100.f);
+
+			// per-vertex local threshold (e=0 deep interior -> e=1 at perimeter)
+			const Mesh::Vertex* __restrict pVtx = mesh.vertices.GetData();
+			std::vector<float> vTrim(numV);
+#ifdef _USE_OPENMP
+			#pragma omp parallel for schedule(static)
+#endif
+			for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v) {
+				int cx, cy; cellOf(pVtx[v].x, pVtx[v].y, cx, cy);
+				const float dcell = dist[(size_t)cy * gw + cx];
+				float e = 1.f - dcell / ramp; if (e < 0.f) e = 0.f; else if (e > 1.f) e = 1.f;
+				vTrim[v] = trimInterior + e * (trimEdge - trimInterior);
+			}
+
+			// cull faces: keep iff avg density >= avg local threshold
+			const Mesh::FIndex numF = mesh.faces.GetSize();
+			std::vector<uint8_t> keepV(numV, 0);
+			Mesh::FaceArr newFaces; newFaces.Reserve(numF);
+			size_t culled = 0;
+			FOREACH(f, mesh.faces) {
+				const Mesh::Face& face = mesh.faces[f];
+				const float dAvg = (pv[(size_t)face[0] * 4 + 3] + pv[(size_t)face[1] * 4 + 3] +
+				                    pv[(size_t)face[2] * 4 + 3]) * (1.f / 3.f);
+				const float tAvg = (vTrim[face[0]] + vTrim[face[1]] + vTrim[face[2]]) * (1.f / 3.f);
+				if (dAvg < tAvg) { ++culled; continue; }
+				keepV[face[0]] = keepV[face[1]] = keepV[face[2]] = 1;
+				newFaces.Insert(face);
+			}
+			if (culled > 0) {
+				std::vector<Mesh::VIndex> remap(numV);
+				Mesh::VIndex vW = 0;
+				for (Mesh::VIndex v = 0; v < numV; ++v) remap[v] = keepV[v] ? vW++ : NO_ID;
+				Mesh::VertexArr nvarr; nvarr.Resize(vW);
+				Mesh::Vertex* __restrict pDst = nvarr.GetData();
+				const Mesh::Vertex* __restrict pSrc = mesh.vertices.GetData();
+				for (Mesh::VIndex v = 0; v < numV; ++v) if (keepV[v]) pDst[remap[v]] = pSrc[v];
+				const Mesh::FIndex nfk = newFaces.GetSize();
+				Mesh::Face* __restrict pFK = newFaces.GetData();
+#ifdef _USE_OPENMP
+				#pragma omp parallel for schedule(static)
+#endif
+				for (ptrdiff_t f = 0; f < (ptrdiff_t)nfk; ++f) {
+					pFK[f][0] = remap[pFK[f][0]]; pFK[f][1] = remap[pFK[f][1]]; pFK[f][2] = remap[pFK[f][2]];
+				}
+				mesh.vertices.Swap(nvarr);
+				mesh.faces.Swap(newFaces);
+			}
+			VERBOSE("Poisson: adaptive footprint trim removed %u faces (interior=%.2f edge=%.2f, ramp=%d, grid %dx%d cell=%.4g) [%s]",
+				(unsigned)culled, trimInterior, trimEdge, POISSON_TRIM_RAMP_CELLS, gw, gh, cellSz, TD_TIMER_GET_FMT().c_str());
+		}
+	}
+#endif // POISSON_ADAPTIVE_TRIM
+
+	// Sanitize the reconstructed mesh: PoissonRecon/SurfaceTrimmer can still
+	// emit non-finite (NaN/Inf) vertices for degenerate octree nodes. Drop
+	// them and any incident face, then compact the vertex indices, so that
+	// downstream stages (e.g. RefineMesh) never consume NaN geometry.
+	{
+		const Mesh::VIndex numV = mesh.vertices.GetSize();
+		uint8_t* __restrict pKeep = (uint8_t*)_aligned_malloc(numV, 64);
+		ptrdiff_t numBad = 0;
+		const Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
+#ifdef _USE_OPENMP
+		#pragma omp parallel for schedule(static) reduction(+:numBad)
+#endif
+		for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v) {
+			const Mesh::Vertex& X = pV[v];
+			const bool finite = ISFINITE(X.x) && ISFINITE(X.y) && ISFINITE(X.z);
+			pKeep[v] = finite ? 1 : 0;
+			if (!finite) ++numBad;
+		}
+		if (numBad > 0) {
+			// Build vertex remap via prefix-sum of pKeep (serial scan, ~numV iterations).
+			std::vector<Mesh::VIndex> remap(numV);
+			Mesh::VIndex writePos = 0;
+			for (Mesh::VIndex v = 0; v < numV; ++v) {
+				if (pKeep[v]) { remap[v] = writePos++; } else { remap[v] = NO_ID; }
+			}
+			// Scatter surviving vertices (parallel).
+			Mesh::VertexArr newVerts;
+			newVerts.Resize(writePos);
+			Mesh::Vertex* __restrict pDst = newVerts.GetData();
+			const Mesh::Vertex* __restrict pSrc = mesh.vertices.GetData();
+#ifdef _USE_OPENMP
+			#pragma omp parallel for schedule(static)
+#endif
+			for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v)
+				if (pKeep[v]) pDst[remap[v]] = pSrc[v];
+			// Compact faces: count survivors, Resize, then parallel scatter with remap.
+			const Mesh::FIndex numF = mesh.faces.GetSize();
+			uint8_t* __restrict fKeep = (uint8_t*)_aligned_malloc(numF, 64);
+			const Mesh::Face* __restrict pFaces = mesh.faces.GetData();
+			ptrdiff_t numFBad = 0;
+#ifdef _USE_OPENMP
+			#pragma omp parallel for schedule(static) reduction(+:numFBad)
+#endif
+			for (ptrdiff_t f = 0; f < (ptrdiff_t)numF; ++f) {
+				const Mesh::Face& face = pFaces[f];
+				const bool keep = pKeep[face[0]] && pKeep[face[1]] && pKeep[face[2]];
+				fKeep[f] = keep ? 1 : 0;
+				if (!keep) ++numFBad;
+			}
+			Mesh::FaceArr newFaces;
+			newFaces.Resize((Mesh::FIndex)(numF - numFBad));
+			Mesh::Face* __restrict pFDst = newFaces.GetData();
+			Mesh::FIndex fWrite = 0;
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				if (fKeep[f]) {
+					const Mesh::Face& face = pFaces[f];
+					pFDst[fWrite++] = Mesh::Face(remap[face[0]], remap[face[1]], remap[face[2]]);
+				}
+			}
+			_aligned_free(fKeep);
+			mesh.vertices.Swap(newVerts);
+			mesh.faces.Swap(newFaces);
+			VERBOSE("Poisson: removed %u non-finite vertices (and incident faces)", (unsigned)numBad);
+		}
+		_aligned_free(pKeep);
+	}
+
+#if POISSON_DISTANCE_CULL
+	// Distance-to-cloud cull: delete Poisson faces whose vertices ALL sit
+	// farther than (POISSON_CULL_FACTOR_X100/100) * medianSpacing from the
+	// nearest actual input point. Orthogonal to SurfaceTrimmer's density trim;
+	// removes invented membranes / skirts / balloons that float away from the
+	// real samples. See the macro comment near the top of this file.
+	if (!mesh.faces.IsEmpty() && !mesh.vertices.IsEmpty() && pointcloud.NumPoints() >= 100) {
+		TD_TIMER_STARTD();
+		const size_t numCloud = pointcloud.NumPoints();
+		const Point3f* __restrict cloudPts = reinterpret_cast<const Point3f*>(pointcloud.PointStream());
+
+		using namespace nanoflann;
+		using KDTree = KDTreeSingleIndexAdaptor<
+			L2_Simple_Adaptor<float, PointCloudAdapter>, PointCloudAdapter, 3>;
+		PointCloudAdapter cloud{ cloudPts, numCloud };
+		KDTree index(3, cloud, KDTreeSingleIndexAdaptorParams(64));
+		index.buildIndex();
+
+		// median nearest-neighbour spacing over a deterministic stride-sampled
+		// subset of the cloud (same statistic EstimatePoissonDepth uses).
+		const size_t kSamples = std::min<size_t>(numCloud, 50000);
+		const size_t stride = std::max<size_t>(1, numCloud / kSamples);
+		const size_t nq = (numCloud + stride - 1) / stride;
+		std::vector<float> spc(nq, -1.f);
+		float* __restrict pSp = spc.data();
+#ifdef _USE_OPENMP
+		#pragma omp parallel for schedule(static)
+#endif
+		for (ptrdiff_t q = 0; q < (ptrdiff_t)nq; ++q) {
+			const size_t i = (size_t)q * stride;
+			uint32_t idx[2]; float d2[2];
+			const size_t found = index.knnSearch((const float*)&cloudPts[i], 2, idx, d2);
+			if (found >= 2 && d2[1] > 0.f)
+				pSp[q] = std::sqrt(d2[1]); // d2[0] is the query point itself
+		}
+		std::vector<float> validSp;
+		validSp.reserve(nq);
+		for (size_t q = 0; q < nq; ++q)
+			if (pSp[q] > 0.f) validSp.push_back(pSp[q]);
+
+		if (!validSp.empty()) {
+			std::nth_element(validSp.begin(), validSp.begin() + validSp.size() / 2, validSp.end());
+			const float medianSpacing = validSp[validSp.size() / 2];
+			const float factor = float(POISSON_CULL_FACTOR_X100) / 100.0f;
+			const float thr = factor * medianSpacing;
+			const float thrSq = thr * thr;
+
+			// Per-vertex: nearest-input-point distance > threshold?
+			const Mesh::VIndex numV = mesh.vertices.GetSize();
+			std::vector<uint8_t> farV(numV);
+			const Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
+			uint8_t* __restrict pFar = farV.data();
+#ifdef _USE_OPENMP
+			#pragma omp parallel for schedule(static)
+#endif
+			for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v) {
+				const Mesh::Vertex& X = pV[v];
+				const float qp[3] = { X.x, X.y, X.z };
+				uint32_t nIdx; float nD2;
+				const size_t found = index.knnSearch(qp, 1, &nIdx, &nD2);
+				pFar[v] = (found >= 1 && nD2 > thrSq) ? 1 : 0;
+			}
+
+			// Cull faces with ALL THREE vertices far; mark surviving vertices.
+			std::vector<uint8_t> keepV(numV, 0);
+			Mesh::FaceArr newFaces;
+			newFaces.Reserve(mesh.faces.GetSize());
+			size_t culled = 0;
+			FOREACH(f, mesh.faces) {
+				const Mesh::Face& face = mesh.faces[f];
+				if (pFar[face[0]] && pFar[face[1]] && pFar[face[2]]) {
+					++culled;
+					continue;
+				}
+				keepV[face[0]] = keepV[face[1]] = keepV[face[2]] = 1;
+				newFaces.Insert(face);
+			}
+
+			if (culled > 0) {
+				// Compact vertices: prefix-sum remap + parallel scatter.
+				std::vector<Mesh::VIndex> remap(numV);
+				Mesh::VIndex vWrite = 0;
+				for (Mesh::VIndex v = 0; v < numV; ++v) {
+					if (keepV[v]) { remap[v] = vWrite++; } else { remap[v] = NO_ID; }
+				}
+				Mesh::VertexArr newVerts;
+				newVerts.Resize(vWrite);
+				Mesh::Vertex* __restrict pVDst = newVerts.GetData();
+				const Mesh::Vertex* __restrict pVSrc = mesh.vertices.GetData();
+#ifdef _USE_OPENMP
+				#pragma omp parallel for schedule(static)
+#endif
+				for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v)
+					if (keepV[v]) pVDst[remap[v]] = pVSrc[v];
+				// Remap face indices (parallel — pure per-element transform).
+				const Mesh::FIndex nfk = newFaces.GetSize();
+				Mesh::Face* __restrict pFK = newFaces.GetData();
+#ifdef _USE_OPENMP
+				#pragma omp parallel for schedule(static)
+#endif
+				for (ptrdiff_t f = 0; f < (ptrdiff_t)nfk; ++f) {
+					Mesh::Face& face = pFK[f];
+					face[0] = remap[face[0]];
+					face[1] = remap[face[1]];
+					face[2] = remap[face[2]];
+				}
+				const size_t keptFaces = newFaces.GetSize();
+				mesh.vertices.Swap(newVerts);
+				mesh.faces.Swap(newFaces);
+				VERBOSE("Poisson: distance cull removed %u/%u faces (thr=%.4g = %.2fx median spacing %.4g) [%s]",
+					(unsigned)culled, (unsigned)(culled + keptFaces),
+					thr, factor, medianSpacing, TD_TIMER_GET_FMT().c_str());
+			} else {
+				VERBOSE("Poisson: distance cull removed no faces (thr=%.4g = %.2fx median spacing %.4g)",
+					thr, factor, medianSpacing);
+			}
+		}
+	}
+#endif
+
+#if 0 // SKIRT CULL DISABLED — eroded boundary unacceptably across multiple approaches
+	// (face-normal angle, escalating threshold, Z-descent). Left as dead code for
+	// reference; the boundary smooth + connected-component cleanup handle the visual
+	// quality without removing real surface geometry.
+		if (mesh.faces.GetSize() > 0) {
+			const Mesh::VIndex numV = mesh.vertices.GetSize();
+			const Mesh::FIndex numF = mesh.faces.GetSize();
+			const Mesh::Face* __restrict pF = mesh.faces.GetData();
+			const Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
+
+			// Find boundary vertices (same logic as the smooth below).
+			struct EdgeHash {
+				size_t operator()(const std::pair<Mesh::VIndex,Mesh::VIndex>& e) const {
+					return std::hash<uint64_t>()(((uint64_t)e.first << 32) | e.second);
+				}
+			};
+			std::unordered_map<std::pair<Mesh::VIndex,Mesh::VIndex>, uint8_t, EdgeHash> edgeCnt;
+			edgeCnt.reserve(numF * 3);
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				const Mesh::Face& face = pF[f];
+				for (int e = 0; e < 3; ++e) {
+					Mesh::VIndex a = face[e], b = face[(e+1)%3];
+					if (a > b) std::swap(a, b);
+					++edgeCnt[{a, b}];
+				}
+			}
+			std::vector<uint8_t> isBnd(numV, 0);
+			for (const auto& kv : edgeCnt) {
+				if (kv.second == 1) {
+					isBnd[kv.first.first] = 1;
+					isBnd[kv.first.second] = 1;
+				}
+			}
+
+			// Cull boundary faces that form the Poisson "skirt" (curtain geometry
+			// hanging below the trim edge). Uses Z-DESCENT criterion: a boundary
+			// face is skirt if its centroid Z is BELOW the average centroid Z of
+			// its adjacent non-boundary faces. This directly detects "hanging
+			// below the surface" regardless of face angle, without eating real
+			// sloped terrain (whose boundary faces sit at the same Z level as
+			// neighbors). Iterates: removing skirt exposes a new boundary which
+			// may also descend, flood-deleting the entire drape.
+			constexpr int kMaxSkirtPasses = 30;
+			size_t totalSkirtCulled = 0;
+			for (int pass = 0; pass < kMaxSkirtPasses; ++pass) {
+				const Mesh::VIndex numVCur = mesh.vertices.GetSize();
+				const Mesh::FIndex numFCur = mesh.faces.GetSize();
+				const Mesh::Face* __restrict pFCur = mesh.faces.GetData();
+				const Mesh::Vertex* __restrict pVCur = mesh.vertices.GetData();
+
+				// Build edge counts and face adjacency
+				std::unordered_map<std::pair<Mesh::VIndex,Mesh::VIndex>, uint8_t, EdgeHash> edgeCntCur;
+				edgeCntCur.reserve(numFCur * 3);
+				// Also build edge->face map for face adjacency
+				std::unordered_map<std::pair<Mesh::VIndex,Mesh::VIndex>, std::pair<Mesh::FIndex,Mesh::FIndex>, EdgeHash> edgeFaces;
+				edgeFaces.reserve(numFCur * 3);
+				for (Mesh::FIndex f = 0; f < numFCur; ++f) {
+					const Mesh::Face& face = pFCur[f];
+					for (int e = 0; e < 3; ++e) {
+						Mesh::VIndex a = face[e], b = face[(e+1)%3];
+						if (a > b) std::swap(a, b);
+						++edgeCntCur[{a, b}];
+						auto it = edgeFaces.find({a, b});
+						if (it == edgeFaces.end())
+							edgeFaces[{a, b}] = {f, (Mesh::FIndex)~0u};
+						else
+							it->second.second = f;
+					}
+				}
+				// Identify boundary vertices
+				std::vector<uint8_t> isBndCur(numVCur, 0);
+				for (const auto& kv : edgeCntCur) {
+					if (kv.second == 1) {
+						isBndCur[kv.first.first] = 1;
+						isBndCur[kv.first.second] = 1;
+					}
+				}
+				// Identify boundary faces (touch at least one boundary vertex)
+				std::vector<uint8_t> isBndFace(numFCur, 0);
+				for (Mesh::FIndex f = 0; f < numFCur; ++f) {
+					const Mesh::Face& face = pFCur[f];
+					if (isBndCur[face[0]] || isBndCur[face[1]] || isBndCur[face[2]])
+						isBndFace[f] = 1;
+				}
+				// Compute face centroids Z
+				std::vector<float> faceCentZ(numFCur);
+				for (Mesh::FIndex f = 0; f < numFCur; ++f) {
+					const Mesh::Face& face = pFCur[f];
+					faceCentZ[f] = (pVCur[face[0]].z + pVCur[face[1]].z + pVCur[face[2]].z) * (1.f/3.f);
+				}
+				// For each boundary face, compare its centroid Z to the average
+				// centroid Z of adjacent NON-boundary faces. If below → skirt.
+				Mesh::FaceArr newFacesCur;
+				newFacesCur.Reserve(numFCur);
+				size_t passculled = 0;
+				for (Mesh::FIndex f = 0; f < numFCur; ++f) {
+					const Mesh::Face& face = pFCur[f];
+					if (!isBndFace[f]) {
+						newFacesCur.Insert(face);
+						continue;
+					}
+					// Find adjacent non-boundary faces via shared edges
+					float sumNbrZ = 0.f;
+					int nbrCount = 0;
+					for (int e = 0; e < 3; ++e) {
+						Mesh::VIndex a = face[e], b = face[(e+1)%3];
+						if (a > b) std::swap(a, b);
+						auto it = edgeFaces.find({a, b});
+						if (it == edgeFaces.end()) continue;
+						Mesh::FIndex nb = (it->second.first == f) ? it->second.second : it->second.first;
+						if (nb == (Mesh::FIndex)~0u) continue;
+						if (!isBndFace[nb]) {
+							sumNbrZ += faceCentZ[nb];
+							++nbrCount;
+						}
+					}
+					if (nbrCount > 0) {
+						const float avgNbrZ = sumNbrZ / (float)nbrCount;
+						// Face is skirt if its centroid is below neighbor average
+						// (any amount — even tiny descent = start of fold-over)
+						if (faceCentZ[f] < avgNbrZ - 1e-6f) {
+							++passculled;
+							continue;
+						}
+					}
+					newFacesCur.Insert(face);
+				}
+				if (passculled == 0) break; // converged
+				totalSkirtCulled += passculled;
+				mesh.faces.Swap(newFacesCur);
+			}
+			if (totalSkirtCulled > 0) {
+				// Final vertex compaction
+				const Mesh::VIndex numVFinal = mesh.vertices.GetSize();
+				const Mesh::FIndex numFFinal = mesh.faces.GetSize();
+				std::vector<uint8_t> keepVF(numVFinal, 0);
+				const Mesh::Face* __restrict pFF = mesh.faces.GetData();
+				for (Mesh::FIndex f = 0; f < numFFinal; ++f) {
+					keepVF[pFF[f][0]] = keepVF[pFF[f][1]] = keepVF[pFF[f][2]] = 1;
+				}
+				std::vector<Mesh::VIndex> remapF(numVFinal);
+				Mesh::VIndex vWriteF = 0;
+				for (Mesh::VIndex v = 0; v < numVFinal; ++v)
+					remapF[v] = keepVF[v] ? vWriteF++ : NO_ID;
+				if (vWriteF < numVFinal) {
+					Mesh::VertexArr newVertsF;
+					newVertsF.Resize(vWriteF);
+					Mesh::Vertex* __restrict pVDstF = newVertsF.GetData();
+					const Mesh::Vertex* __restrict pVSrcF = mesh.vertices.GetData();
+					for (Mesh::VIndex v = 0; v < numVFinal; ++v)
+						if (keepVF[v]) pVDstF[remapF[v]] = pVSrcF[v];
+					Mesh::Face* __restrict pFMF = mesh.faces.GetData();
+					for (Mesh::FIndex f = 0; f < numFFinal; ++f) {
+						pFMF[f][0] = remapF[pFMF[f][0]];
+						pFMF[f][1] = remapF[pFMF[f][1]];
+						pFMF[f][2] = remapF[pFMF[f][2]];
+					}
+					mesh.vertices.Swap(newVertsF);
+				}
+				VERBOSE("Poisson: skirt cull removed %u boundary faces (Z-descent)", (unsigned)totalSkirtCulled);
+			}
+		}
+	}
+#endif // SKIRT CULL DISABLED
+
+	// Connected-component cleanup: remove small isolated face patches ("blobs")
+	// that survive the skirt cull. These are orphaned groups of faces disconnected
+	// from the main surface. Keep only components larger than 0.5% of total faces.
+	{
+		if (mesh.faces.GetSize() > 100) {
+			const Mesh::FIndex numF = mesh.faces.GetSize();
+			const Mesh::VIndex numV = mesh.vertices.GetSize();
+			const Mesh::Face* __restrict pF = mesh.faces.GetData();
+
+			// Build face adjacency via shared edges
+			struct EdgeHash {
+				size_t operator()(const std::pair<Mesh::VIndex,Mesh::VIndex>& e) const {
+					return std::hash<uint64_t>()(((uint64_t)e.first << 32) | e.second);
+				}
+			};
+			std::unordered_map<std::pair<Mesh::VIndex,Mesh::VIndex>, Mesh::FIndex, EdgeHash> edgeToFace;
+			edgeToFace.reserve(numF * 3);
+			std::vector<std::vector<Mesh::FIndex>> faceAdj(numF);
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				const Mesh::Face& face = pF[f];
+				for (int e = 0; e < 3; ++e) {
+					Mesh::VIndex a = face[e], b = face[(e+1)%3];
+					if (a > b) std::swap(a, b);
+					auto it = edgeToFace.find({a, b});
+					if (it != edgeToFace.end()) {
+						faceAdj[f].push_back(it->second);
+						faceAdj[it->second].push_back(f);
+					} else {
+						edgeToFace[{a, b}] = f;
+					}
+				}
+			}
+
+			// BFS to find connected components
+			std::vector<Mesh::FIndex> compId(numF, (Mesh::FIndex)~0u);
+			std::vector<Mesh::FIndex> compSize;
+			std::vector<Mesh::FIndex> queue;
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				if (compId[f] != (Mesh::FIndex)~0u) continue;
+				const Mesh::FIndex cid = (Mesh::FIndex)compSize.size();
+				Mesh::FIndex cnt = 0;
+				queue.clear();
+				queue.push_back(f);
+				compId[f] = cid;
+				while (!queue.empty()) {
+					const Mesh::FIndex cur = queue.back(); queue.pop_back();
+					++cnt;
+					for (Mesh::FIndex nb : faceAdj[cur]) {
+						if (compId[nb] == (Mesh::FIndex)~0u) {
+							compId[nb] = cid;
+							queue.push_back(nb);
+						}
+					}
+				}
+				compSize.push_back(cnt);
+			}
+
+			// Find the largest component; remove anything < 0.5% of total
+			const Mesh::FIndex minCompSize = std::max<Mesh::FIndex>(numF / 200, 10);
+			size_t blobsRemoved = 0;
+			Mesh::FaceArr newFaces;
+			newFaces.Reserve(numF);
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				if (compSize[compId[f]] < minCompSize) {
+					++blobsRemoved;
+					continue;
+				}
+				newFaces.Insert(pF[f]);
+			}
+			if (blobsRemoved > 0) {
+				mesh.faces.Swap(newFaces);
+				// Compact vertices
+				const Mesh::FIndex numFK = mesh.faces.GetSize();
+				std::vector<uint8_t> keepV(numV, 0);
+				const Mesh::Face* __restrict pFK = mesh.faces.GetData();
+				for (Mesh::FIndex f = 0; f < numFK; ++f) {
+					keepV[pFK[f][0]] = keepV[pFK[f][1]] = keepV[pFK[f][2]] = 1;
+				}
+				std::vector<Mesh::VIndex> remap(numV);
+				Mesh::VIndex vW = 0;
+				for (Mesh::VIndex v = 0; v < numV; ++v)
+					remap[v] = keepV[v] ? vW++ : NO_ID;
+				if (vW < numV) {
+					Mesh::VertexArr nv; nv.Resize(vW);
+					Mesh::Vertex* __restrict pDst = nv.GetData();
+					const Mesh::Vertex* __restrict pSrc = mesh.vertices.GetData();
+					for (Mesh::VIndex v = 0; v < numV; ++v)
+						if (keepV[v]) pDst[remap[v]] = pSrc[v];
+					Mesh::Face* __restrict pFM = mesh.faces.GetData();
+					for (Mesh::FIndex f = 0; f < numFK; ++f) {
+						pFM[f][0] = remap[pFM[f][0]];
+						pFM[f][1] = remap[pFM[f][1]];
+						pFM[f][2] = remap[pFM[f][2]];
+					}
+					mesh.vertices.Swap(nv);
+				}
+				VERBOSE("Poisson: removed %u faces in %u small components (threshold %u faces)",
+					(unsigned)blobsRemoved, (unsigned)compSize.size(), (unsigned)minCompSize);
+			}
+		}
+	}
+
+	// Boundary-edge Laplacian smooth: the SurfaceTrimmer cuts along octree cells,
+	// leaving a staircase boundary. Iteratively relax boundary vertices AND their
+	// 1-ring interior neighbors toward the average of their neighbors. Boundary
+	// vertices get lambda=0.7 (strong); 1-ring interior band gets lambda=0.3
+	// (gentle transition). This smooths both the boundary polyline AND the adjacent
+	// surface so the staircase disappears visually, not just geometrically.
+	{
+		const int kBoundarySmooth = POISSON_BOUNDARY_SMOOTH; // iterations; 0 = disable
+		if (kBoundarySmooth > 0 && mesh.faces.GetSize() > 0) {
+			const Mesh::VIndex numV = mesh.vertices.GetSize();
+			const Mesh::FIndex numF = mesh.faces.GetSize();
+			// Count edge uses: boundary edge = used by exactly 1 face.
+			struct EdgeHash {
+				size_t operator()(const std::pair<Mesh::VIndex,Mesh::VIndex>& e) const {
+					return std::hash<uint64_t>()(((uint64_t)e.first << 32) | e.second);
+				}
+			};
+			std::unordered_map<std::pair<Mesh::VIndex,Mesh::VIndex>, uint8_t, EdgeHash> edgeCount;
+			edgeCount.reserve(numF * 3);
+			const Mesh::Face* __restrict pF = mesh.faces.GetData();
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				const Mesh::Face& face = pF[f];
+				for (int e = 0; e < 3; ++e) {
+					Mesh::VIndex a = face[e], b = face[(e+1)%3];
+					if (a > b) std::swap(a, b);
+					++edgeCount[{a, b}];
+				}
+			}
+			// Build full mesh adjacency (all edges, not just boundary).
+			std::vector<std::vector<Mesh::VIndex>> allNbrs(numV);
+			for (const auto& kv : edgeCount) {
+				allNbrs[kv.first.first].push_back(kv.first.second);
+				allNbrs[kv.first.second].push_back(kv.first.first);
+			}
+			// Classify vertices: 0=interior(untouched), 1=boundary, 2=band(1-ring of boundary), 3=band2(2-ring).
+			std::vector<uint8_t> vClass(numV, 0);
+			for (const auto& kv : edgeCount) {
+				if (kv.second == 1) { // boundary edge
+					vClass[kv.first.first] = 1;
+					vClass[kv.first.second] = 1;
+				}
+			}
+			// Mark 1-ring interior band (connected to a boundary vertex but not itself boundary).
+			for (Mesh::VIndex v = 0; v < numV; ++v) {
+				if (vClass[v] != 1) continue;
+				for (Mesh::VIndex n : allNbrs[v]) {
+					if (vClass[n] == 0) vClass[n] = 2;
+				}
+			}
+			// Mark 2-ring band (connected to a 1-ring band vertex but not already classified).
+			for (Mesh::VIndex v = 0; v < numV; ++v) {
+				if (vClass[v] != 2) continue;
+				for (Mesh::VIndex n : allNbrs[v]) {
+					if (vClass[n] == 0) vClass[n] = 3;
+				}
+			}
+			// Iterative TANGENTIAL Laplacian relaxation with per-class lambda.
+			// The tangent constraint projects out the vertex-normal component of
+			// the displacement so vertices slide along the surface (rounding the
+			// boundary from above) but never droop off it into Poisson's "skirt".
+			const float lambdaBnd = 0.8f;   // boundary vertices: strong
+			const float lambdaBand = 0.4f;  // 1-ring band: moderate
+			const float lambdaBand2 = 0.15f; // 2-ring band: gentle feather
+
+			// Precompute per-vertex normals (area-weighted face normals) for
+			// all affected vertices. Only needs to be approximate — it just
+			// prevents the smooth from pulling in the off-surface direction.
+			std::vector<Point3f> vNormals(numV, Point3f(0.f, 0.f, 0.f));
+			for (Mesh::FIndex f = 0; f < numF; ++f) {
+				const Mesh::Face& face = pF[f];
+				// Only bother with faces touching affected vertices
+				if (!vClass[face[0]] && !vClass[face[1]] && !vClass[face[2]]) continue;
+				const Mesh::Vertex& a = mesh.vertices[face[0]];
+				const Mesh::Vertex& b = mesh.vertices[face[1]];
+				const Mesh::Vertex& c = mesh.vertices[face[2]];
+				// Cross product (area-weighted normal)
+				const float e1x = b.x-a.x, e1y = b.y-a.y, e1z = b.z-a.z;
+				const float e2x = c.x-a.x, e2y = c.y-a.y, e2z = c.z-a.z;
+				const float nx = e1y*e2z - e1z*e2y;
+				const float ny = e1z*e2x - e1x*e2z;
+				const float nz = e1x*e2y - e1y*e2x;
+				for (int v = 0; v < 3; ++v) {
+					if (vClass[face[v]]) {
+						vNormals[face[v]].x += nx;
+						vNormals[face[v]].y += ny;
+						vNormals[face[v]].z += nz;
+					}
+				}
+			}
+			// Normalize
+			for (Mesh::VIndex v = 0; v < numV; ++v) {
+				if (!vClass[v]) continue;
+				Point3f& n = vNormals[v];
+				const float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+				if (len > 1e-8f) { n.x /= len; n.y /= len; n.z /= len; }
+				else { n.x = 0.f; n.y = 0.f; n.z = 1.f; } // fallback: up
+			}
+
+			Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
+			std::vector<Mesh::Vertex> tmp(numV);
+			for (int iter = 0; iter < kBoundarySmooth; ++iter) {
+				for (Mesh::VIndex v = 0; v < numV; ++v) {
+					const uint8_t cls = vClass[v];
+					if (cls == 0) { tmp[v] = pV[v]; continue; }
+					const auto& nbrs = allNbrs[v];
+					if (nbrs.empty()) { tmp[v] = pV[v]; continue; }
+					float sx = 0.f, sy = 0.f, sz = 0.f;
+					for (Mesh::VIndex n : nbrs) {
+						sx += pV[n].x; sy += pV[n].y; sz += pV[n].z;
+					}
+					const float inv = 1.f / (float)nbrs.size();
+					const float lam = (cls == 1) ? lambdaBnd : (cls == 2) ? lambdaBand : lambdaBand2;
+					// Compute full displacement
+					float dx = (sx * inv - pV[v].x) * lam;
+					float dy = (sy * inv - pV[v].y) * lam;
+					float dz = (sz * inv - pV[v].z) * lam;
+					// Project out the normal component (tangential-only)
+					const Point3f& nrm = vNormals[v];
+					const float dot = dx*nrm.x + dy*nrm.y + dz*nrm.z;
+					dx -= dot * nrm.x;
+					dy -= dot * nrm.y;
+					dz -= dot * nrm.z;
+					tmp[v].x = pV[v].x + dx;
+					tmp[v].y = pV[v].y + dy;
+					tmp[v].z = pV[v].z + dz;
+				}
+				// Write back only affected vertices.
+				for (Mesh::VIndex v = 0; v < numV; ++v)
+					if (vClass[v]) pV[v] = tmp[v];
+			}
+			unsigned nBnd = 0, nBand = 0, nBand2 = 0;
+			for (Mesh::VIndex v = 0; v < numV; ++v) {
+				if (vClass[v] == 1) ++nBnd;
+				else if (vClass[v] == 2) ++nBand;
+				else if (vClass[v] == 3) ++nBand2;
+			}
+			VERBOSE("Poisson: boundary smooth (%d iter, lambda=%.2f/%.2f/%.2f, %u boundary + %u band1 + %u band2 vertices)",
+				kBoundarySmooth, lambdaBnd, lambdaBand, lambdaBand2, nBnd, nBand, nBand2);
+		}
+	}
+
+	DEBUG_EXTRA("Poisson (Tier 2: PoissonRecon%s) reconstructed: %u vertices, %u faces (%s)",
+		trimThreshold > 0.f ? "+SurfaceTrimmer" : "", mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+	return !mesh.faces.IsEmpty();
+} // ReconstructMeshPoisson
+/*----------------------------------------------------------------*/
+
 // First, iteratively create a Delaunay triangulation of the existing point-cloud by inserting point by point,
 // iif the point to be inserted is not closer than distInsert pixels in at least one of its views to
 // the projection of any of already inserted points.
@@ -3202,9 +4460,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 	float kInf
 )
 {
-#if 0 // JPB WIP BUG Experiment with kqual
-	kQual = 11.25f; // 0.75 didn't help 0.75f;
-#endif
 	double cpuHz = estimateCpuHz();
 
 	using namespace DELAUNAY;
@@ -3802,10 +5057,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// 8/16 about the same, but better than 32, 64 much worse
 			// 16 removes more outliers.
 			// 1.39s/1.286s
-#if 0 // JPB WIP BUG not enough to warrant adding.
-			// Keep more points:
-			// - stddevMul=3.0: keep sparse boundary points (wider upper band)
-			// - interiorMul=FLT_MAX: effectively disable the lower-bound filter
+			// EDGING A/B: keep more sparse boundary/canopy-fringe points. The
+			// tight variant below (16, 2) cuts the upper band at 2-sigma, which
+			// removes the sparse points that ARE the silhouette/canopy fringe
+			// before the Delaunay ever sees them (measured ~34% boundary-point
+			// loss). Set this guard to 0 to restore the tight cut.
+#if 1
+			// - stddevMul=3.0: wider upper band keeps sparse boundary points.
+			// - interiorMul=FLT_MAX: disable the lower-bound (over-dense) filter
 			//   (lowerThr = mean - FLT_MAX*stdev -> clamped to 1e-6f, keeps everything)
 			StatisticalOutlierRemoval(verticesf, numVertices, mask, 16, 3.0f, FLT_MAX);
 #else
@@ -3983,7 +5242,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.21");
+		DEBUG("ReconstructMesh optimization version 1.1.22");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);
@@ -4292,6 +5551,13 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					// *outside* the containing cell. In dense regions (where rejections cluster)
 					// the containing cell almost always already holds at least one rejector;
 					// in sparse regions there's no rejector anywhere anyway.
+					//
+					// FIX 2: extend the rejector search to include the unique vertex of each
+					// of the 4 face-neighbor cells (the vertex of `nc` opposite the face shared
+					// with `c`). That vertex is by construction NOT one of the 4 vertices of
+					// `c`, so we collect up to 8 distinct candidate rejectors total. This
+					// covers virtually all rejectors that the BFS path would have found, at
+					// bounded O(1) cost per insertion (no marker bookkeeping, no restarts).
 					nearest = delaunay.nearest_vertex_in_cell3(p, c);
 					views = pointcloud.pointViewsMemory.data() + offset;
 					_mm_prefetch((const char*)views, _MM_HINT_T0);
@@ -4300,11 +5566,26 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						const float pxFv = (float)p.x();
 						const float pyFv = (float)p.y();
 						const float pzFv = (float)p.z();
-						constexpr float depthThresholdFv = 0.01f;
 
-						for (int vi = 0; vi < 4; ++vi) {
-							const vertex_handle_t vh = c->vertex(vi);
-							if (vh == infV) continue;
+						// Collect up to 8 candidate rejector vertices: 4 from the containing
+						// cell + the unique vertex of each face-neighbor cell. The neighbor's
+						// unique vertex is `nc->vertex(nc->index(c))` — the vertex of nc
+						// opposite the face shared with c, which by definition is not in c.
+						vertex_handle_t candidates[8];
+						int nCands = 0;
+						for (int k = 0; k < 4; ++k) {
+							const vertex_handle_t v = c->vertex(k);
+							if (v != infV) candidates[nCands++] = v;
+						}
+						for (int k = 0; k < 4; ++k) {
+							const cell_handle_t nc = c->neighbor(k);
+							if (delaunay.is_infinite(nc)) continue;
+							const vertex_handle_t vu = nc->vertex(nc->index(c));
+							if (vu != infV) candidates[nCands++] = vu;
+						}
+
+						for (int vi = 0; vi < nCands; ++vi) {
+							const vertex_handle_t vh = candidates[vi];
 							const point_t& np = vh->point();
 							const float nxF = (float)np.x();
 							const float nyF = (float)np.y();
@@ -4324,9 +5605,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 								const float pnz = camera[8] * nxF + camera[9] * nyF + camera[10] * nzF + camera[11];
 								if (pnz <= 0.f) continue;
 
-								if (FastAbsS(pnz - pez) >= depthThresholdFv * pez) {
-									farInSomeView = true; break;
-								}
+								// FIX 1: the depth-mismatch short-circuit that used to live here
+								// (|pnz-pez| >= depthThresholdFv*pez ⇒ farInSomeView=true) was NOT
+								// part of the downstream projection check, so the fast path could
+								// declare vh "far" while downstream would treat the same vh as a
+								// rejector — causing FAST_DISTINSERT to accept points the BFS path
+								// would reject. Removed so this per-vertex test now exactly mirrors
+								// the downstream `shouldInsert` criterion (D-only, with the sound
+								// axis bounds B/C below as early-exits since |dx|>bound ⟹ D true).
 
 								const float zprod = pez * pnz;
 								const float bound = distInsert * zprod;
@@ -5681,7 +6967,6 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 						edge_cap_t& t(infoCells[endCell->info()].t);
 						AtomicAddFloat(&t, alpha_vis);
 
-						facets.resize(0);
 						steps = 0;
 						if (intersect(delaunay, segEndPoint, facets, facets, inter, cellNbrID, allCells)) {
 							lastDist = inter.dist;

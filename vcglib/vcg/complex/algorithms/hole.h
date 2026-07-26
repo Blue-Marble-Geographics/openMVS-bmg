@@ -596,7 +596,8 @@ template<class EAR>
       MESH& m,
       int maxHoleSize,
       bool selected = false,
-      CallBackPos* cb = nullptr)
+      CallBackPos* cb = nullptr,
+      typename MESH::ScalarType maxHoleDiag = -1)
     {
       std::vector<typename tri::Hole<MESH>::Info> vinfo;
       tri::Hole<MESH>::GetInfo(m, selected, vinfo);
@@ -614,6 +615,14 @@ template<class EAR>
         if (cb) (*cb)((++idx * 10) / total, "Closing Holes");
 
         if (info.size >= maxHoleSize)
+          continue;
+
+        // Geometric interior-hole gate: when maxHoleDiag >= 0, only fill loops
+        // whose 3D bounding-box diagonal is at most maxHoleDiag. Interior holes
+        // are compact and pass; the outer silhouette / wide concave bays span a
+        // large fraction of the mesh and are left open, so ear-cutting never
+        // fans a sheet across them. maxHoleDiag < 0 disables the gate (legacy).
+        if (maxHoleDiag >= 0 && info.bb.Diag() > maxHoleDiag)
           continue;
 
         // After filling previous holes, this hole's starting Pos may
@@ -680,7 +689,7 @@ template<class EAR>
           continue;
         }
 
-        // Deduplicate the adjacency ring — faces appear multiple times
+        // Deduplicate the adjacency ring â€” faces appear multiple times
         // when adjacent to more than one boundary vertex.
         std::sort(EAR::AdjacencyRing().begin(), EAR::AdjacencyRing().end());
         EAR::AdjacencyRing().erase(
@@ -820,6 +829,11 @@ template<class EAR>
     {
       UnMarkAll(m);
       const int mark = m.imark;
+      // Holes are a small fraction of the mesh, but the count is unknown until
+      // the border walk below completes. Reserve a modest, mesh-scaled amount up
+      // front so the VHI.push_back loop avoids the geometric 1->2->4->... realloc
+      // churn on meshes with many holes, without over-allocating on large meshes.
+      VHI.reserve(VHI.size() + std::max<size_t>(64, size_t(m.fn) / 1000));
       if (m.hasDeletedFaces)
       {
         for (FaceIterator fi = m.face.begin(); fi != m.face.end(); ++fi)
@@ -843,14 +857,21 @@ template<class EAR>
                   PosType fp = sp;
                   int holesize = 0;
 
-                  Box3Type hbox;
-                  hbox.Add(sp.v->cP());
+                  // Seed the bbox directly from the first boundary vertex and
+                  // expand min/max in place. This skips the Box3 default ctor's
+                  // SetNull() and the per-vertex IsNull() branch that Box3::Add()
+                  // would otherwise run on every step of this tight border walk.
+                  const CoordType &p0 = sp.v->cP();
+                  CoordType bmin = p0, bmax = p0;
                   //printf("Looping %i : (face %i edge %i) \n", VHI.size(),sp.f-&*m.face.begin(),sp.z);
                   sp.f->IMark() = mark;
                   do
                   {
                     sp.f->IMark() = mark;
-                    hbox.Add(sp.v->cP());
+                    const CoordType &pv = sp.v->cP();
+                    if (pv.X() < bmin.X()) bmin.X() = pv.X(); else if (pv.X() > bmax.X()) bmax.X() = pv.X();
+                    if (pv.Y() < bmin.Y()) bmin.Y() = pv.Y(); else if (pv.Y() > bmax.Y()) bmax.Y() = pv.Y();
+                    if (pv.Z() < bmin.Z()) bmin.Z() = pv.Z(); else if (pv.Z() > bmax.Z()) bmax.Z() = pv.Z();
                     ++holesize;
                     sp.NextB();
                     sp.f->IMark() = mark;
@@ -858,7 +879,8 @@ template<class EAR>
                   } while (sp != fp);
 
                   //ho recuperato l'inofrmazione su tutto il buco
-                  VHI.push_back(Info(sp, holesize, hbox));
+                  Box3Type hbox(bmin, bmax);
+                  VHI.emplace_back(sp, holesize, hbox);
                 }
               }//for sugli edge del triangolo
             }//S & !S
@@ -886,14 +908,21 @@ template<class EAR>
                 PosType fp = sp;
                 int holesize = 0;
 
-                Box3Type hbox;
-                hbox.Add(sp.v->cP());
+                // Seed the bbox directly from the first boundary vertex and
+                // expand min/max in place. This skips the Box3 default ctor's
+                // SetNull() and the per-vertex IsNull() branch that Box3::Add()
+                // would otherwise run on every step of this tight border walk.
+                const CoordType &p0 = sp.v->cP();
+                CoordType bmin = p0, bmax = p0;
                 //printf("Looping %i : (face %i edge %i) \n", VHI.size(),sp.f-&*m.face.begin(),sp.z);
                 sp.f->IMark() = mark;
                 do
                 {
                   sp.f->IMark() = mark;
-                  hbox.Add(sp.v->cP());
+                  const CoordType &pv = sp.v->cP();
+                  if (pv.X() < bmin.X()) bmin.X() = pv.X(); else if (pv.X() > bmax.X()) bmax.X() = pv.X();
+                  if (pv.Y() < bmin.Y()) bmin.Y() = pv.Y(); else if (pv.Y() > bmax.Y()) bmax.Y() = pv.Y();
+                  if (pv.Z() < bmin.Z()) bmin.Z() = pv.Z(); else if (pv.Z() > bmax.Z()) bmax.Z() = pv.Z();
                   ++holesize;
                   sp.NextB();
                   sp.f->IMark() = mark;
@@ -901,7 +930,8 @@ template<class EAR>
                 } while (sp != fp);
 
                 //ho recuperato l'inofrmazione su tutto il buco
-                VHI.push_back(Info(sp, holesize, hbox));
+                Box3Type hbox(bmin, bmax);
+                VHI.emplace_back(sp, holesize, hbox);
               }
             }//for sugli edge del triangolo
           }//S & !S
@@ -1084,21 +1114,22 @@ template<class EAR>
   }
   
   
-  static void triangulate(MESH &m, FaceIterator &f,int i, int j,
-                          std::vector< std::vector<int> > vi, std::vector<PosType > vv)
+  static void triangulate(MESH &m, FaceIterator &f, int i, int j,
+                          const std::vector< std::vector<int> >& vi,
+                          const std::vector<PosType >& vv)
   {
     if(i + 1 == j){return;}
     if(i==j)return;
-    
+
     int k = vi[i][j];
-    
+
     if(k == -1)	return;
-    
+
     //Setto i vertici
     f->V(0) = vv[i].v;
     f->V(1) = vv[k].v;
     f->V(2) = vv[j].v;
-    
+
     f++;
     triangulate(m,f,i,k,vi,vv);
     triangulate(m,f,k,j,vi,vv);

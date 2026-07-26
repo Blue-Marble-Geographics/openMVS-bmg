@@ -138,7 +138,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("sharpness-weight", boost::program_options::value(&OPT::fSharpnessWeight)->default_value(0.3f/* Reduce speckle JPB WIP BUG 0.5f*/), "amount of sharpness to be applied on the texture (0 - disabled)")
 		("orthographic-image-resolution", boost::program_options::value(&OPT::nOrthoMapResolution)->default_value(0), "orthographic image resolution to be generated from the textured mesh - the mesh is expected to be already geo-referenced or at least properly oriented (0 - disabled)")
 		("ignore-mask-label", boost::program_options::value(&OPT::nIgnoreMaskLabel)->default_value(-1), "label value to ignore in the image mask, stored in the MVS scene or next to each image with '.mask.png' extension (-1 - auto estimate mask for lens distortion, -2 - disabled)")
-		("max-texture-size", boost::program_options::value(&OPT::nMaxTextureSize)->default_value(8192), "maximum texture size, split it in multiple textures of this size if needed (0 - unbounded)")
+		("max-texture-size", boost::program_options::value(&OPT::nMaxTextureSize)->default_value(-1 /* native GPU size 8192*/), "maximum texture size, split it in multiple textures of this size if needed (0 - unbounded, <0 - native)")
 		;
 
 	// hidden options, allowed both on command line and
@@ -353,9 +353,24 @@ int main(int argc, LPCTSTR* argv)
 		return EXIT_FAILURE;
 	VERBOSE("Mesh texturing completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 
+	// Compute per-vertex normals before saving so the exported mesh carries
+	// nx/ny/nz (SavePLY emits them via the VertexNormalTex path whenever
+	// vertexNormals is non-empty). With normals baked in, the consumer (e.g.
+	// Global Mapper / Assimp) does not have to run a normal-generation pass,
+	// which on an indexed textured mesh would split shared vertices and
+	// desync the texture-coordinate buffer.
+	if (scene.mesh.vertexNormals.empty())
+		scene.mesh.ComputeNormalVertices();
+
 	// save the final mesh
 	// JPB WIP BUG Not needed. scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType);
 	scene.mesh.Save(baseFileName+OPT::strExportType);
+	// Also emit a Global Mapper native binary mesh (.gmmesh) alongside the
+	// primary export when the mesh is textured. The .gmmesh save reuses the
+	// .jpg texture just written by the export above (no second encode), and
+	// lets Global Mapper skip the slow Assimp .ply parse on load.
+	if (scene.mesh.HasTexture())
+		scene.mesh.Save(baseFileName+_T(".gmmesh"));
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2)
 		scene.ExportCamerasMLP(baseFileName+_T(".mlp"), baseFileName+OPT::strExportType);

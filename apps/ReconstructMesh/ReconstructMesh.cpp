@@ -61,9 +61,16 @@ float fDistInsert;
 bool bUseOnlyROI;
 bool bUseConstantWeight;
 bool bUseFreeSpaceSupport;
+bool bPoisson;
+unsigned nPoissonDepth;
+float fPoissonTrim;
+float fPoissonSamples;
+float fPoissonWeight;
+float fPoissonIslandRatio;
 float fThicknessFactor;
 float fQualityFactor;
 float fDecimateMesh;
+float fDecimateMeshError;
 unsigned nTargetFaceNum;
 float fRemoveSpurious;
 bool bRemoveSpikes;
@@ -127,15 +134,20 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("min-point-distance,d", boost::program_options::value(&OPT::fDistInsert)->default_value(2.5f), "minimum distance in pixels between the projection of two 3D points to consider them different while triangulating (0 - disabled)")
 		("integrate-only-roi", boost::program_options::value(&OPT::bUseOnlyROI)->default_value(false), "use only the points inside the ROI")
 		("constant-weight", boost::program_options::value(&OPT::bUseConstantWeight)->default_value(true), "considers all view weights 1 instead of the available weight")
-#if 0 // JPB WIP Not supported
 		("free-space-support,f", boost::program_options::value(&OPT::bUseFreeSpaceSupport)->default_value(false), "exploits the free-space support in order to reconstruct weakly-represented surfaces")
-#endif
 		("thickness-factor", boost::program_options::value(&OPT::fThicknessFactor)->default_value(1.f), "multiplier adjusting the minimum thickness considered during visibility weighting")
 		("quality-factor", boost::program_options::value(&OPT::fQualityFactor)->default_value(1.f), "multiplier adjusting the quality weight considered during graph-cut")
+		("poisson", boost::program_options::value(&OPT::bPoisson)->default_value(false)->implicit_value(true), "use Poisson surface reconstruction (Kazhdan PoissonRecon.exe + SurfaceTrimmer.exe) instead of the Delaunay graph-cut")
+		("poisson-depth", boost::program_options::value(&OPT::nPoissonDepth)->default_value(0), "Poisson octree depth (detail; higher = finer/slower); 0 = auto-select from point-cloud density")
+		("poisson-trim", boost::program_options::value(&OPT::fPoissonTrim)->default_value(7.f), "SurfaceTrimmer density threshold (>0 trims the open-boundary balloon; 0 - disabled)")
+		("poisson-samples", boost::program_options::value(&OPT::fPoissonSamples)->default_value(1.5f), "Poisson samples per node (higher = smoother/coarser, lower = sharper/denser)")
+		("poisson-weight", boost::program_options::value(&OPT::fPoissonWeight)->default_value(2.f), "Poisson screened interpolation weight")
+		("poisson-island-ratio", boost::program_options::value(&OPT::fPoissonIslandRatio)->default_value(0.f), "SurfaceTrimmer --aRatio + --removeIslands: delete isolated components whose area is below this fraction of the whole mesh (removes small floating blobs); 0 - disabled (stock trimmer behavior)")
 		;
 	boost::program_options::options_description config_clean("Clean options");
 	config_clean.add_options()
 		("decimate", boost::program_options::value(&OPT::fDecimateMesh)->default_value(1.f), "decimation factor in range (0..1] to be applied to the reconstructed surface (1 - disabled)")
+		("decimate-error", boost::program_options::value(&OPT::fDecimateMeshError)->default_value(0.f), "adaptive error-bounded decimation strength k (0 - disabled, use the --decimate ratio; >0 - stop at geometric error ~k*median-edge so flat areas collapse and detail is kept, with --decimate as the keep floor; try ~1.0 and calibrate)")
 		("target-face-num", boost::program_options::value(&OPT::nTargetFaceNum)->default_value(0), "target number of faces to be applied to the reconstructed surface. (0 - disabled)")
 		("remove-spurious", boost::program_options::value(&OPT::fRemoveSpurious)->default_value(20.f), "spurious factor for removing faces with too long edges or isolated components (0 - disabled)")
 		("remove-spikes", boost::program_options::value(&OPT::bRemoveSpikes)->default_value(true), "flag controlling the removal of spike faces")
@@ -187,6 +199,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 
 	// print application details: version and command line
 	Util::LogBuild();
+	LOG(_T("OpenMVS-bmg build %d"), OPENMVS_BMG_BUILD);
 	LOG(_T("Command line: ") APPNAME _T("%s"), Util::CommandLineToString(argc, argv).c_str());
 
 	// validate input
@@ -365,7 +378,7 @@ int main(int argc, LPCTSTR* argv)
 
 	Scene scene(OPT::nMaxThreads);
 	// load project
-	if (!scene.Load(MAKE_PATH_SAFE(OPT::strInputFileName), OPT::fSplitMaxArea > 0 || OPT::fDecimateMesh < 1 || OPT::nTargetFaceNum > 0))
+	if (!scene.Load(MAKE_PATH_SAFE(OPT::strInputFileName), OPT::fSplitMaxArea > 0 || OPT::fDecimateMesh < 1 || OPT::nTargetFaceNum > 0 || OPT::fDecimateMeshError > 0))
 		return EXIT_FAILURE;
 	const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));
 	if (OPT::fSplitMaxArea > 0) {
@@ -445,13 +458,16 @@ int main(int argc, LPCTSTR* argv)
 #endif
 			// JPB TEMP: pass CLI values straight through; tuning has moved
 			// to the Mesh::Clean call below (remove-spurious override).
-			if (!scene.ReconstructMesh(
+			const bool bMeshOK(OPT::bPoisson
+				? scene.ReconstructMeshPoisson((int)OPT::nPoissonDepth, OPT::fPoissonTrim, OPT::fPoissonSamples, OPT::fPoissonWeight, OPT::fPoissonIslandRatio)
+				: scene.ReconstructMesh(
 					OPT::fDistInsert,
-					false /* JPB Not supported OPT::bUseFreeSpaceSupport */,
+					OPT::bUseFreeSpaceSupport,
 					OPT::bUseOnlyROI,
 					4,
 					OPT::fThicknessFactor,
-					OPT::fQualityFactor))
+					OPT::fQualityFactor));
+			if (!bMeshOK)
 				return EXIT_FAILURE;
 			VERBOSE("Mesh reconstruction completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 			#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -475,16 +491,18 @@ int main(int argc, LPCTSTR* argv)
 				numVertices-scene.mesh.vertices.size(), numFaces-scene.mesh.faces.size(), TD_TIMER_GET_FMT().c_str());
 		}
 		const float fDecimate(OPT::nTargetFaceNum ? static_cast<float>(OPT::nTargetFaceNum) / scene.mesh.faces.size() : OPT::fDecimateMesh);
-		// JPB TEMP overrides:
-		//   remove-spurious  CLI 0/20 -> 25  (kill worst long-edge sheets while keeping boundary detail)
-		//   close-holes      CLI 100  -> 30
-		//   smooth           default 2 -> 1
+		// Under --poisson, skip ONLY the graph-cut-oriented spurious (long-edge)
+		// removal -- the Poisson surface is coherently oriented, and skipping it also
+		// preserves the edge extrapolation. Hole-closing STAYS ON: SurfaceTrimmer
+		// punches interior holes in low-density regions (textureless roofs, water)
+		// that must be filled; disabling it left open interior patches.
+		const float cleanSpurious(OPT::bPoisson ? 0.f : OPT::fRemoveSpurious);
 		scene.mesh.Clean(fDecimate,
-			OPT::fRemoveSpurious, // JPB WIP BUG 15 will give more edges, but not in a good way.
+			cleanSpurious, // JPB WIP BUG 15 will give more edges, but not in a good way.
 			OPT::bRemoveSpikes,
 			OPT::nCloseHoles,
 			OPT::nSmoothMesh,
-			OPT::fEdgeLength, true);
+			OPT::fEdgeLength, true, OPT::fDecimateMeshError);
 
 		scene.obb = initialOBB;
 

@@ -100,6 +100,9 @@ IBFSGraph::IBFSGraph() {
 	flow = 0;
   orphanFirstIdx = orphanLastIdx = kOrphansEndIdx;
   nodes = nodeEnd = nullptr;
+#if IBFS_OPT_SOA_LABEL
+  labels = nullptr;
+#endif
   arcCountBuild = nullptr;
 }
 
@@ -111,6 +114,10 @@ IBFSGraph::~IBFSGraph() {
 	orphanBuckets.release();
 	_aligned_free(nodes);
 	nodes = nullptr;
+#if IBFS_OPT_SOA_LABEL
+	_aligned_free(labels);
+	labels = nullptr;
+#endif
 }
 
 
@@ -118,14 +125,14 @@ void IBFSGraph::initGraph() {
 	// Must be after nodes are added.
   for (Node* x = nodes; x < nodeEnd; ++x) {
 		if (x->excess == 0) {
-			x->label = numNodes;
+			setLabel(x, numNodes);
 			continue;
 		}
 		if (x->excess > 0) {
-			x->label = 1;
+			setLabel(x, 1);
 			activeS1.add(x);
 		} else {
-			x->label = -1;
+			setLabel(x, -1);
 			activeT1.add(x);
 		}
 	}
@@ -138,6 +145,9 @@ void IBFSGraph::initSize(int n, int)
 	assert(n >= 0 && static_cast<uint32_t>(n) <= kMaxNodes);
 	numNodes = n;
 	nodes = static_cast<Node*>(_aligned_malloc(sizeof(Node) * static_cast<size_t>(n), 64));
+#if IBFS_OPT_SOA_LABEL
+	labels = static_cast<int32_t*>(_aligned_malloc(sizeof(int32_t) * static_cast<size_t>(n), 64));
+#endif
 	arcCountBuild = new std::atomic<int>[n];
 
 #pragma omp parallel for schedule(static)
@@ -152,14 +162,22 @@ void IBFSGraph::initSize(int n, int)
 		node.isParentCurr = 0;
 		node.arcCount = 0;
 		node.residBits = 0;
+#if IBFS_OPT_SOA_LABEL
+		labels[i] = 0;
+#else
 		node.label = 0;
+#endif
 	}
 
 	nodeEnd = nodes + n;
 	active0.init(n);
 	activeS1.init(n);
 	activeT1.init(n);
-	orphanBuckets.init(nodes, n);
+	orphanBuckets.init(nodes,
+#if IBFS_OPT_SOA_LABEL
+		labels,
+#endif
+		n);
 	flow = 0;
 }
 
@@ -197,7 +215,7 @@ __forceinline void IBFSGraph::augmentTree(
 			a->rCap -= bottleneck;
 		}
 
-		if ((sTree ? rev.rCap : a->rCap) == 0) {
+		if ((sTree ? arcSaturated(rev.rCap) : arcSaturated(a->rCap))) {
 			if (sTree) x->residBits &= ~(1u << (int)(a - x->arcs));
 			else parentNode->residBits &= ~(1u << a->revIdx());
 
@@ -481,7 +499,7 @@ void IBFSGraph::augment(Arc * __restrict bridge)
 	rev.rCap += bottleneck;
 	nodes[rev.headIdx()].residBits |= (1u << rev.revIdx());
 	bridge->rCap -= bottleneck;
-	if (bridge->rCap == 0) {
+	if (arcSaturated(bridge->rCap)) {
 		bridgeTgt.residBits &= ~(1u << bridge->revIdx());
 	}
 
@@ -545,8 +563,8 @@ void IBFSGraph::adoption()
 		}
 		x->parentRef = kNullParent;
 
-		if (x->label != (sTree ? 1 : -1)) {
-			minLabel = x->label - (sTree ? 1 : -1);
+		if (getLabel(x) != (sTree ? 1 : -1)) {
+			minLabel = getLabel(x) - (sTree ? 1 : -1);
 			const int cnt = x->arcCount;
 			__assume(cnt <= 4);
 			const uint8_t resBits = x->residBits;
@@ -561,7 +579,7 @@ void IBFSGraph::adoption()
 					_mm_prefetch((const char*)(nodes + x->arcs[i + 1].headIdx()), _MM_HINT_T0);
 #endif
 
-				if ((sTree ? ((resBits >> i) & 1u) : a->rCap) && y->label == minLabel) {
+				if ((sTree ? (((resBits >> i) & 1u) != 0) : arcUsable(a->rCap)) && getLabel(y) == minLabel) {
 					x->parentRef = packParent(a, x);
 					x->nextPtrIdx = y->firstSonIdx;
 					y->firstSonIdx = idxOf(x);
@@ -584,20 +602,20 @@ void IBFSGraph::adoption()
 		}
 		x->firstSonIdx = kNullIdx;
 
-		if (x->label == (sTree ? topLevelS : -topLevelT)) {
-			x->label = numNodes;
+		if (getLabel(x) == (sTree ? topLevelS : -topLevelT)) {
+			setLabel(x, numNodes);
 			continue;
 		}
 
 		if (threePass) {
-			x->label += (sTree ? 1 : -1);
+			addLabel(x, sTree ? 1 : -1);
 			orphanBuckets.add<sTree>(x);
 			continue;
 		}
 
 		// relabel
 		minLabel = (sTree ? topLevelS : -topLevelT);
-		if (x->label != minLabel) {
+		if (getLabel(x) != minLabel) {
 			const int cnt = x->arcCount;
 			__assume(cnt <= 4);
 			const uint8_t resBits = x->residBits;
@@ -613,26 +631,26 @@ void IBFSGraph::adoption()
 					_mm_prefetch((const char*)(nodes + x->arcs[i + 1].headIdx()), _MM_HINT_T0);
 #endif
 
-				if ((sTree ? ((resBits >> i) & 1u) : a->rCap) &&
-					(sTree ? y->label > 0 : y->label < 0) &&
-					(sTree ? y->label < minLabel : y->label > minLabel)) {
-					minLabel = y->label;
+				if ((sTree ? (((resBits >> i) & 1u) != 0) : arcUsable(a->rCap)) &&
+					(sTree ? getLabel(y) > 0 : getLabel(y) < 0) &&
+					(sTree ? getLabel(y) < minLabel : getLabel(y) > minLabel)) {
+					minLabel = getLabel(y);
 					x->parentRef = packParent(a, x);
-					if (minLabel == x->label) break;
+					if (minLabel == getLabel(x)) break;
 				}
 			}
 		}
 
 		if (x->parentRef != kNullParent) {
-			x->label = minLabel + (sTree ? 1 : -1);
+			setLabel(x, minLabel + (sTree ? 1 : -1));
 			Node* po = nodes + unpackParent(x->parentRef)->headIdx();
 			x->nextPtrIdx = po->firstSonIdx;
 			po->firstSonIdx = idxOf(x);
-			if (sTree && x->label == topLevelS) activeS1.add(x);
-			else if (!sTree && x->label == -topLevelT) activeT1.add(x);
+			if (sTree && getLabel(x) == topLevelS) activeS1.add(x);
+			else if (!sTree && getLabel(x) == -topLevelT) activeT1.add(x);
 		}
 		else {
-			x->label = numNodes;
+			setLabel(x, numNodes);
 		}
 	}
 
@@ -655,7 +673,7 @@ void IBFSGraph::adoption3Pass()
 			// pass 2: find lowest level parent
 			if (x->parentRef == kNullParent) {
 				minLabel = (sTree ? topLevelS : -topLevelT);
-				destLabel = x->label - (sTree ? 1 : -1);
+				destLabel = getLabel(x) - (sTree ? 1 : -1);
 
 				const int cnt = x->arcCount;
 				__assume(cnt <= 4);
@@ -663,32 +681,32 @@ void IBFSGraph::adoption3Pass()
 				for (int i = 0; i < cnt; ++i) {
 					a = &x->arcs[i];
 					y = nodes + a->headIdx();
-					if ((sTree ? ((resBits >> i) & 1u) : a->rCap) &&
+					if ((sTree ? (((resBits >> i) & 1u) != 0) : arcUsable(a->rCap)) &&
 						(y->excess || y->parentRef != kNullParent) &&
 						//!y->isOrphan() &&
-						(sTree ? (y->label > 0) : (y->label < 0)) &&
-						(sTree ? (y->label < minLabel) : (y->label > minLabel)))
+						(sTree ? (getLabel(y) > 0) : (getLabel(y) < 0)) &&
+						(sTree ? (getLabel(y) < minLabel) : (getLabel(y) > minLabel)))
 					{
 						x->parentRef = packParent(a, x);
-						if ((minLabel = y->label) == destLabel) break;
+						if ((minLabel = getLabel(y)) == destLabel) break;
 					}
 				}
 
 				if (x->parentRef == kNullParent) {
-					x->label = numNodes;
+					setLabel(x, numNodes);
 					continue;
 				}
 
-				x->label = minLabel + (sTree ? 1 : -1);
-				if (x->label != (sTree ? level : -level)) {
+				setLabel(x, minLabel + (sTree ? 1 : -1));
+				if (getLabel(x) != (sTree ? level : -level)) {
 					orphanBuckets.add<sTree>(x);
 					continue;
 				}
 			}
 
 			// pass 3: lower potential sons and/or find first parent
-			if (x->label != (sTree ? topLevelS : -topLevelT)) {
-				minLabel = x->label + (sTree ? 1 : -1);
+			if (getLabel(x) != (sTree ? topLevelS : -topLevelT)) {
+				minLabel = getLabel(x) + (sTree ? 1 : -1);
 
 				const int cnt = x->arcCount;
 				__assume(cnt <= 4);
@@ -698,15 +716,15 @@ void IBFSGraph::adoption3Pass()
 					y = nodes + a->headIdx();
 
 					Arc& rev = y->arcs[a->revIdx()];
-					if ((sTree ? a->rCap : ((resBits >> i) & 1u)) &&
-							((!sTree && y->label == numNodes) ||
+					if ((sTree ? arcUsable(a->rCap) : (((resBits >> i) & 1u) != 0)) &&
+							((!sTree && getLabel(y) == numNodes) ||
 								// the above implicitly holds by condition below when sTree=true
-								(sTree ? (minLabel < y->label) : (minLabel > y->label))))
+								(sTree ? (minLabel < getLabel(y)) : (minLabel > getLabel(y)))))
 						{
-						if (y->label != numNodes)
+						if (getLabel(y) != numNodes)
 							orphanBuckets.remove<sTree>(y);
 
-						y->label = minLabel;
+						setLabel(y, minLabel);
 						y->parentRef = packParent(&rev, y);
 						orphanBuckets.add<sTree>(y);
 					}
@@ -723,11 +741,11 @@ void IBFSGraph::adoption3Pass()
 
 			// add to active list of the next growth phase
 			if (sTree) {
-				if (x->label == topLevelS)
+				if (getLabel(x) == topLevelS)
 					activeS1.add(x);
 			}
 			else {
-				if (x->label == -topLevelT)
+				if (getLabel(x) == -topLevelT)
 					activeT1.add(x);
 			}
 		}
@@ -768,7 +786,7 @@ void IBFSGraph::growth()
 			_mm_prefetch((const char*)*(active + IBFS_OPT_PREFETCH_DEEP_DIST), _MM_HINT_T1);
 #endif
 
-		if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
+		if (getLabel(x) != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
 			continue;
 
 		if (dirS) stats.incGrowthS();
@@ -777,7 +795,7 @@ void IBFSGraph::growth()
 		for (int i = 0, cnt = x->arcCount; i < cnt; ++i) {
 			Arc* a = &x->arcs[i];
 
-			if ((dirS ? a->rCap : (EdgeCap)((x->residBits >> i) & 1u)) == 0) continue;
+			if (dirS ? arcSaturated(a->rCap) : (((x->residBits >> i) & 1u) == 0)) continue;
 
 			y = nodes + a->headIdx();
 
@@ -789,9 +807,9 @@ void IBFSGraph::growth()
 #endif
 
 			Arc& rev = y->arcs[a->revIdx()];
-			if (y->label == numNodes) {
+			if (getLabel(y) == numNodes) {
 				y->isParentCurr = 0;
-				y->label = x->label + (dirS ? 1 : -1);
+				setLabel(y, getLabel(x) + (dirS ? 1 : -1));
 
 				// parent assignment
 				y->parentRef = packParent(&rev, y);
@@ -803,16 +821,16 @@ void IBFSGraph::growth()
 				else activeT1.add(y);
 
 			}
-			else if (dirS ? (y->label < 0) : (y->label > 0)) {
+			else if (dirS ? (getLabel(y) < 0) : (getLabel(y) > 0)) {
 
 				// found augmenting bridge
 				augment(dirS ? a : &rev);
 
-				if (x->label != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
+				if (getLabel(x) != (dirS ? topLevelS - 1 : -(topLevelT - 1)))
 					break;
 
 				// recheck same arc if it still has residual
-				if (dirS ? a->rCap : (EdgeCap)((x->residBits >> i) & 1u))
+				if (dirS ? arcUsable(a->rCap) : (((x->residBits >> i) & 1u) != 0))
 					--i;
 			}
 		}

@@ -27,6 +27,29 @@ endif()
 # List sources files
 FILE(GLOB LIBRARY_FILES_C "*.cpp")
 FILE(GLOB LIBRARY_FILES_H "*.h" "*.inl")
+
+# In-process Kazhdan PoissonRecon + SurfaceTrimmer, replacing the external-exe
+# shell-out. Built as an isolated static library so that only these two wrapper
+# translation units see the (heavily-templated) PoissonRecon headers and its
+# PreProcessor.h macros; the rest of MVS is unaffected. SurfaceTrimmer.cpp is
+# compiled with POISSONRECON_LIB_BUILD so its main()/CmdLine globals are excluded.
+set(POISSONRECON_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../PoissonRecon/Src")
+add_library(PoissonReconLib STATIC
+	"${POISSONRECON_SRC_DIR}/PoissonReconLib.cpp"
+	"${POISSONRECON_SRC_DIR}/SurfaceTrimmer.cpp"
+)
+target_include_directories(PoissonReconLib PRIVATE "${POISSONRECON_SRC_DIR}")
+target_compile_definitions(PoissonReconLib PRIVATE POISSONRECON_LIB_BUILD NOMINMAX _CRT_SECURE_NO_WARNINGS _CRT_SECURE_NO_DEPRECATE)
+if(MSVC)
+	target_compile_options(PoissonReconLib PRIVATE /bigobj)
+	# Debug info on the optimized Release build so the generated machine code can be
+	# inspected (PDB usable by the VS debugger's disassembly view or `dumpbin /DISASM`).
+	# /O2 is kept. Release-only, so other configs are unaffected.
+	# NOTE: do NOT add /FA* assembly-listing flags here — this build uses LTCG (/GL),
+	# which defers code generation to link time, so the compile-time .cod write fails
+	# (C1083 'Cannot open ... .cod' -> LNK1257). Use the debugger/dumpbin instead.
+	target_compile_options(PoissonReconLib PRIVATE $<$<CONFIG:Release>:/Zi>)
+endif()
 if(_USE_CUDA)
 	FILE(GLOB LIBRARY_FILES_CUDA "*.cu")
 	LIST(APPEND LIBRARY_FILES_C ${LIBRARY_FILES_CUDA})
@@ -54,7 +77,7 @@ if(_USE_CUDA)
 	set_target_properties(MVS PROPERTIES CUDA_ARCHITECTURES "50;72;75")
 endif()
 # TODO: CGAL::TBB_support should be controlled by a configuration option
-TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO CGAL::CGAL CGAL::TBB_support ${CERES_LIBRARIES} ${CUDA_CUDA_LIBRARY})
+TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO CGAL::CGAL CGAL::TBB_support ${CERES_LIBRARIES} ${CUDA_CUDA_LIBRARY} PoissonReconLib)
 
 # Install
 SET_TARGET_PROPERTIES(MVS PROPERTIES

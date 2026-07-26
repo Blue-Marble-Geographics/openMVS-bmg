@@ -541,7 +541,13 @@ public:
 	}
 
 	int SimplexNumber() {
-		return (int) face.size();
+		// Must return the LIVE face count (fn), not face.size(). Edge-collapse
+		// decimation deletes faces lazily (IsD, removed only on Compact), so
+		// face.size() never shrinks during the operation -- returning it makes
+		// LocalOptimization::GoalReached()'s SetTargetSimplices() check never
+		// fire, so decimation overshoots to heap exhaustion. fn is the upstream
+		// VCG semantics (and what HeapSimplexRatio expects too).
+		return fn;
 	} // fn;
 
 	int & VertexNumber(){ return vn;}
