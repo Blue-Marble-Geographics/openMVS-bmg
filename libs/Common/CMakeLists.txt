@@ -12,7 +12,16 @@ IF(CMAKE_VERSION VERSION_GREATER_EQUAL 3.16.0)
 endif()
 
 # Link its dependencies
-TARGET_LINK_LIBRARIES(Common ${Boost_LIBRARIES} ${OpenCV_LIBS} turbojpeg)
+# Prefer the vcpkg CONFIG imported target (carries full lib path + include dirs,
+# portable across machines); fall back to the bare library name for environments
+# where libjpeg-turbo is provided outside vcpkg and the imported target does not
+# exist (otherwise CMake passes "libjpeg-turbo::turbojpeg" to the linker verbatim
+# -> LNK1104 cannot open file 'libjpeg-turbo::turbojpeg.lib').
+if(TARGET libjpeg-turbo::turbojpeg)
+	TARGET_LINK_LIBRARIES(Common ${Boost_LIBRARIES} ${OpenCV_LIBS} libjpeg-turbo::turbojpeg)
+else()
+	TARGET_LINK_LIBRARIES(Common ${Boost_LIBRARIES} ${OpenCV_LIBS} turbojpeg)
+endif()
 
 # Install
 SET_TARGET_PROPERTIES(Common PROPERTIES
