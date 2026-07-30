@@ -88,3 +88,12 @@ INSTALL(TARGETS MVS
 	ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
 	RUNTIME DESTINATION "${INSTALL_BIN_DIR}"
 	PUBLIC_HEADER DESTINATION "${INSTALL_INCLUDE_DIR}/MVS")
+
+# PoissonReconLib is a static library statically linked into MVS. Because MVS is
+# exported via OpenMVSTargets and its objects are not absorbed into the MVS
+# archive, consumers of the static MVS library must also link PoissonReconLib;
+# therefore it has to be part of the same export set or the install(EXPORT ...)
+# step fails with "requires target PoissonReconLib that is not in any export set".
+INSTALL(TARGETS PoissonReconLib
+	EXPORT OpenMVSTargets
+	ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
