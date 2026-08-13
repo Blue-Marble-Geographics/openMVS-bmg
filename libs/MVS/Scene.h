@@ -135,9 +135,15 @@ public:
 
 	// Poisson (Kazhdan PoissonRecon + SurfaceTrimmer, external tools) mesh
 	// reconstruction — gated A/B alternative to the graph-cut
-	bool ReconstructMeshPoisson(int depth=0, float trimThreshold=7.f, float samplesPerNode=1.5f, float pointWeight=2.f, float islandRatio=0.f);
+	bool ReconstructMeshPoisson(int depth=0, float trimThreshold=7.f, float samplesPerNode=1.5f, float pointWeight=2.f, float islandRatio=0.f, bool releasePointCloud=false);
 
 	// Mesh refinement
+	// Deterministic pre-flight sizing check: given this scene and this machine's
+	// total RAM, reduces nMaxViews and/or raises nResolutionLevel -- in that order,
+	// and only as a last resort -- so RefineMesh's per-batch memory floor fits
+	// under this machine's target. No-op on any machine where the scene already
+	// fits, which is the common case; call this once, before RefineMesh(CUDA).
+	void ResolveRefineMeshSafeSettings(unsigned& nResolutionLevel, unsigned nMinResolution, unsigned& nMaxViews) const;
 	bool RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsigned nMaxViews, float fDecimateMesh, unsigned nCloseHoles, unsigned nEnsureEdgeSize,
 		unsigned nMaxFaceArea, unsigned nScales, float fScaleStep, unsigned nReduceMemory, unsigned nAlternatePair, float fRegularityWeight, float fRatioRigidityElasticity,
 		float fThPlanarVertex, float fGradientStep);

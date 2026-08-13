@@ -94,13 +94,21 @@ namespace
 			verts.resize( count.load() * 4 );
 			ThreadPool::ParallelFor( 0 , tData.size() , [&]( unsigned int , size_t t )
 			{
-				const std::vector< VertRec > &d = tData[t];
+				std::vector< VertRec > &d = tData[t];
 				for( size_t k=0 ; k<d.size() ; k++ )
 				{
 					const VertRec &r = d[k];
 					float *dst = &verts[ r.idx*4 ];
 					dst[0] = r.x , dst[1] = r.y , dst[2] = r.z , dst[3] = r.w;
 				}
+				// Release this thread's buffer as soon as it has been scattered:
+				// VertRec is 24 B/vertex against 16 B/vertex in the output, so
+				// holding every buffer until the whole scatter finished cost
+				// ~40 B/vertex at peak instead of ~16 B + one thread's share.
+				// Each index t is visited by exactly one task, so mutating
+				// tData[t] here is race-free. swap-with-empty, not clear():
+				// clear() keeps the capacity allocated and frees nothing.
+				std::vector< VertRec >().swap( d );
 			} );
 		}
 	};
@@ -139,7 +147,15 @@ namespace
 			size_t total = 0;
 			for( const std::vector< Tri > &t : tTris ) total += t.size();
 			tris.reserve( tris.size() + total*3 );
-			for( const std::vector< Tri > &t : tTris ) for( const Tri &tr : t ) tris.push_back( tr.a ) , tris.push_back( tr.b ) , tris.push_back( tr.c );
+			// Release each per-thread buffer as soon as it has been appended
+			// (Tri is 12 B/triangle against 12 B/triangle in the output, so
+			// holding them all cost ~2x the triangle array at peak).
+			// swap-with-empty, not clear(): clear() keeps the capacity.
+			for( std::vector< Tri > &t : tTris )
+			{
+				for( const Tri &tr : t ) tris.push_back( tr.a ) , tris.push_back( tr.b ) , tris.push_back( tr.c );
+				std::vector< Tri >().swap( t );
+			}
 		}
 	};
 }

@@ -247,6 +247,53 @@ namespace { namespace texprof {
 #define TEXTURE_DATACOLOR_MIN_VIEW_COS 0.20f
 #endif
 
+// TEXTURE_DATACOLOR_SEED_MIN_COS: quality gate on which OBSERVED boundary faces are
+// allowed to SEED the synthesized fill colour. The fill diffuses outward from the
+// real-texture faces bordering a no-view region; on a ROUGH mesh that region shatters
+// into many small islands, each seeded from whatever grazing sliver happens to border
+// it, and grazing faces sample noisy/shadowed real texture -> every island converges to
+// a slightly different flat colour = the blotchy CPU fill. Only faces whose OWN view
+// (their patch label camera) sees them more frontally than this cosine are kept as seed
+// donors; grazing donors are skipped, so islands seed from clean frontal texture (or, if
+// an island has no frontal boundary, fall back to the uniform global average instead of a
+// noisy patchwork). cos is a true cosine (1 = frontal, 0 = edge-on). 0.35 ~= reject
+// donors more grazing than ~70deg; raise to demand more frontal seeds; 0 disables the
+// gate (seed from every observed boundary face, previous behaviour).
+// REVERTED to 0 (field test, Aug 2026): the gate made the fill more UNIFORM but the
+// fuller (ungated) seeding colours the region more accurately; the real remaining
+// artifact is highlight over-brightening, handled by TEXTURE_DATACOLOR_SEED_HIGHLIGHT_CLAMP.
+#ifndef TEXTURE_DATACOLOR_SEED_MIN_COS
+#define TEXTURE_DATACOLOR_SEED_MIN_COS 0.0f
+#endif
+
+// TEXTURE_DATACOLOR_SEED_HIGHLIGHT_CLAMP: caps each fill seed colour's luminance to
+// its OWN connected fill component's median_seed_luma * this factor. A specular highlight
+// caught on a boundary donor face seeds an abnormally BRIGHT colour that the two-phase
+// inpaint then spreads inward, over-brightening the fill and smearing it wider than the
+// GPU (whose smoother mesh boundary often misses the highlight). Clamping the seed luma to
+// a robust per-region ceiling (RGB scaled uniformly so hue is preserved) stops highlights
+// from dominating without dimming normal-brightness seeds -- and, because the ceiling is
+// per connected component, a genuinely-bright fill region is measured against its own
+// neighbourhood, not dragged down by a dark region's median elsewhere. 1.6 ~= allow up to
+// 60% above the component median before clamping; lower to clamp harder, raise to allow
+// brighter seeds; 0 disables (no clamp, previous behaviour).
+#ifndef TEXTURE_DATACOLOR_SEED_HIGHLIGHT_CLAMP
+#define TEXTURE_DATACOLOR_SEED_HIGHLIGHT_CLAMP 1.6f
+#endif
+
+// TEXTURE_RASTER_NO_BACKFACE_CULL: match the GPU ProjectMesh (which does NOT
+// back-face cull). The stock texture rasterizer (RasterizeTriangleBary CULL=true)
+// drops any triangle whose projected winding is negative; a near-vertical/grazing
+// wall projects to ~0 signed area, so tiny per-face normal noise flips it negative
+// and it is culled in EVERY view -> demoted to NO_ID / synthesized fill (the
+// magenta wall). With this on, RasterMesh rasterizes both windings and the depth
+// buffer decides visibility; the paired rawCos hard-reject in ListCameraFaces is
+// relaxed to a floored-quality last resort so these depth-visible faces keep their
+// real (grazing) texture instead of the fill. 0 = stock cull behaviour.
+#ifndef TEXTURE_RASTER_NO_BACKFACE_CULL
+#define TEXTURE_RASTER_NO_BACKFACE_CULL 1
+#endif
+
 // TEXTURE_DATACOLOR_BAKE: master switch for the actual data-color FILL/bake step in
 // GenerateTexture. Independent of TEXTURE_DATACOLOR_UNOBSERVED on purpose: with this
 // 0 and TEXTURE_DATACOLOR_UNOBSERVED still 1, the legacy label-forcing stays gated
@@ -348,7 +395,7 @@ namespace { namespace texprof {
 // within normal texture (a camera-to-camera OBSERVED seam, unrelated to the fill). Set BOTH back to
 // 0 for a normal render. Cheap: the stats loop only runs over the feather band.
 #ifndef TEXTURE_DATACOLOR_DIAG
-#define TEXTURE_DATACOLOR_DIAG 1
+#define TEXTURE_DATACOLOR_DIAG 0
 #endif
 #ifndef TEXTURE_DATACOLOR_DIAG_TINT
 #define TEXTURE_DATACOLOR_DIAG_TINT 0
@@ -411,17 +458,79 @@ namespace { namespace texprof {
 // TEXTURE_SEAM_MEM_BUDGET_GB: memory-budget cap on the LocalSeamLeveling worker count.
 // Each worker holds, sized to the patch it is currently processing, 2x Image32F3
 // (24 B/px) + an Image8U mask + the PoissonBlendingNoBias thread_local scratch
-// (~77 B/px LIVE). The MEASURED peak footprint is ~4x that (~256 B/px): per-patch
-// cv::Mat::create()/vector resize() churn transiently holds old+new during realloc,
-// and the pseam:: vectors keep their largest-patch capacity across patches. Sized to
-// the LARGEST patch x every core, this is the +20-30 GB TRANSIENT that sets the whole
-// texturing peak on res-0 (large multi-MP patches x many threads). The cap limits
-// workers so that T * (maxPatchArea * ~256 B) stays under this many GB. Semantics-
+// (~77 B/px LIVE, of which the pseam:: vectors retain their largest-patch capacity).
+// On large multi-MP patches this is the transient that can set the whole texturing
+// peak on res-0. The cap limits workers so that the sum of the N LARGEST patch areas
+// x ~96 B/px stays under the budget -- see bytesPerPixel at the cap site for why the
+// bound is sum-of-top-N rather than N x largest, and why the constant is 96. Semantics-
 // neutral: patches are seam-corrected independently, so fewer workers changes only
-// parallelism, never the output pixels. 0 disables the cap (use every core).
+// parallelism, never the output pixels.
+//   0 (DEFAULT) = AUTO: measure the free physical RAM at the moment the pass starts
+//                 and spend TEXTURE_SEAM_MEM_FREE_FRACTION of it. A fixed budget has
+//                 to be sized for the smallest machine, which throttles a big one to
+//                 a handful of workers for no reason; auto scales the worker count up
+//                 to every core on a box that has the headroom, and still clamps down
+//                 on a box (or a run) that does not.
+//  >0            = fixed budget of that many GB (previous behaviour, for repeatability).
+//  <0            = cap disabled entirely (use every core, whatever the footprint).
 #ifndef TEXTURE_SEAM_MEM_BUDGET_GB
-#define TEXTURE_SEAM_MEM_BUDGET_GB 8
+#define TEXTURE_SEAM_MEM_BUDGET_GB 0
 #endif
+
+// AUTO-budget tuning (only used when TEXTURE_SEAM_MEM_BUDGET_GB == 0):
+// TEXTURE_SEAM_MEM_FREE_FRACTION: share of the CURRENTLY-free physical RAM handed to
+//   the seam pass. Free RAM is measured after the images/patches are already resident,
+//   so it is real headroom; the remaining fraction is the safety margin for the OS,
+//   for other stages' allocator slack, and for the fact that the ~96 B/px model is an
+//   estimate. 0.75 leaves a quarter of the headroom untouched.
+// TEXTURE_SEAM_MEM_BUDGET_MIN_GB: floor, so a transient dip in free RAM cannot collapse
+//   the budget to nothing (the worker count clamps to >=1 regardless).
+// TEXTURE_SEAM_MEM_BUDGET_MAX_GB: optional ceiling, 0 = unlimited. Set it only to keep
+//   texturing from claiming a whole shared machine.
+// TEXTURE_SEAM_MEM_BUDGET_FALLBACK_GB: used when the OS query fails (returns zeros).
+#ifndef TEXTURE_SEAM_MEM_FREE_FRACTION
+#define TEXTURE_SEAM_MEM_FREE_FRACTION 0.75
+#endif
+#ifndef TEXTURE_SEAM_MEM_BUDGET_MIN_GB
+#define TEXTURE_SEAM_MEM_BUDGET_MIN_GB 1
+#endif
+#ifndef TEXTURE_SEAM_MEM_BUDGET_MAX_GB
+#define TEXTURE_SEAM_MEM_BUDGET_MAX_GB 0
+#endif
+#ifndef TEXTURE_SEAM_MEM_BUDGET_FALLBACK_GB
+#define TEXTURE_SEAM_MEM_BUDGET_FALLBACK_GB 8
+#endif
+
+// TEXTURE_SEAM_MAX_WORKERS: PARALLEL-EFFICIENCY cap, applied on top of the memory cap.
+// LocalSeamLeveling is DRAM-bandwidth-bound (Poisson blending streams several float
+// buffers per patch, and the concurrent working set is far larger than L3 at any useful
+// thread count), so it stops scaling well before the logical core count and then goes
+// BACKWARDS. Measured on a 16-core/32-thread 7950X, same 9910-patch scene:
+//     3 workers -> 5198 ms (15.6 core-s)
+//    14 workers -> 2987 ms (41.8 core-s)
+//    32 workers -> 4196 ms (134 core-s)
+// i.e. 32 workers burn ~8.6x the CPU of 3 for the same output and finish SLOWER than 14.
+// This is not a memory-capacity problem -- there was 45 GB free and the process peak did
+// not even move -- so no memory budget can express it; it needs its own cap. Physical
+// cores is the principled default: the SMT siblings add contention but no extra load/store
+// bandwidth, which is the resource this pass is actually short of.
+//   0 (DEFAULT) = auto: cap at the physical core count (no cap if detection fails).
+//  >0           = explicit worker cap, for tuning a specific machine.
+#ifndef TEXTURE_SEAM_MAX_WORKERS
+#define TEXTURE_SEAM_MAX_WORKERS 0
+#endif
+
+// NEGATIVE RESULT -- do not re-try without new evidence: the same physical-core cap was
+// applied to the ListCameraFaces per-view loop, on the theory that its ~20 B/px of private
+// full-res scratch (mGrad x2, imageGradMag, faceMap, depthMap -- ~335 MB/worker at 16.7 MP,
+// ~10.7 GB across 32 workers) would make it DRAM-bound the same way. It did not: on a
+// 192-image res-0 scene, 32 -> 16 workers moved that stage 11165 -> 11475 ms, i.e. no gain
+// (slightly worse, inside run-to-run noise), for a 1.8 GB lower process peak. The two
+// passes are NOT the same regime. The per-view loop allocates its scratch ONCE per worker
+// and reuses it across every view (all source images are the same size), so it streams a
+// FIXED working set. LocalSeamLeveling resizes its buffers per patch across 15k patches of
+// wildly varying size, and it is that realloc churn -- not streaming volume alone -- that
+// makes it contend. Reverted; only the seam pass is capped.
 
 // TEXTURE_CROP_IMAGES: after view-selection, each source image only contributes the
 // bounding box of the faces assigned to it (~0.6 MP of an ~18.6 MP original), yet the
@@ -438,6 +547,30 @@ namespace { namespace texprof {
 // decode pass (~25 s on 367 imgs). 0 = keep all full-res images resident (previous behaviour).
 #ifndef TEXTURE_CROP_IMAGES
 #define TEXTURE_CROP_IMAGES 1
+#endif
+
+// TEXTURE_KEEP_IMAGES_RESIDENT: skip the second decode pass when RAM allows.
+// TEXTURE_CROP_IMAGES frees each source image the moment its view is rasterized, so the
+// per-patch extract stage has to RE-READ AND RE-DECODE every used image from disk purely
+// to cut its crops -- every source image is decoded TWICE per run (~0.5 s on a 109-image
+// 2.9 MP set, ~25 s on a 367-image 18.6 MP set). That trade only makes sense when the
+// images do not fit: 109 x 2.9 MP x 3 B is 0.94 GB, i.e. 2% of a 64 GB box's free RAM.
+// When 1 (default), the decoded-image total is estimated up front and compared against
+// the free physical RAM; if it fits inside TEXTURE_KEEP_IMAGES_FRACTION of it, the images
+// are KEPT resident through ListCameraFaces and the extract stage crops straight out of
+// them -- one decode pass instead of two, no behaviour change (the crops are cloned from
+// identical pixels either way). If it does not fit, the release-and-reload path runs
+// exactly as before. Note the estimate is a headroom check made ONCE, before the images
+// are loaded, so it deliberately measures against a fraction well under 1.
+// 0 = always release and reload (previous behaviour).
+#ifndef TEXTURE_KEEP_IMAGES_RESIDENT
+#define TEXTURE_KEEP_IMAGES_RESIDENT 1
+#endif
+// Share of free physical RAM the resident source images may occupy. Kept low because
+// this budget is spent for the WHOLE run (the images stay live through view selection,
+// patch extraction and seam leveling), unlike the seam-leveling transient.
+#ifndef TEXTURE_KEEP_IMAGES_FRACTION
+#define TEXTURE_KEEP_IMAGES_FRACTION 0.35
 #endif
 
 // uncomment to use SparseLU for solving the linear systems
@@ -596,6 +729,34 @@ struct TRWSInference {
 }
 #endif
 
+// Number of PHYSICAL cores (not SMT siblings), or 0 if it cannot be determined.
+// Used to cap the bandwidth-bound passes -- see TEXTURE_SEAM_MAX_WORKERS.
+// Queried once on first use.
+static int GetPhysicalCoreCount()
+{
+	static const int nCores = []() -> int {
+		#if defined(_MSC_VER)
+		DWORD len = 0;
+		::GetLogicalProcessorInformation(NULL, &len);
+		if (::GetLastError() != ERROR_INSUFFICIENT_BUFFER || len == 0)
+			return 0;
+		std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> buf(
+			(len + sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) - 1) / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
+		if (!::GetLogicalProcessorInformation(buf.data(), &len))
+			return 0;
+		int n = 0;
+		for (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION& e : buf)
+			if (e.Relationship == RelationProcessorCore)
+				++n;
+		return n;
+		#else
+		// No portable physical-core query; callers treat 0 as "unknown" and skip the cap.
+		return 0;
+		#endif
+	}();
+	return nCores;
+}
+
 #if defined(_MSC_VER)
 #define DEBUG_BREAK() __debugbreak()
 #else
@@ -654,6 +815,19 @@ struct MeshTexture {
 				faceMap(pt) = idxFace;
 			}
 		}
+#if TEXTURE_RASTER_NO_BACKFACE_CULL
+		// GPU-parity: rasterize both windings (no back-face cull); the depth buffer
+		// decides visibility, so grazing walls whose winding flips still get pixels
+		void Project(const Mesh::Face& facet) {
+			typename Base::Triangle triangle;
+			typename Base::TriangleRasterizer tr(triangle, *this);
+			for (int v = 0; v < 3; ++v)
+				if (!this->ProjectVertex(vertices[facet[v]], v, triangle))
+					return;
+			Image8U3::RasterizeTriangleBary<float, typename Base::TriangleRasterizer, false>(
+				triangle.pti[0], triangle.pti[1], triangle.pti[2], tr);
+		}
+#endif
 	};
 
 	// used to represent a pixel color
@@ -924,7 +1098,17 @@ public:
 	void CreateSeamVertices();
 	void GlobalSeamLeveling();
 	void LocalSeamLeveling();
-	void GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize);
+	// Returns false if the atlas cannot be built at all (patches don't fit within
+	// nMaxTextureSize even after AdaptiveFitPatches) -- see TEXTURE_ATLAS_ADAPTIVE_FIT.
+	bool GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize);
+	// Downscale only the patches whose native resolution is denser than the mesh
+	// geometry they cover actually needs, until total patch area fits budgetAreaPixels;
+	// also unconditionally clamps any single patch whose own width or height alone
+	// exceeds maxPatchDim (area-based trimming alone cannot rescue that case -- see the
+	// implementation). Patches already within both limits are left untouched. Returns
+	// the number of patches rescaled. No-op (returns 0) when TEXTURE_CROP_IMAGES is off,
+	// since patches don't own a private, independently resizable pixel buffer.
+	unsigned AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatchDim);
 
 	// Source pixels for a patch: its private rect-local crop when TEXTURE_CROP_IMAGES is on
 	// (built in GenerateTexture right after projection), else the shared full source image.
@@ -989,6 +1173,11 @@ public:
 	Mesh::FaceArr& faces;
 	ImageArr& images;
 
+	// TEXTURE_KEEP_IMAGES_RESIDENT: decided once in ListCameraFaces from the free physical
+	// RAM. When true the source images are NOT released after their view is rasterized, and
+	// the per-patch extract stage crops from the resident pixels instead of re-decoding.
+	bool bKeepImagesResident;
+
 	Scene& scene; // the mesh vertices and faces
 };
 
@@ -1004,6 +1193,7 @@ MeshTexture::MeshTexture(Scene& _scene, unsigned _nResolutionLevel, unsigned _nM
 	vertices(_scene.mesh.vertices),
 	faces(_scene.mesh.faces),
 	images(_scene.images),
+	bKeepImagesResident(false), // decided in ListCameraFaces once the budget is known
 	scene(_scene)
 {
 }
@@ -1230,6 +1420,57 @@ inline TYPE2 ComputeAngle2(const TYPE1* V1, const TYPE1* V2) {
 	return CLAMP(TYPE2((V1[0] * V2[0] + V1[1] * V2[1] + V1[2] * V2[2]) / FastSqrtS((V1[0] * V1[0] + V1[1] * V1[1] + V1[2] * V1[2]) * (V2[0] * V2[0] + V2[1] * V2[1] + V2[2] * V2[2]))), TYPE2(-1), TYPE2(1));
 } // ComputeAngle
 
+#if TEXTURE_DATACOLOR_DIAG
+// dump mesh colored by per-face view class (lower = worse; vertex takes the worst
+// incident face):
+//  0 off-frustum/behind camera (blue)   1 back-winding cull only (red, FIXABLE)
+//  2 front-winding but never won a pixel = occluded/sub-pixel (yellow)
+//  3 rasterized but rawCos angle-rejected (orange)   4 observed (gray)
+static void SaveFaceViewClassPLY(const String& fileName, const Mesh& mesh, const std::vector<uint8_t>& faceClass)
+{
+	if (faceClass.size() != mesh.faces.GetSize())
+		return;
+	std::vector<uint8_t> vClass(mesh.vertices.GetSize(), 5);
+	FOREACH(f, mesh.faces) {
+		const uint8_t c = faceClass[f];
+		const Mesh::Face& fc = mesh.faces[f];
+		for (int v = 0; v < 3; ++v)
+			if (vClass[fc[v]] > c)
+				vClass[fc[v]] = c;
+	}
+	FILE* fp = fopen(fileName, "wb");
+	if (!fp)
+		return;
+	fprintf(fp, "ply\nformat binary_little_endian 1.0\n"
+		"element vertex %u\n"
+		"property float x\nproperty float y\nproperty float z\n"
+		"property uchar red\nproperty uchar green\nproperty uchar blue\n"
+		"element face %u\n"
+		"property list uchar int vertex_indices\n"
+		"end_header\n", mesh.vertices.GetSize(), mesh.faces.GetSize());
+	FOREACH(v, mesh.vertices) {
+		const Mesh::Vertex& vert = mesh.vertices[v];
+		uint8_t rgb[3];
+		switch (vClass[v]) {
+		case 0:  rgb[0] = 0;   rgb[1] = 0;   rgb[2] = 255; break; // off-frustum/behind
+		case 1:  rgb[0] = 255; rgb[1] = 0;   rgb[2] = 0;   break; // back-winding cull (fixable)
+		case 2:  rgb[0] = 255; rgb[1] = 255; rgb[2] = 0;   break; // front-winding, occluded/sub-pixel
+		case 3:  rgb[0] = 255; rgb[1] = 128; rgb[2] = 0;   break; // rasterized, angle-rejected
+		case 4:  rgb[0] = 190; rgb[1] = 190; rgb[2] = 190; break; // observed
+		default: rgb[0] = 90;  rgb[1] = 90;  rgb[2] = 90;  break; // untouched
+		}
+		fwrite(&vert, sizeof(float), 3, fp);
+		fwrite(rgb, 1, 3, fp);
+	}
+	FOREACH(f, mesh.faces) {
+		const uint8_t cnt = 3;
+		fwrite(&cnt, 1, 1, fp);
+		fwrite(&mesh.faces[f], sizeof(uint32_t), 3, fp);
+	}
+	fclose(fp);
+}
+#endif
+
 bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThreshold, const IIndexArr& _views)
 {
 	TEX_PROFILE_SCOPE("ListCameraFaces (total)");
@@ -1271,6 +1512,60 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	};
 	std::vector<std::vector<FaceOut>> perViewOut;
 	perViewOut.resize(views.size());
+
+#if TEXTURE_DATACOLOR_DIAG
+	// per-face flag: rasterized (front-facing by winding) in >=1 view, BEFORE the
+	// rawCos angle cull, so we can tell why NO_ID faces were demoted
+	std::vector<uint8_t> everRasterized(faces.size(), 0);
+	// projected in front & on-image in >=1 view, split by winding sign, to further
+	// classify never-rasterized faces (winding cull vs occlusion vs off-frustum)
+	std::vector<uint8_t> projFront(faces.size(), 0), projBack(faces.size(), 0);
+#endif
+
+	// KEEP-IMAGES-RESIDENT DECISION (see TEXTURE_KEEP_IMAGES_RESIDENT): if every decoded
+	// source image fits comfortably in the free physical RAM, hold them through to the
+	// per-patch extract stage so that stage does not have to decode the whole set a
+	// SECOND time just to cut crops.
+	// The size MUST come from RecomputeMaxResolution (which reads the image FILE header),
+	// not from the scene's stored width/height: those two disagree whenever the .mvs was
+	// written by a stage that ran at a reduced resolution. On a real 168-image scene the
+	// stored dims said 2.86 MP/image (1.41 GB total) while the files were 2x larger per
+	// side and actually decoded to 11.2 MP/image (5.63 GB) -- a 4x under-estimate, which
+	// on a bigger set would keep images resident that do not fit. Only the max dimension
+	// comes back, so pair it with the stored ASPECT ratio, which scaling preserves.
+#if TEXTURE_CROP_IMAGES && TEXTURE_KEEP_IMAGES_RESIDENT
+	{
+		constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
+		// header reads hit the disk, so do them in parallel (this is the same query the
+		// per-view loop below makes for each image anyway)
+		std::vector<uint64_t> viewBytes(views.size(), 0);
+#ifdef TEXOPT_USE_OPENMP
+		#pragma omp parallel for schedule(dynamic)
+#endif
+		for (int vi = 0; vi < (int)views.size(); ++vi) {
+			const Image& imageData = images[views[(IIndex)vi]];
+			if (!imageData.IsValid() || imageData.width == 0 || imageData.height == 0)
+				continue;
+			unsigned level(nResolutionLevel);
+			// max dimension the loader will actually produce, derived from the FILE header
+			const uint64_t imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
+			// aspect is scale-invariant, so the stored dims still give the short side
+			const double aspect((double)MINF(imageData.width, imageData.height) / (double)MAXF(imageData.width, imageData.height));
+			viewBytes[(size_t)vi] = (uint64_t)(imageSize * imageSize * aspect) * 3ull;
+		}
+		uint64_t imagesBytes = 0;
+		for (uint64_t b : viewBytes)
+			imagesBytes += b;
+		const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+		// a failed query (zeros) leaves the budget at 0 -> fall back to release-and-reload
+		const uint64_t keepBudget = (uint64_t)((double)memInfo.freePhysical * TEXTURE_KEEP_IMAGES_FRACTION);
+		bKeepImagesResident = (imagesBytes > 0 && imagesBytes <= keepBudget);
+		DEBUG_EXTRA("ListCameraFaces: source images %.2f GB decoded, budget %.2f GB (%.1f GB free x %.2f) -> %s",
+			imagesBytes / (double)GB, keepBudget / (double)GB, memInfo.freePhysical / (double)GB,
+			(double)TEXTURE_KEEP_IMAGES_FRACTION,
+			bKeepImagesResident ? "KEEP resident (single decode pass)" : "release + reload (two decode passes)");
+	}
+#endif
 
 	// Since we are controlling the threading per-view, don't let cv thread
 	// when performing its work.
@@ -1375,6 +1670,28 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			rasterer.idxFace = (FIndex)li;
 			rasterer.Project(facet);
 		}
+#if TEXTURE_DATACOLOR_DIAG
+		// classify projection/winding of each candidate face (same math as the
+		// rasterizer's ProjectVertex + EdgeFunction cull) to sub-bucket NO_ID faces
+		for (uint32_t li = 0; li < numCameraFaces; ++li) {
+			const FIndex idxFace = cameraFaces[li];
+			const Face& facet = faces[idxFace];
+			Point2f pf[3];
+			bool ok = true;
+			for (int v = 0; v < 3; ++v) {
+				const Point3 Xc(imageData.camera.TransformPointW2C(Cast<REAL>(vertices[facet[v]])));
+				if (Xc.z <= 0) { ok = false; break; }
+				pf[v] = imageData.camera.TransformPointC2I(Xc);
+				if (!depthMap.isInsideWithBorder<float, 3>(pf[v])) { ok = false; break; }
+			}
+			if (!ok)
+				continue;
+			if (EdgeFunction(pf[0], pf[1], pf[2]) > 0.f)
+				projFront[idxFace] = 1;
+			else
+				projBack[idxFace] = 1;
+		}
+#endif
 
 		// accumulate per-face quality/area/color over the rasterized pixels; the dense
 		// buffer is indexed by the local face index written into faceMap above.
@@ -1413,18 +1730,31 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			if (a.area == 0)
 				continue; // face had no rasterized pixel in this view
 			const FIndex idxFace = cameraFaces[li];
+#if TEXTURE_DATACOLOR_DIAG
+			// rasterized front-facing here (won the depth test); benign racing set
+			everRasterized[idxFace] = 1;
+#endif
 
 			const Face& f = faces[idxFace];
 			const auto& faceCenter = gFaceCenter[idxFace];
 			const Point3f camDir(Cast<Mesh::Type>(imageData.camera.C) - faceCenter);
 			const Normal& faceNormal = scene.mesh.faceNormals[idxFace];
 			const float rawCosFaceCam(ComputeAngle2(camDir.ptr(), faceNormal.ptr()));
+#if TEXTURE_RASTER_NO_BACKFACE_CULL
+			// visibility is the depth buffer (this face won the pixel), not the
+			// smoothed-normal sign; keep grazing/back-normal faces as a floored-
+			// quality last resort instead of demoting them to synthesized fill
+			if (rawCosFaceCam == 0.f)
+				continue;
+			a.quality *= SQUARE(MAXF(rawCosFaceCam, 0.05f));
+#else
 			// skip observations where the camera looks at the back of the face
 			// (rawCos <= 0); keeping them causes wrong-side texturing on edges.
 			if (rawCosFaceCam <= 0.f) {
 				continue;
 			}
 			a.quality *= SQUARE(rawCosFaceCam);
+#endif
 
 			FaceOut fo;
 			fo.idxFace = idxFace;
@@ -1446,7 +1776,10 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		// GenerateTexture reloads each image and crops it to its used region. The
 		// width/height/camera members stay intact (release() only frees the pixel Mat),
 		// so projection can still compute patch rects from the stored dimensions.
-		imageData.image.release();
+		// Unless bKeepImagesResident: the whole set fits in RAM, so keeping the pixels
+		// lets the extract stage crop from them instead of decoding everything again.
+		if (!bKeepImagesResident)
+			imageData.image.release();
 #endif
 
 		++progress;
@@ -1551,6 +1884,25 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 
 	// Restore cv's ability to thread.
 	cv::setNumThreads(prevCvThreads);
+
+#if TEXTURE_DATACOLOR_DIAG
+	// classify every face to distinguish WHY it is NO_ID (magenta fill): observed /
+	// rawCos-rejected / occluded / back-winding-culled / off-frustum
+	{
+		std::vector<uint8_t> faceClass(faces.size(), 0);
+		size_t nObs = 0, nAngle = 0, nOccl = 0, nBackWind = 0, nOff = 0;
+		for (size_t f = 0; f < faces.size(); ++f) {
+			if (facesDatas[(FIndex)f].GetSize() > 0)      { faceClass[f] = 4; ++nObs; }
+			else if (everRasterized[f])                   { faceClass[f] = 3; ++nAngle; }
+			else if (projFront[f])                        { faceClass[f] = 2; ++nOccl; }
+			else if (projBack[f])                         { faceClass[f] = 1; ++nBackWind; }
+			else                                          { faceClass[f] = 0; ++nOff; }
+		}
+		DEBUG_EXTRA("[TEX-VIEWCLASS] observed=%zu angle-rejected=%zu occluded/subpix=%zu back-winding-cull=%zu off-frustum=%zu (of %u faces)",
+			nObs, nAngle, nOccl, nBackWind, nOff, faces.GetSize());
+		SaveFaceViewClassPLY(MAKE_PATH("TexViewClass.ply"), scene.mesh, faceClass);
+	}
+#endif
 
 #if TEXOPT_FACEOUTLIER != TEXOPT_FACEOUTLIER_NA
 	if (fOutlierThreshold > 0) {
@@ -4877,42 +5229,139 @@ void MeshTexture::LocalSeamLeveling()
   // Notice, we must use dynamic scheduling here as patch size can vary a lot and cause load imbalance.
 	int T = omp_get_max_threads();
 
-	// MEMORY-BUDGET THREAD CAP (see TEXTURE_SEAM_MEM_BUDGET_GB): the per-thread patch
-	// buffers below (2x Image32F3 + mask + Poisson scratch, ~80 B/px) sized to the
-	// LARGEST patch x T workers are the transient that sets the texturing peak on res-0.
-	// Cap T so that footprint stays under the budget. Fewer workers -> identical output,
-	// just less parallelism. 0 disables the cap.
-	if (TEXTURE_SEAM_MEM_BUDGET_GB > 0) {
-		uint64_t maxPatchArea = 0;
-		for (uint32_t p = 0; p < numPatches; ++p) {
-			const TexturePatch& tp = texturePatches[p];
-			if (tp.label == NO_ID || tp.rect.width <= 0 || tp.rect.height <= 0)
-				continue;
-			const uint64_t area = (uint64_t)tp.rect.width * (uint64_t)tp.rect.height;
-			if (area > maxPatchArea)
-				maxPatchArea = area;
+	// PARALLEL-EFFICIENCY CAP (see TEXTURE_SEAM_MAX_WORKERS). Applied BEFORE the memory
+	// cap because it also shrinks the memory model's top-N window: fewer workers can only
+	// hold fewer patches at once. This pass is bandwidth-bound and measurably regresses
+	// past the physical core count (32 workers were slower than 14 on a 7950X), which is
+	// a scaling limit no memory budget can express.
+	{
+		const int nScalingCap = (TEXTURE_SEAM_MAX_WORKERS > 0 ? (int)TEXTURE_SEAM_MAX_WORKERS : GetPhysicalCoreCount());
+		if (nScalingCap > 0 && nScalingCap < T) {
+			DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (bandwidth-bound pass capped at %s)",
+				T, nScalingCap, (TEXTURE_SEAM_MAX_WORKERS > 0 ? "TEXTURE_SEAM_MAX_WORKERS" : "physical cores"));
+			T = nScalingCap;
 		}
-		if (maxPatchArea > 0) {
-			// Effective peak footprint per worker. The LIVE buffers are only ~77 B/px
-			// (2x Image32F3 = 24, mask = 1, Poisson stencil = 16, 6 float x/b = 24,
-			// red/black interior ~8, indices = 4). BUT the measured peak is ~4x that:
-			// the per-patch cv::Mat::create()/vector resize() churn transiently holds
-			// OLD+NEW during realloc, and the pseam:: vectors keep their LARGEST-patch
-			// capacity across patches. A naive 80 B/px model never fired (cap computed
-			// > core count) and the peak blew ~27 GB past an 8 GB budget on a real
-			// 227-image res-0 scene, so use the empirically-observed ~256 B/px.
-			const uint64_t perThreadBytes = maxPatchArea * 256ull;
-			const uint64_t budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_GB * 1024ull * 1024ull * 1024ull;
-			int cap = (int)(budgetBytes / perThreadBytes);
-			if (cap < 1)
-				cap = 1;
-			// Always log the decision (even when NOT capping) so the memory budget is
-			// observable in the profile trace.
-			DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (largest patch %llu px, ~%.2f GB/thread est, %d GB budget)",
-				T, (cap < T ? cap : T), (unsigned long long)maxPatchArea,
-				perThreadBytes / (1024.0*1024.0*1024.0), (int)TEXTURE_SEAM_MEM_BUDGET_GB);
-			if (cap < T)
-				T = cap;
+	}
+
+	// MEMORY-BUDGET THREAD CAP (see TEXTURE_SEAM_MEM_BUDGET_GB): the per-thread patch
+	// buffers below (2x Image32F3 + mask + Poisson scratch) can, across T workers, be the
+	// transient that sets the texturing peak on res-0. Cap T so the footprint of the T
+	// largest patches stays under the budget. Fewer workers -> identical output, just less
+	// parallelism. The budget is measured at runtime by default, so a machine with headroom
+	// is not throttled by a fixed number sized for the smallest box.
+	{
+		constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
+		uint64_t budgetBytes;   // 0 == no cap
+		String strBudgetSrc;
+		if (TEXTURE_SEAM_MEM_BUDGET_GB < 0) {
+			// cap disabled by build option
+			budgetBytes = 0;
+		} else if (TEXTURE_SEAM_MEM_BUDGET_GB > 0) {
+			// fixed build-time budget
+			budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_GB * GB;
+			strBudgetSrc = String::FormatString("fixed %.1f GB", budgetBytes / (double)GB);
+		} else {
+			// AUTO: size the budget from the free physical RAM as it is RIGHT NOW, i.e.
+			// after the source images and the texture patches are already resident, so
+			// what we measure is genuine headroom for this pass.
+			const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+			if (memInfo.totalPhysical == 0) {
+				// OS query failed -> conservative fixed fallback rather than "unlimited"
+				budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_FALLBACK_GB * GB;
+				strBudgetSrc = String::FormatString("fallback %.1f GB (memory query failed)", budgetBytes / (double)GB);
+			} else {
+				budgetBytes = (uint64_t)((double)memInfo.freePhysical * TEXTURE_SEAM_MEM_FREE_FRACTION);
+				// on a constrained address space the virtual headroom can bind first
+				if (memInfo.freeVirtual > 0) {
+					const uint64_t virtualBytes = (uint64_t)((double)memInfo.freeVirtual * TEXTURE_SEAM_MEM_FREE_FRACTION);
+					if (budgetBytes > virtualBytes)
+						budgetBytes = virtualBytes;
+				}
+				if (budgetBytes < (uint64_t)TEXTURE_SEAM_MEM_BUDGET_MIN_GB * GB)
+					budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_MIN_GB * GB;
+				if (TEXTURE_SEAM_MEM_BUDGET_MAX_GB > 0 && budgetBytes > (uint64_t)TEXTURE_SEAM_MEM_BUDGET_MAX_GB * GB)
+					budgetBytes = (uint64_t)TEXTURE_SEAM_MEM_BUDGET_MAX_GB * GB;
+				strBudgetSrc = String::FormatString("auto %.1f GB (%.1f of %.1f GB physical free x %.2f)",
+					budgetBytes / (double)GB, memInfo.freePhysical / (double)GB,
+					memInfo.totalPhysical / (double)GB, (double)TEXTURE_SEAM_MEM_FREE_FRACTION);
+			}
+		}
+		if (budgetBytes > 0) {
+			// FOOTPRINT MODEL: SUM OF THE T LARGEST PATCHES, not T x the largest one.
+			// Patch areas are extremely skewed -- a real 109-image res-0 set had 9910
+			// patches totalling 276.5 Mpx (27.9 kpx MEAN) with only 4 patches over 4 Mpx
+			// and a single 10.2 Mpx outlier. Charging every worker the size of that
+			// outlier assumes all T workers sit on it simultaneously, which cannot happen
+			// when there are only 4 big patches: the old T x max model predicted 34 GB for
+			// 14 workers while the process high-water mark did not move at all (peakWS
+			// 7.58 GB before AND after the pass; curWS delta ~0.8 GB) -- over-estimating
+			// by well over an order of magnitude and needlessly capping 32 cores to 14.
+			// The sum of the T largest areas is still a rigorous worst case: the workers
+			// hold at most T patches at once, so the costliest possible set is the T
+			// biggest. It is also what bounds the RETAINED pseam:: scratch, whose worst
+			// case is likewise "each of the T largest landed on a different thread". And
+			// it is never looser than the old bound, since sum(top T) <= T * max always.
+			std::vector<uint64_t> areas;
+			areas.reserve(numPatches);
+			for (uint32_t p = 0; p < numPatches; ++p) {
+				const TexturePatch& tp = texturePatches[p];
+				if (tp.label == NO_ID || tp.rect.width <= 0 || tp.rect.height <= 0)
+					continue;
+				areas.push_back((uint64_t)tp.rect.width * (uint64_t)tp.rect.height);
+			}
+			if (!areas.empty()) {
+				// only the T largest can ever be resident at once
+				const size_t nTop = MINF((size_t)MAXF(T, 1), areas.size());
+				std::partial_sort(areas.begin(), areas.begin()+nTop, areas.end(),
+					[](uint64_t a, uint64_t b) { return a > b; });
+				// Bytes per patch pixel, sized to the WORST CASE: every one of the top-N
+				// patches resident on its own worker at once. Live buffers are ~77 B/px
+				// (2x Image32F3 = 24, mask = 1, Poisson stencil = 16, 6 float x/b = 24,
+				// red/black interior ~8, indices = 4); of that, the pseam:: vectors (~52)
+				// keep their largest-patch capacity across patches while the cv::Mats
+				// (~25) are resized per patch. 96 B/px covers the full 77 plus ~25% for
+				// the realloc churn that transiently holds OLD+NEW during a resize.
+				//
+				// This was 256 B/px, which was calibrated against the OLD T x max area
+				// model and was really absorbing THAT model's error. With the area term
+				// fixed the two conservatisms compounded and the estimate ran ~15x over
+				// on every scene measured (working-set delta across LocalSeamLeveling,
+				// read before ReleaseSeamScratch):
+				//   109 img, top-14 patches   ->  est 11.5 GB, actual 0.79 GB
+				//   168 img, top-16 patches   ->  est 20.8 GB, actual 1.18 GB
+				//   192 img, top-16 = 111.8 Mpx -> est 28.6 GB, actual 2.04 GB (~18 B/px)
+				// That last one sat at 90% of a 31.9 GB budget, i.e. one slightly larger
+				// scene (or a busier machine) away from throttling workers back down and
+				// undoing the 2 -> 16 worker win that cut this stage from 27.8 s to 10.2 s.
+				// 96 B/px still bounds the rigorous worst case; it just stops double-
+				// counting. Raise it if a real scene is ever measured above ~77 B/px.
+				constexpr uint64_t bytesPerPixel = 96ull;
+				// largest worker count whose top-N area sum stays inside the budget (>=1)
+				int cap = 0;
+				uint64_t sumArea = 0;
+				for (size_t i = 0; i < nTop; ++i) {
+					const uint64_t nextSum = sumArea + areas[i];
+					if (nextSum * bytesPerPixel > budgetBytes)
+						break;
+					sumArea = nextSum;
+					++cap;
+				}
+				if (cap < 1)
+					cap = 1;
+				const int finalT = (cap < T ? cap : T);
+				// footprint estimate for the workers actually used (cap may exceed T)
+				uint64_t finalArea = 0;
+				for (size_t i = 0; i < (size_t)finalT && i < nTop; ++i)
+					finalArea += areas[i];
+				// Always log the decision (even when NOT capping) so the memory budget is
+				// observable in the profile trace.
+				DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (%u patches, largest %llu px, ~%.2f GB est for %d workers, budget %s)",
+					T, finalT, (unsigned)areas.size(), (unsigned long long)areas[0],
+					finalArea * bytesPerPixel / (double)GB, finalT, strBudgetSrc.c_str());
+				T = finalT;
+			}
+		} else {
+			DEBUG_EXTRA("LocalSeamLeveling: threads %d (memory budget cap disabled)", T);
 		}
 	}
 
@@ -5637,7 +6086,172 @@ static int GetOpenGLMaxTextureSize()
 	return cached;
 }
 
-void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
+// TEXTURE_ATLAS_ADAPTIVE_FIT: when the patches (at native resolution) do not fit
+// within nMaxTextureSize, shrink only the outlier patches -- those captured at a
+// source resolution denser than their mesh footprint needs -- instead of growing the
+// atlas past a real GPU/memory ceiling. This replaces an escape valve that used to
+// double the atlas dimension past a "hard" cap toward a multi-hundred-GB allocation
+// on any scene whose total patch area exceeded one nMaxTextureSize square; that
+// valve is gone, so a scene which cannot be adaptively fit now fails loudly instead.
+// 0 = restore the old "just keep growing" behaviour (kept for A/B only; do not ship
+// with this off, it defeats --max-texture-size as a real ceiling).
+#ifndef TEXTURE_ATLAS_ADAPTIVE_FIT
+#define TEXTURE_ATLAS_ADAPTIVE_FIT 1
+#endif
+// Fraction of nMaxTextureSize^2 the adaptive-fit target aims for on its first
+// attempt, leaving slack for the shelf packer's imperfect packing efficiency
+// (rects rarely tile a square with zero waste). Tightened automatically on retry.
+#ifndef TEXTURE_ATLAS_FIT_MARGIN
+#define TEXTURE_ATLAS_FIT_MARGIN 0.85
+#endif
+// When --max-texture-size is 0 (deliberately unbounded, no GPU ceiling to respect),
+// the atlas still has to be built in memory, so derive a RAM-safe packing dimension
+// from this fraction of total physical RAM instead -- same shape as
+// MESHOPT_MEM_TARGET_FRACTION in SceneRefine.cpp.
+#ifndef TEXTURE_ATLAS_MEM_TARGET_FRACTION
+#define TEXTURE_ATLAS_MEM_TARGET_FRACTION 0.85
+#endif
+// Used only if the OS memory query fails (returns zeros).
+#ifndef TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB
+#define TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB 8
+#endif
+
+unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatchDim)
+{
+#if !TEXTURE_CROP_IMAGES
+	// patches share the full source image buffer -- there is no private, independently
+	// resizable crop to shrink, so this is a no-op; the caller's retry loop will exhaust
+	// itself and fail loudly, which is honest given there is really nothing to trim here.
+	return 0;
+#else
+	const unsigned numPatches = texturePatches.GetSize();
+
+	// Resize one patch's crop to (newW,newH) and rescale its texcoords by the REALIZED
+	// integer ratio (not the theoretical target), so rounding to whole pixels can never
+	// leave a texcoord outside the actually-resized buffer. Shared by both steps below.
+	const auto ResizePatch = [this](TexturePatch& tp, int newW, int newH) {
+		newW = std::max(1, newW);
+		newH = std::max(1, newH);
+		if (newW >= tp.rect.width && newH >= tp.rect.height)
+			return;
+		if (!tp.image.empty()) {
+			cv::Mat resized;
+			cv::resize(tp.image, resized, cv::Size(newW, newH), 0, 0, cv::INTER_AREA);
+			tp.image = resized;
+		}
+		const float sx = (float)newW / (float)tp.rect.width;
+		const float sy = (float)newH / (float)tp.rect.height;
+		for (const FIndex idxFace : tp.faces) {
+			TexCoord* texcoords = faceTexcoords.data() + idxFace * 3;
+			for (int v = 0; v < 3; ++v) {
+				texcoords[v].x *= sx;
+				texcoords[v].y *= sy;
+				// A trimmed patch's texcoords must land inside its new, smaller rect --
+				// a mismatch here means a face would sample the wrong pixels (silently
+				// wrong texture), not just lower detail, so this is checked, not assumed.
+				ASSERT(texcoords[v].x >= -0.5f && texcoords[v].x <= (float)newW + 0.5f &&
+					texcoords[v].y >= -0.5f && texcoords[v].y <= (float)newH + 0.5f);
+			}
+		}
+		tp.rect = cv::Rect(0, 0, newW, newH);
+	};
+
+	unsigned numScaled = 0;
+
+	// STEP 1: unconditionally clamp any SINGLE patch whose own width or height alone
+	// exceeds maxPatchDim. No area-budget/density logic below can rescue this case:
+	// PackShelfFast rejects the WHOLE pack the instant one rect cannot fit the atlas in
+	// EITHER orientation (see its unplaceable check), regardless of how small every other
+	// patch is -- a pathologically elongated patch (low density/area, but one dimension
+	// wider than the atlas, e.g. a long thin strip) would otherwise sail through the
+	// area-based water-filling in step 2 untouched and still fail to pack.
+	if (maxPatchDim > 0) {
+		for (unsigned p = 0; p < numPatches; ++p) {
+			TexturePatch& tp = texturePatches[p];
+			if (tp.rect.width <= maxPatchDim && tp.rect.height <= maxPatchDim)
+				continue;
+			const double s = (double)maxPatchDim / (double)std::max(tp.rect.width, tp.rect.height);
+			ResizePatch(tp, (int)std::lround(tp.rect.width * s), (int)std::lround(tp.rect.height * s));
+			++numScaled;
+		}
+	}
+
+	// STEP 2: density-based water-filling over total area, reading the (possibly
+	// step-1-clamped) rects.
+	std::vector<double> areaPx(numPatches, 0.0);
+	std::vector<double> areaWorld(numPatches, 0.0);
+
+	// Per-patch mesh-space (world) area, summed over each patch's OWN face list in a
+	// fixed index order. Patches are independent (disjoint face lists, distinct output
+	// slots), so parallelizing ACROSS patches is safe; the accumulation WITHIN a patch
+	// stays sequential and order-fixed, so the result does not depend on the OpenMP
+	// schedule -- required, since this feeds a decision (which patches get trimmed and
+	// by how much) that must be identical for identical input, not just "close enough".
+#ifdef TEXOPT_USE_OPENMP
+	#pragma omp parallel for schedule(dynamic)
+#endif
+	for (int_t p = 0; p < (int_t)numPatches; ++p) {
+		const TexturePatch& tp = texturePatches[(uint32_t)p];
+		if (tp.rect.width <= 0 || tp.rect.height <= 0)
+			continue;
+		areaPx[(size_t)p] = (double)tp.rect.width * (double)tp.rect.height;
+		double world = 0.0;
+		for (const FIndex idxFace : tp.faces) {
+			const Face& face = faces[idxFace];
+			world += ComputeTriangleArea(vertices[face[0]], vertices[face[1]], vertices[face[2]]);
+		}
+		areaWorld[(size_t)p] = world;
+	}
+
+	double totalAreaPx = 0.0, maxDensity = 0.0;
+	for (unsigned p = 0; p < numPatches; ++p) {
+		totalAreaPx += areaPx[p];
+		if (areaWorld[p] > 1e-12) {
+			const double d = areaPx[p] / areaWorld[p];
+			if (d > maxDensity)
+				maxDensity = d;
+		}
+	}
+	if (totalAreaPx <= (double)budgetAreaPixels || maxDensity <= 0.0)
+		return numScaled; // area already fits (step 1 may still have clamped an outlier dimension)
+
+	// Binary search the density ceiling D: total(D) = sum(min(areaPx[p], D*areaWorld[p]))
+	// is monotonically non-decreasing in D, so bisection converges directly to the
+	// largest D that keeps total area under budget. Capping every patch denser than D
+	// down to exactly D (and leaving everything else untouched) is the minimal set of
+	// patches touched for a given area reduction -- well-matched patches never lose
+	// resolution, only genuine outliers do.
+	double lo = 0.0, hi = maxDensity;
+	for (int iter = 0; iter < 40; ++iter) {
+		const double mid = 0.5 * (lo + hi);
+		double total = 0.0;
+		for (unsigned p = 0; p < numPatches; ++p) {
+			const double cap = mid * areaWorld[p];
+			total += (areaWorld[p] > 1e-12 && cap < areaPx[p]) ? cap : areaPx[p];
+		}
+		if (total > (double)budgetAreaPixels)
+			hi = mid;
+		else
+			lo = mid;
+	}
+	const double D = lo;
+
+	for (unsigned p = 0; p < numPatches; ++p) {
+		if (areaWorld[p] <= 1e-12)
+			continue;
+		const double targetArea = D * areaWorld[p];
+		if (targetArea >= areaPx[p])
+			continue; // at or below the ceiling already -- untouched
+		TexturePatch& tp = texturePatches[p];
+		const double scale = std::sqrt(targetArea / areaPx[p]);
+		ResizePatch(tp, (int)std::lround(tp.rect.width * scale), (int)std::lround(tp.rect.height * scale));
+		++numScaled;
+	}
+	return numScaled;
+#endif // TEXTURE_CROP_IMAGES
+}
+
+bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
 {
 	// --max-texture-size < 0 => cap the final atlas to the GPU's native
 	// GL_MAX_TEXTURE_SIZE (the viewer is OpenGL). == 0 keeps its original meaning:
@@ -5768,23 +6382,33 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			Image& imageData = images[label];
 			Image8U3& scratch = reloadScratch[(size_t)omp_get_thread_num()];
 
-			// decode the full source image into the reused scratch (create() reuses the
-			// buffer when the size matches -> no per-image allocation churn)
-			unsigned level(nResolutionLevel);
-			const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
-			if (Image::ReadImage(imageData.name, scratch) == NULL)
-				continue; // decode failed; patches keep empty images -> skipped downstream
-			// match the resolution level ListCameraFaces used (res-0 => imageSize == full
-			// original, so no resize and the scratch buffer is reused verbatim)
-			if ((unsigned)MAXF(scratch.cols, scratch.rows) > imageSize) {
-				const double s = (double)imageSize / (double)MAXF(scratch.cols, scratch.rows);
-				cv::resize(scratch, scratch, cv::Size(), s, s, cv::INTER_AREA);
+			// When the whole image set fit in RAM (bKeepImagesResident) ListCameraFaces
+			// never released the pixels, so crop straight out of them -- this is the entire
+			// point of that decision: it removes a second full decode pass over every image
+			// (~25 s on a 367-image 18.6 MP set). Same pixels, same crops, just not re-read.
+			const bool bResident = bKeepImagesResident && !imageData.image.empty();
+			if (!bResident) {
+				// decode the full source image into the reused scratch (create() reuses the
+				// buffer when the size matches -> no per-image allocation churn)
+				unsigned level(nResolutionLevel);
+				const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
+				if (Image::ReadImage(imageData.name, scratch) == NULL)
+					continue; // decode failed; patches keep empty images -> skipped downstream
+				// match the resolution level ListCameraFaces used (res-0 => imageSize == full
+				// original, so no resize and the scratch buffer is reused verbatim)
+				if ((unsigned)MAXF(scratch.cols, scratch.rows) > imageSize) {
+					const double s = (double)imageSize / (double)MAXF(scratch.cols, scratch.rows);
+					cv::resize(scratch, scratch, cv::Size(), s, s, cv::INTER_AREA);
+				}
+				imageData.UpdateCamera(scene.platforms);
 			}
-			imageData.UpdateCamera(scene.platforms);
-			if (scratch.empty())
+			// resident pixels were already loaded at this resolution level and had their
+			// camera updated by ListCameraFaces, so no reload/resize/UpdateCamera needed
+			const Image8U3& srcImage = bResident ? imageData.image : scratch;
+			if (srcImage.empty())
 				continue;
 
-			const int srcW = scratch.cols, srcH = scratch.rows;
+			const int srcW = srcImage.cols, srcH = srcImage.rows;
 			for (const uint32_t p : patchesByLabel[label]) {
 				TexturePatch& tp = texturePatches[p];
 				cv::Rect r = tp.rect;
@@ -5794,9 +6418,15 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				if (r.x + r.width > srcW) r.width = srcW - r.x;
 				if (r.y + r.height > srcH) r.height = srcH - r.y;
 				if (r.width <= 0 || r.height <= 0) { tp.rect = cv::Rect(0, 0, 0, 0); continue; }
-				tp.image = scratch(r).clone();               // private full-res crop
+				tp.image = srcImage(r).clone();             // private full-res crop
 				tp.rect = cv::Rect(0, 0, r.width, r.height); // rebase to its own origin
 			}
+			// Crops are cloned, and with TEXTURE_CROP_IMAGES every downstream read goes
+			// through PatchSrcImage() -> the patch's own buffer, so the full image is dead
+			// weight from here on. Release it now (rather than at the later bulk release)
+			// so seam leveling measures the freed RAM as available headroom.
+			if (bResident)
+				imageData.image.release();
 		}
 		// free the (few) reused decode buffers now that all crops are cloned out
 		reloadScratch.clear();
@@ -5908,36 +6538,53 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		int atlasW = 0;
 		int atlasH = 0;
 
-		int maxDim = std::max(64, nMaxTextureSize); // starting point
-
-		// Optional: hard safety cap so you don't allocate something insane
-		const int hardCap = 262144; // pick something you can tolerate
+		// `nMaxTextureSize` is a real ceiling (GPU/viewer texture-size limit), not a
+		// starting guess -- packing must never exceed it. When --max-texture-size is 0
+		// (deliberately unbounded) there is no GPU ceiling to respect, so derive a
+		// RAM-safe one instead: an "unbounded" atlas still has to fit in memory to be
+		// built at all. See TEXTURE_ATLAS_MEM_TARGET_FRACTION.
+		int hardMaxDim = nMaxTextureSize;
+		if (hardMaxDim <= 0) {
+			constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
+			const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+			uint64_t targetBytes = (uint64_t)TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB * GB;
+			if (memInfo.totalPhysical > 0)
+				targetBytes = (uint64_t)((double)memInfo.totalPhysical * TEXTURE_ATLAS_MEM_TARGET_FRACTION);
+			hardMaxDim = (int)std::sqrt((double)targetBytes / 3.0/*Image8U3*/);
+			DEBUG_EXTRA("GenerateTexture: --max-texture-size 0 (unbounded) -> memory-safe cap %d px (%.1f GB target)",
+				hardMaxDim, targetBytes / (double)GB);
+		}
+		hardMaxDim = std::max(64, hardMaxDim);
 
 		TEX_PROFILE_BEGIN(_tGtPack);
-		bool ok = false;
+		bool ok = PackShelfReasonablySquare(rects, (int)nTextureSizeMultiple, hardMaxDim, placed, atlasW, atlasH);
 
-		while (!ok) {
-			ok = PackShelfReasonablySquare(
-				rects,
-				(int)nTextureSizeMultiple,
-				maxDim,
-				placed,
-				atlasW,
-				atlasH);
+		if (!ok && TEXTURE_ATLAS_ADAPTIVE_FIT) {
+			// Patches don't fit within hardMaxDim at native resolution. Rather than
+			// growing the atlas past a real GPU/memory ceiling, shrink only the patches
+			// denser than the mesh geometry actually needs (AdaptiveFitPatches), then
+			// retry packing at the SAME hardMaxDim -- the atlas dimension never moves.
+			double margin = TEXTURE_ATLAS_FIT_MARGIN;
+			for (int attempt = 0; attempt < 3 && !ok; ++attempt, margin *= 0.85) {
+				const uint64_t budgetAreaPixels = (uint64_t)((double)hardMaxDim * (double)hardMaxDim * margin);
+				const unsigned numFit = AdaptiveFitPatches(budgetAreaPixels, hardMaxDim);
+				DEBUG_EXTRA("GenerateTexture: atlas overflow at %d px -- adaptively downscaled %u/%u patches to fit (attempt %d, margin %.2f)",
+					hardMaxDim, numFit, texturePatches.GetSize(), attempt + 1, margin);
+				for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i)
+					rects[i] = texturePatches[(uint32_t)i].rect;
+				ok = PackShelfReasonablySquare(rects, (int)nTextureSizeMultiple, hardMaxDim, placed, atlasW, atlasH);
+				if (numFit == 0)
+					break; // nothing left to trim (TEXTURE_CROP_IMAGES off, or already minimal) -- further attempts can't help
+			}
+		}
 
-			if (ok) {
-				break;
-			}
-
-			// Grow and retry
-			if (maxDim >= hardCap) {
-				// At this point you either need paging or you accept very large atlases.
-				// Since you said "don't fail", last resort: just keep going (or set higher cap).
-				maxDim = maxDim * 2;
-			}
-			else {
-				maxDim = std::min(hardCap, maxDim * 2);
-			}
+		if (!ok) {
+			// Cannot fit even after adaptive downscaling: fail loudly rather than repeat
+			// the old behaviour of silently doubling the atlas dimension past a "hard"
+			// cap toward a multi-hundred-GB allocation.
+			DEBUG_EXTRA("GenerateTexture: FATAL -- cannot fit texture patches within %d px even after "
+				"adaptive downscaling; increase --max-texture-size or reduce mesh/image resolution", hardMaxDim);
+			return false;
 		}
 
 		rects.swap(placed);
@@ -6310,11 +6957,20 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						// one texel at the raw corner -- the main source of the "wrong colour"
 						// fill, because that single pixel was often a gutter or outlier texel.
 						static const float kSeedT[4] = { 0.18f, 0.34f, 0.50f, 0.66f };
+						const float seedMinCos = (float)TEXTURE_DATACOLOR_SEED_MIN_COS;
 						for (const TexturePatch& tp : texturePatches) {
 							for (const FIndex fc : tp.faces) {
 								const Face& face = faces[fc];
 								if (!(vUsed[face[0]] || vUsed[face[1]] || vUsed[face[2]]))
 									continue; // face doesn't touch the fill region
+								if (seedMinCos > 0.f) {
+									// reject grazing seed donors: their noisy/shadowed texture fragments the fill
+									const Vertex& sA = vertices[face[0]]; const Vertex& sB = vertices[face[1]]; const Vertex& sC = vertices[face[2]];
+									const Point3f sCen((sA.x + sB.x + sC.x) * (1.f / 3.f), (sA.y + sB.y + sC.y) * (1.f / 3.f), (sA.z + sB.z + sC.z) * (1.f / 3.f));
+									const Point3f sCamDir(Cast<Mesh::Type>(images[tp.label].camera.C) - sCen);
+									if (ComputeAngle2(sCamDir.ptr(), scene.mesh.faceNormals[fc].ptr()) < seedMinCos)
+										continue;
+								}
 								const TexCoord* tc = faceTexcoords.data() + (size_t)fc * 3;
 								const float cx = (tc[0].x + tc[1].x + tc[2].x) * (1.f / 3.f);
 								const float cy = (tc[0].y + tc[1].y + tc[2].y) * (1.f / 3.f);
@@ -6345,6 +7001,53 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								const float inv = 1.f / (float)scnt[v];
 								vr[v] = ssr[v] * inv; vg[v] = ssg[v] * inv; vb[v] = ssb[v] * inv;
 								vValid[v] = 1; vSeed[v] = 1;
+							}
+						}
+					}
+					// HIGHLIGHT CLAMP (PER-COMPONENT): cap each seed's luma to a robust ceiling
+					// (median x factor) computed over its OWN connected fill region, so a specular
+					// highlight caught on that region's boundary can't over-brighten and spread a
+					// too-bright colour through it, while a genuinely-bright region elsewhere is not
+					// dragged down by a dark region's median (RGB scaled -> hue preserved).
+					{
+						const float seedHiClamp = (float)TEXTURE_DATACOLOR_SEED_HIGHLIGHT_CLAMP;
+						if (seedHiClamp > 0.f) {
+							// label connected components of the no-view faces (edge adjacency) and
+							// tag each used (boundary/interior) vertex with its component id
+							std::vector<uint8_t> isNoViewHi(faces.size(), 0);
+							for (int i = 0; i < N; ++i) isNoViewHi[noViewFaces[i]] = 1;
+							std::vector<int> fCompHi(faces.size(), -1);
+							std::vector<int> vCompHi(NV, -1);
+							int nCompHi = 0;
+							{
+								std::vector<FIndex> bfs;
+								for (int i = 0; i < N; ++i) {
+									const FIndex f0 = noViewFaces[i];
+									if (fCompHi[f0] != -1) continue;
+									const int cid = nCompHi++;
+									fCompHi[f0] = cid; bfs.clear(); bfs.push_back(f0);
+									while (!bfs.empty()) {
+										const FIndex f = bfs.back(); bfs.pop_back();
+										const Face& fa = faces[f];
+										for (int k = 0; k < 3; ++k) { const uint32_t v = fa[k]; if (vCompHi[v] < 0) vCompHi[v] = cid; }
+										const Mesh::FaceFaces& adj = faceFaces[f];
+										for (int k = 0; k < 3; ++k) { const FIndex fn = adj[k]; if (fn == NO_ID || !isNoViewHi[fn] || fCompHi[fn] != -1) continue; fCompHi[fn] = cid; bfs.push_back(fn); }
+									}
+								}
+							}
+							// per-component median luma -> ceiling
+							std::vector<std::vector<float>> lumByComp((size_t)nCompHi);
+							for (int u = 0; u < NU; ++u) { const uint32_t v = pUsed[u]; if (vValid[v] && vCompHi[v] >= 0) lumByComp[(size_t)vCompHi[v]].push_back(0.299f * vr[v] + 0.587f * vg[v] + 0.114f * vb[v]); }
+							std::vector<float> ceilByComp((size_t)nCompHi, -1.f);
+							for (int c = 0; c < nCompHi; ++c) { auto& L = lumByComp[(size_t)c]; if (L.empty()) continue; std::nth_element(L.begin(), L.begin() + L.size() / 2, L.end()); ceilByComp[(size_t)c] = L[L.size() / 2] * seedHiClamp; }
+							// clamp each seed to its component's ceiling
+							for (int u = 0; u < NU; ++u) {
+								const uint32_t v = pUsed[u];
+								if (!vValid[v] || vCompHi[v] < 0) continue;
+								const float cl = ceilByComp[(size_t)vCompHi[v]];
+								if (cl < 0.f) continue;
+								const float L = 0.299f * vr[v] + 0.587f * vg[v] + 0.114f * vb[v];
+								if (L > cl && L > 1e-3f) { const float s = cl / L; vr[v] *= s; vg[v] *= s; vb[v] *= s; }
 							}
 						}
 					}
@@ -7219,6 +7922,7 @@ void MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 #endif // TEXTURE_ENABLE_SHARPEN
 		TEX_PROFILE_END(_tGtFinalize, "GenerateTexture: resize+sharpen");
 	}
+	return true;
 }
 
 // texture mesh
@@ -7246,7 +7950,8 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 	// generate the texture image and atlas
 	{
 		TD_TIMER_STARTD();
-		texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize);
+		if (!texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize))
+			return false;
 		DEBUG_EXTRA("Generating texture atlas and image completed: %u patches, %u image size (%s)", texture.texturePatches.GetSize(), mesh.textureDiffuse.width(), TD_TIMER_GET_FMT().c_str());
 	}
 	LogPeakMem("after GenerateTexture");

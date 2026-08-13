@@ -721,6 +721,17 @@ public:
 	};
 	static MemoryInfo GetMemoryInfo();
 
+	// per-process counters (as opposed to MemoryInfo's system-wide totals): lets
+	// callers distinguish "this process is genuinely growing" from "system-wide free
+	// RAM dropped for some other reason" without waiting for the end-of-run
+	// LogMemoryInfo() dump.
+	struct ProcessMemoryInfo {
+		size_t workingSetSize;
+		size_t pagefileUsage; // commit charge; what actually triggers an OOM allocation failure
+		ProcessMemoryInfo(size_t wss = 0, size_t pfu = 0) : workingSetSize(wss), pagefileUsage(pfu) {}
+	};
+	static ProcessMemoryInfo GetSelfMemoryInfo();
+
 	static LPSTR* CommandLineToArgvA(LPCSTR CmdLine, size_t& _argc);
 	static String CommandLineToString(size_t argc, LPCTSTR* argv) {
 		String strCmdLine;
@@ -789,7 +800,7 @@ public:
 				remaining = static_cast<Timer::Type>((elapsed / clampedPct) - elapsed);
 			}
 
-			// Optional: Option 2 – smoothed ETA (comment out Option 1 if using this)
+			// Optional: Option 2 ï¿½ smoothed ETA (comment out Option 1 if using this)
 			/*
 			static double avgSpeed = 0.0;
 			double currentSpeed = (double)done / (elapsed / 1000.0);  // units/sec

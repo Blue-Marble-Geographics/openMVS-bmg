@@ -170,6 +170,40 @@ void Image::ReleaseImage()
 } // ReleaseImage
 /*----------------------------------------------------------------*/
 
+// acquire a working reference to the color buffer, decoding it (at nMaxResolution)
+// only if it is not already resident; mirrors DepthData::IncRef()
+unsigned Image::IncRefImage(unsigned nMaxResolution)
+{
+	Lock l(cs);
+	if (image.empty() && !ReloadImage(nMaxResolution))
+		return 0;
+	return ++references;
+}
+// release a working reference; frees the color buffer the instant the count hits 0;
+// mirrors DepthData::DecRef()
+unsigned Image::DecRefImage()
+{
+	Lock l(cs);
+	ASSERT(references > 0);
+	if (--references == 0)
+		ReleaseImage();
+	return references;
+}
+/*----------------------------------------------------------------*/
+
+// Copy every real field; cs is deliberately omitted from the initializer list so
+// it default-constructs fresh instead of trying to copy a CriticalSection (not
+// copyable). references is copied verbatim, matching DepthData's precedent in
+// DepthMap.cpp for the identical situation.
+Image::Image(const Image& rhs) :
+	platformID(rhs.platformID), cameraID(rhs.cameraID), poseID(rhs.poseID), ID(rhs.ID),
+	name(rhs.name), maskName(rhs.maskName), camera(rhs.camera),
+	width(rhs.width), height(rhs.height), image(rhs.image), mask(rhs.mask),
+	neighbors(rhs.neighbors), scale(rhs.scale), avgDepth(rhs.avgDepth),
+	references(rhs.references)
+{}
+/*----------------------------------------------------------------*/
+
 // resize image if needed
 // return scale
 float Image::ResizeImage(unsigned nMaxResolution)

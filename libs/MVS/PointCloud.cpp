@@ -697,18 +697,26 @@ PointCloudStreaming::PointCloudStreaming(const PointCloud& src)
 
 void PointCloudStreaming::Release()
 {
-	pointsXYZ.clear();
-	pointViewsOffsets.clear();
-	pointViewsSizes.clear();
-	pointWeightsOffsets.clear();
-	pointWeightsSizes.clear();
+	// swap-with-empty, NOT clear(): std::vector::clear() destroys the elements and
+	// sets size to 0 but KEEPS the whole capacity allocated, so Release() did not
+	// release anything. On a 66M-point cloud that silently held ~3.6 GB for the
+	// rest of the process -- releasing it moved process commit by 0 bytes, and
+	// _heapmin could not help because the memory was never freed in the first
+	// place. These are a handful of very large contiguous blocks, so freeing them
+	// really does hand the pages back.
+	std::vector<float>().swap(pointsXYZ);
 
-	pointViewsMemory.clear();
-	pointWeightsMemory.clear();
+	std::vector<uint32_t>().swap(pointViewsOffsets);
+	std::vector<uint32_t>().swap(pointViewsSizes);
+	std::vector<uint32_t>().swap(pointWeightsOffsets);
+	std::vector<uint32_t>().swap(pointWeightsSizes);
 
-	normalsXYZ.clear();
+	std::vector<uint32_t>().swap(pointViewsMemory);
+	std::vector<float>().swap(pointWeightsMemory);
 
-	colorsRGB.clear();
+	std::vector<float>().swap(normalsXYZ);
+
+	std::vector<uint8_t>().swap(colorsRGB);
 }
 
 // load the dense point cloud from a PLY file

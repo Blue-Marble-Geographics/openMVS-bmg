@@ -31,6 +31,8 @@
 
 #include "Common.h"
 #include "Scene.h"
+#include <algorithm>
+#include <vector>
 
 using namespace MVS;
 
@@ -46,6 +48,81 @@ using namespace MVS;
 // uncomment to ensure edge size and improve vertex valence
 // (should enable more stable flow)
 #define MESHOPT_ENSUREEDGESIZE 1 // 0 - at all resolution
+
+// EXACT frustum-cull (candidate face list) reuse across refinement iterations;
+// the CUDA counterpart of MESHOPT_VISIBILITY_REUSE in SceneRefine.cpp.
+// ScoreMesh() calls ListCameraFaces() every iteration, which rebuilds the whole
+// face octree and re-traverses it once per camera. Cameras are static; only the
+// mesh moves. The per-camera candidate lists only need to be a SUPERSET of the
+// faces that actually rasterize (the ProjectMesh kernel clamps to the frame and
+// rejects everything else itself), so culling once with every frustum plane
+// pushed outward by `pad` world units stays exact for all following iterations
+// while the accumulated per-vertex displacement is <= pad. Typically ~2 reculls
+// per scale instead of one per iteration. 0 = recull every iteration (previous
+// behaviour); set 0 for an A/B.
+#ifndef MESHOPT_CUDA_VISIBILITY_REUSE
+#define MESHOPT_CUDA_VISIBILITY_REUSE 1
+#endif
+// pad = this factor x the max per-vertex displacement applied in the last
+// iteration; displacements decay (gstep *= 0.98), so 16x covers a whole scale's
+// iterations with generous margin. Too small only costs extra reculls.
+#define MESHOPT_CUDA_VISIBILITY_PAD_FACTOR 16.0f
+
+// Keep each view's candidate face-ID list resident in device memory between
+// reculls. Without this, every ProjectMesh launch re-allocates and re-uploads
+// the list (KernelRT allocates its array parameters per call and frees them in
+// Reset()) -- once per view per ITERATION, i.e. sum(candidates)*4 B of cudaMalloc
+// + H2D + cudaFree every iteration. With the lists frozen by
+// MESHOPT_CUDA_VISIBILITY_REUSE they can be uploaded once per recull instead.
+// Costs sum(candidates)*4 B of VRAM on top of the per-view depth/face/bary maps;
+// any view whose allocation fails silently falls back to the per-launch upload,
+// so this degrades rather than fails. Requires MESHOPT_CUDA_VISIBILITY_REUSE.
+// 0 = upload per launch.
+#ifndef MESHOPT_CUDA_FACEIDS_RESIDENT
+#define MESHOPT_CUDA_FACEIDS_RESIDENT 1
+#endif
+#if MESHOPT_CUDA_FACEIDS_RESIDENT && !MESHOPT_CUDA_VISIBILITY_REUSE
+#undef MESHOPT_CUDA_FACEIDS_RESIDENT
+#define MESHOPT_CUDA_FACEIDS_RESIDENT 0
+#endif
+
+// Frustum-cull the cameras in parallel. octree.Traverse() is const and every
+// camera writes its own list, so the cameras are fully independent (the CPU path
+// has done this for a while). Only pays off on the iterations that actually
+// recull. 0 = serial (previous behaviour).
+#ifndef MESHOPT_CUDA_PARALLEL_CULL
+#define MESHOPT_CUDA_PARALLEL_CULL 1
+#endif
+
+// Use the fused kernels (mean+var, cov+ZNCC, norm-update with pixel-counter
+// reset) instead of the individual ones: bit-identical math (same operand order
+// and rounding), but fewer launches and less global-memory traffic per image
+// pair -- the intermediate mean/cov stay in registers instead of round-tripping
+// through device memory, and the fused norm update replaces the per-pair
+// photoGradPixels memset. 0 = original individual kernels.
+#ifndef MESHCUDAOPT_FUSED_KERNELS
+#define MESHCUDAOPT_FUSED_KERNELS 1
+#endif
+
+// Compute the reference image's local mean/variance once per reference-image
+// group instead of once per directed pair. The values depend only on the image
+// itself, so ScoreMesh sorts the directed pairs by reference image and hoists
+// the computation out of the pair loop. It is computed over the whole frame
+// (mask set to 1) rather than the pair mask, which is equivalent because every
+// consumer (ComputeImageCov/ZNCC/DZNCC, ComputePhotometricGradient) gates its
+// reads on the per-pair mask -- the extra pixels are written but never read.
+// 0 = recompute per pair (previous behaviour).
+#ifndef MESHCUDAOPT_HOIST_REFSTATS
+#define MESHCUDAOPT_HOIST_REFSTATS 1
+#endif
+
+// Per-iteration timing of the host-side cull vs. the ProjectMesh round vs. the
+// whole ScoreMesh, appended to the iteration log line. This is what tells you
+// what MESHOPT_CUDA_VISIBILITY_REUSE is actually worth on a given scene/GPU:
+// the saving is (cull share of an iteration) x (1 - reculls/iters).
+#ifndef MESHOPT_CUDA_PROFILE
+#define MESHOPT_CUDA_PROFILE 1
+#endif
 
 
 // S T R U C T S ///////////////////////////////////////////////////
@@ -1932,6 +2009,350 @@ static LPCSTR const g_szMeshRefineModule =
 	"	st.global.f32 [%rl8+8], %f7;\n"
 	"	BB00_1:\n"
 	"	ret;\n"
+	"}\n"
+	"\n"
+	// fused kernel: ComputeImageMean followed by ComputeImageVar in one launch;
+	// bit-identical two-pass form (mean kept in a register; f32 store/load is exact)
+	".visible .entry ComputeImageMeanVar(\n"
+	"	.param .u64 .ptr param_1, // image mask\n"
+	"	.param .u64 .ptr param_2, // image pixels mean [out]\n"
+	"	.param .u64 .ptr param_3, // image pixels variance [out]\n"
+	"	.param .u32 param_4, // image width\n"
+	"	.param .u32 param_5, // image height\n"
+	"	.param .u32 param_6 // half-window size\n"
+	")\n"
+	"{\n"
+	"	.reg .f32 %f<16>;\n"
+	"	.reg .pred %p<22>;\n"
+	"	.reg .s16 %rc<6>;\n"
+	"	.reg .s32 %r<46>;\n"
+	"	.reg .s64 %rl<16>;\n"
+	"\n"
+	"	ld.param.u32 %r1, [param_4];\n"
+	"	ld.param.u32 %r2, [param_5];\n"
+	"	mov.u32 %r12, %ntid.x;\n"
+	"	mov.u32 %r13, %ctaid.x;\n"
+	"	mov.u32 %r14, %tid.x;\n"
+	"	mad.lo.s32 %r4, %r12, %r13, %r14;\n"
+	"	mov.u32 %r15, %ntid.y;\n"
+	"	mov.u32 %r16, %ctaid.y;\n"
+	"	mov.u32 %r17, %tid.y;\n"
+	"	mad.lo.s32 %r5, %r15, %r16, %r17;\n"
+	"	setp.gt.s32 %p1, %r4, -1;\n"
+	"	setp.lt.s32 %p2, %r4, %r1;\n"
+	"	and.pred %p3, %p1, %p2;\n"
+	"	setp.gt.s32 %p4, %r5, -1;\n"
+	"	and.pred %p5, %p3, %p4;\n"
+	"	setp.lt.s32 %p6, %r5, %r2;\n"
+	"	and.pred %p7, %p5, %p6;\n"
+	"	@!%p7 bra BB00_1;\n"
+	"\n"
+	"	ld.param.u64 %rl7, [param_1];\n"
+	"	ld.param.u64 %rl8, [param_2];\n"
+	"	ld.param.u64 %rl9, [param_3];\n"
+	"	cvta.to.global.u64 %rl2, %rl7;\n"
+	"	cvta.to.global.u64 %rl3, %rl8;\n"
+	"	cvta.to.global.u64 %rl4, %rl9;\n"
+	"	ld.param.u32 %r36, [param_6];\n"
+	"	shl.b32 %r18, %r36, 1;\n"
+	"	or.b32 %r19, %r18, 1;\n"
+	"	cvt.rn.f32.s32 %f6, %r19;\n"
+	"	mul.f32 %f1, %f6, %f6;\n"
+	"	mad.lo.s32 %r20, %r5, %r1, %r4;\n"
+	"	cvt.s64.s32 %rl5, %r20;\n"
+	"	mul.wide.s32 %rl10, %r20, 4;\n"
+	"	add.s64 %rl6, %rl3, %rl10;\n"
+	"	add.s64 %rl11, %rl4, %rl10;\n"
+	"	mov.u32 %r21, 0;\n"
+	"	st.global.u32 [%rl6], %r21;\n"
+	"	st.global.u32 [%rl11], %r21;\n"
+	"	sub.s32 %r23, %r1, %r36;\n"
+	"	setp.lt.s32 %p8, %r4, %r23;\n"
+	"	setp.ge.s32 %p9, %r4, %r36;\n"
+	"	and.pred %p10, %p8, %p9;\n"
+	"	setp.ge.s32 %p11, %r5, %r36;\n"
+	"	and.pred %p12, %p10, %p11;\n"
+	"	sub.s32 %r24, %r2, %r36;\n"
+	"	setp.lt.s32 %p13, %r5, %r24;\n"
+	"	and.pred %p14, %p12, %p13;\n"
+	"	@!%p14 bra BB00_1;\n"
+	"\n"
+	"	add.s64 %rl12, %rl2, %rl5;\n"
+	"	ld.global.u8 %rc1, [%rl12];\n"
+	"	cvt.s16.s8 %rc1, %rc1;\n"
+	"	mov.b16 %rc2, 1;\n"
+	"	cvt.s16.s8 %rc2, %rc2;\n"
+	"	setp.eq.s16 %p15, %rc1, %rc2;\n"
+	"	@!%p15 bra BB00_1;\n"
+	"\n"
+	"	neg.s32 %r6, %r36;\n"
+	"	setp.gt.s32 %p16, %r6, %r36;\n"
+	"	@%p16 bra BB00_5;\n"
+	"\n"
+	"	mov.f32 %f9, 0f00000000;\n"
+	"	mov.u32 %r39, %r6;\n"
+	"\n"
+	"	BB00_3:\n"
+	"	mov.u32 %r7, %r39;\n"
+	"	add.s32 %r8, %r7, %r4;\n"
+	"	mov.u32 %r38, %r6;\n"
+	"\n"
+	"	BB00_4:\n"
+	"	add.s32 %r26, %r38, %r5;\n"
+	"	shl.b32 %r27, %r8, 1;\n"
+	"	suld.b.2d.b16.trap {%rc3}, [surfImageRef, {%r27, %r26}];\n"
+	"	{\n"
+	"	.reg .b16 %temp;\n"
+	"	mov.b16 %temp, %rc3;\n"
+	"	cvt.f32.f16 %f7, %temp;\n"
+	"	}\n"
+	"	add.f32 %f9, %f9, %f7;\n"
+	"	add.s32 %r38, %r38, 1;\n"
+	"	setp.le.s32 %p17, %r38, %r36;\n"
+	"	@%p17 bra BB00_4;\n"
+	"\n"
+	"	add.s32 %r11, %r7, 1;\n"
+	"	setp.le.s32 %p18, %r11, %r36;\n"
+	"	mov.u32 %r39, %r11;\n"
+	"	@%p18 bra BB00_3;\n"
+	"	bra.uni BB00_2;\n"
+	"\n"
+	"	BB00_5:\n"
+	"	mov.f32 %f9, 0f00000000;\n"
+	"\n"
+	"	BB00_2:\n"
+	"	div.rn.f32 %f2, %f9, %f1;\n"
+	"	st.global.f32 [%rl6], %f2;\n"
+	"	mov.f32 %f14, 0f00000000;\n"
+	"	@%p16 bra BB00_9;\n"
+	"\n"
+	"	mov.u32 %r42, %r6;\n"
+	"\n"
+	"	BB00_6:\n"
+	"	mov.u32 %r9, %r42;\n"
+	"	add.s32 %r10, %r9, %r4;\n"
+	"	mov.u32 %r41, %r6;\n"
+	"\n"
+	"	BB00_7:\n"
+	"	add.s32 %r28, %r41, %r5;\n"
+	"	shl.b32 %r29, %r10, 1;\n"
+	"	suld.b.2d.b16.trap {%rc5}, [surfImageRef, {%r29, %r28}];\n"
+	"	{\n"
+	"	.reg .b16 %temp;\n"
+	"	mov.b16 %temp, %rc5;\n"
+	"	cvt.f32.f16 %f10, %temp;\n"
+	"	}\n"
+	"	sub.f32 %f11, %f10, %f2;\n"
+	"	fma.rn.f32 %f14, %f11, %f11, %f14;\n"
+	"	add.s32 %r41, %r41, 1;\n"
+	"	setp.le.s32 %p19, %r41, %r36;\n"
+	"	@%p19 bra BB00_7;\n"
+	"\n"
+	"	add.s32 %r30, %r9, 1;\n"
+	"	setp.le.s32 %p20, %r30, %r36;\n"
+	"	mov.u32 %r42, %r30;\n"
+	"	@%p20 bra BB00_6;\n"
+	"\n"
+	"	BB00_9:\n"
+	"	div.rn.f32 %f12, %f14, %f1;\n"
+	"	max.f32 %f12, %f12, 0f38D1B717;\n"
+	"	st.global.f32 [%rl11], %f12;\n"
+	"\n"
+	"	BB00_1:\n"
+	"	ret;\n"
+	"}\n"
+	"\n"
+	// fused kernel: ComputeImageCov followed by ComputeImageZNCC in one launch;
+	// bit-identical (same operand order and div.rn rounding as the ZNCC kernel)
+	".visible .entry ComputeImageCovZNCC(\n"
+	"	.param .u64 .ptr param_1, // meanA\n"
+	"	.param .u64 .ptr param_2, // meanB\n"
+	"	.param .u64 .ptr param_3, // varA\n"
+	"	.param .u64 .ptr param_4, // varB\n"
+	"	.param .u64 .ptr param_5, // mask\n"
+	"	.param .u64 .ptr param_6, // cov [out]\n"
+	"	.param .u64 .ptr param_7, // ZNCC [out]\n"
+	"	.param .u32 param_8, // image width\n"
+	"	.param .u32 param_9, // image height\n"
+	"	.param .u32 param_10 // window size\n"
+	")\n"
+	"{\n"
+	"	.reg .f32 %f<26>;\n"
+	"	.reg .pred %p<20>;\n"
+	"	.reg .s16 %rs<4>;\n"
+	"	.reg .s32 %r<56>;\n"
+	"	.reg .s64 %rl<26>;\n"
+	"\n"
+	"	ld.param.u32 %r1, [param_8];\n"
+	"	ld.param.u32 %r2, [param_9];\n"
+	"	ld.param.u64 %rl10, [param_1];\n"
+	"	ld.param.u64 %rl12, [param_2];\n"
+	"	ld.param.u64 %rl13, [param_5];\n"
+	"	ld.param.u64 %rl11, [param_6];\n"
+	"	cvta.to.global.u64 %rl2, %rl12;\n"
+	"	cvta.to.global.u64 %rl4, %rl10;\n"
+	"	cvta.to.global.u64 %rl6, %rl13;\n"
+	"	cvta.to.global.u64 %rl7, %rl11;\n"
+	"	ld.param.u64 %rl18, [param_7];\n"
+	"	cvta.to.global.u64 %rl9, %rl18;\n"
+	"	mov.u32 %r12, %ntid.x;\n"
+	"	mov.u32 %r13, %ctaid.x;\n"
+	"	mov.u32 %r14, %tid.x;\n"
+	"	mad.lo.s32 %r4, %r12, %r13, %r14;\n"
+	"	mov.u32 %r15, %ntid.y;\n"
+	"	mov.u32 %r16, %ctaid.y;\n"
+	"	mov.u32 %r17, %tid.y;\n"
+	"	mad.lo.s32 %r5, %r15, %r16, %r17;\n"
+	"	setp.gt.s32 %p1, %r4, -1;\n"
+	"	setp.lt.s32 %p2, %r4, %r1;\n"
+	"	and.pred %p3, %p1, %p2;\n"
+	"	setp.gt.s32 %p4, %r5, -1;\n"
+	"	and.pred %p5, %p3, %p4;\n"
+	"	setp.lt.s32 %p6, %r5, %r2;\n"
+	"	and.pred %p7, %p5, %p6;\n"
+	"	@!%p7 bra BB00_1;\n"
+	"\n"
+	"	ld.param.u32 %r49, [param_10];\n"
+	"	shl.b32 %r18, %r49, 1;\n"
+	"	or.b32 %r19, %r18, 1;\n"
+	"	cvt.rn.f32.s32 %f8, %r19;\n"
+	"	mul.f32 %f1, %f8, %f8;\n"
+	"	mad.lo.s32 %r20, %r5, %r1, %r4;\n"
+	"	cvt.s64.s32 %rl8, %r20;\n"
+	"	mul.wide.s32 %rl14, %r20, 4;\n"
+	"	add.s64 %rl15, %rl7, %rl14;\n"
+	"	add.s64 %rl19, %rl9, %rl14;\n"
+	"	mov.u32 %r21, 0;\n"
+	"	st.global.u32 [%rl15], %r21;\n"
+	"	st.global.u32 [%rl19], %r21;\n"
+	"	sub.s32 %r23, %r1, %r49;\n"
+	"	setp.lt.s32 %p8, %r4, %r23;\n"
+	"	setp.ge.s32 %p9, %r4, %r49;\n"
+	"	and.pred %p10, %p8, %p9;\n"
+	"	setp.ge.s32 %p11, %r5, %r49;\n"
+	"	and.pred %p12, %p10, %p11;\n"
+	"	sub.s32 %r24, %r2, %r49;\n"
+	"	setp.lt.s32 %p13, %r5, %r24;\n"
+	"	and.pred %p14, %p12, %p13;\n"
+	"	@!%p14 bra BB00_1;\n"
+	"\n"
+	"	add.s64 %rl16, %rl6, %rl8;\n"
+	"	ld.global.u8 %rs3, [%rl16];\n"
+	"	{\n"
+	"	.reg .s16 %temp1;\n"
+	"	.reg .s16 %temp2;\n"
+	"	cvt.s16.s8 %temp1, %rs3;\n"
+	"	mov.b16 %temp2, 1;\n"
+	"	cvt.s16.s8 %temp2, %temp2;\n"
+	"	setp.eq.s16 %p15, %temp1, %temp2;\n"
+	"	}\n"
+	"	@!%p15 bra BB00_1;\n"
+	"\n"
+	"	neg.s32 %r6, %r49;\n"
+	"	setp.gt.s32 %p16, %r6, %r49;\n"
+	"	@%p16 bra BB00_4;\n"
+	"\n"
+	"	add.s64 %rl20, %rl4, %rl14;\n"
+	"	ld.global.f32 %f2, [%rl20];\n"
+	"	add.s64 %rl21, %rl2, %rl14;\n"
+	"	ld.global.f32 %f3, [%rl21];\n"
+	"	mov.f32 %f16, 0f00000000;\n"
+	"	mov.u32 %r52, %r6;\n"
+	"\n"
+	"	BB00_2:\n"
+	"	mov.u32 %r7, %r52;\n"
+	"	add.s32 %r8, %r7, %r4;\n"
+	"	mov.u32 %r51, %r6;\n"
+	"\n"
+	"	BB00_3:\n"
+	"	add.s32 %r26, %r51, %r5;\n"
+	"	shl.b32 %r27, %r8, 1;\n"
+	"	suld.b.2d.b16.trap {%rs1}, [surfImageRef, {%r27, %r26}];\n"
+	"	{\n"
+	"	.reg .b16 %temp;\n"
+	"	mov.b16 %temp, %rs1;\n"
+	"	cvt.f32.f16 %f10, %temp;\n"
+	"	}\n"
+	"	sub.f32 %f11, %f10, %f2;\n"
+	"	suld.b.2d.b16.trap {%rs2}, [surfImageProjRef, {%r27, %r26}];\n"
+	"	{\n"
+	"	.reg .b16 %temp;\n"
+	"	mov.b16 %temp, %rs2;\n"
+	"	cvt.f32.f16 %f12, %temp;\n"
+	"	}\n"
+	"	sub.f32 %f13, %f12, %f3;\n"
+	"	fma.rn.f32 %f16, %f11, %f13, %f16;\n"
+	"	add.s32 %r51, %r51, 1;\n"
+	"	setp.le.s32 %p17, %r51, %r49;\n"
+	"	@%p17 bra BB00_3;\n"
+	"\n"
+	"	add.s32 %r11, %r7, 1;\n"
+	"	setp.le.s32 %p18, %r11, %r49;\n"
+	"	mov.u32 %r52, %r11;\n"
+	"	@%p18 bra BB00_2;\n"
+	"	bra.uni BB00_5;\n"
+	"\n"
+	"	BB00_4:\n"
+	"	mov.f32 %f16, 0f00000000;\n"
+	"\n"
+	"	BB00_5:\n"
+	"	div.rn.f32 %f15, %f16, %f1;\n"
+	"	st.global.f32 [%rl15], %f15;\n"
+	"	ld.param.u64 %rl22, [param_3];\n"
+	"	cvta.to.global.u64 %rl23, %rl22;\n"
+	"	ld.param.u64 %rl24, [param_4];\n"
+	"	cvta.to.global.u64 %rl25, %rl24;\n"
+	"	add.s64 %rl17, %rl23, %rl14;\n"
+	"	ld.global.f32 %f21, [%rl17];\n"
+	"	add.s64 %rl3, %rl25, %rl14;\n"
+	"	ld.global.f32 %f20, [%rl3];\n"
+	"	mul.f32 %f22, %f21, %f20;\n"
+	"	sqrt.rn.f32 %f23, %f22;\n"
+	"	div.rn.f32 %f24, %f15, %f23;\n"
+	"	st.global.f32 [%rl19], %f24;\n"
+	"	BB00_1:\n"
+	"	ret;\n"
+	"}\n"
+	"\n"
+	// UpdatePhotoGradNorm variant that also zeroes the consumed pixel counter,
+	// replacing the per-pair cuMemsetD32 (counters are only ever 0 or positive)
+	".visible .entry UpdatePhotoGradNormReset(\n"
+	"	.param .u64 .ptr param_1, // photoGradNorm [in/out]\n"
+	"	.param .u64 .ptr param_2, // photoGradPixels [in/out, zeroed]\n"
+	"	.param .u32 param_3 // numVertices\n"
+	")\n"
+	"{\n"
+	"	.reg .f32 %f<5>;\n"
+	"	.reg .pred %p<3>;\n"
+	"	.reg .s32 %r<9>;\n"
+	"	.reg .s64 %rl<10>;\n"
+	"\n"
+	"	ld.param.u32 %r2, [param_3];\n"
+	"	mov.u32 %r3, %ntid.x;\n"
+	"	mov.u32 %r4, %ctaid.x;\n"
+	"	mov.u32 %r5, %tid.x;\n"
+	"	mad.lo.s32 %r1, %r3, %r4, %r5;\n"
+	"	setp.ge.s32 %p1, %r1, %r2;\n"
+	"	@%p1 bra BB00_1;\n"
+	"\n"
+	"	ld.param.u64 %rl5, [param_2];\n"
+	"	cvta.to.global.u64 %rl2, %rl5;\n"
+	"	mul.wide.s32 %rl6, %r1, 4;\n"
+	"	add.s64 %rl7, %rl2, %rl6;\n"
+	"	ld.global.f32 %f1, [%rl7];\n"
+	"	setp.le.f32 %p2, %f1, 0f00000000;\n"
+	"	@%p2 bra BB00_1;\n"
+	"\n"
+	"	mov.u32 %r6, 0;\n"
+	"	st.global.u32 [%rl7], %r6;\n"
+	"	ld.param.u64 %rl4, [param_1];\n"
+	"	cvta.to.global.u64 %rl1, %rl4;\n"
+	"	add.s64 %rl8, %rl1, %rl6;\n"
+	"	ld.global.f32 %f2, [%rl8];\n"
+	"	add.f32 %f3, %f2, 0f3F800000;\n"
+	"	st.global.f32 [%rl8], %f3;\n"
+	"	BB00_1:\n"
+	"	ret;\n"
 	"}\n";
 
 
@@ -1955,6 +2376,13 @@ public:
 		SEACAVE::CUDA::MemDevice depthMap;
 		SEACAVE::CUDA::MemDevice faceMap;
 		SEACAVE::CUDA::MemDevice baryMap;
+		#if MESHOPT_CUDA_FACEIDS_RESIDENT
+		// candidate face IDs held on the device between reculls; invalid if the
+		// allocation failed or this view has no candidates (see
+		// MESHOPT_CUDA_FACEIDS_RESIDENT)
+		SEACAVE::CUDA::MemDevice faceIDs;
+		FIndex numFaceIDs = 0;
+		#endif
 		inline View() {}
 		inline View(View&) {}
 	};
@@ -2016,6 +2444,30 @@ public:
 	unsigned nAlternatePair; // using an image pair alternatively as reference image (0 - both, 1 - alternate, 2 - only left, 3 - only right)
 	unsigned iteration; // current refinement iteration
 
+	// per-camera candidate face lists; persistent so they can be reused across
+	// iterations (see MESHOPT_CUDA_VISIBILITY_REUSE)
+	CameraFacesArr arrCameraFaces;
+#if MESHOPT_CUDA_VISIBILITY_REUSE
+	bool candidateCacheValid = false; // lists match the current topology/image dims
+	float frustumPadWorld = 0.f;      // outward plane pad used at the last recull
+	float accumDispSinceCull = 0.f;   // summed per-iteration max vertex displacement
+	float lastIterMaxDisp = 0.f;      // sizes the pad for the next recull
+	// called by the caller after applying the gradient, with the largest
+	// per-vertex displacement it just applied
+	void OnVerticesDisplaced(float maxDisp) { accumDispSinceCull += maxDisp; lastIterMaxDisp = maxDisp; }
+	// the mesh topology or the image dimensions changed: the cached lists no
+	// longer index the current faces (or were culled against the wrong frustums)
+	void InvalidateVisibilityCache() { candidateCacheValid = false; accumDispSinceCull = 0.f; lastIterMaxDisp = 0.f; }
+#else
+	void OnVerticesDisplaced(float /*maxDisp*/) {}
+	void InvalidateVisibilityCache() {}
+#endif
+#if MESHOPT_CUDA_PROFILE
+	double tCullMs = 0.0;    // host-side octree build + frustum cull, last ScoreMesh
+	double tProjectMs = 0.0; // ProjectMesh round (all views), last ScoreMesh
+	unsigned numReculls = 0; // reculls so far at this scale
+#endif
+
 	Scene& scene; // the mesh vertices and faces
 
 	// constant the entire time
@@ -2037,6 +2489,11 @@ public:
 	SEACAVE::CUDA::KernelRT kernelComputeSmoothnessGradient;
 	SEACAVE::CUDA::KernelRT kernelCombineGradients;
 	SEACAVE::CUDA::KernelRT kernelCombineAllGradients;
+#if MESHCUDAOPT_FUSED_KERNELS
+	SEACAVE::CUDA::KernelRT kernelComputeImageMeanVar; // fused mean+var
+	SEACAVE::CUDA::KernelRT kernelComputeImageCovZNCC; // fused cov+ZNCC
+	SEACAVE::CUDA::KernelRT kernelUpdatePhotoGradNormReset; // norm update + pixel-counter reset
+#endif
 
 	SEACAVE::CUDA::MemDevice vertices;
 	SEACAVE::CUDA::MemDevice vertexVertices;
@@ -2160,6 +2617,17 @@ bool MeshRefineCUDA::InitKernels(int device)
 	if (kernelCombineAllGradients.Reset(module, "CombineAllGradients") != CUDA_SUCCESS)
 		return false;
 	ASSERT(kernelCombineAllGradients.IsValid());
+#if MESHCUDAOPT_FUSED_KERNELS
+	if (kernelComputeImageMeanVar.Reset(module, "ComputeImageMeanVar") != CUDA_SUCCESS)
+		return false;
+	ASSERT(kernelComputeImageMeanVar.IsValid());
+	if (kernelComputeImageCovZNCC.Reset(module, "ComputeImageCovZNCC") != CUDA_SUCCESS)
+		return false;
+	ASSERT(kernelComputeImageCovZNCC.IsValid());
+	if (kernelUpdatePhotoGradNormReset.Reset(module, "UpdatePhotoGradNormReset") != CUDA_SUCCESS)
+		return false;
+	ASSERT(kernelUpdatePhotoGradNormReset.IsValid());
+#endif
 
 	// init textures
 	if (texImageRef.Reset(module, "texImageRef", CU_TR_FILTER_MODE_LINEAR) != CUDA_SUCCESS)
@@ -2251,6 +2719,12 @@ bool MeshRefineCUDA::InitImages(float scale, float sigma)
 	reportCudaError(imageDZNCC.Reset(sizeof(float)*area));
 	surfImageProjRef.Bind(imageAB);
 	iteration = 0;
+	// the images were rescaled and the cameras updated, so the cached candidate
+	// lists were culled against the wrong frustums
+	InvalidateVisibilityCache();
+#if MESHOPT_CUDA_PROFILE
+	numReculls = 0;
+#endif
 	return true;
 }
 
@@ -2261,6 +2735,9 @@ void MeshRefineCUDA::ListVertexFacesPre()
 	scene.mesh.EmptyExtra();
 	scene.mesh.ListIncidenteFaces();
 	reportCudaError(faces.Reset(scene.mesh.faces));
+	// this is the hook every topology change (Clean/Subdivide/EnsureEdgeSize)
+	// funnels through: the cached lists index faces that no longer exist
+	InvalidateVisibilityCache();
 }
 void MeshRefineCUDA::ListVertexFacesPost()
 {
@@ -2293,6 +2770,11 @@ void MeshRefineCUDA::ListVertexFacesPost()
 	reportCudaError(photoGrad.Reset(sizeof(Point3f)*numVertices));
 	reportCudaError(photoGradNorm.Reset(sizeof(float)*numVertices));
 	reportCudaError(photoGradPixels.Reset(sizeof(float)*numVertices));
+#if MESHCUDAOPT_FUSED_KERNELS
+	// the fused norm update consumes the counters and leaves them zeroed, so
+	// there is no per-pair memset to clear a fresh allocation's garbage
+	reportCudaError(cuMemsetD32(photoGradPixels, 0, numVertices));
+#endif
 	reportCudaError(smoothGrad1.Reset(sizeof(Point3f)*numVertices));
 	reportCudaError(smoothGrad2.Reset(sizeof(Point3f)*numVertices));
 }
@@ -2300,19 +2782,84 @@ void MeshRefineCUDA::ListVertexFacesPost()
 // extract array of faces viewed by each image
 void MeshRefineCUDA::ListCameraFaces()
 {
-	// extract array of faces viewed by each camera
-	CameraFacesArr arrCameraFaces(images.GetSize()); {
-		Mesh::Octree octree;
-		Mesh::FacesInserter::CreateOctree(octree, scene.mesh);
-		FOREACH(ID, images) {
-			const Image& imageData = images[ID];
-			if (!imageData.IsValid())
-				continue;
-			const TFrustum<float,5> frustum(Matrix3x4f(imageData.camera.P), (float)imageData.width, (float)imageData.height);
-			Mesh::FacesInserter inserter(arrCameraFaces[ID]);
-			octree.Traverse(frustum, inserter);
+	const int64_t numImages((int64_t)images.GetSize());
+#if MESHOPT_CUDA_VISIBILITY_REUSE
+	// reuse the padded-frustum candidate lists while the accumulated mesh
+	// displacement stays within the pad they were culled with (exact superset;
+	// see MESHOPT_CUDA_VISIBILITY_REUSE)
+	const bool bRecull(!candidateCacheValid || accumDispSinceCull > frustumPadWorld);
+#else
+	const bool bRecull(true);
+#endif
+
+	if (bRecull) {
+	#if MESHOPT_CUDA_PROFILE
+		const auto tCull0(std::chrono::steady_clock::now());
+		++numReculls;
+	#endif
+	#if MESHOPT_CUDA_VISIBILITY_REUSE
+		// pad sized from the last applied displacement; 0 on the first cull of a
+		// scale (nothing has moved yet) degrades to the plain unpadded cull
+		const float padRaw(MESHOPT_CUDA_VISIBILITY_PAD_FACTOR * lastIterMaxDisp);
+		const float frustumPad(ISFINITE(padRaw) ? padRaw : 0.f);
+	#endif
+		// extract array of faces viewed by each camera
+		arrCameraFaces.Resize(images.GetSize());
+		for (CameraFaces& cameraFaces: arrCameraFaces)
+			cameraFaces.Empty(); // keep the capacity of the inner lists
+		{
+			Mesh::Octree octree;
+			Mesh::FacesInserter::CreateOctree(octree, scene.mesh);
+			#if MESHOPT_CUDA_PARALLEL_CULL && defined(MESHCUDAOPT_USE_OPENMP)
+			#pragma omp parallel for schedule(dynamic)
+			#endif
+			for (int64_t ID=0; ID<numImages; ++ID) {
+				const Image& imageData = images[ID];
+				if (!imageData.IsValid())
+					continue;
+				TFrustum<float,5> frustum(Matrix3x4f(imageData.camera.P), (float)imageData.width, (float)imageData.height);
+				#if MESHOPT_CUDA_VISIBILITY_REUSE
+				// expand the frustum outward by the displacement budget (plane
+				// normals are unit-length and point outside the volume)
+				if (frustumPad > 0.f)
+					for (int p=0; p<5; ++p)
+						frustum.m_planes[p].m_fD -= frustumPad;
+				#endif
+				Mesh::FacesInserter inserter(arrCameraFaces[ID]);
+				octree.Traverse(frustum, inserter);
+			}
 		}
+	#if MESHOPT_CUDA_FACEIDS_RESIDENT
+		// hand the frozen lists to the device once, instead of once per launch
+		// per iteration; a view that does not fit keeps its host list and falls
+		// back to the per-launch upload in ProjectMesh
+		for (int64_t ID=0; ID<numImages; ++ID) {
+			View& view = views[ID];
+			view.faceIDs.Release();
+			view.numFaceIDs = 0;
+			CameraFaces& cameraFaces = arrCameraFaces[ID];
+			if (!images[ID].IsValid() || cameraFaces.IsEmpty())
+				continue;
+			if (view.faceIDs.Reset(cameraFaces) == CUDA_SUCCESS) {
+				view.numFaceIDs = cameraFaces.GetSize();
+				cameraFaces.Release(); // consumed; dead weight on the host now
+			}
+		}
+	#endif
+	#if MESHOPT_CUDA_VISIBILITY_REUSE
+		candidateCacheValid = true;
+		frustumPadWorld = frustumPad;
+		accumDispSinceCull = 0.f;
+	#endif
+	#if MESHOPT_CUDA_PROFILE
+		tCullMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tCull0).count();
+	#endif
 	}
+#if MESHOPT_CUDA_PROFILE
+	else
+		tCullMs = 0.0;
+	const auto tProj0(std::chrono::steady_clock::now());
+#endif
 
 	// project mesh to each camera plane
 	reportCudaError(vertices.Reset(scene.mesh.vertices));
@@ -2321,6 +2868,14 @@ void MeshRefineCUDA::ListCameraFaces()
 		if (imageData.IsValid())
 			ProjectMesh(arrCameraFaces[idxImage], imageData.camera, views[idxImage].size, idxImage);
 	}
+#if MESHOPT_CUDA_PROFILE
+	tProjectMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tProj0).count();
+#endif
+#if !MESHOPT_CUDA_VISIBILITY_REUSE
+	// no reuse: release the lists as the previous local array did on scope exit
+	for (CameraFaces& cameraFaces: arrCameraFaces)
+		cameraFaces.Release();
+#endif
 }
 
 // compute for each face the projection area as the maximum area in both images of a pair
@@ -2493,6 +3048,46 @@ void MeshRefineCUDA::ScoreMesh(float* gradients)
 	// for each pair of images, compute a photo-consistency score
 	// between the reference image and the pixels of the second image
 	// projected in the reference image through the mesh surface
+#if MESHCUDAOPT_HOIST_REFSTATS
+	// process the directed pairs grouped by the reference image, so that its
+	// local statistics are computed only once per group
+	std::vector<PairIdx> directedPairs;
+	directedPairs.reserve(pairs.size()*2);
+	FOREACHPTR(pPair, pairs) {
+		ASSERT(pPair->i < pPair->j);
+		switch (nAlternatePair) {
+		case 1:
+			directedPairs.push_back(iteration%2 ? PairIdx(pPair->j,pPair->i) : PairIdx(pPair->i,pPair->j));
+			break;
+		case 2:
+			directedPairs.push_back(PairIdx(pPair->i,pPair->j));
+			break;
+		case 3:
+			directedPairs.push_back(PairIdx(pPair->j,pPair->i));
+			break;
+		default:
+			directedPairs.push_back(PairIdx(pPair->i,pPair->j));
+			directedPairs.push_back(PairIdx(pPair->j,pPair->i));
+		}
+	}
+	std::stable_sort(directedPairs.begin(), directedPairs.end(),
+		[](const PairIdx& a, const PairIdx& b) { return a.i < b.i; });
+	uint32_t idxLastImageA(NO_ID);
+	for (const PairIdx& pair: directedPairs) {
+		if (pair.i != idxLastImageA) {
+			idxLastImageA = pair.i;
+			// the reference mean/variance depend only on the image itself, so
+			// compute them once for the whole group over the full frame; every
+			// downstream read is gated by the per-pair mask that ImageMeshWarp
+			// writes inside ProcessPair, so this is identical to the per-pair
+			// compute (see MESHCUDAOPT_HOIST_REFSTATS)
+			const Image8U::Size& sizeA(views[pair.i].size);
+			reportCudaError(cuMemsetD8(mask, 1, (size_t)sizeA.area()));
+			ComputeLocalVariance(views[pair.i].image, sizeA, imageMeanA, imageVarA);
+		}
+		ProcessPair(pair.i, pair.j);
+	}
+#else
 	FOREACHPTR(pPair, pairs) {
 		ASSERT(pPair->i < pPair->j);
 		switch (nAlternatePair) {
@@ -2513,6 +3108,7 @@ void MeshRefineCUDA::ScoreMesh(float* gradients)
 			}
 		}
 	}
+#endif
 
 	// loop through all vertices and compute the smoothing score
 	ComputeSmoothnessGradient(numVertices);
@@ -2532,22 +3128,40 @@ void MeshRefineCUDA::ProjectMesh(
 	// init depth-map
 	const float fltMax(FLT_MAX);
 	reportCudaError(cuMemsetD32(view.depthMap, (uint32_t&)fltMax, size.area()));
-	// fetch only the faces viewed by this camera
-	Mesh::FaceIdxArr faceIDsView(0, (FIndex)cameraFaces.size());
-	for (auto idxFace : cameraFaces)
-		faceIDsView.Insert(idxFace);
-	// project mesh
-	reportCudaError(kernelProjectMesh((int)faceIDsView.GetSize(),
-		vertices,
-		faces,
-		faceIDsView,
-		view.depthMap,
-		view.faceMap,
-		view.baryMap,
-		CameraCUDA(camera, size),
-		faceIDsView.GetSize()
-	));
-	kernelProjectMesh.Reset();
+	// project mesh, off the device-resident candidate list when there is one
+	// (see MESHOPT_CUDA_FACEIDS_RESIDENT), otherwise uploading it per launch
+#if MESHOPT_CUDA_FACEIDS_RESIDENT
+	if (view.faceIDs.IsValid()) {
+		ASSERT(view.numFaceIDs > 0);
+		reportCudaError(kernelProjectMesh((int)view.numFaceIDs,
+			vertices,
+			faces,
+			view.faceIDs,
+			view.depthMap,
+			view.faceMap,
+			view.baryMap,
+			CameraCUDA(camera, size),
+			view.numFaceIDs
+		));
+		kernelProjectMesh.Reset();
+	} else
+#endif
+	// the candidate list is already a FaceIdxArr, so it is passed straight to the
+	// kernel (the copy into a temporary this replaced was a pure reallocation);
+	// an empty list would launch a 0-thread grid, so skip to the cross-check
+	if (!cameraFaces.IsEmpty()) {
+		reportCudaError(kernelProjectMesh((int)cameraFaces.GetSize(),
+			vertices,
+			faces,
+			cameraFaces,
+			view.depthMap,
+			view.faceMap,
+			view.baryMap,
+			CameraCUDA(camera, size),
+			cameraFaces.GetSize()
+		));
+		kernelProjectMesh.Reset();
+	}
 	// cross-check valid depth and face index
 	reportCudaError(kernelCrossCheckProjection(size,
 		view.depthMap,
@@ -2581,7 +3195,14 @@ void MeshRefineCUDA::ProcessPair(uint32_t idxImageA, uint32_t idxImageB)
 	ImageMeshWarp(cameraA, cameraB, sizeA, idxImageA, idxImageB);
 	// init vertex textures
 	ComputeLocalVariance(imageAB, sizeA, imageMeanAB, imageVarAB);
+#if MESHCUDAOPT_HOIST_REFSTATS
+	// imageMeanA/imageVarA were computed once for this reference image in
+	// ScoreMesh; the ZNCC kernels window-sample the reference image, so rebind
+	// surfImageRef away from imageAB (which the call above left bound)
+	surfImageRef.Bind(views[idxImageA].image);
+#else
 	ComputeLocalVariance(views[idxImageA].image, sizeA, imageMeanA, imageVarA);
+#endif
 	ComputeLocalZNCC(sizeA);
 	const float RegularizationScale((float)((REAL)(imageDataA.avgDepth*imageDataB.avgDepth)/(cameraA.GetFocalLength()*cameraB.GetFocalLength())));
 	ComputePhotometricGradient(cameraA, cameraB, sizeA, idxImageA, idxImageB, scene.mesh.vertices.GetSize(), RegularizationScale);
@@ -2619,6 +3240,15 @@ void MeshRefineCUDA::ComputeLocalVariance(const SEACAVE::CUDA::ArrayRT16F& image
 	SEACAVE::CUDA::MemDevice& imageMean, SEACAVE::CUDA::MemDevice& imageVar)
 {
 	surfImageRef.Bind(image);
+#if MESHCUDAOPT_FUSED_KERNELS
+	reportCudaError(kernelComputeImageMeanVar(size,
+		mask,
+		imageMean,
+		imageVar,
+		size.width, size.height,
+		HalfSize
+	));
+#else
 	reportCudaError(kernelComputeImageMean(size,
 		mask,
 		imageMean,
@@ -2632,6 +3262,7 @@ void MeshRefineCUDA::ComputeLocalVariance(const SEACAVE::CUDA::ArrayRT16F& image
 		size.width, size.height,
 		HalfSize
 	));
+#endif
 	#if 0
 	// debug view
 	Image32F mean(size);
@@ -2644,6 +3275,19 @@ void MeshRefineCUDA::ComputeLocalVariance(const SEACAVE::CUDA::ArrayRT16F& image
 // compute local ZNCC and its gradient for each image pixel
 void MeshRefineCUDA::ComputeLocalZNCC(const Image8U::Size& size)
 {
+#if MESHCUDAOPT_FUSED_KERNELS
+	reportCudaError(kernelComputeImageCovZNCC(size,
+		imageMeanA,
+		imageMeanAB,
+		imageVarA,
+		imageVarAB,
+		mask,
+		imageCov,
+		imageZNCC,
+		size.width, size.height,
+		HalfSize
+	));
+#else
 	reportCudaError(kernelComputeImageCov(size,
 		imageMeanA,
 		imageMeanAB,
@@ -2661,6 +3305,7 @@ void MeshRefineCUDA::ComputeLocalZNCC(const Image8U::Size& size)
 		size.width, size.height,
 		HalfSize
 	));
+#endif
 	reportCudaError(kernelComputeImageDZNCC(size,
 		imageMeanA,
 		imageMeanAB,
@@ -2686,7 +3331,9 @@ void MeshRefineCUDA::ComputePhotometricGradient(const Camera& cameraA, const Cam
 	uint32_t idxImageA, uint32_t idxImageB, uint32_t numVertices, float RegularizationScale)
 {
 	// compute photometric gradient for all visible vertices
+#if !MESHCUDAOPT_FUSED_KERNELS
 	reportCudaError(cuMemsetD32(photoGradPixels, 0, numVertices));
+#endif
 	reportCudaError(kernelComputePhotometricGradient(size,
 		faces, faceNormals,
 		views[idxImageA].depthMap,
@@ -2700,10 +3347,18 @@ void MeshRefineCUDA::ComputePhotometricGradient(const Camera& cameraA, const Cam
 		RegularizationScale
 	));
 	// update photometric gradient norm for all visible vertices
+#if MESHCUDAOPT_FUSED_KERNELS
+	// (also zeroes photoGradPixels, replacing the per-pair memset above)
+	reportCudaError(kernelUpdatePhotoGradNormReset(numVertices,
+		photoGradNorm, photoGradPixels,
+		numVertices
+	));
+#else
 	reportCudaError(kernelUpdatePhotoGradNorm(numVertices,
 		photoGradNorm, photoGradPixels,
 		numVertices
 	));
+#endif
 	#if 0
 	// debug view
 	Point3fArr _photoGrad(numVertices);
@@ -2835,18 +3490,36 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 			refine.nAlternatePair = (iter+1 < iters ? nAlternatePair : 0);
 			refine.ratioRigidityElasticity = (iter <= iterStop ? fRatioRigidityElasticity : 1.f);
 			// evaluate residuals and gradients
+			#if MESHOPT_CUDA_PROFILE
+			const auto tScore0(std::chrono::steady_clock::now());
+			#endif
 			refine.ScoreMesh(gradients.data());
+			#if MESHOPT_CUDA_PROFILE
+			const double tScoreMs(std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tScore0).count());
+			#endif
 			// apply gradients
 			float gv(0);
+			float maxGradNorm(0);
 			FOREACH(v, mesh.vertices) {
 				Vertex& vert = mesh.vertices[v];
 				const Point3f grad(gradients.row(v));
 				if (!ISFINITE(grad))
 					continue;
 				vert -= Vertex(grad*gstep);
-				gv += norm(grad);
+				const float gn(norm(grad));
+				gv += gn;
+				if (maxGradNorm < gn)
+					maxGradNorm = gn;
 			}
+			// the applied displacement is exactly |grad|*gstep, so the largest one
+			// comes free from the norms already accumulated above; it is what
+			// sizes/spends the padded-frustum budget (MESHOPT_CUDA_VISIBILITY_REUSE)
+			refine.OnVerticesDisplaced(maxGradNorm*gstep);
 			DEBUG_EXTRA("\t%2d. g: %.5f (%.3e - %.3e)\ts: %.3f", iter+1, gradients.norm(), gradients.norm()/mesh.vertices.GetSize(), gv/mesh.vertices.GetSize(), gstep);
+			#if MESHOPT_CUDA_PROFILE
+			DEBUG_EXTRA("\t    [CUDA] ScoreMesh %.0f ms = cull %.0f ms + project %.0f ms + pairs %.0f ms (reculls %u at this scale)",
+				tScoreMs, refine.tCullMs, refine.tProjectMs, tScoreMs-refine.tCullMs-refine.tProjectMs, refine.numReculls);
+			#endif
 			gstep *= 0.98f;
 			progress.display(iter);
 		}

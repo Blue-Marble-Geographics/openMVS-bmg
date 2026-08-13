@@ -758,8 +758,13 @@ int main(int argc, LPCTSTR* argv)
 	}
 
 	#if DENSIFY_MORTON_SORT_OUTPUT
+	// Keep the Morton reorder AFTER the visibility filter: reordering before it
+	// makes spatially-near points index-near, which CONCENTRATES the filter's
+	// atomic visibility[] updates onto few cache lines and badly increases
+	// cross-thread contention (measured ~2x slower). Order here is output-only.
 	ReorderPointCloudMorton(scene.pointcloud);
 	#endif
+
 	if (scene.pointcloud.IsEmpty())
 		VERBOSE("error: dense point-cloud is EMPTY before save (nothing will be written) -- check fusion / filter threshold");
 	if (!scene.Save(baseFileName+_T(".mvs"), (ARCHIVE_TYPE)OPT::nArchiveType))

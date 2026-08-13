@@ -271,9 +271,13 @@ public:
 
 	void ReleaseWeights()
 	{
-		pointWeightsOffsets.clear();
-		pointWeightsSizes.clear();
-		pointWeightsMemory.clear();
+		// swap-with-empty, NOT clear(): these are POD vectors, so clear() sets size
+		// to 0 while keeping the whole capacity allocated -- i.e. a function named
+		// Release that releases nothing. At 66M points the weights are ~1.3 GB
+		// (offsets + sizes + the flat weight array). Same defect as Release() had.
+		std::vector<uint32_t>().swap(pointWeightsOffsets);
+		std::vector<uint32_t>().swap(pointWeightsSizes);
+		std::vector<float>().swap(pointWeightsMemory);
 	}
 
 	void RemovePoint(IDX);

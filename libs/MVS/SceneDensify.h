@@ -44,6 +44,7 @@ namespace MVS {
 	
 // Forward declarations
 class MVS_API Scene;
+struct ImageCache; // bounded on-demand cache for the base decoded color images (see SceneDensify.cpp)
 #ifdef _USE_CUDA
 namespace CUDA {
 class PatchMatch;
@@ -93,6 +94,14 @@ public:
 	Scene& scene;
 
 	DepthDataArr arrDepthData;
+
+	// bounded on-demand cache for scene.images[*].image (the base decoded color
+	// buffers); spans ESTIMATE and FUSE, both of which read from it. targetMaxResolution
+	// is the per-image decode target computed once in the "prepare images" step and
+	// referenced by imageCache for the lifetime of the run; declared before imageCache
+	// so it is already constructed when imageCache's constructor binds a reference to it.
+	cList<unsigned> targetMaxResolution;
+	CAutoPtr<ImageCache> imageCache;
 
 	// used internally to estimate the depth-maps
 	Image8U::Size prevDepthMapSize; // remember the size of the last estimated depth-map

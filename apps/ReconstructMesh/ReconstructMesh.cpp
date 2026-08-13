@@ -67,6 +67,7 @@ float fPoissonTrim;
 float fPoissonSamples;
 float fPoissonWeight;
 float fPoissonIslandRatio;
+bool bReleasePointCloud;
 float fThicknessFactor;
 float fQualityFactor;
 float fDecimateMesh;
@@ -143,6 +144,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("poisson-samples", boost::program_options::value(&OPT::fPoissonSamples)->default_value(1.5f), "Poisson samples per node (higher = smoother/coarser, lower = sharper/denser)")
 		("poisson-weight", boost::program_options::value(&OPT::fPoissonWeight)->default_value(2.f), "Poisson screened interpolation weight")
 		("poisson-island-ratio", boost::program_options::value(&OPT::fPoissonIslandRatio)->default_value(0.f), "SurfaceTrimmer --aRatio + --removeIslands: delete isolated components whose area is below this fraction of the whole mesh (removes small floating blobs); 0 - disabled (stock trimmer behavior)")
+		("release-pointcloud", boost::program_options::value(&OPT::bReleasePointCloud)->default_value(true), "release the dense point-cloud once the Poisson solve has taken its geometry, keeping only xyz+normals (frees ~51 bytes/point; measured 2.6GB of a 5.67GB peak at 50.6M points). The saved scene then carries 0 points - the mesh is unaffected, and RefineMesh/TextureMesh do not read them. Set 0 if anything downstream reads points back out of the reconstructed scene (--poisson only)")
 		;
 	boost::program_options::options_description config_clean("Clean options");
 	config_clean.add_options()
@@ -459,7 +461,7 @@ int main(int argc, LPCTSTR* argv)
 			// JPB TEMP: pass CLI values straight through; tuning has moved
 			// to the Mesh::Clean call below (remove-spurious override).
 			const bool bMeshOK(OPT::bPoisson
-				? scene.ReconstructMeshPoisson((int)OPT::nPoissonDepth, OPT::fPoissonTrim, OPT::fPoissonSamples, OPT::fPoissonWeight, OPT::fPoissonIslandRatio)
+				? scene.ReconstructMeshPoisson((int)OPT::nPoissonDepth, OPT::fPoissonTrim, OPT::fPoissonSamples, OPT::fPoissonWeight, OPT::fPoissonIslandRatio, OPT::bReleasePointCloud)
 				: scene.ReconstructMesh(
 					OPT::fDistInsert,
 					OPT::bUseFreeSpaceSupport,

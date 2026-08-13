@@ -457,6 +457,14 @@ struct MVS_API DepthData {
 		for (ViewData& image: images) {
 			image.image.release();
 			image.depthMap.release();
+			image.imageBig.release(); // DPC_FASTER_SAMPLING's 4-plane derivative cache (16
+				// bytes/pixel) -- was never released here, so it stayed resident on every
+				// processed image's ViewData from the moment EstimateDepthMap assigned it
+				// until that image's slot was reused in the NEXT pass, letting nearly the
+				// whole dataset's worth accumulate simultaneously by the end of one pass.
+				// Safe to release unconditionally: it's a cache copy (sCachedImages, or the
+				// per-view ViewData copy assigned from it) that gets rebuilt on next use,
+				// not authoritative data.
 		}
 	}
 	inline void Release() {

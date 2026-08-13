@@ -1994,7 +1994,22 @@ void Mesh::Clean(
 
 	CLEAN::Mesh mesh;
 	{
-		mesh.vert.reserve(vertices.size() * 2);
+		// Headroom for the phases that ADD elements. Reserving 2x unconditionally
+		// doubled the VCG footprint (48 B/vertex + 112 B/face = ~136 B/face on a
+		// triangle mesh) even on the common path where nothing grows -- on a
+		// 30M-face mesh that is ~4 GB of capacity that is never touched.
+		// Growth comes from remeshing (fEdgeLength>0, which also duplicates the
+		// whole mesh via MeshCopy), from hole closing, and from the band refine
+		// (MESH_BAND_REFINE_ENABLED -> vcg::tri::RefineMidpoint, which subdivides);
+		// decimation only shrinks. Anything that does exceed the reserve still
+		// grows CORRECTLY through vcg::tri::Allocator, which fixes up the
+		// VF/FF/VertexRef pointers on reallocation -- it just costs one
+		// realloc+copy, which is why the growing paths keep real headroom.
+		// The 1.5 is not calibrated: log the peak VN()/FN() against these
+		// reserves before tightening it further.
+		const float fGrowth(fEdgeLength > 0.f ? 2.f :
+			((nCloseHoles > 0 || MESH_BAND_REFINE_ENABLED) ? 1.5f : 1.05f));
+		mesh.vert.reserve((size_t)(vertices.size() * fGrowth));
 
 		CLEAN::Mesh::VertexIterator vi = vcg::tri::Allocator<CLEAN::Mesh>::AddVertices(mesh, vertices.GetSize());
 		FOREACHPTR(pVert, vertices) {
@@ -2013,7 +2028,7 @@ void Mesh::Clean(
 			++vi;
 		}
 
-		mesh.face.reserve(faces.size() * 2);
+		mesh.face.reserve((size_t)(faces.size() * fGrowth));
 
 		CLEAN::Mesh::FaceIterator fi = vcg::tri::Allocator<CLEAN::Mesh>::AddFaces(mesh, faces.GetSize());
 		FOREACHPTR(pFace, faces) {

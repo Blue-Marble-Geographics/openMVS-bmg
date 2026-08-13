@@ -348,6 +348,9 @@
 #ifndef POISSON_ADAPTIVE_TRIM
 #define POISSON_ADAPTIVE_TRIM 0
 #endif
+// NOTE: releasing the dense point cloud before the Poisson solve is a RUNTIME
+// option (`--release-pointcloud`, the releasePointCloud argument below), not a
+// compile-time gate -- see ReconstructMeshPoisson.
 // Edge threshold as a multiple of the interior (passed) trimThreshold, x100.
 // 160 = edge threshold is 1.60x the interior threshold (e.g. 5.5 -> 8.8).
 #ifndef POISSON_TRIM_EDGE_MULT_X100
@@ -3520,7 +3523,22 @@ static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
 //                    delete isolated components whose area is below this fraction
 //                    of the whole mesh (removes small floating blobs). 0 (default)
 //                    = OFF, i.e. the tool's stock behavior (native aRatio 0.001).
-bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samplesPerNode, float pointWeight, float islandRatio)
+//   releasePointCloud : drop the dense cloud once the solve has what it needs.
+//                    The resident cloud is 43 B/point fixed (xyz 12 + normals 12
+//                    + color 3 + view off/size 8 + weight off/size 8) plus
+//                    8 B/point per average view -- ~75 B/point at 4 views -- but
+//                    the solve only ever reads xyz and normals. Keeping just
+//                    those (24 B/point, moved out, not copied) frees ~51 B/point:
+//                    measured 2.6 GB of a 5.67 GB peak on a 50.6M-point cloud.
+//                    SIDE EFFECT, and the reason this is optional: the caller's
+//                    scene.Save() will write 0 points instead of the full cloud.
+//                    The MESH is unaffected. RefineMesh reads the cloud only via
+//                    SelectNeighborViews, which is skipped when Image::neighbors
+//                    is already populated (it is serialized, and ReconstructMesh
+//                    fills it before calling this); TextureMesh never reads it.
+//                    Pass false if anything downstream reads points back out of
+//                    the reconstructed scene file.
+bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samplesPerNode, float pointWeight, float islandRatio, bool releasePointCloud)
 {
 	TD_TIMER_STARTD();
 	ASSERT(!pointcloud.IsEmpty());
@@ -3615,6 +3633,29 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	if (depth <= 0)
 		depth = EstimatePoissonDepth(poissonPts, poissonCount);
 
+	// Compact to xyz+normals only, then release the full cloud before the solve
+	// (see releasePointCloud in the header comment above). Done AFTER
+	// EstimatePoissonDepth, which reads poissonPts. pts/nrm outlive the solve,
+	// so poissonPts/poissonNrm stay valid for the adaptive-trim path below.
+	if (releasePointCloud) {
+		if (pts.empty()) {
+			// Zero-copy path: poissonPts/poissonNrm still alias the cloud's
+			// streams. MOVE the two geometry arrays out of the cloud -- an O(1)
+			// vector steal, not a 24 B/point copy -- so this costs no time and
+			// adds no transient peak. The moved-from vectors are left empty,
+			// which Release() below handles fine.
+			pts = std::move(pointcloud.pointsXYZ);
+			nrm = std::move(pointcloud.normalsXYZ);
+			poissonPts = pts.data();
+			poissonNrm = nrm.data();
+		}
+		// else: the non-finite filter already built pts/nrm as filtered copies
+		// that do not alias the cloud -- nothing to move.
+		pointcloud.Release();
+		VERBOSE("Poisson: released the dense point cloud (%u points kept as %u MB of xyz+normals)",
+			(unsigned)poissonCount, (unsigned)((poissonCount * 6 * sizeof(float)) >> 20));
+	}
+
 	// 1) In-process screened-Poisson reconstruction (replaces PoissonRecon.exe),
 	// with per-vertex density so the trimmer can threshold by it.
 	PoissonReconLib::Mesh pmesh;
@@ -3672,6 +3713,19 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 #endif
 		for (ptrdiff_t i = 0; i < (ptrdiff_t)nv; ++i)
 			memcpy(&dst[i], pv + i * 4, 3 * sizeof(float));
+
+#if !POISSON_ADAPTIVE_TRIM
+		// The Poisson vertex array (16 B/vertex: x,y,z,density) is dead once the
+		// positions are copied out, so release it BEFORE allocating the face
+		// array rather than holding both. swap-with-empty, not clear(): clear()
+		// keeps the capacity allocated and frees nothing.
+		// NOTE: deliberately not done under POISSON_ADAPTIVE_TRIM -- that path
+		// reads pmesh.vertices (for per-vertex density) after this block, and
+		// its guard tests VertexCount(), so freeing here would silently skip
+		// the trim rather than fail loudly.
+		// pv dangles after this point; it is not used again.
+		std::vector<float>().swap(pmesh.vertices);
+#endif
 
 		// Faces: source is packed uint32_t triples, same layout as Mesh::Face.
 		static_assert(sizeof(Mesh::Face) == 3 * sizeof(Mesh::VIndex), "Face layout mismatch");
@@ -3920,10 +3974,16 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	// nearest actual input point. Orthogonal to SurfaceTrimmer's density trim;
 	// removes invented membranes / skirts / balloons that float away from the
 	// real samples. See the macro comment near the top of this file.
-	if (!mesh.faces.IsEmpty() && !mesh.vertices.IsEmpty() && pointcloud.NumPoints() >= 100) {
+	// Reads poissonPts/poissonCount, NOT `pointcloud`: those are the filtered
+	// finite samples actually handed to the solver, and they stay valid when
+	// releasePointCloud has already dropped the cloud. Reading the cloud here
+	// would make this block silently no-op under --release-pointcloud (the
+	// guard would see 0 points) -- and a lever that skips work looks exactly
+	// like a lever that saves time.
+	if (!mesh.faces.IsEmpty() && !mesh.vertices.IsEmpty() && poissonCount >= 100) {
 		TD_TIMER_STARTD();
-		const size_t numCloud = pointcloud.NumPoints();
-		const Point3f* __restrict cloudPts = reinterpret_cast<const Point3f*>(pointcloud.PointStream());
+		const size_t numCloud = poissonCount;
+		const Point3f* __restrict cloudPts = reinterpret_cast<const Point3f*>(poissonPts);
 
 		using namespace nanoflann;
 		using KDTree = KDTreeSingleIndexAdaptor<

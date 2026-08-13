@@ -69,13 +69,24 @@ public:
 	float scale; // image scale relative to the original size
 	float avgDepth; // average depth of the points seen by this camera
 
+	// reference-count / cache bookkeeping for on-demand decode of the color buffer
+	// (mirrors DepthData::references/cs/IncRef/DecRef in DepthMap.h)
+	mutable unsigned references; // how many times .image is currently referenced (0 => may be released)
+	mutable CriticalSection cs; // guards references / lazy decode
+
 public:
-	inline Image() : poseID(NO_ID), width(0), height(0), avgDepth(0) {}
+	inline Image() : poseID(NO_ID), width(0), height(0), avgDepth(0), references(0) {}
+	// CriticalSection is not copyable (see CriticalSection.h), so the implicit
+	// copy constructor is deleted; user-defined here mirroring DepthData's
+	// precedent in DepthMap.h/.cpp (see Image.cpp).
+	Image(const Image&);
 
 	inline bool IsValid() const { return poseID != NO_ID; }
 	inline bool HasResolution() const { return width > 0 && height > 0; }
 	inline cv::Size GetSize() const { return cv::Size(width, height); }
 	inline String GetMaskFileName() const { return maskName.empty() ? Util::getFileFullName(name)+".mask.png" : maskName; }
+	inline bool IsImageEmpty() const { return image.empty(); }
+	inline size_t GetImageMemorySize() const { return image.empty() ? 0 : image.total()*image.elemSize(); }
 
 	// read image data from the file
 	static IMAGEPTR OpenImage(const String& fileName);
@@ -88,6 +99,8 @@ public:
 	bool ReloadImage(unsigned nMaxResolution = 0, bool bLoadPixels = true);
 	bool ReloadImageRaw(unsigned nMaxResolution = 0);
 	void ReleaseImage();
+	unsigned IncRefImage(unsigned nMaxResolution); // acquire a working reference, decoding iff not already resident
+	unsigned DecRefImage(); // release a working reference; frees .image once the count hits 0
 	float ResizeImage(unsigned nMaxResolution=0);
 	unsigned RecomputeMaxResolution(unsigned& level, unsigned minImageSize, unsigned maxImageSize=INT_MAX) const;
 

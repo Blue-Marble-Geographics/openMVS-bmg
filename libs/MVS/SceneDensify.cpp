@@ -149,6 +149,119 @@ static inline bool TryClaimBitAtomic(SEACAVE::BitMatrix& mask, const ImageRef& i
 // S T R U C T S ///////////////////////////////////////////////////
 
 
+// Bounded on-demand cache for the base decoded color image (scene.images[*].image).
+// Mirrors FilterDMapCache's structure exactly (see below), but wraps
+// Image::IncRefImage()/DecRefImage() instead of DepthData::IncRef()/DecRef(). This is
+// the single largest unbounded allocation in the Densify pipeline: "prepare images"
+// used to decode every scene image up front and never release it (resident through
+// ESTIMATE and FUSE, freed only at process exit). maxMemory == 0 means "no eviction"
+// (Tier 1: the pre-flight fits-check decided everything fits -- Acquire/Release degrade
+// to a plain ref-count inc/dec, same cost as the old always-resident behavior).
+// maxMemory > 0 means Tier 2: bounded LRU, decode-on-miss, evict-on-pressure. Spans
+// both ESTIMATE and FUSE (both read the color buffer), so it is owned by DepthMapsData
+// rather than scoped to one sub-phase like FilterDMapCache/DMapCache are.
+// NOTE: defined inside an explicit "namespace MVS { }" block (rather than relying on
+// the file's "using namespace MVS;") because SceneDensify.h forward-declares this type
+// as MVS::ImageCache; completing it at file (global) scope would create an unrelated
+// ::ImageCache and leave MVS::ImageCache permanently incomplete.
+namespace MVS {
+struct ImageCache {
+	// Sentinel for "Tier 1: never evict, everything stays resident" -- deliberately
+	// NOT 0, because 0 is a legitimate real budget (evict down to the bare minimum)
+	// that the periodic re-derivation can and does compute when the box is critically
+	// tight. Using 0 for both meanings was a real bug: SetMaxMemory(0) from the
+	// periodic recompute silently disabled eviction instead of evicting harder, right
+	// when eviction was needed most -- confirmed live: greyImages/sCachedImages tracked
+	// a shrinking budget correctly for many images, then stopped shrinking entirely
+	// (nothing left to constrain them or anything else) a few images before an OOM.
+	static constexpr size_t UNBOUNDED = std::numeric_limits<size_t>::max();
+
+	ImageCache(ImageArr& _images, const cList<unsigned>& _targetMaxResolution, size_t _maxMemory)
+		: images(_images), targetMaxResolution(_targetMaxResolution),
+		  usedMemory(0), maxMemory(_maxMemory), numAcquireCalls(0), numDecodes(0) {
+		DEBUG_EXTRA("ImageCache: budget %s (%s)", _maxMemory == UNBOUNDED ? "n/a" : Util::formatBytes(_maxMemory).c_str(),
+			_maxMemory == UNBOUNDED ? "unlimited/resident" : "bounded LRU");
+	}
+	~ImageCache() { Clear(); }
+
+	// acquire a working reference (decoding from disk only if not resident) and retain it
+	bool Acquire(IIndex idx) {
+		Image& imageData = images[idx];
+		const bool wasResident = !imageData.IsImageEmpty();
+		const unsigned r = imageData.IncRefImage(targetMaxResolution[idx]); // working ref
+		if (r == 0)
+			return false;
+		Lock l(cs);
+		++numAcquireCalls;
+		if (!wasResident)
+			++numDecodes;
+		const auto it = lruIter.find(idx);
+		if (it == lruIter.end()) {
+			imageData.IncRefImage(targetMaxResolution[idx]); // retain ref (+1); already resident -> no I/O
+			lru.push_front(idx);
+			lruIter[idx] = lru.begin();
+			usedMemory += imageData.GetImageMemorySize();
+		} else {
+			lru.splice(lru.begin(), lru, it->second); // move to most-recently-used (iterator stays valid)
+		}
+		EvictLocked(idx);
+		return true;
+	}
+	// release the working reference; the retain reference keeps the image resident
+	void Release(IIndex idx) { images[idx].DecRefImage(); }
+
+	uint32_t GetNumDecodes() const { return numDecodes; }
+	double GetHitRate() const { return numAcquireCalls ? 1.0 - static_cast<double>(numDecodes) / numAcquireCalls : 0.0; }
+	size_t GetUsedMemory() const { return usedMemory; }
+	// true if this is a Tier-2 (bounded LRU) cache; false for Tier-1 (always resident).
+	// Callers must only refresh the budget of an already-bounded cache -- never flip
+	// Tier 1 <-> Tier 2 mid-run, since the Tier-1 baseline refs aren't cache-tracked.
+	bool IsBounded() const { return maxMemory != UNBOUNDED; }
+
+	void SetMaxMemory(size_t max_memory_bytes) {
+		Lock l(cs);
+		maxMemory = max_memory_bytes;
+		EvictLocked(NO_ID);
+	}
+
+	// drop every retain reference (returns ref-counts to baseline)
+	void Clear() {
+		Lock l(cs);
+		for (const IIndex idx : lru)
+			images[idx].DecRefImage();
+		lru.clear();
+		lruIter.clear();
+		usedMemory = 0;
+	}
+private:
+	void EvictLocked(IIndex protectIdx) {
+		if (maxMemory == UNBOUNDED)
+			return; // Tier 1: eviction disabled, everything stays resident
+		while (usedMemory > maxMemory && lru.size() > 1) {
+			const IIndex idx = lru.back();
+			if (idx == protectIdx)
+				break;
+			lru.pop_back();
+			lruIter.erase(idx);
+			Image& imageData = images[idx];
+			const size_t sz = imageData.GetImageMemorySize();
+			usedMemory = (usedMemory > sz) ? usedMemory - sz : 0;
+			imageData.DecRefImage(); // drop retain ref; frees iff no working ref left
+		}
+	}
+	ImageArr& images;
+	const cList<unsigned>& targetMaxResolution; // per-image decode target (bytes-per-image sizing)
+	std::list<IIndex> lru; // front = most-recently used
+	std::unordered_map<IIndex, std::list<IIndex>::iterator> lruIter;
+	size_t usedMemory, maxMemory;
+	CriticalSection cs;
+	// total Acquire() calls and how many of those hit the disk (debug only)
+	uint32_t numAcquireCalls, numDecodes;
+};
+} // namespace MVS
+/*----------------------------------------------------------------*/
+
+
 DepthMapsData::DepthMapsData(Scene& _scene)
 	:
 	scene(_scene),
@@ -318,7 +431,66 @@ bool DepthMapsData::SelectViews(DepthData& depthData)
 /*----------------------------------------------------------------*/
 
 #ifdef DPC_IMAGE_CACHE
-static std::vector<std::pair<IDX, std::unique_ptr<Image32F>>> greyImages;
+// Bounded LRU cache for the per-image grayscale derivative (one entry per unique
+// image ID, seeded from scene.images[*].image the first time InitViews() needs it).
+// maxMemory == 0 means "no eviction" (matches the pre-existing behavior when a box
+// has enough RAM); maxMemory > 0 evicts the least-recently-used entry once exceeded.
+// Callers already hold sGreyImagesMutex across the whole find-or-insert sequence
+// (unchanged from before), so this struct itself needs no internal lock.
+// Evicting an entry here is safe even if another in-flight DepthData::ViewData holds
+// a shallow copy of the same buffer: cv::Mat is itself refcounted, so destroying this
+// cache's owning Image32F only drops one reference -- the underlying pixel buffer is
+// freed only once every other holder (each released within one image's processing
+// cycle, since at most the 2 ESTIMATE worker threads have live copies at a time) lets
+// go too.
+struct GreyImageCache {
+	Image32F* Find(IDX id) {
+		const auto it = lruIter.find(id);
+		if (it == lruIter.end())
+			return nullptr;
+		lru.splice(lru.begin(), lru, it->second);
+		return data[id].get();
+	}
+	Image32F* Insert(IDX id, std::unique_ptr<Image32F> img) {
+		const size_t bytes = img->total() * img->elemSize();
+		Image32F* const p = img.get();
+		data[id] = std::move(img);
+		lru.push_front(id);
+		lruIter[id] = lru.begin();
+		usedMemory += bytes;
+		Evict();
+		return p;
+	}
+	void SetMaxMemory(size_t max_memory_bytes) { maxMemory = max_memory_bytes; Evict(); }
+	void Clear() { data.clear(); lru.clear(); lruIter.clear(); usedMemory = 0; }
+	size_t GetUsedMemory() const { return usedMemory; }
+	size_t GetCount() const { return data.size(); }
+private:
+	void Evict() {
+		// No "maxMemory == 0 means unbounded" special case here on purpose: unlike
+		// ImageCache's Tier 1, this cache is always budget-driven, and the periodic
+		// live re-derivation can legitimately compute a budget of exactly 0 when the
+		// box is critically tight -- that must evict aggressively (down to the last
+		// entry, per the lru.size()>1 guard below), not disable eviction. Treating 0
+		// as "unbounded" here was a real bug: it let the cache (and everything else
+		// competing for the same RAM) grow unchecked right when eviction was needed
+		// most, confirmed by a live OOM a few images after the budget hit zero.
+		while (usedMemory > maxMemory && lru.size() > 1) {
+			const IDX id = lru.back();
+			lru.pop_back();
+			lruIter.erase(id);
+			const auto it = data.find(id);
+			usedMemory -= it->second->total() * it->second->elemSize();
+			data.erase(it);
+		}
+	}
+	std::unordered_map<IDX, std::unique_ptr<Image32F>> data;
+	std::list<IDX> lru; // front = most-recently used
+	std::unordered_map<IDX, std::list<IDX>::iterator> lruIter;
+	size_t usedMemory = 0, maxMemory = 0;
+};
+static GreyImageCache greyImages;
+static std::mutex sGreyImagesMutex;
 #endif
 
 // select target image for the reference image (the first image in "images"),
@@ -350,20 +522,19 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 		viewTrg.camera = viewTrg.pImageData->camera;
 		if (loadImages) {
 #ifdef DPC_IMAGE_CACHE
-			Image32F* found = nullptr;
-			for (auto& i : greyImages) {
-				if (i.first == neighbor.ID) {
-					found = i.second.get();
-					break;
+			{
+				std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+				Image32F* found = greyImages.Find(neighbor.ID);
+				if (!found) {
+					imageCache->Acquire(neighbor.ID); // decode-on-demand if Tier 2; no-op cost if Tier 1
+					auto img = std::make_unique<Image32F>(viewTrg.image);
+					viewTrg.pImageData->image.toGray(*img, cv::COLOR_BGR2GRAY, true);
+					imageCache->Release(neighbor.ID);
+					found = greyImages.Insert(neighbor.ID, std::move(img));
 				}
-			}
-			if (!found) {
-				greyImages.emplace_back(neighbor.ID, std::make_unique<Image32F>(viewTrg.image));
-				viewTrg.pImageData->image.toGray(*greyImages.back().second, cv::COLOR_BGR2GRAY, true);
-				found = greyImages.back().second.get();
-			}
 
-			viewTrg.image = *found;
+				viewTrg.image = *found;
+			}
 #else
 			viewTrg.pImageData->image.toGray(viewTrg.image, cv::COLOR_BGR2GRAY, true);
 #endif
@@ -388,20 +559,19 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 			viewTrg.camera = viewTrg.pImageData->camera;
 			if (loadImages) {
 #ifdef DPC_IMAGE_CACHE
-				Image32F* found = nullptr;
-				for (auto& i : greyImages) {
-					if (i.first == neighbor.ID) {
-						found = i.second.get();
-						break;
+				{
+					std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+					Image32F* found = greyImages.Find(neighbor.ID);
+					if (!found) {
+						imageCache->Acquire(neighbor.ID); // decode-on-demand if Tier 2; no-op cost if Tier 1
+						auto img = std::make_unique<Image32F>(viewTrg.image);
+						viewTrg.pImageData->image.toGray(*img, cv::COLOR_BGR2GRAY, true);
+						imageCache->Release(neighbor.ID);
+						found = greyImages.Insert(neighbor.ID, std::move(img));
 					}
-				}
-				if (!found) {
-					greyImages.emplace_back(neighbor.ID, std::make_unique<Image32F>(viewTrg.image));
-	 				viewTrg.pImageData->image.toGray(*greyImages.back().second, cv::COLOR_BGR2GRAY, true);
-					found = greyImages.back().second.get();
-				}
 
-				viewTrg.image = *found;
+					viewTrg.image = *found;
+				}
 #else
 				viewTrg.pImageData->image.toGray(viewTrg.image, cv::COLOR_BGR2GRAY, true);
 #endif
@@ -435,20 +605,19 @@ bool DepthMapsData::InitViews(DepthData& depthData, IIndex idxNeighbor, IIndex n
 	viewRef.camera = viewRef.pImageData->camera;
 	if (loadImages) {
 #ifdef DPC_IMAGE_CACHE
-		Image32F* found = nullptr;
-		for (auto& i : greyImages) {
-			if (i.first == idxImage) {
-				found = i.second.get();
-				break;
+		{
+			std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+			Image32F* found = greyImages.Find(idxImage);
+			if (!found) {
+				imageCache->Acquire(idxImage); // decode-on-demand if Tier 2; no-op cost if Tier 1
+				auto img = std::make_unique<Image32F>(viewRef.image);
+				viewRef.pImageData->image.toGray(*img, cv::COLOR_BGR2GRAY, true);
+				imageCache->Release(idxImage);
+				found = greyImages.Insert(idxImage, std::move(img));
 			}
-		}
-		if (!found) {
-			greyImages.emplace_back(idxImage, std::make_unique<Image32F>(viewRef.image));
-			viewRef.pImageData->image.toGray(*greyImages.back().second, cv::COLOR_BGR2GRAY, true);
-			found = greyImages.back().second.get();
-		}
 
-		viewRef.image = *found;
+			viewRef.image = *found;
+		}
 #else
 		viewRef.pImageData->image.toGray(viewRef.image, cv::COLOR_BGR2GRAY, true);
 #endif
@@ -887,8 +1056,78 @@ struct std::hash<ImageKey_t>
 	}
 };
 std::mutex sCachedImagesMutex;
-std::unordered_map<ImageKey_t, Image32F> sCachedImages;
+// Bounded LRU cache for the per-(image,scale) 4-plane sampling derivative (see the
+// insertion site below for what each entry holds and why). Same maxMemory==0-means-
+// unbounded / LRU-eviction-above-budget shape as GreyImageCache above, and safe to
+// evict for the same reason: cv::Mat's own refcounting keeps any already-copied-out
+// reference (e.g. "i.imageBig = ...") alive independently of this cache's ownership.
+struct ScaledImageCache {
+	Image32F* Find(const ImageKey_t& key) {
+		const auto it = lruIter.find(key);
+		if (it == lruIter.end())
+			return nullptr;
+		lru.splice(lru.begin(), lru, it->second);
+		return &data[key];
+	}
+	Image32F* Insert(const ImageKey_t& key, Image32F&& img) {
+		const size_t bytes = img.total() * img.elemSize();
+		Image32F& slot = data[key];
+		slot = std::move(img);
+		lru.push_front(key);
+		lruIter[key] = lru.begin();
+		usedMemory += bytes;
+		Evict();
+		return &data[key];
+	}
+	void SetMaxMemory(size_t max_memory_bytes) { maxMemory = max_memory_bytes; Evict(); }
+	void Clear() { data.clear(); lru.clear(); lruIter.clear(); usedMemory = 0; }
+	size_t GetUsedMemory() const { return usedMemory; }
+	size_t GetCount() const { return data.size(); }
+private:
+	void Evict() {
+		// See GreyImageCache::Evict() above for why maxMemory == 0 is NOT special-cased
+		// as "unbounded" here -- a live-recomputed budget of exactly 0 must evict
+		// aggressively, not disable eviction.
+		while (usedMemory > maxMemory && lru.size() > 1) {
+			const ImageKey_t key = lru.back();
+			lru.pop_back();
+			lruIter.erase(key);
+			const auto it = data.find(key);
+			usedMemory -= it->second.total() * it->second.elemSize();
+			data.erase(it);
+		}
+	}
+	std::unordered_map<ImageKey_t, Image32F> data;
+	std::list<ImageKey_t> lru; // front = most-recently used
+	std::unordered_map<ImageKey_t, std::list<ImageKey_t>::iterator> lruIter;
+	size_t usedMemory = 0, maxMemory = 0;
+};
+static ScaledImageCache sCachedImages;
 #endif
+
+// Release the ESTIMATE-phase-only grey/derivative image caches (DPC_IMAGE_CACHE's
+// greyImages, DPC_FASTER_SAMPLING's sCachedImages). Both are bounded LRU caches (one
+// entry per unique image[,scale] currently resident, budget re-derived periodically --
+// see SetEstimationImageCacheBudgets()), but neither is read again once FILTER/FUSE
+// start (those only touch saved .dmap files via FilterDMapCache/DMapCache, never
+// InitViews()), so clearing every remaining entry here is output-neutral.
+static void ClearEstimationImageCaches()
+{
+#ifdef DPC_IMAGE_CACHE
+	{
+		std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+		DEBUG_EXTRA("greyImages cache: %u images, %s released", (unsigned)greyImages.GetCount(), Util::formatBytes(greyImages.GetUsedMemory()).c_str());
+		greyImages.Clear();
+	}
+#endif
+#ifdef DPC_FASTER_SAMPLING
+	{
+		std::lock_guard<std::mutex> lock(sCachedImagesMutex);
+		DEBUG_EXTRA("sCachedImages cache: %u entries, %s released", (unsigned)sCachedImages.GetCount(), Util::formatBytes(sCachedImages.GetUsedMemory()).c_str());
+		sCachedImages.Clear();
+	}
+#endif
+}
 
 // estimate depth-map using propagation and random refinement with NCC score
 // as in: "Accurate Multiple View 3D Reconstruction Using Patch-Based Stereo for Large-Scale Scenes", S. Shen, 2013
@@ -967,10 +1206,11 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 		for (int j = 0; j < numImages; ++j) {
 			auto& i = depthData.images[j];
 			sCachedImagesMutex.lock();
-			auto itPair = sCachedImages.try_emplace(ImageKey_t(i.pImageData->ID, scale, i.image.cols, i.image.rows));
-			if (itPair.second) { // Insertion took place
-				itPair.first->second = Image32F(i.image.rows, i.image.cols*4);
-				float* __restrict dst = (float*)itPair.first->second.data;
+			const ImageKey_t key(i.pImageData->ID, scale, i.image.cols, i.image.rows);
+			Image32F* pImg = sCachedImages.Find(key);
+			if (!pImg) { // not resident -- compute and insert
+				Image32F img(i.image.rows, i.image.cols*4);
+				float* __restrict dst = (float*)img.data;
 				for (int y = 0; y < i.image.rows; ++y) {
 					const float* row = i.image.ptr<float>(y);
 					const float* nextRow = i.image.ptr<float>(y + (y < (i.image.rows-1) ? 1 : 0));
@@ -988,10 +1228,12 @@ bool DepthMapsData::EstimateDepthMap(IIndex idxImage, int nGeometricIter)
 					s3 = nextRow[0];
 					*dst++ = s0; *dst++ = (s1-s0); *dst++ = (s2-s0); *dst++ = (s3-s2-s1+s0);
 				}
+				pImg = sCachedImages.Insert(key, std::move(img));
 			}
+			// copied out while still holding the lock (the old try_emplace path copied
+			// after unlocking, which raced against a concurrent insert rehashing the map)
+			i.imageBig = *pImg;
 			sCachedImagesMutex.unlock();
-
-			i.imageBig = itPair.first->second;
 		}
 #endif
 
@@ -1523,7 +1765,11 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 		const Point3 c(Mr(0,2)-a.x*Kn02-b.x*Kn12, Mr(1,2)-a.y*Kn02-b.y*Kn12, Mr(2,2)-a.z*Kn02-b.z*Kn12);
 		const Point3 t(cameraRef.R * (camera.C - cameraRef.C));
 		const REAL Kr00(cameraRef.K(0,0)), Kr11(cameraRef.K(1,1)), Kr02(cameraRef.K(0,2)), Kr12(cameraRef.K(1,2));
-		const int wRef(size.width), hRef(size.height);
+		// bounds for the splat target: depthMap/confMap are allocated with sizeRef
+		// (the reference image), NOT the neighbor's size. Using the neighbor size here
+		// let projected coordinates that are valid for a larger neighbor but out of
+		// range for the smaller reference write past the depthMap buffer.
+		const int wRef(sizeRef.width), hRef(sizeRef.height);
 		// z-buffered splat of one reference pixel (keep the nearest depth)
 		const auto splat = [&](int px, int py, Depth cz, float conf) {
 			if ((unsigned)px < (unsigned)wRef && (unsigned)py < (unsigned)hRef) {
@@ -1660,15 +1906,17 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 		const ImageRef xDs[nDeltas] = { ImageRef(-1,0), ImageRef(1,0), ImageRef(0,-1), ImageRef(0,1) };
 		// hoist per-neighbor row-base pointers once per row (byte-identical addressing;
 		// removes the cList index + i*cols multiply from the hot neighbor reads). The delta
-		// block needs rows i-1,i,i+1 per neighbor; the border rows (&map(-1,0) / &map(h,0))
-		// reproduce the exact same linear offsets the original map(xRef+delta) access used.
-		// The counts summed here are order-independent.
+		// block needs rows i-1,i,i+1 per neighbor; rows i-1/i+1 only exist for interior rows,
+		// so they are only populated (and read) when in range to avoid reading outside the
+		// depth-map buffer. The counts summed here are order-independent.
 		std::vector<const Depth*> pRow0(N), pRowM(N), pRowP(N);
 		for (int i=0; i<sizeRef.height; ++i) {
+			const bool hasRowM(i > 0);
+			const bool hasRowP(i+1 < sizeRef.height);
 			for (IIndex k=0; k<N; ++k) {
 				pRow0[k] = &depthMaps[k](i, 0);
-				pRowM[k] = &depthMaps[k](i-1, 0);
-				pRowP[k] = &depthMaps[k](i+1, 0);
+				pRowM[k] = hasRowM ? &depthMaps[k](i-1, 0) : NULL;
+				pRowP[k] = hasRowP ? &depthMaps[k](i+1, 0) : NULL;
 			}
 			const Depth* const __restrict pRefDepth = &depthDataRef.depthMap(i, 0);
 			const float* const __restrict pRefConf = &depthDataRef.confMap(i, 0);
@@ -1713,21 +1961,31 @@ bool DepthMapsData::FilterDepthMap(DepthData& depthDataRef, const IIndexArr& idx
 				// check if similar with the neighbors projected around this pixel
 				// deltas: (-1,0)->row i col j-1, (1,0)->row i col j+1,
 				//         (0,-1)->row i-1 col j, (0,1)->row i+1 col j
+				// border rows/cols are skipped so we never read outside the depth-map buffer
 				{
 					unsigned nGoodViews(0);
 					unsigned nViews(0);
+					const bool hasColL(j > 0), hasColR(j+1 < sizeRef.width);
 					const int jL(j-1), jR(j+1);
 					unsigned n(N);
 					do {
 						--n;
-						const Depth dA(pRow0[n][jL]);
-						if (dA > 0) { ++nViews; if (IsDepthSimilar(depth, dA, thDepthDiff)) ++nGoodViews; }
-						const Depth dB(pRow0[n][jR]);
-						if (dB > 0) { ++nViews; if (IsDepthSimilar(depth, dB, thDepthDiff)) ++nGoodViews; }
-						const Depth dC(pRowM[n][j]);
-						if (dC > 0) { ++nViews; if (IsDepthSimilar(depth, dC, thDepthDiff)) ++nGoodViews; }
-						const Depth dD(pRowP[n][j]);
-						if (dD > 0) { ++nViews; if (IsDepthSimilar(depth, dD, thDepthDiff)) ++nGoodViews; }
+						if (hasColL) {
+							const Depth dA(pRow0[n][jL]);
+							if (dA > 0) { ++nViews; if (IsDepthSimilar(depth, dA, thDepthDiff)) ++nGoodViews; }
+						}
+						if (hasColR) {
+							const Depth dB(pRow0[n][jR]);
+							if (dB > 0) { ++nViews; if (IsDepthSimilar(depth, dB, thDepthDiff)) ++nGoodViews; }
+						}
+						if (hasRowM) {
+							const Depth dC(pRowM[n][j]);
+							if (dC > 0) { ++nViews; if (IsDepthSimilar(depth, dC, thDepthDiff)) ++nGoodViews; }
+						}
+						if (hasRowP) {
+							const Depth dD(pRowP[n][j]);
+							if (dD > 0) { ++nViews; if (IsDepthSimilar(depth, dD, thDepthDiff)) ++nGoodViews; }
+						}
 					} while (n);
 					if (nGoodViews < nMinViewsDelta || nGoodViews < nViews*nMinGoodViewsDeltaProc/100) {
 						#if TD_VERBOSE != TD_VERBOSE_OFF
@@ -2066,6 +2324,8 @@ void DepthMapsData::MergeDepthMaps(PointCloudStreaming& pointcloud, bool bEstima
 		if (depthData.IncRef(ComposeDepthFilePath(depthData.GetView().GetID(), "dmap")) == 0)
 			return;
 		ASSERT(!depthData.IsEmpty());
+		if (bEstimateColor)
+			imageCache->Acquire(idxImage); // only the reference image's color is read below
 		const DepthData::ViewData& image = depthData.GetView();
 		const size_t nNumPointsPrev(pointcloud.NumPoints());
 
@@ -2096,6 +2356,8 @@ void DepthMapsData::MergeDepthMaps(PointCloudStreaming& pointcloud, bool bEstima
 				++nDepths;
 			}
 		}
+		if (bEstimateColor)
+			imageCache->Release(idxImage);
 		depthData.DecRef();
 		++nDepthMaps;
 		//ASSERT(pointcloud.points.size() == pointcloud.pointViews.size());
@@ -2183,8 +2445,9 @@ struct DMapCache {
 		:
 		loadFlags(_loadFlags), arrDepthData(_arrDepthData),
 		maxMemory(_max_memory_bytes), disabledMaxMemory(0), usedMemory(0),
-		skipMemoryCheckIdxImage(NO_ID), numImageRead(0)
+		skipMemoryCheckIdxImage(NO_ID), numImageRead(0), numUseImageCalls(0)
 	{
+		DEBUG_EXTRA("DMapCache: budget %s", Util::formatBytes(_max_memory_bytes).c_str());
 	}
 
 	bool IsEmpty() const { ASSERT((usedMemory == 0) == fifo.IsEmpty()); return fifo.IsEmpty(); }
@@ -2207,6 +2470,7 @@ struct DMapCache {
 		ASSERT(idxImage < arrDepthData.size());
 		std::lock_guard<std::mutex> guard(mutex);
 		ASSERT(arrDepthData[idxImage].IsValid());
+		++numUseImageCalls;
 		if (!arrDepthData[idxImage].IsEmpty()) {
 			fifo.Put(idxImage);
 			return false;
@@ -2242,6 +2506,8 @@ struct DMapCache {
 
 	// get the number of times images were read from disk
 	uint32_t GetNumImageReads() const { return numImageRead; }
+	// fraction of UseImage() calls that hit an already-resident depth-map (0..1)
+	double GetHitRate() const { return numUseImageCalls ? 1.0 - static_cast<double>(numImageRead) / numUseImageCalls : 0.0; }
 
 	void ClearCache() {
 		std::lock_guard<std::mutex> guard(mutex);
@@ -2317,6 +2583,8 @@ struct DMapCache {
 
 	// number of times images were read from disk (debug only)
 	mutable uint32_t numImageRead;
+	// total number of UseImage() calls, i.e. hits+misses (debug only)
+	mutable uint32_t numUseImageCalls;
 };
 
 // compute available memory to be used for depth-data caching
@@ -2367,15 +2635,21 @@ size_t GetAvailableMemory(const DepthDataArr& arrDepthData, const BoolArr& fused
 // sub-phase (which asserts ref-count == 1), i.e. from SignalCompleteDepthmapFilter().
 struct FilterDMapCache {
 	FilterDMapCache(DepthDataArr& _arrDepthData, size_t _maxMemory)
-		: arrDepthData(_arrDepthData), usedMemory(0), maxMemory(_maxMemory) {}
+		: arrDepthData(_arrDepthData), usedMemory(0), maxMemory(_maxMemory), numAcquireCalls(0), numDiskLoads(0) {
+		DEBUG_EXTRA("FilterDMapCache: budget %s", Util::formatBytes(_maxMemory).c_str());
+	}
 	~FilterDMapCache() { Clear(); }
 	// acquire a working reference (loading from disk only if not resident) and retain it
 	bool Acquire(IIndex idx, const String& fileName) {
 		DepthData& depthData = arrDepthData[idx];
+		const bool wasResident = !depthData.IsEmpty(); // best-effort hit/miss stat, not synchronized with IncRef's own lock
 		const unsigned r = depthData.IncRef(fileName); // working ref; loads iff empty (outside lock)
 		if (r == 0)
 			return false;
 		Lock l(cs);
+		++numAcquireCalls;
+		if (!wasResident)
+			++numDiskLoads;
 		const auto it = lruIter.find(idx);
 		if (it == lruIter.end()) {
 			depthData.IncRef(fileName);              // retain ref (+1); already loaded -> no disk I/O
@@ -2388,6 +2662,9 @@ struct FilterDMapCache {
 		EvictLocked(idx);
 		return true;
 	}
+	// number of disk loads and hit-rate (0..1) across all Acquire() calls so far
+	uint32_t GetNumDiskLoads() const { return numDiskLoads; }
+	double GetHitRate() const { return numAcquireCalls ? 1.0 - static_cast<double>(numDiskLoads) / numAcquireCalls : 0.0; }
 	// release the working reference; the retain reference keeps the map resident
 	void Release(IIndex idx) {
 		arrDepthData[idx].DecRef();
@@ -2420,6 +2697,8 @@ private:
 	std::unordered_map<IIndex, std::list<IIndex>::iterator> lruIter;
 	size_t usedMemory, maxMemory;
 	CriticalSection cs;
+	// total Acquire() calls and how many of those hit the disk (debug only)
+	uint32_t numAcquireCalls, numDiskLoads;
 };
 static FilterDMapCache* g_filterCache = NULL;
 
@@ -2519,6 +2798,17 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 	const size_t nElementsAvailableToUse = (bytesAvailable / elementSize) / 4;
 	pointcloud.ReservePointViewsMemory(nElementsAvailableToUse / 4);
 	pointcloud.ReservePointWeightsMemory(nElementsAvailableToUse / 4);
+
+	// Re-derive the (bounded) color-image cache's budget from current freePhysical
+	// before sizing cacheDMaps below, so cacheDMaps' GetAvailableMemory() call sees
+	// whatever imageCache's own eviction (run synchronously inside SetMaxMemory)
+	// just freed -- same "compute the competing budget first" ordering already used
+	// at the ESTIMATE->FILTER handoff.
+	if (imageCache && imageCache->IsBounded()) {
+		const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+		const size_t safetyMemory(std::max(static_cast<size_t>(memInfo.totalPhysical * 0.08), size_t(1)*1024*1024*1024ull));
+		imageCache->SetMaxMemory(memInfo.freePhysical > safetyMemory ? memInfo.freePhysical - safetyMemory : 0);
+	}
 
 	Util::Progress progress(_T("Fused depth-maps"), arrDepthData.size());
 	GET_LOGCONSOLE().Pause();
@@ -2734,6 +3024,17 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			neighborCache.push_back(nc);
 		}
 
+		// Acquire the color buffers for the reference image + every populated
+		// neighbor once per reference-image iteration (image granularity, not
+		// per-point/per-pixel -- bEstimateColor is the only reason this loop
+		// reads scene.images[*].image, via the "->image.pix(...)" reads deep in
+		// the per-point phase below). Paired with the Release block further down.
+		if (bEstimateColor) {
+			imageCache->Acquire(idxImage);
+			for (const auto& nc : neighborCache)
+				imageCache->Acquire(nc.idxImageB);
+		}
+
 		const float fDepthDiffThreshold = OPTDENSE::fDepthDiffThreshold;
 		// Match reference exactly: fusion uses the raw threshold (no multiplier).
 		const float fDepthDiffThresholdFuse = fDepthDiffThreshold;
@@ -2768,17 +3069,35 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			uint32_t* pIdxPointB; // pointer for deferred commit
 			PointCloud::Normal normalB; // world-space neighbor normal from the Phase 1 gate (reused in Phase 2)
 		};
+		// NOTE: these were previously _alloca()'d. _alloca reserves from the WHOLE
+		// enclosing function's stack frame, not the current loop iteration -- since
+		// this sits inside FuseDepthMaps' outer per-reference-image loop (one call of
+		// FuseDepthMaps processes every image in the dataset), every image's buffers
+		// accumulated on the stack and were never reclaimed until the entire fuse
+		// operation finished. Confirmed live: a 1873-image run crashed with
+		// STATUS_STACK_OVERFLOW (0xC00000FD) at image 437 (~23%), consistent with a
+		// few KB/image of unreclaimed stack space exhausting a ~1MB thread stack
+		// around that point. Heap-backed containers declared here are destroyed (and
+		// their memory freed) at the end of each loop iteration instead, which is
+		// exactly the fix -- these are small (bounded by nMaxViewsFuse, 32 by
+		// default), so the heap-allocation cost versus alloca is negligible next to
+		// everything else done per image.
 		const unsigned maxNeighbors = (unsigned)neighborCache.size();
-		NeighborHit* hitsStorage = (NeighborHit*)_alloca(maxNeighbors * sizeof(NeighborHit));
-		NeighborHit* invalidHitsStorage = (NeighborHit*)_alloca(maxNeighbors * sizeof(NeighborHit));
+		std::vector<NeighborHit> hitsStorageBuf(maxNeighbors);
+		std::vector<NeighborHit> invalidHitsStorageBuf(maxNeighbors);
+		NeighborHit* hitsStorage = hitsStorageBuf.data();
+		NeighborHit* invalidHitsStorage = invalidHitsStorageBuf.data();
 		unsigned nHits = 0, nInvalidHits = 0;
 
 		const unsigned maxViews = (unsigned)neighborCache.size() + 1; // +1 for reference view
-		uint32_t* __restrict viewsStorage = (uint32_t*)_alloca(maxViews * sizeof(uint32_t));
-		float* __restrict weightsStorage = (float*)_alloca(maxViews * sizeof(float));
+		std::vector<uint32_t> viewsStorageBuf(maxViews);
+		std::vector<float> weightsStorageBuf(maxViews);
+		uint32_t* __restrict viewsStorage = viewsStorageBuf.data();
+		float* __restrict weightsStorage = weightsStorageBuf.data();
 		// Defer idxPointB assignments until we know the point survives the fuse check.
 		// Collect pointers to idxPointB slots so we can commit them only for accepted points.
-		uint32_t** __restrict deferredStorage = (uint32_t**)_alloca(neighborCache.size() * sizeof(uint32_t*));
+		std::vector<uint32_t*> deferredStorageBuf(neighborCache.size());
+		uint32_t** __restrict deferredStorage = deferredStorageBuf.data();
 		unsigned nViews = 0, nDeferred = 0;
 
 		bool bNormalMap = !depthData.normalMap.empty();
@@ -3245,6 +3564,12 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			(unsigned long long)(cHitsHistCulled[6]+cHitsHistCulled[7]+cHitsHistCulled[8]+cHitsHistCulled[9]+cHitsHistCulled[10]+cHitsHistCulled[11]+cHitsHistCulled[12]+cHitsHistCulled[13]+cHitsHistCulled[14]+cHitsHistCulled[15]));
 #endif
 
+		if (bEstimateColor) {
+			for (const auto& nc : neighborCache)
+				imageCache->Release(nc.idxImageB);
+			imageCache->Release(idxImage);
+		}
+
 		fusedDMaps[idxImage] = true;
 		DEBUG_ULTIMATE("Depth-map for reference image %3u fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
 			idxImage, depthData.images.size() - 1, pointcloud.NumPoints() - nNumPointsPrev, numImageNeighborsInCache, numImagesInCache, TD_TIMER_GET_FMT().c_str());
@@ -3257,13 +3582,16 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 
 	GET_LOGCONSOLE().Play();
 	progress.close();
+	const uint32_t cacheNumReads(cacheDMaps.GetNumImageReads());
+	const double cacheHitRate(cacheDMaps.GetHitRate());
 	arrDepthIdx.Release();
 	cacheDMaps.ClearCache();
 
-	DEBUG_EXTRA("Depth-maps fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s)",
+	DEBUG_EXTRA("Depth-maps fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s), dmap-cache: %u disk reads, %.1f%%%% hit-rate",
 		numDMapsFused, nDepths, pointcloud.NumPoints(), ROUND2INT((100.f * pointcloud.NumPoints()) / nDepths),
 		static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused,
-		static_cast<double>(totalNumImagesInCache) / numDMapsFused, TD_TIMER_GET_FMT().c_str());
+		static_cast<double>(totalNumImagesInCache) / numDMapsFused, TD_TIMER_GET_FMT().c_str(),
+		cacheNumReads, cacheHitRate * 100.0);
 
 	// Normals are emitted directly during fusion (normalized(N) per surviving
 	// point), so no separate post-pass is needed. The previous projs[]-based
@@ -3359,6 +3687,14 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 		const size_t nElementsAvailableToUse = (bytesAvailable / elementSize) / 4;
 		pointcloud.ReservePointViewsMemory(nElementsAvailableToUse / 4);
 		pointcloud.ReservePointWeightsMemory(nElementsAvailableToUse / 4);
+	}
+
+	// Re-derive the (bounded) color-image cache's budget from current freePhysical
+	// before sizing cacheDMaps below -- see the identical comment in FuseDepthMaps.
+	if (imageCache && imageCache->IsBounded()) {
+		const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+		const size_t safetyMemory(std::max(static_cast<size_t>(memInfo.totalPhysical * 0.08), size_t(1)*1024*1024*1024ull));
+		imageCache->SetMaxMemory(memInfo.freePhysical > safetyMemory ? memInfo.freePhysical - safetyMemory : 0);
 	}
 
 	Util::Progress progress(_T("Dense fused depth-maps"), arrDepthData.size());
@@ -3870,6 +4206,19 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 		}
 #endif
 
+		// Acquire the color buffers for the reference image + every direct neighbor
+		// whose depth-map warmed up successfully. The same "neighbors[id]" gate is
+		// also what bounds FusePoint's recursive cluster search (see the
+		// "if (!neighbors[nextID]) continue;" checks below), so this exactly covers
+		// every image curID can be during this iteration's fusion -- image
+		// granularity, once per reference image, not per-point/per-pixel.
+		if (bEstimateColor) {
+			imageCache->Acquire(idxImage);
+			for (const ViewScore& neighbor : depthData.neighbors)
+				if (neighbors[neighbor.ID])
+					imageCache->Acquire(neighbor.ID);
+		}
+
 		const Image& imageData = *depthData.images.front().pImageData;
 		ASSERT(&imageData - scene.images.data() == idxImage);
 		// Use depthMap.size() (the live map) instead of depthData.size
@@ -3978,6 +4327,13 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 		cClustersTried=cClustersEmitted=cClustersTooSmall=cClustersTooFewViews=0;
 		#endif
 
+		if (bEstimateColor) {
+			for (const ViewScore& neighbor : depthData.neighbors)
+				if (neighbors[neighbor.ID])
+					imageCache->Release(neighbor.ID);
+			imageCache->Release(idxImage);
+		}
+
 		fusedDMaps[idxImage] = true;
 		DEBUG_ULTIMATE("Depth-map for reference image %3u dense-fused using %u depth-maps: %u new points, %u/%u cached images (%s)",
 			idxImage, depthData.images.size() - 1, pointcloud.NumPoints() - nNumPointsPrev,
@@ -3990,15 +4346,18 @@ void DepthMapsData::DenseFuseDepthMaps(PointCloudStreaming& pointcloud, bool bEs
 
 	GET_LOGCONSOLE().Play();
 	progress.close();
+	const uint32_t cacheNumReads(cacheDMaps.GetNumImageReads());
+	const double cacheHitRate(cacheDMaps.GetHitRate());
 	arrUseMask.Release();
 	cacheDMaps.ClearCache();
 
-	DEBUG_EXTRA("Depth-maps dense fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s)",
+	DEBUG_EXTRA("Depth-maps dense fused and filtered: %u depth-maps, %u depths, %u points (%d%%%%), %.2f hits in %.2f cached (%s), dmap-cache: %u disk reads, %.1f%%%% hit-rate",
 		numDMapsFused, nDepths, pointcloud.NumPoints(),
 		nDepths ? ROUND2INT((100.f * pointcloud.NumPoints()) / nDepths) : 0,
 		numDMapsFused ? static_cast<double>(totalNumImageNeighborsInCache) / numDMapsFused : 0.0,
 		numDMapsFused ? static_cast<double>(totalNumImagesInCache) / numDMapsFused : 0.0,
-		TD_TIMER_GET_FMT().c_str());
+		TD_TIMER_GET_FMT().c_str(),
+		cacheNumReads, cacheHitRate * 100.0);
 } // DenseFuseDepthMaps
 
 
@@ -4479,17 +4838,35 @@ void DepthMapsData::FuseDepthMaps(PointCloudStreaming& pointcloud, bool bEstimat
 			Depth*   pDepthB;  // pointer for invalidation / deferred commit
 			uint32_t* pIdxPointB; // pointer for deferred commit
 		};
+		// NOTE: these were previously _alloca()'d. _alloca reserves from the WHOLE
+		// enclosing function's stack frame, not the current loop iteration -- since
+		// this sits inside FuseDepthMaps' outer per-reference-image loop (one call of
+		// FuseDepthMaps processes every image in the dataset), every image's buffers
+		// accumulated on the stack and were never reclaimed until the entire fuse
+		// operation finished. Confirmed live: a 1873-image run crashed with
+		// STATUS_STACK_OVERFLOW (0xC00000FD) at image 437 (~23%), consistent with a
+		// few KB/image of unreclaimed stack space exhausting a ~1MB thread stack
+		// around that point. Heap-backed containers declared here are destroyed (and
+		// their memory freed) at the end of each loop iteration instead, which is
+		// exactly the fix -- these are small (bounded by nMaxViewsFuse, 32 by
+		// default), so the heap-allocation cost versus alloca is negligible next to
+		// everything else done per image.
 		const unsigned maxNeighbors = (unsigned)neighborCache.size();
-		NeighborHit* hitsStorage = (NeighborHit*)_alloca(maxNeighbors * sizeof(NeighborHit));
-		NeighborHit* invalidHitsStorage = (NeighborHit*)_alloca(maxNeighbors * sizeof(NeighborHit));
+		std::vector<NeighborHit> hitsStorageBuf(maxNeighbors);
+		std::vector<NeighborHit> invalidHitsStorageBuf(maxNeighbors);
+		NeighborHit* hitsStorage = hitsStorageBuf.data();
+		NeighborHit* invalidHitsStorage = invalidHitsStorageBuf.data();
 		unsigned nHits = 0, nInvalidHits = 0;
 
 		const unsigned maxViews = (unsigned)neighborCache.size() + 1; // +1 for reference view
-		uint32_t* __restrict viewsStorage = (uint32_t*)_alloca(maxViews * sizeof(uint32_t));
-		float* __restrict weightsStorage = (float*)_alloca(maxViews * sizeof(float));
+		std::vector<uint32_t> viewsStorageBuf(maxViews);
+		std::vector<float> weightsStorageBuf(maxViews);
+		uint32_t* __restrict viewsStorage = viewsStorageBuf.data();
+		float* __restrict weightsStorage = weightsStorageBuf.data();
 		// Defer idxPointB assignments until we know the point survives the fuse check.
 		// Collect pointers to idxPointB slots so we can commit them only for accepted points.
-		uint32_t** __restrict deferredStorage = (uint32_t**)_alloca(neighborCache.size() * sizeof(uint32_t*));
+		std::vector<uint32_t*> deferredStorageBuf(neighborCache.size());
+		uint32_t** __restrict deferredStorage = deferredStorageBuf.data();
 		unsigned nViews = 0, nDeferred = 0;
 
 		for (int i = 0; i < sizeMap.height; ++i) {
@@ -4973,6 +5350,10 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 
 	std::vector<float> meanDist(n);
 	const int kq = k + 1; // +1 because the query point itself is returned
+	// cache pass-1 neighbor indices (found==kq under the early-out guard) so the
+	// local-threshold pass below reuses them instead of re-running an identical
+	// knnSearch -> deterministic, bit-identical decisions at half the tree queries
+	std::vector<uint32_t> nbrIdx((size_t)n * (size_t)kq);
 #ifdef DENSE_USE_OPENMP
 #pragma omp parallel
 #endif
@@ -4985,8 +5366,10 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 		for (int64_t i = 0; i < (int64_t)n; ++i) {
 			const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
 			const size_t found = index.knnSearch(q, kq, idxBuf.data(), d2Buf.data());
+			uint32_t* __restrict pn = nbrIdx.data() + (size_t)i * (size_t)kq;
 			float sum = 0.f; size_t cnt = 0;
 			for (size_t j = 0; j < found; ++j) {
+				pn[j] = idxBuf[j];
 				if (idxBuf[j] == (uint32_t)i) continue; // skip self
 				sum += d2Buf[j]; ++cnt;
 			}
@@ -5018,71 +5401,84 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 	// consults view count, so nMinViewsFuse=2 is fully respected.
 	std::vector<uint8_t> outlier(n, 0);
 #ifdef DENSE_USE_OPENMP
-#pragma omp parallel
+#pragma omp parallel for schedule(static, 1024)
 #endif
-	{
-		std::vector<uint32_t> idxBuf(kq);
-		std::vector<float> d2Buf(kq);
-#ifdef DENSE_USE_OPENMP
-#pragma omp for schedule(static, 1024)
-#endif
-		for (int64_t i = 0; i < (int64_t)n; ++i) {
-			// global gate first (cheap, no neighborhood stats needed)
-			if (meanDist[i] > globalThr) { outlier[i] = 1; continue; }
-			const float q[3] = { xyz[i * 3 + 0], xyz[i * 3 + 1], xyz[i * 3 + 2] };
-			const size_t found = index.knnSearch(q, kq, idxBuf.data(), d2Buf.data());
-			// local mean+std of the neighbors' own neighbor-distance
-			double lmean = 0.0; size_t cnt = 0;
-			for (size_t j = 0; j < found; ++j) {
-				if (idxBuf[j] == (uint32_t)i) continue; // skip self
-				lmean += meanDist[idxBuf[j]]; ++cnt;
-			}
-			if (cnt == 0) continue;
-			lmean /= (double)cnt;
-			double lvar = 0.0;
-			for (size_t j = 0; j < found; ++j) {
-				if (idxBuf[j] == (uint32_t)i) continue;
-				const double d = (double)meanDist[idxBuf[j]] - lmean;
-				lvar += d * d;
-			}
-			lvar /= (double)cnt;
-			const double lthr = lmean + (double)stddevMul * std::sqrt(lvar);
-			// high (sparse) side only: a point sparser than its neighborhood is fuzz
-			if ((double)meanDist[i] > lthr)
-				outlier[i] = 1;
+	for (int64_t i = 0; i < (int64_t)n; ++i) {
+		// global gate first (cheap, no neighborhood stats needed)
+		if (meanDist[i] > globalThr) { outlier[i] = 1; continue; }
+		// reuse the neighbor list gathered in pass 1 (identical to re-querying the tree)
+		const uint32_t* __restrict pn = nbrIdx.data() + (size_t)i * (size_t)kq;
+		// local mean+std of the neighbors' own neighbor-distance
+		double lmean = 0.0; size_t cnt = 0;
+		for (int j = 0; j < kq; ++j) {
+			const uint32_t idx = pn[j];
+			if (idx == (uint32_t)i) continue; // skip self
+			lmean += meanDist[idx]; ++cnt;
 		}
+		if (cnt == 0) continue;
+		lmean /= (double)cnt;
+		double lvar = 0.0;
+		for (int j = 0; j < kq; ++j) {
+			const uint32_t idx = pn[j];
+			if (idx == (uint32_t)i) continue;
+			const double d = (double)meanDist[idx] - lmean;
+			lvar += d * d;
+		}
+		lvar /= (double)cnt;
+		const double lthr = lmean + (double)stddevMul * std::sqrt(lvar);
+		// high (sparse) side only: a point sparser than its neighborhood is fuzz
+		if ((double)meanDist[i] > lthr)
+			outlier[i] = 1;
 	}
 
-	// compact every parallel stream in lockstep, keeping only inliers
+	// compact every parallel stream in lockstep, keeping only inliers.
+	// A serial prefix pass assigns each survivor its destination point index and
+	// (for the variable-length view/weight blobs) its destination memory offset;
+	// the heavy copying is then done in parallel with each survivor writing only
+	// its own disjoint slots, so the output layout is identical to a serial pass.
 	const bool hasNormals = !pc.normalsXYZ.empty();
 	const bool hasColors  = !pc.colorsRGB.empty();
 	const bool hasViews   = !pc.pointViewsSizes.empty();
 	const bool hasWeights = !pc.pointWeightsSizes.empty();
 
-	std::vector<float>    newXYZ;     newXYZ.reserve(pc.pointsXYZ.size());
-	std::vector<float>    newNormals; if (hasNormals) newNormals.reserve(pc.normalsXYZ.size());
-	std::vector<uint8_t>  newColors;  if (hasColors)  newColors.reserve(pc.colorsRGB.size());
-	std::vector<uint32_t> newViewsOff, newViewsSize, newViewsMem;
-	std::vector<uint32_t> newWeightsOff, newWeightsSize;
-	std::vector<float>    newWeightsMem;
-	if (hasViews)   { newViewsOff.reserve(pc.pointViewsOffsets.size()); newViewsSize.reserve(pc.pointViewsSizes.size()); newViewsMem.reserve(pc.pointViewsMemory.size()); }
-	if (hasWeights) { newWeightsOff.reserve(pc.pointWeightsOffsets.size()); newWeightsSize.reserve(pc.pointWeightsSizes.size()); newWeightsMem.reserve(pc.pointWeightsMemory.size()); }
-
-	size_t removed = 0;
+	std::vector<uint32_t> dstIdx(n);
+	std::vector<uint32_t> viewOff(hasViews ? n : 0);
+	std::vector<uint32_t> weightOff(hasWeights ? n : 0);
+	size_t nKeep = 0, viewMem = 0, weightMem = 0;
 	for (size_t i = 0; i < n; ++i) {
-		if (outlier[i]) { ++removed; continue; }
-		newXYZ.push_back(xyz[i * 3 + 0]); newXYZ.push_back(xyz[i * 3 + 1]); newXYZ.push_back(xyz[i * 3 + 2]);
-		if (hasNormals) { newNormals.push_back(pc.normalsXYZ[i * 3 + 0]); newNormals.push_back(pc.normalsXYZ[i * 3 + 1]); newNormals.push_back(pc.normalsXYZ[i * 3 + 2]); }
-		if (hasColors)  { newColors.push_back(pc.colorsRGB[i * 3 + 0]); newColors.push_back(pc.colorsRGB[i * 3 + 1]); newColors.push_back(pc.colorsRGB[i * 3 + 2]); }
+		if (outlier[i]) continue;
+		dstIdx[i] = (uint32_t)nKeep;
+		if (hasViews)   { viewOff[i]   = (uint32_t)viewMem;   viewMem   += pc.pointViewsSizes[i]; }
+		if (hasWeights) { weightOff[i] = (uint32_t)weightMem; weightMem += pc.pointWeightsSizes[i]; }
+		++nKeep;
+	}
+	const size_t removed = n - nKeep;
+
+	std::vector<float>    newXYZ(nKeep * 3);
+	std::vector<float>    newNormals(hasNormals ? nKeep * 3 : 0);
+	std::vector<uint8_t>  newColors(hasColors ? nKeep * 3 : 0);
+	std::vector<uint32_t> newViewsOff(hasViews ? nKeep : 0), newViewsSize(hasViews ? nKeep : 0), newViewsMem(viewMem);
+	std::vector<uint32_t> newWeightsOff(hasWeights ? nKeep : 0), newWeightsSize(hasWeights ? nKeep : 0);
+	std::vector<float>    newWeightsMem(weightMem);
+
+#ifdef DENSE_USE_OPENMP
+#pragma omp parallel for schedule(static, 1024)
+#endif
+	for (int64_t i = 0; i < (int64_t)n; ++i) {
+		if (outlier[i]) continue;
+		const size_t w = dstIdx[i];
+		newXYZ[w * 3 + 0] = xyz[i * 3 + 0]; newXYZ[w * 3 + 1] = xyz[i * 3 + 1]; newXYZ[w * 3 + 2] = xyz[i * 3 + 2];
+		if (hasNormals) { newNormals[w * 3 + 0] = pc.normalsXYZ[i * 3 + 0]; newNormals[w * 3 + 1] = pc.normalsXYZ[i * 3 + 1]; newNormals[w * 3 + 2] = pc.normalsXYZ[i * 3 + 2]; }
+		if (hasColors)  { newColors[w * 3 + 0] = pc.colorsRGB[i * 3 + 0]; newColors[w * 3 + 1] = pc.colorsRGB[i * 3 + 1]; newColors[w * 3 + 2] = pc.colorsRGB[i * 3 + 2]; }
 		if (hasViews) {
-			const uint32_t off = pc.pointViewsOffsets[i], sz = pc.pointViewsSizes[i];
-			newViewsOff.push_back((uint32_t)newViewsMem.size()); newViewsSize.push_back(sz);
-			for (uint32_t t = 0; t < sz; ++t) newViewsMem.push_back(pc.pointViewsMemory[off + t]);
+			const uint32_t off = pc.pointViewsOffsets[i], sz = pc.pointViewsSizes[i], dOff = viewOff[i];
+			newViewsOff[w] = dOff; newViewsSize[w] = sz;
+			for (uint32_t t = 0; t < sz; ++t) newViewsMem[dOff + t] = pc.pointViewsMemory[off + t];
 		}
 		if (hasWeights) {
-			const uint32_t off = pc.pointWeightsOffsets[i], sz = pc.pointWeightsSizes[i];
-			newWeightsOff.push_back((uint32_t)newWeightsMem.size()); newWeightsSize.push_back(sz);
-			for (uint32_t t = 0; t < sz; ++t) newWeightsMem.push_back(pc.pointWeightsMemory[off + t]);
+			const uint32_t off = pc.pointWeightsOffsets[i], sz = pc.pointWeightsSizes[i], dOff = weightOff[i];
+			newWeightsOff[w] = dOff; newWeightsSize[w] = sz;
+			for (uint32_t t = 0; t < sz; ++t) newWeightsMem[dOff + t] = pc.pointWeightsMemory[off + t];
 		}
 	}
 
@@ -5619,6 +6015,94 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 		TD_TIMER_START();
 		data.images.Reserve(images.GetSize());
 		imagesMap.Resize(images.GetSize());
+
+		// Pass 0: header-only sizing for every image (RecomputeMaxResolution only reads
+		// the file header via ReadImageHeader(), no pixel decode) so the Tier-1/Tier-2
+		// decision and fail-fast floor below can run before any real decode work starts.
+		data.depthMaps.targetMaxResolution.Resize(images.GetSize());
+		std::vector<uint64_t> imageBytes(images.GetSize(), 0);
+		#ifdef DENSE_USE_OPENMP
+		#pragma omp parallel for schedule(dynamic)
+		for (int_t ID=0; ID<(int_t)images.GetSize(); ++ID) {
+			const IIndex idxImage((IIndex)ID);
+		#else
+		FOREACH(idxImage, images) {
+		#endif
+			Image& imageData = images[idxImage];
+			data.depthMaps.targetMaxResolution[idxImage] = 0;
+			if (!imageData.IsValid())
+				continue;
+			unsigned nResolutionLevel(OPTDENSE::nResolutionLevel);
+			const unsigned nMaxResolution(imageData.RecomputeMaxResolution(nResolutionLevel, OPTDENSE::nMinResolution, OPTDENSE::nMaxResolution));
+			data.depthMaps.targetMaxResolution[idxImage] = nMaxResolution;
+			const double aspect(imageData.width && imageData.height
+				? (double)MINF(imageData.width, imageData.height) / (double)MAXF(imageData.width, imageData.height) : 1.0);
+			imageBytes[idxImage] = (uint64_t)((double)nMaxResolution * (double)nMaxResolution * aspect) * 3ull/*bytes/pixel, color*/;
+		}
+		uint64_t totalImageBytes(0);
+		for (const uint64_t b : imageBytes)
+			totalImageBytes += b;
+
+		// Tier-1/Tier-2 decision + fail-fast floor: a deterministic, one-time, loudly
+		// logged pre-flight check. Never silently changes resolution/quality settings --
+		// only decides WHEN the base color buffer (scene.images[*].image) is decoded/
+		// evicted, and refuses to start (rather than let the OS thrash or crash) if even
+		// the minimum possible working set cannot fit.
+		const Util::MemoryInfo prepMemInfo(Util::GetMemoryInfo());
+		const double DENSE_KEEP_IMAGES_FRACTION(0.35); // mirrors SceneTexture's TEXTURE_KEEP_IMAGES_FRACTION: this budget is spent for the WHOLE run (ESTIMATE+FUSE), not one transient stage
+		const uint64_t keepBudget((uint64_t)((double)prepMemInfo.freePhysical * DENSE_KEEP_IMAGES_FRACTION));
+		const bool bKeepResident(totalImageBytes > 0 && totalImageBytes <= keepBudget);
+		const uint64_t safetyMemory(std::max((uint64_t)((double)prepMemInfo.totalPhysical * 0.08), (uint64_t)1*1024*1024*1024ull));
+
+		// worst-case simultaneous floor: ESTIMATE always runs 2 event-loop worker threads
+		// regardless of --max-threads (see the "cList<SEACAVE::Thread> threads(2)" call
+		// sites further down), each holding (1 reference + up to nNumViews neighbors)
+		// resident at once.
+		const unsigned nFloorNeighbors(MAXF(1u, OPTDENSE::nNumViews ? OPTDENSE::nNumViews : OPTDENSE::nMaxViews));
+		const uint64_t meanImageBytes(images.GetSize() ? totalImageBytes / images.GetSize() : 0);
+		const uint64_t floorBytes(2ull * (1 + nFloorNeighbors) * meanImageBytes);
+		if (meanImageBytes > 0 && floorBytes + safetyMemory > prepMemInfo.freePhysical) {
+			VERBOSE("error: insufficient RAM for dense reconstruction even at minimum working set: "
+				"need >= %s (2 concurrent estimate threads x (1 ref + %u neighbors) @ %s/image + safety margin), "
+				"only %s free. Reduce --max-resolution or --num-views, or (if nothing else works) --resolution-level, "
+				"or run on a machine with more RAM.",
+				Util::formatBytes(floorBytes+safetyMemory).c_str(), nFloorNeighbors,
+				Util::formatBytes(meanImageBytes).c_str(), Util::formatBytes(prepMemInfo.freePhysical).c_str());
+			return false;
+		}
+		DEBUG_EXTRA("Image cache: %s decoded (estimated) vs %s budget (%s free x %.2f) -> %s",
+			Util::formatBytes(totalImageBytes).c_str(), Util::formatBytes(keepBudget).c_str(),
+			Util::formatBytes(prepMemInfo.freePhysical).c_str(), DENSE_KEEP_IMAGES_FRACTION,
+			bKeepResident ? "KEEP resident (Tier 1)" : "bounded LRU cache (Tier 2)");
+		data.depthMaps.imageCache = new ImageCache(images, data.depthMaps.targetMaxResolution,
+			bKeepResident ? ImageCache::UNBOUNDED : (prepMemInfo.freePhysical > safetyMemory ? prepMemInfo.freePhysical - safetyMemory : 0));
+
+		// Bound the derived per-image caches too (greyImages, sCachedImages): on a
+		// large enough dataset they grow for the WHOLE ESTIMATE super-phase otherwise
+		// (one entry per unique image[,scale] ever touched, never evicted until
+		// ClearEstimationImageCaches() at phase end) -- confirmed in practice on a
+		// 2000-image scene as continuous ~0.1GB/image growth with no ceiling. Budget
+		// kept deliberately modest (each independently capped at this fraction of the
+		// SAME free-RAM snapshot used above) since these compete for the same pool as
+		// imageCache/DMapCache/FilterDMapCache; refined from measurement, not a
+		// precisely-modeled joint budget.
+		const double DENSE_DERIVED_CACHE_FRACTION(0.15);
+		const uint64_t derivedCacheBudget((uint64_t)((double)prepMemInfo.freePhysical * DENSE_DERIVED_CACHE_FRACTION));
+		#ifdef DPC_IMAGE_CACHE
+		{
+			std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+			greyImages.SetMaxMemory(derivedCacheBudget);
+			DEBUG_EXTRA("greyImages cache: budget %s", Util::formatBytes(derivedCacheBudget).c_str());
+		}
+		#endif
+		#ifdef DPC_FASTER_SAMPLING
+		{
+			std::lock_guard<std::mutex> lock(sCachedImagesMutex);
+			sCachedImages.SetMaxMemory(derivedCacheBudget);
+			DEBUG_EXTRA("sCachedImages cache: budget %s", Util::formatBytes(derivedCacheBudget).c_str());
+		}
+		#endif
+
 		#ifdef DENSE_USE_OPENMP
 		bool bAbort(false);
 		#pragma omp parallel for shared(data, bAbort)
@@ -5647,17 +6131,31 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 				imagesMap[idxImage] = data.images.GetSize();
 				data.images.Insert(idxImage);
 			}
-			// reload image at the appropriate resolution
-			unsigned nResolutionLevel(OPTDENSE::nResolutionLevel);
-			const unsigned nMaxResolution(imageData.RecomputeMaxResolution(nResolutionLevel, OPTDENSE::nMinResolution, OPTDENSE::nMaxResolution));
-			if (!imageData.ReloadImage(nMaxResolution)) {
-				#ifdef DENSE_USE_OPENMP
-				bAbort = true;
-				#pragma omp flush (bAbort)
-				continue;
-				#else
-				return false;
-				#endif
+			// Pass 1: decode now at the target resolution (Tier 1, matches the previous
+			// unconditional behavior) or read only the header now and let ImageCache
+			// decode on demand later (Tier 2, bounded).
+			const unsigned nMaxResolution(data.depthMaps.targetMaxResolution[idxImage]);
+			if (bKeepResident) {
+				if (!imageData.ReloadImage(nMaxResolution)) {
+					#ifdef DENSE_USE_OPENMP
+					bAbort = true;
+					#pragma omp flush (bAbort)
+					continue;
+					#else
+					return false;
+					#endif
+				}
+				imageData.references = 1; // permanent Tier-1 baseline ref; ImageCache (maxMemory=0) never evicts it anyway
+			} else {
+				if (!imageData.ReloadImage(nMaxResolution, /*bLoadPixels=*/false)) {
+					#ifdef DENSE_USE_OPENMP
+					bAbort = true;
+					#pragma omp flush (bAbort)
+					continue;
+					#else
+					return false;
+					#endif
+				}
 			}
 			imageData.UpdateCamera(platforms);
 			// print image camera
@@ -5860,6 +6358,23 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 		data.nEstimationGeometricIter = -1;
 	}
 
+	// estimation is fully done (including all geometric-consistency iterations):
+	// release the per-image grey/derivative caches before sizing the filter cache,
+	// so their freed memory is reflected in the filter budget below
+	ClearEstimationImageCaches();
+
+	// If the base color-image cache is bounded (Tier 2), re-derive its budget now
+	// that the grey/derivative caches above were just released -- freePhysical has
+	// changed, and FUSE (which reads this same cache) starts after FILTER, so this
+	// gives it a head start on the correct number. Never flip a Tier-1 (always
+	// resident) cache into Tier 2 here, or vice versa -- the tier is a one-time,
+	// deterministic decision made in "prepare images".
+	if (data.depthMaps.imageCache && data.depthMaps.imageCache->IsBounded()) {
+		const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+		const size_t safetyMemory(std::max(static_cast<size_t>(memInfo.totalPhysical * 0.08), size_t(1)*1024*1024*1024ull));
+		data.depthMaps.imageCache->SetMaxMemory(memInfo.freePhysical > safetyMemory ? memInfo.freePhysical - safetyMemory : 0);
+	}
+
 	if ((OPTDENSE::nOptimize & OPTDENSE::ADJUST_FILTER) != 0) {
 #if FILTER_PROFILE
 		g_filterProfile.Reset();
@@ -5882,6 +6397,8 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 		const Util::MemoryInfo filterMemInfo(Util::GetMemoryInfo());
 		const size_t filterSafetyMemory(std::max(static_cast<size_t>(filterMemInfo.totalPhysical * 0.10), size_t(2)*1024*1024*1024ull));
 		const size_t filterCacheBudget(filterMemInfo.freePhysical > filterSafetyMemory ? filterMemInfo.freePhysical - filterSafetyMemory : 0);
+		DEBUG_EXTRA("FilterDMapCache: freePhysical=%s totalPhysical=%s safetyMemory=%s",
+			Util::formatBytes(filterMemInfo.freePhysical).c_str(), Util::formatBytes(filterMemInfo.totalPhysical).c_str(), Util::formatBytes(filterSafetyMemory).c_str());
 		FilterDMapCache filterCache(data.depthMaps.arrDepthData, filterCacheBudget);
 		g_filterCache = &filterCache;
 		// The filter phase is disk-bound on a single NVMe: with one thread per core,
@@ -5908,6 +6425,7 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 			DenseReconstructionFilter((void*)&data);
 		}
 		GET_LOGCONSOLE().Play();
+		DEBUG_EXTRA("FilterDMapCache: %u disk loads, %.1f%%%% hit-rate", filterCache.GetNumDiskLoads(), filterCache.GetHitRate() * 100.0);
 		g_filterCache = NULL;
 		if (!data.events.IsEmpty())
 			return false;
@@ -5924,6 +6442,21 @@ void* DenseReconstructionEstimateTmp(void* arg) {
 	const DenseDepthMapData& dataThreads = *((const DenseDepthMapData*)arg);
 	dataThreads.scene.DenseReconstructionEstimate(arg);
 	return NULL;
+}
+
+// Temporary bisection diagnostic: prints this process's own commit charge at a named
+// stage of one image's estimation lifecycle, throttled to every 50th image. A live
+// 2000-image run reached procCommit=213GB with both derived caches (greyImages,
+// sCachedImages) pinned at their absolute floor, proving the leak is somewhere else
+// in this per-image lifecycle -- this bisects WHICH stage (view init vs. the actual
+// PatchMatch estimate vs. optimize/save) the jump happens in, instead of only knowing
+// "somewhere in estimation".
+static void LogMemCheckpoint(const char* stage, IIndex idxImage) {
+	if (idxImage % 50 != 0)
+		return;
+	const Util::ProcessMemoryInfo procInfo(Util::GetSelfMemoryInfo());
+	DEBUG_EXTRA("MEMCP %-12s img=%u procWS=%s procCommit=%s", stage, idxImage,
+		Util::formatBytes(procInfo.workingSetSize).c_str(), Util::formatBytes(procInfo.pagefileUsage).c_str());
 }
 
 // initialize the dense reconstruction with the sparse point cloud
@@ -5951,11 +6484,13 @@ void Scene::DenseReconstructionEstimate(void* pData)
 			const bool depthmapComputed(data.nFusionMode < 0 || (data.nFusionMode >= 0 && data.nEstimationGeometricIter < 0 && File::access(ComposeDepthFilePath(data.scene.images[idx].ID, "dmap"))));
 			// initialize images pair: reference image and the best neighbor view
 			ASSERT(data.neighborsMap.IsEmpty() || data.neighborsMap[evtImage.idxImage] != NO_ID);
+			LogMemCheckpoint("before-init", evtImage.idxImage);
 			if (!data.depthMaps.InitViews(depthData, data.neighborsMap.IsEmpty()?NO_ID:data.neighborsMap[evtImage.idxImage], OPTDENSE::nNumViews, !depthmapComputed, depthmapComputed ? -1 : (data.nEstimationGeometricIter >= 0 ? 1 : 0))) {
 				// process next image
 				data.events.AddEvent(new EVTProcessImage((IIndex)Thread::safeInc(data.idxImage)));
 				break;
 			}
+			LogMemCheckpoint("after-init", evtImage.idxImage);
 			// try to load already compute depth-map for this image
 			if (depthmapComputed && data.nFusionMode >= 0) {
 				if (OPTDENSE::nOptimize & OPTDENSE::OPTIMIZE) {
@@ -5980,6 +6515,7 @@ void Scene::DenseReconstructionEstimate(void* pData)
 			data.events.AddEvent(new EVTProcessImage((uint32_t)Thread::safeInc(data.idxImage)));
 			// extract depth map
 			data.sem.Wait();
+			LogMemCheckpoint("before-est", evtImage.idxImage);
 			if (data.nFusionMode >= 0) {
 				// extract depth-map using Patch-Match algorithm
 				data.depthMaps.EstimateDepthMap(data.images[evtImage.idxImage], data.nEstimationGeometricIter);
@@ -5997,6 +6533,7 @@ void Scene::DenseReconstructionEstimate(void* pData)
 					depthData.dMin = ZEROTOLERANCE<float>(); depthData.dMax = FLT_MAX;
 				}
 			}
+			LogMemCheckpoint("after-est", evtImage.idxImage);
 			data.sem.Signal();
 			if (OPTDENSE::nOptimize & OPTDENSE::OPTIMIZE) {
 				// optimize depth-map
@@ -6049,13 +6586,74 @@ void Scene::DenseReconstructionEstimate(void* pData)
 				}
 			}
 			#endif
+			LogMemCheckpoint("before-save", evtImage.idxImage);
 			// save compute depth-map for this image
 			// JPB WIP Saving this asynchronously doesn't help.
 			if (!depthData.depthMap.empty())
 				depthData.Save(ComposeDepthFilePath(depthData.GetView().GetID(), data.nEstimationGeometricIter < 0 ? "dmap" : "geo.dmap"));
 			depthData.ReleaseImages();
 			depthData.Release();
+			LogMemCheckpoint("after-release", evtImage.idxImage);
 			data.progress->operator++();
+			// Re-derive the greyImages/sCachedImages budgets from LIVE free RAM instead of
+			// the one-time prepare-images snapshot. The one-time snapshot was the actual
+			// bug behind the large-dataset OOM: each cache's budget was a fixed fraction of
+			// free RAM measured before ANY decoding started, so neither one ever learned
+			// that the other (or ImageCache's Tier-1 residency, or normal per-image working
+			// memory) was also eating into the same pool. Sharing one pool re-measured from
+			// Util::GetMemoryInfo() (which reflects everything currently resident, from any
+			// source) makes both caches shrink automatically as real headroom shrinks, the
+			// same self-correcting pattern DMapCache already uses in FUSE.
+			//
+			// Runs every image, not periodically: a live run confirmed a 50-image interval
+			// is far too coarse -- free RAM collapsed from single-digit GB to under 100MB
+			// within one 50-image window, i.e. faster than a periodic check could react.
+			// The recompute itself is cheap (one syscall, two brief mutex locks), so there
+			// is no real cost to doing it every time; only the diagnostic log line below is
+			// throttled, to avoid flooding the log on a large dataset.
+			const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+			const size_t safetyMemory(std::max(static_cast<size_t>(memInfo.totalPhysical * 0.08), size_t(1)*1024*1024*1024ull));
+			size_t greyBytes(0), greyCount(0), scaledBytes(0), scaledCount(0);
+#ifdef DPC_IMAGE_CACHE
+			size_t greyUsed(0);
+			{ std::lock_guard<std::mutex> lock(sGreyImagesMutex); greyUsed = greyImages.GetUsedMemory(); }
+#endif
+#ifdef DPC_FASTER_SAMPLING
+			size_t scaledUsed(0);
+			{ std::lock_guard<std::mutex> lock(sCachedImagesMutex); scaledUsed = sCachedImages.GetUsedMemory(); }
+#endif
+#if defined(DPC_IMAGE_CACHE) && defined(DPC_FASTER_SAMPLING)
+			// pool = current free RAM + what these two caches already hold (reclaimable
+			// on demand), so re-adding their own usage avoids double-subtracting it
+			const size_t pool(memInfo.freePhysical + greyUsed + scaledUsed);
+			const size_t sharedBudget(pool > safetyMemory ? pool - safetyMemory : 0);
+			{ std::lock_guard<std::mutex> lock(sGreyImagesMutex); greyImages.SetMaxMemory(sharedBudget / 2); greyBytes = greyImages.GetUsedMemory(); greyCount = greyImages.GetCount(); }
+			{ std::lock_guard<std::mutex> lock(sCachedImagesMutex); sCachedImages.SetMaxMemory(sharedBudget / 2); scaledBytes = sCachedImages.GetUsedMemory(); scaledCount = sCachedImages.GetCount(); }
+#elif defined(DPC_IMAGE_CACHE)
+			const size_t pool(memInfo.freePhysical + greyUsed);
+			std::lock_guard<std::mutex> lock(sGreyImagesMutex);
+			greyImages.SetMaxMemory(pool > safetyMemory ? pool - safetyMemory : 0);
+			greyBytes = greyImages.GetUsedMemory(); greyCount = greyImages.GetCount();
+#elif defined(DPC_FASTER_SAMPLING)
+			const size_t pool(memInfo.freePhysical + scaledUsed);
+			std::lock_guard<std::mutex> lock(sCachedImagesMutex);
+			sCachedImages.SetMaxMemory(pool > safetyMemory ? pool - safetyMemory : 0);
+			scaledBytes = sCachedImages.GetUsedMemory(); scaledCount = sCachedImages.GetCount();
+#endif
+			if (evtImage.idxImage % 50 == 0) {
+				// process-level counters alongside the system-wide free RAM: if
+				// pagefileUsage (this process's own commit charge -- what actually
+				// triggers an OOM allocation failure) keeps climbing even with both
+				// derived caches pinned at their floor, the leak is genuinely inside
+				// this process (somewhere in estimation, not yet found) rather than
+				// system-wide free RAM dropping for some unrelated reason.
+				const Util::ProcessMemoryInfo procInfo(Util::GetSelfMemoryInfo());
+				DEBUG_EXTRA("MEMDIAG img=%u free=%s greyImages=%s(%u) sCachedImages=%s(%u) procWS=%s procCommit=%s",
+					evtImage.idxImage, Util::formatBytes(memInfo.freePhysical).c_str(),
+					Util::formatBytes(greyBytes).c_str(), (unsigned)greyCount,
+					Util::formatBytes(scaledBytes).c_str(), (unsigned)scaledCount,
+					Util::formatBytes(procInfo.workingSetSize).c_str(), Util::formatBytes(procInfo.pagefileUsage).c_str());
+			}
 			break; }
 
 		case EVT_CLOSE: {
@@ -6196,11 +6794,21 @@ void Scene::DenseReconstructionFilter(void* pData)
 /*----------------------------------------------------------------*/
 
 // filter point-cloud based on camera-point visibility intersections
+// Toggle the tighter cone-vs-box octree prune (default on). 0 = original cone-vs-boundingsphere.
+#ifndef PCF_CONE_AABB
+#define PCF_CONE_AABB 1
+#endif
 void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 {
 	TD_TIMER_STARTD();
 
-	typedef TOctree<PointCloud::PointArr,PointCloud::Point::Type,3,uint32_t> Octree;
+	// Build the octree over a uint32-indexed point array. PointCloud::PointArr's index is
+	// 64-bit (size_t), which doubles the octree's per-point index storage (m_indices, read
+	// on every leaf visit); the cloud never exceeds 2^32 points, so 32-bit indices halve it
+	// and improve cache during traversal -- identical tree, identical result. Local type, so
+	// the shared PointCloud class is untouched.
+	typedef CLISTDEF0IDX(PointCloud::Point, uint32_t) PointArr32;
+	typedef TOctree<PointArr32,PointCloud::Point::Type,3,uint32_t> Octree;
 	// Lock-free visibility collector: carries only per-query state (no shared
 	// mutable members, no critical section) and accumulates into the shared
 	// visibility array with a single atomic add. Because nothing is shared
@@ -6218,12 +6826,28 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 		const ConeIntersect coneIntersect;
 		const PointCloudStreaming& pointcloud;
 		int* const __restrict visibility;
+		// leaf-ordered SoA positions (aligned with the octree index array) so the classify
+		// loop reads positions sequentially instead of gathering scattered points
+		const float* const __restrict pLeafX;
+		const float* const __restrict pLeafY;
+		const float* const __restrict pLeafZ;
+		const IDX* const __restrict pIdxBase; // octree index array base; a leaf's idices offset into this
 		PointCloud::Index idxPoint;
 		Real distance;
 		int weight;
+		const Real tanAngle; // cone half-angle tangent (per view); capsule radius = maxHeight*tanAngle
+		// separating-axis data (rebuilt per point/view) for the cone-axis capsule vs octree cell box
+		Real capRadius;
+		Real m_axN[6][3];
+		Real m_axInv[6];
+		Real m_axL1[6];
+		Real m_segLo[6];
+		Real m_segHi[6];
 
-		Collector(const Cone::RAY& ray, Real angle, const PointCloudStreaming& _pointcloud, int* __restrict _visibility)
-			: cone(ray, angle), coneIntersect(cone), pointcloud(_pointcloud), visibility(_visibility) {}
+		Collector(const Cone::RAY& ray, Real angle, const PointCloudStreaming& _pointcloud, int* __restrict _visibility,
+			const float* __restrict _pLeafX, const float* __restrict _pLeafY, const float* __restrict _pLeafZ, const IDX* __restrict _pIdxBase)
+			: cone(ray, angle), coneIntersect(cone), pointcloud(_pointcloud), visibility(_visibility),
+			  pLeafX(_pLeafX), pLeafY(_pLeafY), pLeafZ(_pLeafZ), pIdxBase(_pIdxBase), tanAngle(std::tan(angle)) {}
 		inline void Init(PointCloud::Index _idxPoint, const PointCloud::Point& X, int _weight) {
 			const Real thMaxDepth(1.02f);
 			idxPoint = _idxPoint;
@@ -6232,9 +6856,51 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 			cone.ray.m_vDir = D/distance;
 			cone.maxHeight = MaxDepthDifference(distance, thMaxDepth);
 			weight = _weight;
+			BuildSepAxes();
+		}
+		// Build the capsule (cone-axis segment + capRadius) that conservatively encloses the finite
+		// cone; Intersects then rejects a cell only when a projection proves it lies farther than
+		// capRadius from the segment (a lower bound on true distance, so no in-cone point is ever
+		// pruned -> removed set stays bit-identical to the exact cone-sphere filter).
+		inline void BuildSepAxes() {
+			const Real ox(cone.ray.m_pOrig.x()), oy(cone.ray.m_pOrig.y()), oz(cone.ray.m_pOrig.z());
+			const Real dx(cone.ray.m_vDir.x()), dy(cone.ray.m_vDir.y()), dz(cone.ray.m_vDir.z());
+			const Real h0(cone.minHeight), h1(cone.maxHeight);
+			const Real Ax(ox+dx*h0), Ay(oy+dy*h0), Az(oz+dz*h0);
+			const Real Bx(ox+dx*h1), By(oy+dy*h1), Bz(oz+dz*h1);
+			// 3 (axis x box-face) cross products first (reject thin cones laterally), then 3 box faces
+			const Real N[6][3] = {
+				{ Real(0), dz, -dy }, { -dz, Real(0), dx }, { dy, -dx, Real(0) },
+				{ Real(1), Real(0), Real(0) }, { Real(0), Real(1), Real(0) }, { Real(0), Real(0), Real(1) }
+			};
+			for (int k=0; k<6; ++k) {
+				const Real nx(N[k][0]), ny(N[k][1]), nz(N[k][2]);
+				m_axN[k][0]=nx; m_axN[k][1]=ny; m_axN[k][2]=nz;
+				m_axL1[k] = std::abs(nx)+std::abs(ny)+std::abs(nz);
+				const Real nn(std::sqrt(nx*nx+ny*ny+nz*nz));
+				m_axInv[k] = (nn > Real(1e-12)) ? (Real(1)/nn) : Real(0);
+				const Real pA(Ax*nx+Ay*ny+Az*nz), pB(Bx*nx+By*ny+Bz*nz);
+				m_segLo[k] = pA<pB?pA:pB;
+				m_segHi[k] = pA<pB?pB:pA;
+			}
+			// capsule radius = max cone radius over the segment, plus small FP slack (keeps the prune conservative)
+			capRadius = h1*tanAngle*Real(1.01) + h1*Real(1e-4);
 		}
 		inline bool Intersects(const Octree::POINT_TYPE& center, Octree::Type radius) const {
+		#if PCF_CONE_AABB
+			const Real cx(center.x()), cy(center.y()), cz(center.z());
+			for (int k=0; k<6; ++k) {
+				const Real cP(cx*m_axN[k][0]+cy*m_axN[k][1]+cz*m_axN[k][2]);
+				const Real boxExt(radius*m_axL1[k]);
+				const Real boxLo(cP-boxExt), boxHi(cP+boxExt);
+				const Real g((m_segLo[k] > boxHi) ? (m_segLo[k]-boxHi) : ((boxLo > m_segHi[k]) ? (boxLo-m_segHi[k]) : Real(0)));
+				if (g*m_axInv[k] > capRadius)
+					return false;
+			}
+			return true;
+		#else
 			return coneIntersect(Sphere(center, radius*Real(SQRT_3)));
+		#endif
 		}
 		inline void operator () (const IDX* __restrict idices, IDX size) const {
 			// Hoist every per-cone constant into a local so the inner loop reads no
@@ -6253,7 +6919,6 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 			const Real refDist(distance);
 			const Real thSimilar(0.01f);
 			const int w(weight);
-			const float* const __restrict pXYZ = pointcloud.pointsXYZ.data();
 			int* const __restrict vis = visibility;
 
 			// commit one VISIBLE point (rare path): depth-similarity reject, then a
@@ -6273,13 +6938,18 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 			const __m128 vDx = _mm_set1_ps(dx), vDy = _mm_set1_ps(dy), vDz = _mm_set1_ps(dz);
 			const __m128 vMinH = _mm_set1_ps(minH), vMaxH = _mm_set1_ps(maxH), vCosSq = _mm_set1_ps(cosSq);
 
+			// leaf-ordered positions: this leaf's points are contiguous at [base, base+size),
+			// so positions load sequentially (1-2 cache lines) instead of 12 scattered loads.
+			const size_t base = (size_t)(idices - pIdxBase);
+			const float* const __restrict lx = pLeafX + base;
+			const float* const __restrict ly = pLeafY + base;
+			const float* const __restrict lz = pLeafZ + base;
+
 			IDX k = 0;
 			for (; k + 4 <= size; k += 4) {
-				const uint32_t i0(idices[k]), i1(idices[k+1]), i2(idices[k+2]), i3(idices[k+3]);
-				// gather 4 points (SoA); SSE2 has no gather so the loads stay scalar
-				const __m128 px = _mm_set_ps(pXYZ[(size_t)i3*3+0], pXYZ[(size_t)i2*3+0], pXYZ[(size_t)i1*3+0], pXYZ[(size_t)i0*3+0]);
-				const __m128 py = _mm_set_ps(pXYZ[(size_t)i3*3+1], pXYZ[(size_t)i2*3+1], pXYZ[(size_t)i1*3+1], pXYZ[(size_t)i0*3+1]);
-				const __m128 pz = _mm_set_ps(pXYZ[(size_t)i3*3+2], pXYZ[(size_t)i2*3+2], pXYZ[(size_t)i1*3+2], pXYZ[(size_t)i0*3+2]);
+				const __m128 px = _mm_loadu_ps(lx + k);
+				const __m128 py = _mm_loadu_ps(ly + k);
+				const __m128 pz = _mm_loadu_ps(lz + k);
 				const __m128 Dx = _mm_sub_ps(px, vAx), Dy = _mm_sub_ps(py, vAy), Dz = _mm_sub_ps(pz, vAz);
 				// t = axial projection of (P-apex) onto the cone axis
 				const __m128 t = _mm_add_ps(_mm_add_ps(_mm_mul_ps(vDx, Dx), _mm_mul_ps(vDy, Dy)), _mm_mul_ps(vDz, Dz));
@@ -6291,33 +6961,32 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 				if (bits) {
 					alignas(16) float tArr[4];
 					_mm_store_ps(tArr, t);
-					if (bits & 1) emit(i0, tArr[0]);
-					if (bits & 2) emit(i1, tArr[1]);
-					if (bits & 4) emit(i2, tArr[2]);
-					if (bits & 8) emit(i3, tArr[3]);
+					if (bits & 1) emit(idices[k], tArr[0]);
+					if (bits & 2) emit(idices[k+1], tArr[1]);
+					if (bits & 4) emit(idices[k+2], tArr[2]);
+					if (bits & 8) emit(idices[k+3], tArr[3]);
 				}
 			}
 			// scalar tail (< 4 remaining)
 			for (; k < size; ++k) {
-				const uint32_t idx(idices[k]);
-				const float Dx(pXYZ[(size_t)idx*3+0] - ax), Dy(pXYZ[(size_t)idx*3+1] - ay), Dz(pXYZ[(size_t)idx*3+2] - az);
+				const float Dx(lx[k] - ax), Dy(ly[k] - ay), Dz(lz[k] - az);
 				const float t(dx*Dx + dy*Dy + dz*Dz);
 				if (t <= minH || t > maxH)
 					continue;
 				if (t*t <= cosSq * (Dx*Dx + Dy*Dy + Dz*Dz))
 					continue;
-				emit(idx, t);
+				emit(idices[k], t);
 			}
 		}
 	};
 
 	// gather points into a contiguous array for the octree (streaming cloud
 	// stores XYZ as a flat float stream, so build the typed array once)
-	PointCloud::PointArr ptsForOctree(pointcloud.GetSize());
+	PointArr32 ptsForOctree(pointcloud.GetSize());
 	#ifdef DENSE_USE_OPENMP
 	#pragma omp parallel for
 	for (int64_t i=0; i<(int64_t)ptsForOctree.GetSize(); ++i)
-		ptsForOctree[(PointCloud::Index)i] = pointcloud.Point((PointCloud::Index)i);
+		ptsForOctree[(uint32_t)i] = pointcloud.Point((PointCloud::Index)i);
 	#else
 	FOREACH(i, ptsForOctree)
 		ptsForOctree[i] = pointcloud.Point(i);
@@ -6328,6 +6997,29 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	});
 	IntArr visibility(pointcloud.GetSize()); visibility.Memset(0);
 	int* const __restrict pVisibility = visibility.Begin();
+
+	// Build leaf-ordered SoA positions aligned with the octree's index array so the classify
+	// inner loop reads positions sequentially -- the profiled bottleneck was the scattered
+	// per-point position gather. Result-identical: same positions, same lane order, same math.
+	const Octree::IDXARR_TYPE& octIdx = octree.GetIndexArr();
+	const size_t nOctItems = octIdx.size();
+	std::vector<float> leafX(nOctItems), leafY(nOctItems), leafZ(nOctItems);
+	{
+		const float* const __restrict pXYZsrc = pointcloud.pointsXYZ.data();
+		const Octree::IDX_TYPE* const __restrict pMI = octIdx.data();
+		float* const __restrict pLX = leafX.data(); float* const __restrict pLY = leafY.data(); float* const __restrict pLZ = leafZ.data();
+		#ifdef DENSE_USE_OPENMP
+		#pragma omp parallel for
+		#endif
+		for (int64_t j = 0; j < (int64_t)nOctItems; ++j) {
+			const size_t s = (size_t)pMI[j] * 3;
+			pLX[j] = pXYZsrc[s+0]; pLY[j] = pXYZsrc[s+1]; pLZ[j] = pXYZsrc[s+2];
+		}
+	}
+	const float* const pLeafX = leafX.data();
+	const float* const pLeafY = leafY.data();
+	const float* const pLeafZ = leafZ.data();
+	const Octree::IDX_TYPE* const pIdxBase = octIdx.data();
 
 	// pre-compute each view's cone origin (camera center) and half-angle once;
 	// each (point,view) query then builds a private Collector from these, so the
@@ -6363,7 +7055,8 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 		boost::container::small_vector<Collector, 512> pool;
 		pool.reserve(numViews);
 		for (size_t v = 0; v < numViews; ++v)
-			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility);
+			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
+		size_t progressBatch = 0; // batch the display-only counter: one contended atomic per 65536 pts, not per pt
 		#pragma omp for schedule(dynamic, 2048)
 		for (int64_t i = 0; i < numPoints; ++i) {
 			const PointCloud::Index idxPoint((PointCloud::Index)i);
@@ -6375,15 +7068,17 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 				c.Init(idxPoint, X, (int)nViews);
 				octree.Collect(c, c);
 			}
-			++progress;
+			if (++progressBatch == 65536) { progress += (int)progressBatch; progressBatch = 0; }
 		}
+		if (progressBatch)
+			progress += (int)progressBatch;
 	}
 	#else
 	{
 		boost::container::small_vector<Collector, 512> pool;
 		pool.reserve(numViews);
 		for (size_t v = 0; v < numViews; ++v)
-			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility);
+			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
 		for (PointCloud::Index idxPoint=0; idxPoint<(PointCloud::Index)numPoints; ++idxPoint) {
 			const PointCloud::Point& X = pointcloud.Point(idxPoint);
 			const uint32_t* __restrict views = pointcloud.ViewsStream(idxPoint);

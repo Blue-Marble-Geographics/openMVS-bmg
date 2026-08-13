@@ -119,7 +119,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("output-file,o", boost::program_options::value<std::string>(&OPT::strOutputFileName), "output filename for storing the mesh")
 		("resolution-level", boost::program_options::value(&OPT::nResolutionLevel)->default_value(0), "how many times to scale down the images before mesh refinement")
 		("min-resolution", boost::program_options::value(&OPT::nMinResolution)->default_value(640), "do not scale images lower than this resolution")
-		("max-views", boost::program_options::value(&OPT::nMaxViews)->default_value(8), "maximum number of neighbor images used to refine the mesh")
+		("max-views", boost::program_options::value(&OPT::nMaxViews)->default_value(8/* JPB WIP BUG lower values than 8 start losing information*/), "maximum number of neighbor images used to refine the mesh")
 		("decimate", boost::program_options::value(&OPT::fDecimateMesh)->default_value(0.f), "decimation factor in range [0..1] to be applied to the input surface before refinement (0 - auto, 1 - disabled)")
 		("close-holes", boost::program_options::value(&OPT::nCloseHoles)->default_value(30), "try to close small holes in the input surface (0 - disabled)")
 		("ensure-edge-size", boost::program_options::value(&OPT::nEnsureEdgeSize)->default_value(1), "ensure edge size and improve vertex valence of the input surface (0 - disabled, 1 - auto, 2 - force)")
@@ -130,7 +130,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("alternate-pair", boost::program_options::value(&OPT::nAlternatePair)->default_value(0), "refine mesh using an image pair alternatively as reference (0 - both, 1 - alternate, 2 - only left, 3 - only right)")
 		("regularity-weight", boost::program_options::value(&OPT::fRegularityWeight)->default_value(0.2f), "scalar regularity weight to balance between photo-consistency and regularization terms during mesh optimization")
 		("rigidity-elasticity-ratio", boost::program_options::value(&OPT::fRatioRigidityElasticity)->default_value(0.9f), "scalar ratio used to compute the regularity gradient as a combination of rigidity and elasticity")
-		("gradient-step", boost::program_options::value(&OPT::fGradientStep)->default_value(45.05f), "gradient step to be used instead (0 - auto)")
+		("gradient-step", boost::program_options::value(&OPT::fGradientStep)->default_value(45.05/* JPB WIP BUG 45.05*/), "gradient step to be used instead (0 - auto)")
 		("planar-vertex-ratio", boost::program_options::value(&OPT::fPlanarVertexRatio)->default_value(0.f), "threshold used to remove vertices on planar patches (0 - disabled)")
 		;
 
@@ -256,7 +256,16 @@ int main(int argc, LPCTSTR* argv)
 		VERBOSE("error: empty initial mesh");
 		return EXIT_FAILURE;
 	}
+
+	// Pre-flight, deterministic memory-safety check: only touches max-views/
+	// resolution-level as a last resort, and only on machines where this scene's
+	// per-batch memory floor would not otherwise fit (see
+	// Scene::ResolveRefineMeshSafeSettings). No-op, and no added cost, on any
+	// adequately sized machine -- the common case.
+	scene.ResolveRefineMeshSafeSettings(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews);
+
 	TD_TIMER_START();
+	try {
 	#ifdef _USE_CUDA
 	if (SEACAVE::CUDA::desiredDeviceID < -1 ||
 		!scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
@@ -278,6 +287,13 @@ int main(int argc, LPCTSTR* argv)
 						  OPT::fPlanarVertexRatio,
 						  OPT::fGradientStep))
 		return EXIT_FAILURE;
+	} catch (const std::exception& e) {
+		// Turns a genuine OOM (e.g. the PlaneAlloc backstop in SceneRefine.cpp) into
+		// a clean, logged failure instead of a crash -- the pre-flight check above
+		// is estimate-based and can be wrong; this is what catches it when it is.
+		VERBOSE("error: mesh refinement failed (possibly out of memory): %s", e.what());
+		return EXIT_FAILURE;
+	}
 	VERBOSE("Mesh refinement completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 
 	// save the final mesh

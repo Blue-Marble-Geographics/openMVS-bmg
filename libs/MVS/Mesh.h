@@ -99,9 +99,23 @@ public:
 			cameraFaces.Join(indices, size);
 		}
 		static void CreateOctree(Octree& octree, const Mesh& mesh) {
-			VertexArr centroids(mesh.faces.size());
-			FOREACH(idx, mesh.faces)
-				centroids[idx] = mesh.ComputeCentroid(idx);
+			CreateOctree(octree, mesh.faces, mesh.vertices);
+		}
+		// same, but from explicit arrays (allows building from a vertex snapshot on a worker thread)
+		static void CreateOctree(Octree& octree, const FaceArr& faces, const VertexArr& vertices) {
+			VertexArr centroids(faces.size());
+			#ifdef _USE_OPENMP
+			#pragma omp parallel for
+			for (int_t idx=0; idx<(int_t)faces.size(); ++idx) {
+				const Face& face = faces[(FIndex)idx];
+				centroids[(FIndex)idx] = (vertices[face[0]] + vertices[face[1]] + vertices[face[2]]) * (Type(1)/Type(3));
+			}
+			#else
+			FOREACH(idx, faces) {
+				const Face& face = faces[idx];
+				centroids[idx] = (vertices[face[0]] + vertices[face[1]] + vertices[face[2]]) * (Type(1)/Type(3));
+			}
+			#endif
 			// Absolute minimum cell radius, used as a recursion floor.
 			// NOTE: do NOT use octree.GetRadius() here - m_radius is only set
 			// inside Insert(), so before insertion it is uninitialized and yields

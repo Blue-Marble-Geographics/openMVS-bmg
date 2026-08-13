@@ -27,6 +27,10 @@ endif()
 # List sources files
 FILE(GLOB LIBRARY_FILES_C "*.cpp")
 FILE(GLOB LIBRARY_FILES_H "*.h" "*.inl")
+# Local source snapshots are not part of the library. FILE(GLOB) otherwise
+# picks them up on every CMake regeneration when a legitimate source is added.
+list(FILTER LIBRARY_FILES_C EXCLUDE REGEX ".*( -|Copy).*")
+list(FILTER LIBRARY_FILES_C EXCLUDE REGEX ".*[.]bak$")
 
 # In-process Kazhdan PoissonRecon + SurfaceTrimmer, replacing the external-exe
 # shell-out. Built as an isolated static library so that only these two wrapper
@@ -66,6 +70,17 @@ cxx_library_with_type(MVS "Libs" "" "${cxx_default}"
 	${LIBRARY_FILES_C} ${LIBRARY_FILES_H}
 	${CUDA_LIBRARY_FILES_C} ${CUDA_LIBRARY_FILES_H}
 )
+
+# Keep AVX2 code in one translation unit so the rest of MVS retains the
+# baseline x64/SSE2 instruction set. Disable LTCG for this source to prevent
+# cross-module inlining from leaking AVX2 instructions into baseline code.
+if(MSVC)
+	set_source_files_properties(SceneRefineAVX2.cpp PROPERTIES
+		COMPILE_OPTIONS "/arch:AVX2;/GL-"
+		SKIP_PRECOMPILE_HEADERS ON)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+	set_source_files_properties(SceneRefineAVX2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mno-fma")
+endif()
 
 # Manually set Common.h as the precompiled header
 IF(CMAKE_VERSION VERSION_GREATER_EQUAL 3.16.0)

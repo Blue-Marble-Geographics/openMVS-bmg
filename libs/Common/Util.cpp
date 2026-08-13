@@ -691,6 +691,26 @@ Util::MemoryInfo Util::GetMemoryInfo()
 /*----------------------------------------------------------------*/
 
 
+// get this process's own working-set size and commit charge (as opposed to
+// GetMemoryInfo()'s system-wide totals) -- lets a caller tell "this process is
+// genuinely growing" apart from "system-wide free RAM dropped for some other
+// reason" without waiting for the end-of-run LogMemoryInfo() dump.
+Util::ProcessMemoryInfo Util::GetSelfMemoryInfo()
+{
+	#if defined(_MSC_VER)                   // windows
+	PROCESS_MEMORY_COUNTERS pmc;
+	if (!::GetProcessMemoryInfo(::GetCurrentProcess(), &pmc, sizeof(pmc))) {
+		ASSERT(false);
+		return ProcessMemoryInfo();
+	}
+	return ProcessMemoryInfo(pmc.WorkingSetSize, pmc.PagefileUsage);
+	#else
+	return ProcessMemoryInfo();
+	#endif
+}
+/*----------------------------------------------------------------*/
+
+
 // Parses a ASCII command line string and returns an array of pointers to the command line arguments,
 // along with a count of such arguments, in a way that is similar to the standard C run-time
 // argv and argc values.
