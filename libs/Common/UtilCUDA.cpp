@@ -163,6 +163,47 @@ CUresult _gpuGetMaxGflopsDeviceId(Device& bestDevice)
 	return CUDA_SUCCESS;
 }
 
+// see the declaration in UtilCUDA.h for why this exists
+bool HasLegacyDriverAPI()
+{
+	#ifdef _MSC_VER
+	// -1 unknown, 0 absent, 1 present
+	static int s_state = -1;
+	if (s_state >= 0)
+		return s_state != 0;
+	s_state = 0;
+	// GetModuleHandle first: if nvcuda.dll is already mapped (a CUDA context was
+	// created earlier) reuse it rather than bumping its reference count.
+	HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
+	if (hCuda == NULL)
+		hCuda = LoadLibraryA("nvcuda.dll");
+	if (hCuda == NULL) {
+		// VERBOSE, not DEBUG: this is only reached when the caller explicitly asked
+		// for a GPU (--cuda-device >= -1), so the user needs to see why they are
+		// getting CPU processing instead. Logged once; the result is cached.
+		VERBOSE("CUDA: no NVIDIA driver found (nvcuda.dll); using CPU processing");
+		return false;
+	}
+	// the exact set removed in CUDA 12.0 that KernelRT/TTextureRT/TSurfaceRT need
+	static LPCSTR const szLegacyProcs[] = {
+		"cuParamSetSize", "cuParamSetv", "cuFuncSetBlockShape", "cuLaunchGrid",
+		"cuModuleGetTexRef", "cuTexRefSetArray", "cuTexRefSetFormat",
+		"cuModuleGetSurfRef", "cuSurfRefSetArray"
+	};
+	for (LPCSTR szProc: szLegacyProcs) {
+		if (GetProcAddress(hCuda, szProc) == NULL) {
+			VERBOSE("CUDA: driver does not export '%s' (removed in CUDA 12.0); "
+					"falling back to CPU for kernel-launch/texture-reference paths", szProc);
+			return false;
+		}
+	}
+	s_state = 1;
+	return true;
+	#else
+	return true;
+	#endif
+}
+
 // initialize the given CUDA device and add it to the array of initialized devices;
 // if the given device is -1, the best available device is selected
 CUresult initDevice(int deviceID)

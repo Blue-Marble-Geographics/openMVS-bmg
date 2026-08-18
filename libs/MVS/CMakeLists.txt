@@ -94,6 +94,27 @@ endif()
 # TODO: CGAL::TBB_support should be controlled by a configuration option
 TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO CGAL::CGAL CGAL::TBB_support ${CERES_LIBRARIES} ${CUDA_CUDA_LIBRARY} PoissonReconLib)
 
+# Delay-load the CUDA driver library. Statically bound, nvcuda.dll is resolved by
+# the loader before main() runs, so a machine with no NVIDIA driver fails the
+# process with 0xC0000135 and one whose driver dropped the legacy entry points we
+# still import fails it with 0xC0000139 -- in both cases killing CPU-only runs
+# (--cuda-device -2) that never wanted CUDA at all. Delay-loading binds each
+# entry point on first call instead, so the CPU path never touches the driver and
+# the GPU path behaves exactly as before on machines where it already works.
+# CUDA::HasLegacyDriverAPI() is what keeps a first call from ever happening on an
+# incompatible driver.
+# PUBLIC, not PRIVATE: MVS is normally a static library, so the flag has to reach
+# the executables' link line, which is where the delay-load stubs are generated.
+if(_USE_CUDA AND MSVC)
+	if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.13.0)
+		target_link_libraries(MVS PUBLIC delayimp)
+		target_link_options(MVS PUBLIC "/DELAYLOAD:nvcuda.dll")
+	else()
+		message(WARNING "CMake < 3.13 cannot propagate /DELAYLOAD:nvcuda.dll to the apps; "
+						"RefineMesh will keep a hard load-time dependency on the CUDA driver.")
+	endif()
+endif()
+
 # Install
 SET_TARGET_PROPERTIES(MVS PROPERTIES
 	PUBLIC_HEADER "${LIBRARY_FILES_H}")

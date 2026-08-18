@@ -70,11 +70,12 @@ public:
   enum { kApproxMaxNumSharedViews = 32 }; // Too low and we reallocate; too high and we waste memory and slow down too.
 
 public:
+	// Messages do NOT live here: they are in the flat ping-pong msgBuf[] arrays
+	// (see PrepareMessageBuffers). This struct is instantiated once per directed
+	// edge -- millions of times -- so it must stay small.
 	struct DirectedEdge {
 		NodeID nodeID1;
 		NodeID nodeID2;
-		boost::container::small_vector<EnergyType, kApproxMaxNumSharedViews> newMsgs;
-		boost::container::small_vector<EnergyType, kApproxMaxNumSharedViews> oldMsgs;
 		inline DirectedEdge(NodeID _nodeID1, NodeID _nodeID2) : nodeID1(_nodeID1), nodeID2(_nodeID2) {}
 	};
 
@@ -173,11 +174,6 @@ public:
 			node.label = label;
 			node.dataCost = dataCost;
 		}
-		for (EdgeID edgeID: node.incomingEdges) {
-			DirectedEdge& incomingEdge = edges[edgeID];
-			incomingEdge.oldMsgs.push_back(0);
-			incomingEdge.newMsgs.push_back(0);
-		}
 	}
 	inline void SetDataCost(LabelID label, const DataCost& cost) {
 		SetDataCost(label, cost.nodeID, cost.cost);
@@ -214,6 +210,52 @@ public:
 		return energy;
 	}
 
+	// Diagnostic breakdown of the same objective ComputeEnergy() sums up.
+	// The total alone cannot tell the two failure modes apart:
+	//  - data:   how far down its quality ranking each face's chosen view sits.
+	//            Excess here is a REAL fidelity loss (more oblique / lower
+	//            resolution source), which seam leveling cannot undo.
+	//  - smooth: the Potts penalty for neighbours picking different views, i.e.
+	//            patch fragmentation and seam length -- largely cosmetic, and
+	//            what the later seam leveling / blending pass exists to hide.
+	//  - numUndefined: nodes still on label 0, which become NO_ID faces and are
+	//            left untextured. Should be only faces with no candidate view;
+	//            if it is still falling late in the solve, stopping early is
+	//            costing real coverage, not just view-selection optimality.
+	// Accumulated in double: EnergyType is float, and at a total near 1e10 its
+	// ULP is ~1024, i.e. bigger than a single node's contribution.
+	struct EnergySplit {
+		double data = 0;
+		double smooth = 0;
+		int_t numUndefined = 0;
+	};
+
+	EnergySplit ComputeEnergySplit() const {
+		double dataE(0), smoothE(0);
+		int_t nUndefined(0);
+		#ifdef LBP_USE_OPENMP
+		#pragma omp parallel for reduction(+:dataE,nUndefined)
+		#endif
+		for (int_t nodeID = 0; nodeID < (int_t)nodes.size(); ++nodeID) {
+			const Node& node = nodes[nodeID];
+			dataE += (double)node.dataCost;
+			if (node.label == 0)
+				++nUndefined;
+		}
+		#ifdef LBP_USE_OPENMP
+		#pragma omp parallel for reduction(+:smoothE)
+		#endif
+		for (int_t edgeID = 0; edgeID < (int_t)edges.size(); ++edgeID) {
+			const DirectedEdge& edge = edges[edgeID];
+			smoothE += (double)fncSmoothCost(edge.nodeID1, edge.nodeID2, nodes[edge.nodeID1].label, nodes[edge.nodeID2].label);
+		}
+		EnergySplit split;
+		split.data = dataE;
+		split.smooth = smoothE;
+		split.numUndefined = nUndefined;
+		return split;
+	}
+
 	// Two aligned buffers for ping-pong messaging
 	std::vector<EnergyType, AlignedAllocator<EnergyType, 32>> msgBuf[2];
 	std::vector<size_t> msgOffset;
@@ -233,6 +275,14 @@ public:
 	std::vector<std::vector<EnergyType>> tlSumAll;
 	std::vector<std::vector<EnergyType>> tlEnergyBuf;
 
+	// Per-thread label -> index-within-this-node lookup, used by the Potts fast
+	// path to replace the linear scan over labels1 (see kNoLabelPos). Sized
+	// globalMaxLabel+1 (a few KB per thread: one entry per view in the scene) and
+	// kept all-sentinel between nodes, so it is filled/cleared in O(L1) per node
+	// instead of being rescanned O(L1) per (outgoing edge, label) pair.
+	static const uint32_t kNoLabelPos = (uint32_t)-1;
+	std::vector<std::vector<uint32_t>> tlLabelPos;
+
 	// Release the per-thread scratch buffers (called once optimization
 	// finishes, so the memory does not outlive the last Optimize call).
 	void ReleaseScratch() {
@@ -240,6 +290,32 @@ public:
 		tlSumAll.shrink_to_fit();
 		tlEnergyBuf.clear();
 		tlEnergyBuf.shrink_to_fit();
+		tlLabelPos.clear();
+		tlLabelPos.shrink_to_fit();
+	}
+
+	// Release the message buffers and cached topology once the sweeps are done.
+	// Only finalLabels (plus nodes/edges, which ComputeEnergy still needs) matter
+	// after the solve, while msgBuf alone is 2x the message-buffer size reported by
+	// [LBP-DIAG] -- gigabytes on a full-resolution mesh. Everything freed here is
+	// rebuilt on demand by PrepareMessageBuffers()/PrepareTopology(), so calling
+	// Optimize() again on the same object stays correct (just pays the rebuild).
+	void ReleaseSolveBuffers() {
+		msgBuf[0].clear();
+		msgBuf[0].shrink_to_fit();
+		msgBuf[1].clear();
+		msgBuf[1].shrink_to_fit();
+		msgOffset.clear();
+		msgOffset.shrink_to_fit();
+		edgeMsgLen.clear();
+		edgeMsgLen.shrink_to_fit();
+		edgeWeight.clear();
+		edgeWeight.shrink_to_fit();
+		outEdges.clear();
+		outEdges.shrink_to_fit();
+		buffersInitialized = false;
+		topologyPrepared = false;
+		msgParity = 0; // rebuilt buffers start zeroed, so read from buf0 again
 	}
 
 	void PrepareMessageBuffers()
@@ -288,6 +364,7 @@ public:
 		if ((int)tlSumAll.size() < numThreads) {
 			tlSumAll.resize(numThreads);
 			tlEnergyBuf.resize(numThreads);
+			tlLabelPos.resize(numThreads);
 		}
 
 	#ifdef LBP_USE_OPENMP
@@ -305,6 +382,7 @@ public:
 	#endif
 			std::vector<EnergyType>& sumAll = tlSumAll[tid];
 			std::vector<EnergyType>& energyBuf = tlEnergyBuf[tid];
+			std::vector<uint32_t>& labelPos = tlLabelPos[tid];
 
 			// per-node scratch
 			if (sumAll.size() < maxLabelsPerNode)
@@ -312,6 +390,12 @@ public:
 
 			if (energyBuf.size() < maxLabelsPerNode)
 				energyBuf.resize(maxLabelsPerNode);
+
+			// Only the Potts path uses the reverse lookup. Filled with the
+			// sentinel once here; the per-node code below always restores it to
+			// all-sentinel, so this never needs re-clearing between nodes.
+			if (bPottsSmoothness && labelPos.size() < (size_t)globalMaxLabel + 1)
+				labelPos.assign((size_t)globalMaxLabel + 1, kNoLabelPos);
 
 	#ifdef LBP_USE_OPENMP
 	#pragma omp for schedule(dynamic, 256) nowait // Better than static
@@ -371,13 +455,28 @@ public:
 				}
 
 				// --------------------------------------------------------
+				// Build the label -> k reverse lookup ONCE per node, so the
+				// Potts path below is a single indexed load instead of a scan
+				// over labels1 for every (outgoing edge, label2) pair. Walked
+				// backwards so that on duplicate labels the LOWEST k wins,
+				// matching the first-match "break" of the original scan.
+				// --------------------------------------------------------
+				if (bPottsSmoothness) {
+					uint32_t* __restrict lp = labelPos.data();
+					for (size_t k = L1; k-- > 0; )
+						lp[labels1[k]] = (uint32_t)k;
+				}
+
+				// --------------------------------------------------------
 				// Emit message for each outgoing edge
 				// --------------------------------------------------------
 				for (EdgeID eid : outE) {
 					const DirectedEdge& edge = edges[eid];
 					const Node& n2 = nodes[edge.nodeID2];
 					const LabelID* __restrict labels2 = n2.labels.data();
-					const size_t L2 = (size_t)edgeMsgLen[eid];
+					// same value as edgeMsgLen[eid], but n2 is already loaded here,
+					// so this avoids a second load from an unrelated array
+					const size_t L2 = n2.labels.size();
 
 					// Find message from v -> u (subtraction term)
 					const EnergyType* __restrict sub = nullptr;
@@ -413,16 +512,14 @@ public:
 						for (size_t k = 1; k < L1; ++k)
 							if (energyBuf[k] < minAll) minAll = energyBuf[k];
 						const EnergyType minPlusW = minAll + W;
+						const uint32_t* __restrict lp = labelPos.data();
 						for (size_t j = 0; j < L2; ++j) {
-							const LabelID l2 = labels2[j];
+							const uint32_t k = lp[labels2[j]];
 							EnergyType best = minPlusW;
-							for (size_t k = 0; k < L1; ++k) {
-								if (labels1[k] == l2) {
-									if (energyBuf[k] < best)
-										best = energyBuf[k];
-									break;
-								}
-							}
+							// k == kNoLabelPos means node u has no such label, i.e.
+							// the old scan would have fallen through without a match
+							if (k != kNoLabelPos && energyBuf[k] < best)
+								best = energyBuf[k];
 							msgOut[j] = best;
 						}
 						continue;
@@ -445,6 +542,14 @@ public:
 
 						msgOut[j] = best;
 					}
+				}
+
+				// Restore labelPos to all-sentinel for the next node, in O(L1)
+				// (only the L1 entries just written can be dirty).
+				if (bPottsSmoothness) {
+					uint32_t* __restrict lp = labelPos.data();
+					for (size_t k = 0; k < L1; ++k)
+						lp[labels1[k]] = kNoLabelPos;
 				}
 			}
 
@@ -510,11 +615,10 @@ public:
 					continue; // inactive
 				const size_t deg = inEdges.size();
 
-				// Unrolling this like the one above is not currently effective.
+				// Unrolling this like the one above is not effective.
 				EnergyType bestE = std::numeric_limits<EnergyType>::max();
 				size_t bestIdx = 0;
 				LabelID bestL = labels[0];
-				const EnergyType invQ = (EnergyType)(1.0f / 1024.0f);
 
 				if (deg == 3) {
 					const EnergyType* __restrict m0 = msgs + offs[inEdges[0]];
@@ -578,6 +682,20 @@ public:
 			if (it < kTraceMax) changedTrace[it] = changed;
 			itersRun = it + 1;
 
+			#ifdef DEBUG_EXTRA
+			// Track the OBJECTIVE every few sweeps, not just the flip count: with
+			// dozens of near-tied labels per node the tail sweeps can keep flipping
+			// marginal ties (or oscillate between them) long after the energy has
+			// gone flat. Energy is what decides whether raising LBP_MAX_ITERS buys
+			// any real quality. O(nodes+edges), negligible next to a sweep.
+			if (it == 0 || (it % 5) == 4) {
+				const EnergySplit es = ComputeEnergySplit();
+				DEBUG_EXTRA("[LBP-DIAG] iter=%u changed=%d energy=%.9g data=%.9g smooth=%.9g undefined=%lld",
+					itersRun, changed, es.data + es.smooth, es.data, es.smooth,
+					(long long)es.numUndefined);
+			}
+			#endif
+
 			if (changed < nodes.size() * LBP_CONVERGENCE_FRAC)
 				break;
 
@@ -618,8 +736,11 @@ public:
 			finalLabels[i] = nodes[i].label;
 
 		// Optimization done: release the per-thread scratch so it does not
-		// outlive the last Optimize call.
+		// outlive the last Optimize call, and drop the message buffers/topology
+		// now that finalLabels holds everything the caller needs. Must come after
+		// the [LBP-DIAG] block above, which reads msgBuf[0].size().
 		ReleaseScratch();
+		ReleaseSolveBuffers();
 
 		const EnergyType finalEnergy = ComputeEnergy();
 		#ifdef DEBUG_EXTRA

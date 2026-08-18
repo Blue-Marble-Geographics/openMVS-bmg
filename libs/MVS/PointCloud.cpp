@@ -1096,6 +1096,85 @@ void PointCloudStreaming::RemovePoint(IDX idx)
 	pointsXYZ.erase(std::begin(pointsXYZ) + idx*3, std::begin(pointsXYZ) + (idx+1)*3);
 }
 
+// remove all points outside the given oriented bounding-box.
+// Single O(n) in-place compaction pass, no temporary buffers: calling RemovePoint()
+// per culled point would be O(n^2) (each mid-vector erase shifts the tail) and is
+// unusable at the tens of millions of points this cloud routinely holds.
+void PointCloudStreaming::RemovePointsOutside(const OBB3f& obb)
+{
+	ASSERT(obb.IsValid());
+	const size_t numPoints = NumPoints();
+	if (numPoints == 0)
+		return;
+	const bool hasN(!normalsXYZ.empty());
+	const bool hasC(!colorsRGB.empty());
+	const bool hasV(!pointViewsOffsets.empty() && !pointViewsSizes.empty());
+	const bool hasW(!pointWeightsOffsets.empty() && !pointWeightsSizes.empty());
+	// the flat view/weight blobs can only be compacted in-place (write cursor trailing
+	// the read cursor) if the per-point offsets are non-decreasing, which is what the
+	// sequential Add*() build order produces; if they are not, leave the blobs untouched
+	// and only rewrite the offsets, exactly as RemovePoint() does
+	const bool packV(hasV && std::is_sorted(pointViewsOffsets.cbegin(), pointViewsOffsets.cend()));
+	const bool packW(hasW && std::is_sorted(pointWeightsOffsets.cbegin(), pointWeightsOffsets.cend()));
+	size_t w = 0, vMem = 0, wMem = 0;
+	for (size_t r = 0; r < numPoints; ++r) {
+		if (!obb.Intersects(Point(r)))
+			continue;
+		if (packV) {
+			const uint32_t off(pointViewsOffsets[r]), sz(pointViewsSizes[r]);
+			ASSERT(vMem <= off);
+			for (uint32_t t = 0; t < sz; ++t)
+				pointViewsMemory[vMem+t] = pointViewsMemory[off+t];
+			pointViewsOffsets[w] = (uint32_t)vMem;
+			pointViewsSizes[w] = sz;
+			vMem += sz;
+		} else if (hasV) {
+			pointViewsOffsets[w] = pointViewsOffsets[r];
+			pointViewsSizes[w] = pointViewsSizes[r];
+		}
+		if (packW) {
+			const uint32_t off(pointWeightsOffsets[r]), sz(pointWeightsSizes[r]);
+			ASSERT(wMem <= off);
+			for (uint32_t t = 0; t < sz; ++t)
+				pointWeightsMemory[wMem+t] = pointWeightsMemory[off+t];
+			pointWeightsOffsets[w] = (uint32_t)wMem;
+			pointWeightsSizes[w] = sz;
+			wMem += sz;
+		} else if (hasW) {
+			pointWeightsOffsets[w] = pointWeightsOffsets[r];
+			pointWeightsSizes[w] = pointWeightsSizes[r];
+		}
+		if (w != r) {
+			pointsXYZ[w*3+0] = pointsXYZ[r*3+0]; pointsXYZ[w*3+1] = pointsXYZ[r*3+1]; pointsXYZ[w*3+2] = pointsXYZ[r*3+2];
+			if (hasN) { normalsXYZ[w*3+0] = normalsXYZ[r*3+0]; normalsXYZ[w*3+1] = normalsXYZ[r*3+1]; normalsXYZ[w*3+2] = normalsXYZ[r*3+2]; }
+			if (hasC) { colorsRGB[w*3+0] = colorsRGB[r*3+0]; colorsRGB[w*3+1] = colorsRGB[r*3+1]; colorsRGB[w*3+2] = colorsRGB[r*3+2]; }
+		}
+		++w;
+	}
+	if (w == numPoints)
+		return;
+	pointsXYZ.resize(w*3);
+	if (hasN) normalsXYZ.resize(w*3);
+	if (hasC) colorsRGB.resize(w*3);
+	if (hasV) { pointViewsOffsets.resize(w); pointViewsSizes.resize(w); }
+	if (hasW) { pointWeightsOffsets.resize(w); pointWeightsSizes.resize(w); }
+	if (packV) pointViewsMemory.resize(vMem);
+	if (packW) pointWeightsMemory.resize(wMem);
+	// resize() alone keeps the full capacity allocated; a ROI crop can drop most of the
+	// cloud, so hand the freed pages back once the saving is worth the realloc+copy
+	if (w*8 < numPoints*7) {
+		pointsXYZ.shrink_to_fit();
+		normalsXYZ.shrink_to_fit();
+		colorsRGB.shrink_to_fit();
+		pointViewsOffsets.shrink_to_fit();
+		pointViewsSizes.shrink_to_fit();
+		pointWeightsOffsets.shrink_to_fit();
+		pointWeightsSizes.shrink_to_fit();
+		if (packV) pointViewsMemory.shrink_to_fit();
+		if (packW) pointWeightsMemory.shrink_to_fit();
+	}
+}
+
 // compute the axis-aligned bounding-box of the point-cloud
 PointCloudStreaming::Box PointCloudStreaming::GetAABB() const
 {

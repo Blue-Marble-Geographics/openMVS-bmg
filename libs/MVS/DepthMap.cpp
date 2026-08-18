@@ -109,9 +109,37 @@ MDEFVAR_OPTDENSE_uint32(nIpolGapSize, "Interpolate Gap Size", "interpolate small
 MDEFVAR_OPTDENSE_int32(nIgnoreMaskLabel, "Ignore Mask Label", "label id used during ignore mask filter (<0 - disabled)", "-1")
 MDEFVAR_OPTDENSE_float(fOutlierFilterStdDev, "Outlier Filter StdDev", "remove fused-cloud points whose kNN mean distance exceeds mean + N*stddev (0 - disabled); cleans the sparse spray on low-overlap edges, dataset-adaptive", "0")
 MDEFVAR_OPTDENSE_uint32(nOutlierFilterKNN, "Outlier Filter KNN", "number of nearest neighbors used by the density/low-view outlier filters", "16")
+// ENABLED (Aug 2026), default 0 -> 1. FIELD-OBSERVED on the 115-view OKState corridor:
+// "point spray beneath the surface extending down" in the dense cloud, present both with
+// and without --filter-point-cloud. That is depth OVERestimation scattered along the nadir
+// viewing rays, and this filter is the mechanism written for it -- note its own wording,
+// "floating fuzz displaced off the surface along the viewing ray".
+//
+// It was unreachable while this was 0: FilterRedundantLowViewPoints() returns immediately on
+// supportMin==0, which also dead-ended the planarity pass whose fLowViewPlanarityMax default
+// (0.2) was already tuned for exactly this scatter.
+//
+// 1 is the most aggressive setting and the one that matches the intent here: it approximates
+// a global nMinViewsFuse+1 (i.e. stock OpenMVS 3) but ONLY where a higher-view surface
+// already exists, so the sole-evidence 2-view regions that provide the extra COVERAGE this
+// pipeline wants are kept while the spray beside real surface goes. Raise it to require more
+// supporting surface points (more conservative) if genuine sparse geometry is lost.
+//
+// Reachable only via --dense-config-file, which the Global Mapper pipeline does not pass, so
+// the default is the only lever without changing the caller.
+// BACK TO 0 -- the support test DELETES BUILDING WALLS. A wall is seen by few views
+// (occluded from most angles) so it is a min-view candidate, and the many-view roof above
+// and ground below sit inside fLowViewSupportRadius, so it is judged "redundant" when it
+// is merely adjacent. Observed at 1: missing facades across every building, and it took
+// 21.7% of the cloud without reducing the ray spray it was enabled for.
+//
+// The shape tests (fLowViewPlanarityMax, fLowViewLinearityMin) now run INDEPENDENTLY of
+// this -- they used to be gated behind it -- and they are the ones that actually target
+// off-surface fuzz: a wall is planar and survives, a ray smear is linear and does not.
 MDEFVAR_OPTDENSE_uint32(nLowViewSupportCut, "Low View Support Cut", "delete a fused point that has only the minimum views (nMinViewsFuse) when at least N better-supported (more-view) points lie within fLowViewSupportRadius (0 - disabled); emulates nMinViewsFuse+1 ONLY where a higher-view surface already exists, leaving sole-evidence min-view regions intact (1 = remove every min-view point that touches a real surface = closest to a global nMinViewsFuse+1; raise to be more conservative)", "0")
 MDEFVAR_OPTDENSE_float(fLowViewSupportRadius, "Low View Support Radius", "search radius for nLowViewSupportCut, as a multiple of the LOCAL surface (higher-view) point spacing near each candidate; larger reaches across a thicker low-overlap scatter slab to find the real higher-view surface", "4.0")
 MDEFVAR_OPTDENSE_float(fLowViewPlanarityMax, "Low View Planarity Max", "for min-view points that have NO higher-view surface nearby (floating, unsupported): delete the point when its local neighborhood is volumetric/scattered rather than thin/planar, i.e. surface-variation (smallest/sum of PCA eigenvalues, 0=flat plane ~0.33=isotropic blob) EXCEEDS this; removes floating fuzz while keeping genuine sparse 2-view surfaces. 0 - disable (keep all unsupported min-view points)", "0.2"/* JPB WIP BUG "0.1"*/)
+MDEFVAR_OPTDENSE_float(fLowViewLinearityMin, "Low View Linearity Min", "companion to fLowViewPlanarityMax for min-view points with NO higher-view surface nearby: delete the point when its local neighborhood is a 1D SMEAR ALONG THE VIEWING RAY, i.e. linearity (l1-l2)/l1 EXCEEDS this. Needed because surface-variation (l3/sum) is ~0 for a LINE just as for a PLANE, so the planarity test alone cannot see ray-aligned depth-error spray -- only isotropic blobs. A genuine thin sparse surface is low on both. 0 - disable", "0.6")
 MDEFVAR_OPTDENSE_bool(bFlattenWater, "Flatten Water", "snap a rough water/pond surface onto a robustly fitted near-horizontal plane; the crust is selected by a LOW elevation band AND local roughness, so genuine flat ground and out-of-band features are left untouched; heavily guarded (declines unless a large, near-horizontal, well-fit rough sheet exists and the change stays under Flatten Water Max Frac) so it is a near no-op on datasets without prominent water (0 - disabled)", "0")
 MDEFVAR_OPTDENSE_float(fFlattenWaterBandPct, "Flatten Water Band Pct", "elevation band for water-surface detection: candidates must lie within the lowest N percent of the cloud height (gravity-up Z assumed); larger reaches higher up the banks (more aggressive)", "15.0")
 MDEFVAR_OPTDENSE_float(fFlattenWaterRoughness, "Flatten Water Roughness", "minimum local PCA surface-variation (0=flat plane ~0.33=isotropic blob) for a band point to be treated as noisy water crust; raise to be more selective (only very rough), lower to catch gently rippled water", "0.04")

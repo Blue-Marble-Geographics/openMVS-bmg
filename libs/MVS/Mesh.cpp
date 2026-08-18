@@ -189,11 +189,31 @@ using namespace MVS;
 // smaller (floating junk islands) is deleted. The main body is always the
 // largest component by a huge margin, so this auto-scales to any scene with no
 // hand-tuned absolute size -- robust across datasets. Stored as thousandths of
-// a percent: 20 = 0.020% of the largest. Higher removes more (and risks
+// a percent: 2000 = 2.000% of the largest. Higher removes more (and risks
 // dropping a genuinely-isolated real structure); lower keeps more. Only touches
 // DISCONNECTED components; attached peninsulas are never removed.
+//
+// MEASURED, 115-view corridor scene:
+//     DIAG component sizes (top of 2): 1307464 17485
+// Only two components exist and the gap between them is 75x. The island is
+// 1.337% of the body, so a 0.1% floor (1,307 faces) and a 1% floor (13,074
+// faces) BOTH pass it -- it survived Clean and was visible as a floating blob in
+// the render. 2% is 26,149 faces, which sits inside that gap and is the first
+// floor that actually drops it. Removing it HERE also means it never reaches
+// TextureMesh, so the texture-stage orphan filter does not have to catch it after
+// decimation has scaled every count.
+//
+// This is the correct lever for floating blobs -- NOT --poisson-island-ratio,
+// which is a SurfaceTrimmer MERGE knob (raising it merges across the trim contour
+// and can mask trimming entirely; keep it at 0 / 0.001).
+//
+// CAVEAT: this drops a genuinely separate structure smaller than 2% of the body.
+// Defensible for single-site aerial surveys, which are one contiguous surface;
+// lower it if the input is ever several distinct objects. Read the component-sizes
+// DIAG line before changing it -- if there is no clear gap, no floor is the right
+// tool.
 #ifndef MESH_KEEP_COMPONENT_PCT_X1000
-#define MESH_KEEP_COMPONENT_PCT_X1000 100
+#define MESH_KEEP_COMPONENT_PCT_X1000 2000
 #endif
 
 // Hole-closing geometry gate (Mesh::Clean Phase 4 / Phase 8).
@@ -213,6 +233,30 @@ using namespace MVS;
 #endif
 #ifndef MESH_HOLE_MAX_EDGES
 #define MESH_HOLE_MAX_EDGES 2000           // hard safety ceiling on loop edges
+#endif
+
+// SECOND geometric gate, in units of the mesh's own resolution rather than the
+// scene's extent. The frac gate above is scene-RELATIVE, so on a large site it
+// stops bounding anything physical: MEASURED on a 1251 m scene it worked out to a
+// 157 m allowance, and the edge cap (92 edges x 1.28 m median edge, ~53 m across
+// for a compact loop) was the only thing actually limiting fills. 2,194 holes were
+// sealed, and holes that wide are not surface the solve was ever uncertain about --
+// no camera observed them, so the fill is invented geometry that then textures
+// black. That is the one defect visible in a finished render.
+//
+// A hole is safe to fill when the surrounding surface still constrains it, and
+// "surrounding" is measured in the mesh's OWN sampling, not in metres: at 12 median
+// edges the fan spans about a dozen triangles and the fill stays local to geometry
+// that was actually observed. Beyond that the interpolation is unconstrained.
+//
+// Deliberately expressed in median edges, not in Poisson cells: Clean() runs after
+// decimation (and inside RefineMesh's subdivide loop), so the cell size is neither
+// available here nor still true of the mesh -- but the median edge is measured from
+// the mesh in hand and tracks whatever it has become.
+//
+// Set to 0 to disable and revert to the frac gate alone.
+#ifndef MESH_HOLE_MAX_SPAN_EDGES
+#define MESH_HOLE_MAX_SPAN_EDGES 12
 #endif
 
 // Density-aware edge cap for --close-holes. A boundary loop of a FIXED physical
@@ -2080,43 +2124,68 @@ void Mesh::Clean(
 	// faces, inverted sheets, spikes) instead of preserving real features
 	// like roof edges, eaves, and curbs.
 
-	if (fSpurious > 0) {
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
+	// Phase 2: topology repair.
+	//
+	// Only PASS 1 (long-edge removal) is spurious-specific and keyed on
+	// fSpurious. The three passes after it -- orientation coherence, flipped-sheet
+	// removal, and small-connected-component removal -- are general topology
+	// repair that every reconstruction path needs, so they run unconditionally.
+	//
+	// WHY THIS SPLIT EXISTS: ReconstructMesh passes fSpurious=0 under --poisson on
+	// purpose (long-edge removal eats the Poisson edge extrapolation, and the
+	// surface is already coherently oriented in principle). But all four passes
+	// used to sit inside one `if (fSpurious > 0)`, so that single decision also
+	// switched off:
+	//   - OrientCoherentlyMesh / FlipNormalOutside, which the down-cull documents
+	//     as its precondition ("coherent outward orientation, set by the
+	//     spurious-removal pass") -- so that precondition was never met;
+	//   - the flipped-normal sheet removal;
+	//   - the small-component filter, which is the ONLY island removal that runs
+	//     BEFORE decimation and hole-closing. Deferred to Phase 9.1, islands first
+	//     consume decimation budget and then get SEALED WATERTIGHT by hole-closing,
+	//     which is why Poisson meshes showed solid floating blobs rather than
+	//     scraps -- and why no `DIAG component sizes` line ever appeared on that
+	//     path to diagnose them with.
+	// None of that has anything to do with long edges; it was incidental nesting.
+	{
+		if (fSpurious > 0) {
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
 
-		FloatArr edgeLens(0, mesh.EN());
-		for (auto& e : mesh.edge) {
-			const auto& P0 = e.V(0)->cP();
-			const auto& P1 = e.V(1)->cP();
-			edgeLens.Insert((P1 - P0).SquaredNorm());
-		}
-
-		// JPB: use 98th percentile (was 95th) so the threshold is anchored to
-		// truly extreme edges -- bbox-bridging sheets sit far in the tail,
-		// while merely-long boundary triangles fall safely below.
-		const float longEdge =
-			sqrtf(edgeLens.GetNth(edgeLens.size() * 98 / 100)) * fSpurious;
-
-		// Pass 1: Remove faces with long edges (original spurious removal)
-		// Build FaceFace topology so we can identify boundary faces.
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-		vcg::tri::UpdateSelection<CLEAN::Mesh>::Clear(mesh);
-		vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, longEdge);
-
-		int removed = 0;
-		for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-			if (!fi->IsD() && fi->IsS()) {
-				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
-				++removed;
+			FloatArr edgeLens(0, mesh.EN());
+			for (auto& e : mesh.edge) {
+				const auto& P0 = e.V(0)->cP();
+				const auto& P1 = e.V(1)->cP();
+				edgeLens.Insert((P1 - P0).SquaredNorm());
 			}
+
+			// JPB: use 98th percentile (was 95th) so the threshold is anchored to
+			// truly extreme edges -- bbox-bridging sheets sit far in the tail,
+			// while merely-long boundary triangles fall safely below.
+			const float longEdge =
+				sqrtf(edgeLens.GetNth(edgeLens.size() * 98 / 100)) * fSpurious;
+
+			// Pass 1: Remove faces with long edges (original spurious removal)
+			// Build FaceFace topology so we can identify boundary faces.
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateSelection<CLEAN::Mesh>::Clear(mesh);
+			vcg::tri::UpdateSelection<CLEAN::Mesh>::FaceOutOfRangeEdge(mesh, 0, longEdge);
+
+			int removed = 0;
+			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
+				if (!fi->IsD() && fi->IsS()) {
+					vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fi);
+					++removed;
+				}
+			}
+			stats.removedLongEdgeFaces += removed;
+
+			// TIER 1: Pass 2 (below) immediately rebuilds FaceFace topology, so we
+			// only need to compact here -- the FF/VF rebuild would be wasted.
+			Compact();
+
+			DEBUG("DIAG after long-edge removal: %d vn, %d fn (removed %d)",
+				mesh.vn, mesh.fn, removed);
 		}
-		stats.removedLongEdgeFaces += removed;
-
-		// TIER 1: Pass 2 (below) immediately rebuilds FaceFace topology, so we
-		// only need to compact here -- the FF/VF rebuild would be wasted.
-		Compact();
-
-		DEBUG("DIAG after long-edge removal: %d vn, %d fn (removed %d)",
-			mesh.vn, mesh.fn, removed);
 
 		// Pass 2: Fix normal orientation globally.
 		// The mesh from reconstruction should be predominantly correctly oriented.
@@ -2308,9 +2377,10 @@ void Mesh::Clean(
 
 		CompactAndRefresh();
 
-		DEBUG("DIAG after spurious: %d vn, %d fn",
-			mesh.vn, mesh.fn);
-		ValidateMesh(mesh, "after spurious removal", false);
+		DEBUG("DIAG after topology repair: %d vn, %d fn (long-edge pass %s)",
+			mesh.vn, mesh.fn,
+			fSpurious > 0 ? "ran" : "skipped, fSpurious=0");
+		ValidateMesh(mesh, "after topology repair", false);
 	}
 
 	// =============================================================
@@ -2778,7 +2848,9 @@ void Mesh::Clean(
 		vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
 
 		const float meshDiag = mesh.bbox.Diag();
-		const float maxHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * meshDiag;
+		// Measured once and used by BOTH gates below (the edge cap and the
+		// resolution-relative span cap), so it is hoisted out of the edge-cap block.
+		const float medianEdge = ComputeMedianEdgeLength(mesh);
 		// --close-holes (nCloseHoles) is the edge cap, made DENSITY-AWARE so a
 		// given value closes the same PHYSICAL hole size at any mesh fineness
 		// (see MESH_HOLE_REF_EDGES_ACROSS_DIAG). Finer mesh -> more edges per
@@ -2787,7 +2859,6 @@ void Mesh::Clean(
 		{
 			int scaledCloseHoles = (int)nCloseHoles;
 			if (MESH_HOLE_REF_EDGES_ACROSS_DIAG > 0) {
-				const float medianEdge = ComputeMedianEdgeLength(mesh);
 				if (medianEdge > 0.f && meshDiag > 0.f) {
 					const float edgesAcrossDiag = meshDiag / medianEdge;
 					const float densityScale = edgesAcrossDiag / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
@@ -2798,6 +2869,14 @@ void Mesh::Clean(
 			}
 			holeEdgeCap = std::min<int>(scaledCloseHoles, MESH_HOLE_MAX_EDGES);
 		}
+		// Take the more restrictive of the scene-relative and resolution-relative
+		// gates (see MESH_HOLE_MAX_SPAN_EDGES). On small/close-range scenes the frac
+		// gate is already the tighter of the two and nothing changes; on large sites
+		// the span gate is what stops the fill inventing tens of metres of surface.
+		const float fracHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * meshDiag;
+		const float spanHoleDiag = (MESH_HOLE_MAX_SPAN_EDGES > 0 && medianEdge > 0.f)
+			? float(MESH_HOLE_MAX_SPAN_EDGES) * medianEdge : fracHoleDiag;
+		const float maxHoleDiag = std::min(fracHoleDiag, spanHoleDiag);
 
 #if 0 // JPB WIP BUG Diag
 		// DIAG: classify every boundary loop so we can see WHY interior holes
@@ -2840,8 +2919,10 @@ void Mesh::Clean(
 			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, holeEdgeCap, false, nullptr, maxHoleDiag);
 
 		if (closed > 0) {
-			DEBUG("Closed %d interior holes (<= %.3g world units = %.0f%% of mesh diag %.3g, up to %d edges)",
-				closed, maxHoleDiag, float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 10.f, meshDiag, holeEdgeCap);
+			DEBUG("Closed %d interior holes (<= %.3g world units [%s: frac %.3g vs span %.3g = %d x median edge %.4g], up to %d edges)",
+				closed, maxHoleDiag,
+				(spanHoleDiag < fracHoleDiag) ? "span-gated" : "frac-gated",
+				fracHoleDiag, spanHoleDiag, MESH_HOLE_MAX_SPAN_EDGES, medianEdge, holeEdgeCap);
 			CompactAndRefresh();
 		}
 
@@ -2928,20 +3009,25 @@ void Mesh::Clean(
 		vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
 
 		const float sealMeshDiag = mesh.bbox.Diag();
-		const float sealMaxHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * sealMeshDiag;
+		const float sealMedianEdge = ComputeMedianEdgeLength(mesh);
 		// Density-aware edge cap, matching Phase 4 (see MESH_HOLE_REF_EDGES_ACROSS_DIAG).
 		int sealHoleEdgeCap;
 		{
 			int scaledCloseHoles = (int)nCloseHoles;
 			if (MESH_HOLE_REF_EDGES_ACROSS_DIAG > 0) {
-				const float medianEdge = ComputeMedianEdgeLength(mesh);
-				if (medianEdge > 0.f && sealMeshDiag > 0.f) {
-					const float densityScale = (sealMeshDiag / medianEdge) / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
+				if (sealMedianEdge > 0.f && sealMeshDiag > 0.f) {
+					const float densityScale = (sealMeshDiag / sealMedianEdge) / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
 					scaledCloseHoles = std::max(1, ROUND2INT(nCloseHoles * densityScale));
 				}
 			}
 			sealHoleEdgeCap = std::min<int>(scaledCloseHoles, MESH_HOLE_MAX_EDGES);
 		}
+		// Same two-gate rule as Phase 4. This also tightens the fallback pass below,
+		// which is defined as 2x this value -- it was reaching 315 m on a 1251 m scene.
+		const float sealFracHoleDiag = (float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 1000.f) * sealMeshDiag;
+		const float sealSpanHoleDiag = (MESH_HOLE_MAX_SPAN_EDGES > 0 && sealMedianEdge > 0.f)
+			? float(MESH_HOLE_MAX_SPAN_EDGES) * sealMedianEdge : sealFracHoleDiag;
+		const float sealMaxHoleDiag = std::min(sealFracHoleDiag, sealSpanHoleDiag);
 
 		// First pass: geometry-gated interior-hole fill (same rule as Phase 4),
 		// so the final seal closes remaining compact holes without fanning the
@@ -2965,13 +3051,48 @@ void Mesh::Clean(
 			std::vector<CLEAN::Mesh::FacePointer*> upd;
 			upd.reserve(loops.size());
 			for (auto& L : loops) upd.push_back(&L.p.f);
-			int closedTiny = 0;
+			int closedTiny = 0, skippedStale = 0;
 			for (auto& L : loops) {
 				if (L.size < 3 || L.size > MESH_HOLE_FALLBACK_MAX_EDGES) continue;
 				if (L.bb.Diag() > fallbackMaxDiag) continue; // never bridge a wide loop
+
+				// STALE-POS GUARD -- without this the loop can HANG.
+				//
+				// GetInfo() collects one Pos per border loop UP FRONT, and nothing
+				// revalidates them as we fill. Sealing one hole removes border status from
+				// the vertices it closes, so a later loop's Pos can end up on an edge that
+				// is no longer a border -- or on a vertex with no border edge left at all
+				// when two loops shared vertices. Pos::NextB() is then unbounded:
+				//
+				//     assert(f->FFp(z)==f);   // compiled out in release
+				//     do NextE(); while(!IsBorder());
+				//
+				// it walks the vertex fan forever looking for a border that no longer
+				// exists. (vcglib/vcg/simplex/face/pos.h)
+				//
+				// Latent until the mesh got fine enough for loops to be adjacent: this pass
+				// used to close 1-3 holes, and at a 0.13 cell it sees ~3700 loops, where
+				// loops sharing a vertex are close to certain.
+				//
+				// Re-testing the Pos is cheap and is the standard vcg idiom. The two
+				// conditions are exactly NextB's own preconditions: the edge must be a
+				// border, and the Pos vertex must belong to that edge.
+				if (L.p.f == nullptr || L.p.f->IsD() || !L.p.IsBorder()) {
+					++skippedStale;
+					continue;
+				}
+				if (!(L.p.f->V(L.p.z) == L.p.v ||
+				      L.p.f->V(L.p.f->Next(L.p.z)) == L.p.v)) {
+					++skippedStale;
+					continue;
+				}
+
 				vcg::tri::Hole<CLEAN::Mesh>::FillHoleEar<vcg::tri::TrivialEar<CLEAN::Mesh>>(mesh, L.p, upd);
 				++closedTiny;
 			}
+			if (skippedStale > 0)
+				DEBUG("DIAG fallback seal: skipped %d loops whose Pos was invalidated by an"
+					" earlier fill (of %zu loops)", skippedStale, loops.size());
 			closed += closedTiny;
 			if (closedTiny > 0)
 				DEBUG("DIAG fallback seal: trivially closed %d small holes (<=%d edges, <= %.3g-unit diag)",
@@ -2979,8 +3100,10 @@ void Mesh::Clean(
 		}
 
 		if (closed > 0) {
-			DEBUG("Final seal: closed %d interior holes (<= %.0f%% of mesh diag, up to %d edges)",
-				closed, float(MESH_HOLE_MAX_DIAG_FRAC_X1000) / 10.f, sealHoleEdgeCap);
+			DEBUG("Final seal: closed %d interior holes (<= %.3g world units [%s], up to %d edges)",
+				closed, sealMaxHoleDiag,
+				(sealSpanHoleDiag < sealFracHoleDiag) ? "span-gated" : "frac-gated",
+				sealHoleEdgeCap);
 			// TIER 1: nothing after this consumes FF/VF -- the export loop just
 			// iterates mesh.vert / mesh.face and skips IsD() entries.
 			Compact();
@@ -7210,6 +7333,13 @@ CUDA::KernelRT Mesh::kernelComputeFaceNormal;
 
 bool Mesh::InitKernels(int device)
 {
+	// kernelComputeFaceNormal is a KernelRT, which is built on the pre-CUDA-12
+	// launch API; bail out cleanly on a driver that no longer exports it so
+	// ComputeNormalFaces() takes its CPU branch instead of faulting on a
+	// delay-load stub. See CUDA::HasLegacyDriverAPI().
+	if (!CUDA::HasLegacyDriverAPI())
+		return false;
+
 	// initialize CUDA device if needed
 	if (CUDA::devices.IsEmpty() && CUDA::initDevice(device) != CUDA_SUCCESS)
 		return false;

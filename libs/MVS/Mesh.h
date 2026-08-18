@@ -175,7 +175,12 @@ public:
 public:
 	#ifdef _USE_CUDA
 	inline Mesh() {
-		InitKernels(SEACAVE::CUDA::desiredDeviceID);
+		// -2 and below means "CPU processing" (see the --cuda-device option). Skip
+		// the CUDA probe entirely in that case so simply constructing a Mesh --
+		// which every Scene does, before any GPU decision is made -- can never be
+		// what pulls in the CUDA driver. Mirrors the guard in SceneDensify.cpp.
+		if (SEACAVE::CUDA::desiredDeviceID >= -1)
+			InitKernels(SEACAVE::CUDA::desiredDeviceID);
 	}
 	#endif
 

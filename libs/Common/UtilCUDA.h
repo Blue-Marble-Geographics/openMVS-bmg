@@ -37,6 +37,21 @@ namespace CUDA {
 
 extern int desiredDeviceID;
 
+// True if nvcuda.dll is loadable AND still exports the legacy driver-API entry
+// points this code base uses for kernel launch and texture/surface binding
+// (cuParamSet*/cuFuncSetBlockShape/cuLaunchGrid, cuModuleGetTexRef/cuTexRefSet*,
+// cuModuleGetSurfRef/cuSurfRefSetArray). CUDA 12.0 REMOVED all of them, so on a
+// current driver the library loads fine but those symbols are gone.
+//
+// Only the code paths that actually use those APIs need to consult this --
+// KernelRT/TTextureRT/TSurfaceRT users, i.e. Mesh::InitKernels and
+// MeshRefineCUDA::InitKernels. PatchMatchCUDA (Densify) is on the modern
+// runtime API and must NOT be gated on this, or it would lose GPU support on
+// exactly the machines where it still works.
+//
+// Result is computed once and cached.
+bool HasLegacyDriverAPI();
+
 // global list of initialized devices
 struct Device {
 	CUdevice ID;

@@ -281,6 +281,7 @@ public:
 	}
 
 	void RemovePoint(IDX);
+	void RemovePointsOutside(const OBB3f&);
 
 	typedef TOctree<std::vector<Point3f>,TPoint3<float>::Type,3> Octree;
 

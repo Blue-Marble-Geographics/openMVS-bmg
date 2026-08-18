@@ -167,6 +167,7 @@ extern unsigned nOutlierFilterKNN;
 extern unsigned nLowViewSupportCut;
 extern float fLowViewSupportRadius;
 extern float fLowViewPlanarityMax;
+extern float fLowViewLinearityMin;
 extern bool bFlattenWater;
 extern float fFlattenWaterBandPct;
 extern float fFlattenWaterRoughness;

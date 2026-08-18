@@ -304,18 +304,33 @@
 // vertices) and only deletes faces fully detached from the data. Vertices and
 // faces are then compacted exactly like the NaN-removal block.
 //
-// DEFAULT OFF: a single global threshold tied to the median (densest-region)
-// NN spacing over-culls real surface. Point density varies enormously across a
-// scene (obliquely-viewed walls, distant ground, canopy fringe), so legitimate
-// surface in sparse-but-real regions sits many median-spacings from the nearest
-// sample and is indistinguishable from invented skirts/balloons by a global
-// distance test. Measured on an aerial scene: ~13.5% of faces removed at 3.5x,
-// most of them good geometry. Density trimming (SurfaceTrimmer --trim) already
-// handles the invented-balloon case far more reliably. Leave this at 0 unless
-// you have a local-density-adaptive replacement for the threshold.
-// Set to 1 to re-enable (and tune POISSON_CULL_FACTOR_X100, expect 8-10x+).
+// WAS DEFAULT OFF because a single GLOBAL threshold tied to the median
+// (densest-region) NN spacing over-culls real surface: point density varies
+// enormously across a scene (obliquely-viewed walls, distant ground, canopy
+// fringe), so legitimate surface in sparse-but-real regions sits many
+// median-spacings from the nearest sample and is indistinguishable from invented
+// skirts by a global distance test. Measured: ~13.5% of faces removed at 3.5x,
+// most of them good geometry.
+//
+// The threshold is now LOCAL (see the implementation): each vertex is compared
+// against the point spacing measured where it actually sits, estimated from the
+// K-th nearest neighbour distance, so the test is scale-invariant per region.
+// That is the "local-density-adaptive replacement" the old note asked for, and it
+// targets the axis SurfaceTrimmer cannot: trim removes LOW-DENSITY surface, which
+// also removes real-but-sparse regions and is what makes datasets less complete.
+// This removes surface that is FAR FROM ANY DATA regardless of its density.
+//
+// Backed by POISSON_CULL_MAX_FRACTION: if the cull wants more than that share of
+// the mesh, it is abandoned wholesale rather than gutting the surface, so the
+// worst case is a no-op.
 #ifndef POISSON_DISTANCE_CULL
 #define POISSON_DISTANCE_CULL 0
+#endif
+// Abandon the distance cull entirely if it would remove more than this fraction of
+// faces -- see the SAFETY GUARD note at the call site. Incompleteness is worse than
+// surplus geometry, so this fails toward keeping everything.
+#ifndef POISSON_CULL_MAX_FRACTION
+#define POISSON_CULL_MAX_FRACTION 0.06
 #endif
 
 // POISSON_CULL_FACTOR_X100: distance threshold as a multiple of the median NN
@@ -3426,21 +3441,772 @@ static bool LoadPoissonMeshPLY(const String& path, Mesh& mesh)
 } // LoadPoissonMeshPLY
 /*----------------------------------------------------------------*/
 
-// Estimate a sensible Poisson octree depth from the cloud itself. The useful
-// depth is the one whose finest voxel matches the cloud's actual point spacing:
-// PoissonRecon builds its octree over a cube of side scale*maxExtent divided into
-// 2^depth cells per axis, so the finest cell width = scale*maxExtent / 2^depth.
-// Setting that equal to the median nearest-neighbour spacing s gives
-//     depth = round( log2( scale * maxExtent / s ) ).
-// Beyond this the octree cells contain no new samples and Poisson only amplifies
-// noise (a heavier, bumpier mesh for no real detail), so the result is clamped to
-// [minDepth, maxDepth] to also bound memory. minDepth/maxDepth keep absurd inputs
-// (sparse or huge scenes) from picking a runaway depth.
-static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
-	float scaleFactor = 1.1f, int minDepth = 8, int maxDepth = 10)
+// Voxel edge for the Poisson INPUT subsample, expressed as a right-shift of the
+// finest octree cell: voxel = cell / 2^SHIFT. Powers of two are used so the voxel
+// grid lines up with the octree (and with a Morton ordering built over the same
+// box), which keeps same-voxel points contiguous.
+//   1 = cell/2  (~4 pts per finest cell)  most aggressive
+//   2 = cell/4  (~16 pts per cell)        DEFAULT -- ample for samplesPerNode 1.5
+//   3 = cell/8  (~64 pts per cell)        conservative
+#ifndef POISSON_INPUT_SUBSAMPLE_SHIFT
+#define POISSON_INPUT_SUBSAMPLE_SHIFT 2
+#endif
+// MEASURED AND REJECTED -- default OFF. Set to 1 only to re-test.
+//
+// The idea was that PoissonRecon merges its input into octree samples, so points
+// beyond a few per finest cell only cost tree-construction memory. The measurement
+// on a 263M-point / depth-12 aerial scene says otherwise:
+//
+//                        full cloud      subsampled (voxel = cell/4)
+//   input points         262,967,556     190,393,190   (1.4x)
+//   octree nodes          50,436,585      50,408,257   (-0.06%)
+//   tree-read current       7,077 MB       11,432 MB
+//   tree build time            17.3 s          13.0 s
+//
+// 7077 + 4357 (the subsample array) = 11434, i.e. the tree used IDENTICAL memory
+// both times and the whole delta was the copy. At a fixed depth PoissonRecon's
+// footprint is bounded by the OCTREE STRUCTURE, not by input point count, so
+// thinning the input buys wall time (-25%) and costs memory (+4.4 GB). Bad trade.
+//
+// Secondary finding: the contiguous-run filter only reached 1.4x where a 6.5 cm
+// voxel over 2.36 cm spacing predicts ~7.6x, so same-voxel points are NOT
+// contiguous at that scale -- the cloud's Morton granularity is coarser than the
+// voxel. A hash-set dedup would recover the full ratio, but per the above it would
+// not help memory anyway, so it was not written.
+//
+// The real peak on this stage is the dense cloud itself: ~75 B/point at load, of
+// which ~51 B/point (colors/views/weights) Poisson never reads. Attack that
+// instead -- it needs a scene-load flag, not a filter here.
+#ifndef POISSON_INPUT_SUBSAMPLE
+#define POISSON_INPUT_SUBSAMPLE 0
+#endif
+
+// Run a coarse reconstruction first, purely to measure the face-density
+// coefficient k, then re-decide the depth with the measured value. This is what
+// makes the depth fully automatic: k is terrain roughness and cannot be derived
+// from the cloud (see the probe block in ReconstructMeshPoisson).
+//
+// COST: one extra solve at target-2 depth. The per-point phases (tree read, kernel
+// density, normal field) dominate and are depth-independent, so expect roughly
+// +25-40% on this stage. Set to 0 to skip it and fall back to the assumed k, which
+// is deliberately conservative (a high k picks a shallower depth).
+#ifndef POISSON_CALIBRATION_PROBE
+#define POISSON_CALIBRATION_PROBE 1
+#endif
+
+// sqrt(RefineMesh --max-face-area). A face is subdivided when it projects larger
+// than max-face-area (default 32 px), so the finest geometry refinement can
+// introduce is sqrt(32) ~ 5.66 working pixels across. Used to decide whether
+// RefineMesh can add detail to a given mesh at all.
+// Decay of ln(k) per octree depth level, used to extrapolate the calibration probe
+// forward to the target depth. 0 disables the correction (probe value used raw,
+// which over-predicts k and costs a depth level). See the probe block for the four
+// measurements this is fitted to.
+#ifndef POISSON_K_DEPTH_DECAY
+#define POISSON_K_DEPTH_DECAY 0.10
+#endif
+// Run a SECOND, one-level-shallower probe to measure k's actual decay slope and report
+// it ([MESH-SLOPE]). Never changes a decision.
+//
+// DEFAULT 0 -- the experiment ran and the answer was no. MEASURED on the 1940-view
+// aerial set: k(8)=1.828, k(9)=1.376 gives lambda=0.284/level, which predicts k(11)=0.779
+// against a true 1.079 -- off by -27.8%, where the flat POISSON_K_DEPTH_DECAY constant
+// managed +4.4%. Six times worse AND in the unsafe direction (under-predicting k allows a
+// deeper solve than the budget intended).
+//
+// Root cause: lambda is not a constant to be measured, it decays with depth as k
+// approaches its asymptote -- 0.284, 0.200, 0.105, 0.081 at depths 8->13. What governs
+// the answer is lambda NEAR THE TARGET depth, and a cheap shallow probe cannot see it.
+// The 0.10 constant works on this site precisely because it encodes the near-target value
+// (10->12 measures 0.105). Probing near the target would be accurate but costs more than
+// the solve.
+//
+// Also measured: the second probe is NOT cheap. Both probes took 38 s against ~21 s for
+// one, so the shallower probe cost ~17 s, not the ~5 s a 1/4-work estimate predicts --
+// PoissonRecon's fixed overhead (reading 263M points, building the base octree) dominates
+// and does not scale with depth.
+//
+// Set to 1 to re-collect on a new dataset; the diagnostic is still correct and honest.
+#ifndef POISSON_K_SLOPE_PROBE
+#define POISSON_K_SLOPE_PROBE 0
+#endif
+
+// Relative error in the probe's predicted k that warrants a warning. A depth level is
+// 4x in faces and therefore 4x in k, so errors well under 100% cannot move the chosen
+// depth except right at a boundary. Observed with the decay correction applied: 0.6%,
+// 2.5%, ~1%. 25% leaves ample margin while still catching a genuinely broken probe.
+#ifndef POISSON_PROBE_ERROR_WARN_PCT
+#define POISSON_PROBE_ERROR_WARN_PCT 25.0
+#endif
+
+// How much finer than the texture-imposed output cap the Poisson solve may go.
+// Adaptive decimation needs SOME surplus to redistribute detail with, but heavy ratios
+// erode the features the fine solve captured (measured: 2.8x clean, 6x rounds roof
+// ridges and kerbs, 10.3x visibly damaging). 3 sits inside the safe range and, because
+// faces scale 4x per depth level, effectively means "at most one level finer".
+#ifndef POISSON_TEXTURE_OVERSOLVE
+#define POISSON_TEXTURE_OVERSOLVE 3.0
+#endif
+
+// Subdivision headroom to leave RefineMesh, as a multiple of the reliability floor.
+//
+// This is the ceiling that matters most, and the one that was missing.
+//
+// A face must project to at least sqrt(--max-face-area) ~ 5.66 pixels for TextureMesh's
+// per-face view selection to be well determined; below that, adjacent faces pick
+// different views and the result SPECKLES (observed at 3.7 px/face). RefineMesh
+// subdivides down TOWARD that floor, adding geometry only where the imagery justifies
+// it -- so the Poisson mesh should start a factor of 2 above it, leaving exactly one
+// level of adaptive subdivision.
+//
+// Building finer than this in Poisson is doubly wrong: the extra geometry cannot be
+// textured reliably, AND it consumes the headroom RefineMesh needs, disabling the very
+// stage designed to add detail. MEASURED: depth 12 on a 142 m scene gave 3.82 cm cells
+// (3.4 px/face), 35M faces, 27 minutes, speckled texture and RefineMesh skipped; depth
+// 10 gives 15.3 cm cells (13.7 px/face), 1.7M faces, 4 minutes, and RefineMesh runs.
+//
+// 2.0 reproduces the previously hand-tuned depth on both a 142 m and a 974 m site.
+#ifndef POISSON_REFINE_HEADROOM
+#define POISSON_REFINE_HEADROOM 2.0
+#endif
+// Headroom used when RefineMesh WILL run: two levels instead of one, so the coarse
+// Poisson mesh is deliberately left for RefineMesh to subdivide adaptively. Only
+// applies when refinement is both affordable and has signal -- otherwise nothing would
+// add the detail back and POISSON_REFINE_HEADROOM (one level) is used instead.
+//
+// CALIBRATED against two scenes whose hand-tuned depth was known good:
+//   142 m / 109 views,  GSD 1.116 cm -> depth 10 requires headroom in (1.21, 2.42]
+//   276 m / 368 views,  GSD 1.191 cm -> depth 10 requires headroom in (2.20, 4.41]
+// The overlap is (2.20, 2.42], so 2.3. Above it the 142 m scene drops to depth 9
+// (coarser than known-good); below it the 276 m scene rises to depth 11, which
+// measured 5x the faces, pushed atlas padding from ~1.3x to ~1.75x, cost 5 extra
+// minutes, and produced a visually indistinguishable render.
+#ifndef POISSON_REFINE_HEADROOM_ADAPTIVE
+#define POISSON_REFINE_HEADROOM_ADAPTIVE 2.3
+#endif
+
+#ifndef POISSON_REFINE_SUBDIV_FACTOR
+#define POISSON_REFINE_SUBDIV_FACTOR 5.66
+#endif
+// Resident bytes per source pixel per view inside RefineMesh's view streamer.
+// MEASURED: a 1940-view / 15.19 MPixel run at resolution-level 0 reached 120 GB
+// commit with 1239 views resident -- ~97 MB/view, i.e. ~6.4 B/pixel.
+//
+// That 6.4 is TIER 1 ONLY. RefineMesh's own kStreamBytesPerPixel (SceneRefine.cpp)
+// is 15 B/px: tier 1 is the u16 gray plane + two int16 gradient planes = 6 B/px, and
+// tier 2 is depthMap 4 + faceMap 4 + isValid 1 = 9 B/px. Tier 2 is independently
+// evictable and was mostly NOT resident during the measurement, which is why the
+// commit figure lands on tier 1 almost exactly (6.38 measured vs 6.00).
+//
+// So use 6.4 here -- this constant answers "what will a resident view typically
+// cost", which is the right question for choosing a resolution level. Do NOT
+// propagate it into SceneRefine's own budget: that one must stay at the worst case
+// (15), because under-charging there risks an OOM abort rather than a slow run.
+// An earlier revision of this comment claimed the streamer assumed 33.5 MB/view
+// (2.2 B/px) and was "2.9x low"; no such constant exists, and the sign was
+// backwards -- at 15 vs a typical 6 the streamer OVER-charges and over-batches.
+#ifndef POISSON_REFINE_BYTES_PER_PIXEL
+#define POISSON_REFINE_BYTES_PER_PIXEL 6.4
+#endif
+// Below this many input points, skip the subsample entirely -- small clouds are
+// not the problem and every point matters to the normal field.
+#ifndef POISSON_INPUT_SUBSAMPLE_MIN_POINTS
+#define POISSON_INPUT_SUBSAMPLE_MIN_POINTS 2000000
+#endif
+// Never hand PoissonRecon fewer than this many points, whatever the voxel says.
+#ifndef POISSON_INPUT_SUBSAMPLE_FLOOR
+#define POISSON_INPUT_SUBSAMPLE_FLOOR 100000
+#endif
+
+// Finest PoissonRecon cell at a given depth: one bounding-box pass, no kd-tree.
+// Used when the caller pinned the depth, so the input subsample below can still
+// be sized from the mesh resolution rather than a constant.
+static float PoissonCellSizeAtDepth(const float* ptsRaw, size_t numPoints,
+	float scaleFactor, int depth)
 {
+	if (numPoints == 0 || depth <= 0 || depth > 30)
+		return 0.f;
+	const Point3f* __restrict pts = reinterpret_cast<const Point3f*>(ptsRaw);
+	float minx = FLT_MAX, miny = FLT_MAX, minz = FLT_MAX;
+	float maxx = -FLT_MAX, maxy = -FLT_MAX, maxz = -FLT_MAX;
+	for (size_t i = 0; i < numPoints; ++i) {
+		const Point3f& p = pts[i];
+		if (p.x < minx) minx = p.x;  if (p.x > maxx) maxx = p.x;
+		if (p.y < miny) miny = p.y;  if (p.y > maxy) maxy = p.y;
+		if (p.z < minz) minz = p.z;  if (p.z > maxz) maxz = p.z;
+	}
+	const float ext = std::max(std::max(maxx - minx, maxy - miny), maxz - minz);
+	return (ext > 0.f) ? scaleFactor * ext / (float)(1u << depth) : 0.f;
+} // PoissonCellSizeAtDepth
+/*----------------------------------------------------------------*/
+
+// Voxel-subsample the oriented points handed to PoissonRecon.
+//
+// WHY: PoissonRecon merges the input into octree samples, so points beyond a few
+// per finest cell buy nothing but tree-construction memory. A 263M-point / depth-12
+// case produced 7.9M samples -- 97% of the input was merged away, after paying
+// ~23 GB of transient peak to load it. The mesh is unchanged; only the bill isn't.
+//
+// HOW: `voxel` is derived from the octree cell, so this scales with the dataset
+// instead of hardcoding a rate -- a small object scan gets a small voxel and keeps
+// nearly everything, an aerial site gets a large one. Emission is one forward pass
+// that keeps the FIRST point whenever the quantised cell changes from the previous
+// kept one. That relies on same-voxel points being CONTIGUOUS, which holds for a
+// spatially sorted (e.g. Morton-ordered) cloud.
+//
+// GENERALITY: if the cloud is NOT spatially sorted, consecutive points land in
+// different voxels and almost everything is kept -- the function degrades to "no
+// reduction", never to a wrong or biased subsample. The caller checks the achieved
+// reduction and falls back to the full cloud, so an unsorted input costs one cheap
+// pass and nothing else. Deterministic in all cases (first point wins, input order).
+//
+// First-point rather than centroid-averaging is deliberate: averaging would pull
+// samples off the measured surface and could bridge thin structures whose two sides
+// share a voxel (walls, railings) -- a quality regression that would only show up
+// on non-aerial data. PoissonRecon does its own averaging downstream anyway.
+//
+// Returns the number of points written into outPts/outNrm.
+static size_t VoxelSubsampleOrientedPoints(
+	const float* __restrict ptsRaw, const float* __restrict nrmRaw, size_t numPoints,
+	float voxel, std::vector<float>& outPts, std::vector<float>& outNrm)
+{
+	if (numPoints == 0 || !(voxel > 0.f))
+		return 0;
+	// Quantise RELATIVE to the bounding-box minimum, not to the absolute origin.
+	// A cloud carried in projected coordinates (UTM easting ~5e5) has only ~1
+	// fractional digit left in float32, so absolute quantisation at a centimetre
+	// voxel would be pure noise and this filter would silently keep everything or
+	// collapse unrelated points. Offsetting first keeps the arithmetic in the
+	// scene's own extent, where float32 has millimetre headroom. One extra pass.
+	float ox = FLT_MAX, oy = FLT_MAX, oz = FLT_MAX;
+	for (size_t i = 0; i < numPoints; ++i) {
+		const float* __restrict p = ptsRaw + i * 3;
+		if (p[0] < ox) ox = p[0];
+		if (p[1] < oy) oy = p[1];
+		if (p[2] < oz) oz = p[2];
+	}
+	const float inv = 1.f / voxel;
+	// Count first, then fill exactly. A guessed reserve that undershoots forces a
+	// reallocation holding old+new simultaneously -- 1-2 GB of transient waste on a
+	// 263M-point cloud, which is precisely what this function exists to avoid. The
+	// extra pass is a sequential scan of memory already being streamed.
+	const auto CellOf = [&](size_t i, int64_t& cx, int64_t& cy, int64_t& cz) {
+		const float* __restrict p = ptsRaw + i * 3;
+		cx = (int64_t)std::floor((p[0] - ox) * inv);
+		cy = (int64_t)std::floor((p[1] - oy) * inv);
+		cz = (int64_t)std::floor((p[2] - oz) * inv);
+	};
+	size_t kept = 0;
+	{
+		int64_t lx = INT64_MIN, ly = INT64_MIN, lz = INT64_MIN, cx, cy, cz;
+		for (size_t i = 0; i < numPoints; ++i) {
+			CellOf(i, cx, cy, cz);
+			if (cx == lx && cy == ly && cz == lz)
+				continue;
+			lx = cx; ly = cy; lz = cz;
+			++kept;
+		}
+	}
+	if (kept == 0)
+		return 0;
+
+	outPts.clear(); outNrm.clear();
+	outPts.resize(kept * 3);
+	outNrm.resize(kept * 3);
+	float* __restrict oP = outPts.data();
+	float* __restrict oN = outNrm.data();
+	{
+		int64_t lx = INT64_MIN, ly = INT64_MIN, lz = INT64_MIN, cx, cy, cz;
+		size_t w = 0;
+		for (size_t i = 0; i < numPoints; ++i) {
+			CellOf(i, cx, cy, cz);
+			if (cx == lx && cy == ly && cz == lz)
+				continue;
+			lx = cx; ly = cy; lz = cz;
+			const float* __restrict p = ptsRaw + i * 3;
+			const float* __restrict n = nrmRaw + i * 3;
+			oP[w*3+0]=p[0]; oP[w*3+1]=p[1]; oP[w*3+2]=p[2];
+			oN[w*3+0]=n[0]; oN[w*3+1]=n[1]; oN[w*3+2]=n[2];
+			++w;
+		}
+		ASSERT(w == kept);
+	}
+	return kept;
+} // VoxelSubsampleOrientedPoints
+/*----------------------------------------------------------------*/
+
+// Median full-resolution ground sample distance, in cloud units: for a stride-
+// sampled subset of points, the distance to the nearest camera centre divided by
+// that camera's focal length in pixels. Deliberately needs neither per-point
+// visibility nor Image::avgDepth (neither is reliably populated on a scene loaded
+// straight from disk), so it works on any scene that has poses. Returns 0 when it
+// cannot be measured, which callers must treat as "unknown" rather than "zero".
+static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_t numPoints)
+{
+	if (numPoints == 0 || images.IsEmpty())
+		return 0.f;
+
+	// Collect valid camera centres and focal lengths once.
+	std::vector<Point3f> centers;
+	std::vector<float> focals;
+	centers.reserve((size_t)images.GetSize());
+	focals.reserve((size_t)images.GetSize());
+	for (size_t i = 0; i < (size_t)images.GetSize(); ++i) {
+		const Image& img = images[(IIndex)i];
+		if (!img.IsValid())
+			continue;
+		const float f = (float)img.camera.K(0, 0);
+		if (!(f > 0.f))
+			continue;
+		centers.emplace_back((float)img.camera.C.x, (float)img.camera.C.y, (float)img.camera.C.z);
+		focals.push_back(f);
+	}
+	if (centers.empty())
+		return 0.f;
+
+	const Point3f* __restrict pts = reinterpret_cast<const Point3f*>(ptsRaw);
+	const size_t kSamples = std::min<size_t>(numPoints, 20000);
+	const size_t stride = std::max<size_t>(1, numPoints / kSamples);
+	const size_t nq = (numPoints + stride - 1) / stride;
+	std::vector<float> gsd(nq, -1.f);
+	float* __restrict pG = gsd.data();
+	const size_t nc = centers.size();
+	const Point3f* __restrict pC = centers.data();
+	const float* __restrict pF = focals.data();
+#ifdef _USE_OPENMP
+	#pragma omp parallel for schedule(static)
+#endif
+	for (ptrdiff_t q = 0; q < (ptrdiff_t)nq; ++q) {
+		const Point3f& p = pts[(size_t)q * stride];
+		float best = FLT_MAX; size_t bestI = 0;
+		for (size_t c = 0; c < nc; ++c) {
+			const float dx = p.x - pC[c].x, dy = p.y - pC[c].y, dz = p.z - pC[c].z;
+			const float d2 = dx*dx + dy*dy + dz*dz;
+			if (d2 < best) { best = d2; bestI = c; }
+		}
+		if (best > 0.f && best < FLT_MAX)
+			pG[q] = std::sqrt(best) / pF[bestI];
+	}
+	std::vector<float> valid;
+	valid.reserve(nq);
+	for (size_t q = 0; q < nq; ++q)
+		if (pG[q] > 0.f) valid.push_back(pG[q]);
+	if (valid.empty())
+		return 0.f;
+	std::nth_element(valid.begin(), valid.begin() + valid.size() / 2, valid.end());
+	return valid[valid.size() / 2];
+} // EstimateSceneGSD
+/*----------------------------------------------------------------*/
+
+// Mesh resolution policy: every downstream stage's detail setting, derived from
+// the cloud instead of hardcoded, so the same numbers work on a 20 m object scan
+// and a 1 km aerial site.
+//
+// The governing identity. PoissonRecon divides a cube of side scale*maxExtent
+// into 2^depth cells per axis, so cell = scale*ext / 2^depth, and the output face
+// count is
+//     faces ~= k * (ext / cell)^2                        (k = face-density coeff)
+// Substituting cell and solving for depth eliminates ext entirely:
+//     depth = 0.5 * log2( scale^2 * F / k )               (F = face budget)
+// So DEPTH IS A FUNCTION OF THE FACE BUDGET, NOT OF SCENE SIZE. Extent is handled
+// by tile count instead. This is what makes one policy work at every scale: a
+// small scene reaches a fine cell at the same depth a large scene reaches a
+// coarse one, and both stay inside the same memory envelope.
+//
+// Two independent ceilings apply, and we take the lower:
+//   * budget-limited: the depth above, from F (memory / how big a mesh you want)
+//   * data-limited:   round(log2(scale*ext / s)), s = median NN spacing. Past this
+//                     the octree cells hold no new samples and Poisson just
+//                     amplifies noise -- a heavier, bumpier mesh for no detail.
+//
+// NOTE the semantic change from the previous version: depth used to come from the
+// data-limited term ALONE, which on dense aerial clouds asks for depth 15+ (a
+// multi-billion-face mesh) and was only survivable because maxDepth capped it.
+// The cap is now a backstop rather than the actual mechanism.
+//
+// The defaults (F = 40M faces, k = 3.0) yield depth 12, matching the value this
+// tree used before, so dropping this in changes nothing until you pass a budget.
+struct MeshPolicy {
+	int    depth        = 0;     // PoissonRecon octree depth
+	float  cellSingle   = 0.f;   // finest cell reachable in ONE untiled mesh
+	float  cell         = 0.f;   // cell actually delivered (== cellSingle if tiles==1)
+	int    tilesPerAxis = 1;     // >1 : target needs tiled meshing to reach `cell`
+	int    refineLevel  = -1;    // RefineMesh resolution-level; -1 = unknown (no GSD)
+	float  extent       = 0.f;   // cloud bounding-box max axis extent
+	float  spacing      = 0.f;   // median nearest-neighbour spacing (0 = unmeasured)
+	float  k            = 0.f;   // face-density coefficient used
+	double facesBudget  = 0.0;   // face budget used
+	// The four ceilings, as chosen (depth == min of them, clamped). Exposed so the
+	// caller can tell whether k could possibly have changed the answer: budget and
+	// texture are functions of k, data and pixels are not.
+	int    depthBudget  = 0;
+	int    depthData    = 0;
+	int    depthTexture = 0;
+	int    depthPixels  = 0;
+};
+
+// targetCell   : desired output cell size; <=0 means "best single mesh"
+// facesBudget  : max faces per mesh; <=0 falls back to OPENMVS_POISSON_FACE_BUDGET_M
+//                then the built-in default. Derive it from available RAM at the
+//                orchestrator (~40M faces per 64 GB, linear), which is also where
+//                the value is needed to size RefineMesh.
+// faceDensityK : terrain roughness coefficient; <=0 falls back to
+//                OPENMVS_POISSON_FACE_K then the built-in default.
+//                Flat ground runs ~2, mixed terrain ~3, dense vegetation/urban
+//                5-8. Calibrate per dataset by reconstructing once at depth 9 and
+//                solving k = faces * scale^2 / 4^9.
+// gsdFull      : full-resolution ground sample distance, same units as the cloud.
+//                Only used to derive refineLevel; <=0 leaves it -1 (unknown).
+// Effective face budget / roughness, resolved once from (in priority order) an
+// explicit argument, an environment override, then the built-in default. The env
+// path exists because both are per-DATASET properties: baking them into macros
+// would mean a rebuild per site, which defeats the point of an adaptive policy.
+//   OPENMVS_POISSON_FACE_BUDGET_M : max faces per mesh, in millions
+//   OPENMVS_POISSON_FACE_K        : measured face-density coefficient
+// Bytes of solve-time footprint per output face, measured on the 974 m / depth-12
+// run: during the linear solve the process held ~13.3 GB while producing 14.6M raw
+// faces, of which ~6.0 GB was the retained xyz+normals cloud -- so the octree and
+// solver accounted for ~7.3 GB, i.e. ~500 B/face. Used to turn available RAM into
+// a face budget. Log-and-compare on every run via [MESH-CALIB] so this can be
+// re-derived if it drifts.
+// MEASURED on the 974 m depth-12 run: "Finalized tree" held 10,022 MB, of which
+// 6,018 MB was the retained xyz+normals cloud -> 4.0 GB of octree for 14,502,317
+// raw faces = 276 B/face. Rounded up slightly for headroom. (An earlier value of
+// 500 was inferred from total process memory and was ~1.8x too conservative, which
+// cost a whole depth level.) Re-derive from the [MESH-CALIB] projected-vs-actual
+// line if it drifts on other terrain.
+#ifndef POISSON_BYTES_PER_FACE
+#define POISSON_BYTES_PER_FACE 290.0
+#endif
+// Bytes per point freed by releasePointCloud before the solve -- the colours,
+// per-point view lists and weights that Poisson never reads. From the
+// release-pointcloud measurement: ~51 B/point (2.6 GB of a 5.67 GB peak at 50.6M
+// points). This memory is NOT available when the budget is computed (the cloud is
+// already loaded, so the OS has it excluded from availPhys) but IS available during
+// the solve, so it must be added back or the budget under-shoots badly.
+#ifndef POISSON_CLOUD_RECLAIMABLE_BYTES_PER_POINT
+#define POISSON_CLOUD_RECLAIMABLE_BYTES_PER_POINT 51.0
+#endif
+// Total resident bytes per point of the FULLY loaded dense cloud: the 24 B of
+// xyz+normals we keep plus the ~51 B of colours/views/weights released before the
+// solve. This is what sets the process peak before the octree exists (measured:
+// 262,967,556 points -> 22.23 GB observed peak, ~85 B/point including allocator
+// slack), and it is used as a floor on the face budget so the chosen depth does not
+// vary with unrelated memory pressure on the machine.
+#ifndef POISSON_CLOUD_LOADED_BYTES_PER_POINT
+#define POISSON_CLOUD_LOADED_BYTES_PER_POINT 85.0
+#endif
+// Fraction of AVAILABLE physical memory the mesh stage may plan to occupy. The
+// remainder absorbs allocator slack, the trim/cull kd-tree, and the OS.
+#ifndef POISSON_MEMORY_FRACTION
+#define POISSON_MEMORY_FRACTION 0.70
+#endif
+
+static double PoissonFaceBudget(double override_, size_t numPoints)
+{
+	static const double env = []() -> double {
+		const char* v = std::getenv("OPENMVS_POISSON_FACE_BUDGET_M");
+		return v ? std::atof(v) * 1.0e6 : 0.0;
+	}();
+	if (override_ > 0.0) return override_;
+	if (env > 0.0)       return env;
+
+	// Derive from what the machine actually has, so the same build produces a
+	// coarser mesh on a 16 GB laptop and a finer one on a 64 GB workstation with no
+	// operator input. Falls back to a fixed budget if the query is unavailable.
+	double availBytes = 0.0;
+#ifdef _WIN32
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+	if (GlobalMemoryStatusEx(&ms))
+		availBytes = (double)ms.ullAvailPhys;
+#endif
+	if (!(availBytes > 0.0))
+		return 40.0e6;
+	// The cloud is resident when this runs, so availPhys already excludes all of it.
+	// Add back the part releasePointCloud frees before the solve, and subtract only
+	// the xyz+normals that stay resident throughout it.
+	const double reclaimable = (double)numPoints * POISSON_CLOUD_RECLAIMABLE_BYTES_PER_POINT;
+	const double retained    = (double)numPoints * 6.0 * sizeof(float);
+	double usable = (availBytes + reclaimable) * POISSON_MEMORY_FRACTION - retained;
+
+	// Floor: loading the dense cloud has ALREADY set the process peak (~75 B/point
+	// with all its streams). An octree that stays under that peak therefore costs
+	// nothing extra -- measured, a depth-13 solve reached 20.57 GB inside a
+	// cloud-driven peak of 22.23 GB, so it was free. Without this floor the chosen
+	// depth swings with whatever else happens to be running on the machine, which
+	// makes the output resolution non-reproducible for the same dataset.
+	const double alreadyPaid = (double)numPoints * POISSON_CLOUD_LOADED_BYTES_PER_POINT - retained;
+	if (alreadyPaid > usable)
+		usable = alreadyPaid;
+
+	const double faces  = usable / POISSON_BYTES_PER_FACE;
+	// Clamp: below the floor the mesh is useless, above the ceiling the downstream
+	// RefineMesh/TextureMesh stages become the real constraint anyway.
+	return std::min(std::max(faces, 2.0e6), 400.0e6);
+}
+static float PoissonFaceDensityK(float override_)
+{
+	static const float env = []() -> float {
+		const char* v = std::getenv("OPENMVS_POISSON_FACE_K");
+		return v ? (float)std::atof(v) : 0.f;
+	}();
+	if (override_ > 0.f) return override_;
+	if (env > 0.f)       return env;
+	// Conservative: a HIGH k selects a SHALLOWER depth and fewer faces, so an
+	// uncalibrated run under-delivers resolution rather than exhausting memory.
+	// Measured values run far lower than this on aerial terrain (~1.05 on a
+	// 974 m site); every run now reports its own k -- see the [MESH-CALIB] line.
+	return 3.0f;
+}
+/*----------------------------------------------------------------*/
+
+// Finest RefineMesh resolution level whose view planes fit the memory we may use.
+//
+// Depends only on view pixel count and free RAM -- NOT on the mesh -- which is exactly
+// what lets the depth policy consult it BEFORE any mesh exists, and so decide how much
+// subdivision headroom to leave RefineMesh.
+// freedBeforeStage: bytes this process still holds that will be gone before the stage
+// in question runs. RefineMesh and TextureMesh are SEPARATE PROCESSES launched after
+// this one exits, so the entire dense cloud counts -- querying availPhys with 22 GB of
+// cloud resident understates their budget by exactly that, which measured as a whole
+// depth level lost on a 1940-view scene (texture ceiling 11 instead of 12).
+static int RefineFinestAffordableLevel(const ImageArr& images, size_t freedBeforeStage,
+	size_t& outViews, double& outTotalPixels, double& outAllowBytes)
+{
+	outViews = 0;
+	outTotalPixels = 0.0;
+	for (size_t i = 0; i < (size_t)images.GetSize(); ++i) {
+		const Image& img = images[(IIndex)i];
+		if (!img.IsValid())
+			continue;
+		outTotalPixels += (double)img.width * (double)img.height;
+		++outViews;
+	}
+	double availBytes = 0.0;
+#ifdef _WIN32
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+	if (GlobalMemoryStatusEx(&ms))
+		availBytes = (double)ms.ullAvailPhys;
+#endif
+	outAllowBytes = ((availBytes > 0.0 ? availBytes : 32.0e9) + (double)freedBeforeStage)
+		* POISSON_MEMORY_FRACTION;
+	if (outViews == 0 || outTotalPixels <= 0.0)
+		return 0;
+	int lvl = 0;
+	while (lvl < 6 &&
+		outTotalPixels * POISSON_REFINE_BYTES_PER_PIXEL / std::pow(4.0, (double)lvl) > outAllowBytes)
+		++lvl;
+	return lvl;
+}
+/*----------------------------------------------------------------*/
+
+// Face budget imposed by TEXTURING, which is the tightest stage in the chain.
+//
+// TextureMesh holds ~132 observations per face on a 1940-view scene (measured:
+// 975,795,624 obs over 7,388,176 faces) across two structures at 44 B/obs --
+// perViewOut 24 B plus facesDatas 20 B -- so ~5.8 KB per FACE, roughly 21x the
+// Poisson solve's ~272 B/face. Observations per face scale with VIEW COUNT, not with
+// face count (a face is seen by however many cameras cover it, and subdividing it
+// does not change that), so the coefficient is per-view.
+//
+// NOT a function of atlas size: atlas demand is surfaceArea/GSD^2 and is invariant to
+// face count -- halving the faces doubles each face's texel footprint. The atlas caps
+// texture RESOLUTION, not geometry. Only per-patch seam padding gives face count any
+// atlas cost at all, and that is a ~1.3-2x effect, not an ordering constraint.
+//
+// NON-STATIC: both the depth policy below (to avoid solving far finer than the output
+// can carry) and ReconstructMesh.cpp (to set its decimation target) need this number,
+// and they must not disagree.
+// freedBeforeStage: see RefineFinestAffordableLevel. TextureMesh is a separate process
+// launched after this one exits, so anything this process still holds is available to
+// it and must be added back before sizing its budget.
+double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
+{
+	constexpr double kObsPerFacePerView = 132.0 / 1940.0; // measured
+	constexpr double kBytesPerObs       = 44.0;           // 24 B + 20 B
+	constexpr double kMemFraction       = 0.75;           // OS + atlas headroom
+	if (nViews == 0)
+		return 0.0;
+	double availBytes = 0.0;
+#ifdef _WIN32
+	MEMORYSTATUSEX ms; ms.dwLength = sizeof(ms);
+	if (GlobalMemoryStatusEx(&ms))
+		availBytes = (double)ms.ullAvailPhys;
+#endif
+	if (!(availBytes > 0.0))
+		return 0.0; // unknown: caller falls back to no cap
+	const double obsPerFace = kObsPerFacePerView * (double)nViews;
+	double budget = ((availBytes + (double)freedBeforeStage) * kMemFraction)
+		/ (obsPerFace * kBytesPerObs);
+	if (budget < 500000.0)    budget = 500000.0;
+	if (budget > 200000000.0) budget = 200000000.0;
+	return budget;
+}
+/*----------------------------------------------------------------*/
+
+// Face budget imposed by the TEXTURE ATLAS, independent of RAM.
+//
+// A face that occupies only a handful of atlas texels carries no texture detail -- it is
+// a flat-shaded triangle with a geometry cost. So the atlas bounds how many faces are
+// worth building:
+//
+//     faces <= atlasTexels / texelsPerFace
+//
+// SURFACE AREA CANCELS. Texel size is sqrt(surfaceArea / atlasTexels), and the texels a
+// face covers is faceArea / texel^2 = faceArea * atlasTexels / surfaceArea -- so for a
+// mesh of N roughly-equal faces the texels per face is just atlasTexels / N. The bound is
+// therefore a pure function of the hardware, valid at any scene scale, which is what lets
+// it generalize: detect a 32k atlas and every stage upstream is allowed to be finer.
+//
+// This is the constraint the earlier "NOT a function of atlas size" note on
+// ComputeTextureFaceBudget missed. That note is correct that atlas CONTENT demand is
+// surfaceArea/GSD^2 and invariant to face count -- but total demand is content plus
+// per-patch padding, and padding is not small: MEASURED on a 276 m / 368-view scene,
+// 5x the faces cost 1.75x the atlas demand (demand ~ faces^0.35). Halving the faces on an
+// atlas-limited scene buys roughly 10% finer texture.
+//
+// MEASURED at 16384^2 on the 1940-view aerial site: 4.1M faces allowed against a 2.6M
+// mesh, so it does not bind there -- correct, since that scene's texel budget is spent on
+// area, not on face count. It binds on scenes that are small in extent but heavily
+// subdivided, which is exactly where over-solving is wasted work.
+#ifndef POISSON_ATLAS_MAX_DIM
+#define POISSON_ATLAS_MAX_DIM 16384   // GL_MAX_TEXTURE_SIZE on current mainstream GPUs
+#endif
+// Usable fraction of the atlas: must match TEXTURE_ATLAS_FIT_MARGIN in SceneTexture.cpp,
+// which is the fraction AdaptiveFitPatches actually fills (measured: realized area lands
+// on 100% of that budget).
+#ifndef POISSON_ATLAS_USABLE_FRACTION
+#define POISSON_ATLAS_USABLE_FRACTION 0.97
+#endif
+// Minimum atlas texels per face, i.e. an 8x8 texel patch. Below this a face cannot show
+// texture detail and the geometry is decoration the render cannot display.
+#ifndef POISSON_ATLAS_TEXELS_PER_FACE
+#define POISSON_ATLAS_TEXELS_PER_FACE 64.0
+#endif
+double ComputeAtlasFaceBudget(int atlasMaxDim)
+{
+	static const double envDim = []() -> double {
+		const char* v = std::getenv("OPENMVS_ATLAS_MAX_DIM");
+		return v ? std::atof(v) : 0.0;
+	}();
+	double dim = (atlasMaxDim > 0) ? (double)atlasMaxDim
+		: (envDim > 0.0 ? envDim : (double)POISSON_ATLAS_MAX_DIM);
+	if (!(dim > 0.0))
+		return 0.0; // unknown: caller falls back to no cap
+	const double texels = dim * dim * POISSON_ATLAS_USABLE_FRACTION;
+	return texels / POISSON_ATLAS_TEXELS_PER_FACE;
+}
+/*----------------------------------------------------------------*/
+
+static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
+	float scaleFactor = 1.1f, float targetCell = 0.f,
+	double facesBudget = 0.0, float faceDensityK = 0.f, float gsdFull = 0.f,
+	int minDepth = 8, int maxDepth = 14,
+	float knownExtent = 0.f, float knownSpacing = 0.f,
+	double textureFaceCap = 0.0,
+	double refineHeadroom = POISSON_REFINE_HEADROOM)
+{
+	// RefineMesh subdivides any face projecting larger than --max-face-area (32 px
+	// by default), so its working GSD must be ~1/sqrt(32) of the cell for
+	// refinement to add detail rather than idle. 8 is sqrt(32) rounded up.
+	constexpr float kRefinePixelsPerCell = 8.f;
+
+	MeshPolicy pol;
+	pol.k           = PoissonFaceDensityK(faceDensityK);
+	pol.facesBudget = PoissonFaceBudget(facesBudget, numPoints);
+
+	// Budget-limited depth. Independent of the cloud, so it is also the answer for
+	// every degenerate-input path below.
+	//
+	// FLOOR, not round: faces scale 4x per level, so rounding up can overshoot the
+	// budget by nearly 2x (12.73 -> 13 turned a 40M budget into 58M on the 974 m
+	// site). The budget is a ceiling, so truncate and let the operator raise the
+	// budget if they want the extra level.
+	const double sc2 = (double)scaleFactor * (double)scaleFactor;
+	const int depthBudget = (int)std::floor(
+		0.5 * std::log2(sc2 * pol.facesBudget / (double)pol.k));
+
+	// Third ceiling: the OUTPUT face count, which texturing bounds. Solving far finer
+	// than the deliverable can carry is pure waste -- and worse than waste, because the
+	// surplus has to be decimated away and heavy decimation erodes exactly the features
+	// the fine solve captured. MEASURED: 53.5M raw faces decimated 10.3x to 5.2M took
+	// 9m38s and visibly rounded edges, where 14.5M decimated 2.8x to the same 5.2M took
+	// 2m40s and did not. So allow only a modest oversolve above the cap -- enough for
+	// adaptive decimation to redistribute detail, not enough to erode it.
+	const int depthTexture = (textureFaceCap > 0.0)
+		? (int)std::floor(0.5 * std::log2(
+			sc2 * textureFaceCap * POISSON_TEXTURE_OVERSOLVE / (double)pol.k))
+		: maxDepth;
+
+	// Fourth ceiling, and in practice the binding one: keep the cell large enough that
+	// faces project to enough pixels for reliable per-face view selection, with one
+	// level of subdivision headroom for RefineMesh. See POISSON_REFINE_HEADROOM.
+	// Needs the extent, so it is resolved inside finish() below where that is known.
+	const double minCellForTexture = (gsdFull > 0.f)
+		? refineHeadroom * POISSON_REFINE_SUBDIV_FACTOR * (double)gsdFull
+		: 0.0;
+
+	// Degenerate inputs: no spacing to measure, so no data-limited ceiling. Fall
+	// back to the budget alone rather than the old midpoint guess, which ignored
+	// both the data and the memory envelope.
+	const auto finish = [&](int depthData) {
+		int chosen = (depthData > 0) ? std::min(depthBudget, depthData) : depthBudget;
+		chosen = std::min(chosen, depthTexture);
+		// Deepest depth whose cell is still >= minCellForTexture.
+		int depthPixels = maxDepth;
+		if (minCellForTexture > 0.0 && pol.extent > 0.f) {
+			depthPixels = (int)std::floor(
+				std::log2((double)scaleFactor * (double)pol.extent / minCellForTexture));
+			chosen = std::min(chosen, depthPixels);
+		}
+		pol.depth        = std::clamp(chosen, minDepth, maxDepth);
+		pol.depthBudget  = depthBudget;
+		// Normalized to maxDepth when unmeasurable (degenerate cloud, no GSD) so that
+		// callers can take a plain min of the four without re-testing for "not set".
+		pol.depthData    = (depthData > 0) ? depthData : maxDepth;
+		pol.depthTexture = depthTexture;
+		pol.depthPixels  = depthPixels;
+		pol.cellSingle = (pol.extent > 0.f)
+			? scaleFactor * pol.extent / (float)(1u << pol.depth) : 0.f;
+		// Never target finer than the cloud actually resolves.
+		float desired = (targetCell > 0.f) ? targetCell : pol.cellSingle;
+		if (pol.spacing > 0.f && desired < pol.spacing)
+			desired = pol.spacing;
+		pol.tilesPerAxis = (desired > 0.f && pol.cellSingle > desired)
+			? (int)std::ceil(pol.cellSingle / desired) : 1;
+		if (pol.tilesPerAxis < 1) pol.tilesPerAxis = 1;
+		pol.cell = (pol.extent > 0.f)
+			? scaleFactor * (pol.extent / (float)pol.tilesPerAxis) / (float)(1u << pol.depth)
+			: 0.f;
+		if (gsdFull > 0.f && pol.cell > 0.f)
+			pol.refineLevel = std::clamp((int)std::lround(
+				std::log2(pol.cell / (kRefinePixelsPerCell * gsdFull))), 0, 4);
+
+		VERBOSE("[MESH-POLICY] ext=%.4g spacing=%.4g k=%.2f budget=%.1fM faces",
+			pol.extent, pol.spacing, pol.k, pol.facesBudget * 1e-6);
+		VERBOSE("[MESH-POLICY] depth: budget=%d data=%d texture=%d pixels=%d -> %d%s"
+			" | cell_single=%.4g target=%.4g tiles=%dx%d cell=%.4g | refineLevel=%d",
+			depthBudget, depthData, depthTexture, depthPixels, pol.depth,
+			(pol.depth != chosen) ? " (CLAMPED)" : "",
+			pol.cellSingle, desired, pol.tilesPerAxis, pol.tilesPerAxis, pol.cell,
+			pol.refineLevel);
+		if (pol.tilesPerAxis > 1)
+			VERBOSE("[MESH-POLICY] cell %.4g needs %dx%d tiled meshing; an untiled run"
+				" delivers %.4g instead", desired, pol.tilesPerAxis, pol.tilesPerAxis,
+				pol.cellSingle);
+		return pol;
+	};
+
+	// Caller already measured the cloud (e.g. re-deciding after a calibration probe)
+	// -- skip the bbox pass and the kd-tree, which is the expensive half.
+	if (knownExtent > 0.f && knownSpacing > 0.f) {
+		pol.extent = knownExtent;
+		pol.spacing = knownSpacing;
+		return finish((int)std::lround(std::log2((scaleFactor * knownExtent) / knownSpacing)));
+	}
+
 	if (numPoints < 100)
-		return (minDepth + maxDepth) / 2;
+		return finish(0);
 	const Point3f* __restrict pts = reinterpret_cast<const Point3f*>(ptsRaw);
 
 	// 1) axis-aligned bounding box -> largest axis extent. Serial single pass.
@@ -3454,8 +4220,247 @@ static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
 		if (p.z < minz) minz = p.z;  if (p.z > maxz) maxz = p.z;
 	}
 	const float ext = std::max(std::max(maxx - minx, maxy - miny), maxz - minz);
+	pol.extent = ext;
 	if (!(ext > 0.f))
-		return (minDepth + maxDepth) / 2;
+		return finish(0);
+
+	// ROBUST EXTENT CHECK -- the raw min/max above is set by the single most distant
+	// point on each axis, so a handful of far outliers (dense-matching flyers over
+	// water, sky blobs) inflate it. That is not cosmetic: PoissonRecon sizes its octree
+	// cube from the SAME bounding box, so
+	//     cell = scale * extent / 2^depth
+	// means every cell is coarser by exactly the inflation factor, at every depth. The
+	// mesh is blurred and the solve wastes resolution on empty space, and the balloon
+	// has further to travel before the trimmer stops it.
+	//
+	// Compare against a percentile extent measured on a stride-sampled subset. Report
+	// only -- the fix is to REMOVE the outliers so Poisson's own bbox shrinks too;
+	// shrinking this number alone would make the policy disagree with the solver and
+	// produce cells of a size nobody asked for.
+	{
+		const size_t kExtSamples = std::min<size_t>(numPoints, 200000);
+		const size_t extStride = std::max<size_t>(1, numPoints / kExtSamples);
+		std::vector<float> ax, ay, az;
+		ax.reserve(numPoints / extStride + 1);
+		ay.reserve(numPoints / extStride + 1);
+		az.reserve(numPoints / extStride + 1);
+		for (size_t i = 0; i < numPoints; i += extStride) {
+			ax.push_back(pts[i].x); ay.push_back(pts[i].y); az.push_back(pts[i].z);
+		}
+		const auto span = [](std::vector<float>& v, double lo, double hi) -> float {
+			if (v.size() < 10) return 0.f;
+			const size_t iLo = (size_t)(lo * (double)(v.size() - 1));
+			const size_t iHi = (size_t)(hi * (double)(v.size() - 1));
+			std::nth_element(v.begin(), v.begin() + iLo, v.end());
+			const float a = v[iLo];
+			std::nth_element(v.begin(), v.begin() + iHi, v.end());
+			return v[iHi] - a;
+		};
+		const float rx = span(ax, 0.002, 0.998);
+		const float ry = span(ay, 0.002, 0.998);
+		const float rz = span(az, 0.002, 0.998);
+		const float robust = std::max(std::max(rx, ry), rz);
+		if (robust > 0.f) {
+			const double inflation = (double)ext / (double)robust;
+			VERBOSE("[MESH-EXTENT] raw bbox %.4g vs 0.2-99.8 percentile %.4g"
+				" -> inflation x%.2f | per-axis raw %.4g/%.4g/%.4g robust %.4g/%.4g/%.4g%s",
+				ext, robust, inflation,
+				maxx - minx, maxy - miny, maxz - minz, rx, ry, rz,
+				(inflation > 1.15)
+					? "  <-- OUTLIERS ARE INFLATING THE OCTREE CUBE; every cell is this"
+					  " much coarser than the data warrants"
+					: "");
+
+			// The octree is a CUBE sized by the LARGEST axis, so if that axis is the
+			// vertical one on an aerial survey, cell size is being set by something that
+			// is probably not terrain. MEASURED on a 227-view site: raw z 1251 against
+			// x 829 / y 582, i.e. the cube -- and therefore every cell -- is ~1.5x larger
+			// than the horizontal footprint warrants, with most of the octree volume
+			// empty air.
+			//
+			// A percentile cut is not enough to decide what to do: the same 0.2/99.8 trim
+			// left z at 1070, so this is not a handful of flyers. Print the full ladder so
+			// the SHAPE is visible -- a tight core with long thin tails (outliers, cuttable
+			// at the gap) reads completely differently from a broad spread (real relief, or
+			// a systematically bad reconstruction, neither of which a cut would fix).
+			const auto pctOf = [](std::vector<float>& v, double p) -> float {
+				if (v.empty()) return 0.f;
+				const size_t i = (size_t)(p * (double)(v.size() - 1));
+				std::nth_element(v.begin(), v.begin() + i, v.end());
+				return v[i];
+			};
+			const int domAxis = (rz >= rx && rz >= ry) ? 2 : ((rx >= ry) ? 0 : 1);
+			std::vector<float>& dom = (domAxis == 2) ? az : ((domAxis == 0) ? ax : ay);
+
+			// IS THE CLOUD A SLAB, AND IN WHICH ORIENTATION?
+			//
+			// The axis-aligned extents cannot answer this. Terrain is a thin sheet, so its
+			// point cloud must be slab-shaped in SOME frame -- but if that frame is rotated
+			// relative to the coordinate axes, the sheet's thickness projects onto all
+			// three axes and every one of them reads large. MEASURED on this scene:
+			// 829/582/1251 with a smooth z distribution (IQR 383) is exactly that pattern,
+			// and it is indistinguishable from "the cloud is genuinely volumetric, i.e.
+			// mostly garbage" without looking at the principal axes.
+			//
+			// Principal extents settle it in one pass:
+			//   thin 3rd extent  -> a slab lying oblique to the axes. The cloud is fine,
+			//                       the bbox is honest, and there is nothing to reclaim --
+			//                       note an oblique slab actually gives a SMALLER cube than
+			//                       an aligned one (a length-L object along (1,1,1) spans
+			//                       only L/sqrt(3) per axis), so re-orienting would HURT.
+			//   all three large  -> the cloud really is volumetric and the problem is
+			//                       upstream in densification, not in meshing.
+			{
+				const size_t n = ax.size();
+				if (n > 100) {
+					double mx = 0, my = 0, mz = 0;
+					for (size_t i = 0; i < n; ++i) { mx += ax[i]; my += ay[i]; mz += az[i]; }
+					mx /= (double)n; my /= (double)n; mz /= (double)n;
+					double cxx=0, cxy=0, cxz=0, cyy=0, cyz=0, czz=0;
+					for (size_t i = 0; i < n; ++i) {
+						const double dx = ax[i]-mx, dy = ay[i]-my, dz = az[i]-mz;
+						cxx+=dx*dx; cxy+=dx*dy; cxz+=dx*dz; cyy+=dy*dy; cyz+=dy*dz; czz+=dz*dz;
+					}
+					// Self-contained cyclic Jacobi for a symmetric 3x3 -- deliberately no
+					// Eigen here: this file does not include <Eigen/Eigenvalues> and pulling
+					// a header in for one diagnostic is not worth a build break.
+					double A[3][3] = { {cxx/(double)n, cxy/(double)n, cxz/(double)n},
+					                   {cxy/(double)n, cyy/(double)n, cyz/(double)n},
+					                   {cxz/(double)n, cyz/(double)n, czz/(double)n} };
+					double V[3][3] = { {1,0,0}, {0,1,0}, {0,0,1} };
+					for (int sweep = 0; sweep < 24; ++sweep) {
+						double off = 0.0;
+						for (int p = 0; p < 3; ++p) for (int q = p+1; q < 3; ++q) off += A[p][q]*A[p][q];
+						if (off < 1e-24) break;
+						for (int p = 0; p < 3; ++p) for (int q = p+1; q < 3; ++q) {
+							if (std::fabs(A[p][q]) < 1e-30) continue;
+							const double theta = (A[q][q]-A[p][p]) / (2.0*A[p][q]);
+							const double t = (theta >= 0.0 ? 1.0 : -1.0)
+								/ (std::fabs(theta) + std::sqrt(theta*theta + 1.0));
+							const double c = 1.0/std::sqrt(t*t+1.0), s = t*c;
+							for (int k = 0; k < 3; ++k) {
+								const double akp = A[k][p], akq = A[k][q];
+								A[k][p] = c*akp - s*akq;  A[k][q] = s*akp + c*akq;
+							}
+							for (int k = 0; k < 3; ++k) {
+								const double apk = A[p][k], aqk = A[q][k];
+								A[p][k] = c*apk - s*aqk;  A[q][k] = s*apk + c*aqk;
+								const double vkp = V[k][p], vkq = V[k][q];
+								V[k][p] = c*vkp - s*vkq;  V[k][q] = s*vkp + c*vkq;
+							}
+						}
+					}
+					// Order eigenvector columns by eigenvalue (A[i][i]) descending.
+					int ord[3] = { 0, 1, 2 };
+					for (int i = 0; i < 3; ++i) for (int j = i+1; j < 3; ++j)
+						if (A[ord[j]][ord[j]] > A[ord[i]][ord[i]]) std::swap(ord[i], ord[j]);
+					double pmin[3] = { 1e300, 1e300, 1e300 }, pmax[3] = { -1e300, -1e300, -1e300 };
+					for (size_t i = 0; i < n; ++i) {
+						const double dx = ax[i]-mx, dy = ay[i]-my, dz = az[i]-mz;
+						for (int a = 0; a < 3; ++a) {
+							const int c = ord[a];
+							const double t = dx*V[0][c] + dy*V[1][c] + dz*V[2][c];
+							if (t < pmin[a]) pmin[a] = t;
+							if (t > pmax[a]) pmax[a] = t;
+						}
+					}
+					// a=0 is the largest-variance direction, a=2 the smallest (the normal).
+					const double e2 = pmax[0]-pmin[0], e1 = pmax[1]-pmin[1], e0 = pmax[2]-pmin[2];
+					const int cn = ord[2];
+					// ROD vs SLAB vs VOLUMETRIC, and the distinction is NOT cosmetic: it
+					// decides whether re-orienting the cloud would shrink the octree cube
+					// or grow it.
+					//   ROD  (middle extent << longest): behaves like a line segment. A
+					//        length-L rod along (1,1,1) spans only L/sqrt(3) per axis, so an
+					//        OBLIQUE orientation gives the SMALLER cube. Aligning it makes
+					//        the cube the full rod length -- worse. Nothing to reclaim.
+					//   SLAB (middle extent ~ longest, thin third): rotation GROWS the
+					//        axis-aligned box, so ALIGNING minimizes the cube. Worth doing.
+					//   VOLUMETRIC: not a surface in any orientation -- the problem is
+					//        upstream in densification, not in the mesh policy.
+					// Testing thinnest-vs-longest alone cannot tell a rod from a slab, and
+					// an earlier revision of this line reported a 1490/284/177 corridor
+					// (clearly a rod at 5.2:1 middle-to-longest) as a SLAB.
+					const bool isRod  = (e1 * 3.0 < e2);
+					const bool isSlab = !isRod && (e0 * 5.0 < e1);
+					VERBOSE("[MESH-EXTENT] principal extents %.4g / %.4g / %.4g"
+						" (thinnest axis dir %.3f,%.3f,%.3f)"
+						" | mid:long 1:%.1f thin:long 1:%.1f -- %s",
+						e2, e1, e0, V[0][cn], V[1][cn], V[2][cn],
+						(e1 > 1e-9) ? e2/e1 : 0.0, (e0 > 1e-9) ? e2/e0 : 0.0,
+						isRod
+							? "ROD/CORRIDOR: elongated, so the OBLIQUE orientation already"
+							  " gives the smallest cube -- aligning it would make the cube the"
+							  " full corridor length. Nothing to reclaim by re-orienting;"
+							  " tiling ALONG the corridor is what would buy finer cells"
+						: isSlab
+							? "SLAB: a sheet oblique to the axes. Rotation GROWS an"
+							  " axis-aligned box for a slab, so aligning the cloud WOULD"
+							  " shrink the cube -- worth measuring"
+							: "VOLUMETRIC: not a surface in any orientation. The problem is"
+							  " upstream in densification, not in the mesh policy");
+				}
+			}
+
+			// DENSEST CONTIGUOUS BAND. This is both the measurement and the basis of the
+			// fix, so it is computed rather than eyeballed off the ladder.
+			//
+			// On a gravity-aligned aerial survey the terrain is a THIN slab in z, while
+			// bad depth estimates smear points along camera rays over hundreds of metres.
+			// That smear is CONTINUOUS, so neither a percentile (it survived 0.2/99.8 with
+			// z still at 1070) nor a gap test (there is no void to find) separates it. What
+			// does separate it is density: the terrain band holds almost every point in a
+			// small fraction of the range, and the smear holds almost none over the rest.
+			//
+			// Slide a window over a histogram and report the NARROWEST band containing
+			// kBandFrac of the points. Self-limiting by construction -- if the data really
+			// does span the full range, the band is the full range and there is nothing to
+			// cut, so this cannot damage a scene that does not have the problem.
+			{
+				constexpr int   kBins     = 2048;
+				constexpr double kBandFrac = 0.995;
+				const float lo = pctOf(dom, 0.0), hi = pctOf(dom, 1.0);
+				if (hi > lo && dom.size() > 1000) {
+					std::vector<uint32_t> hist(kBins, 0);
+					const double invW = (double)kBins / ((double)hi - (double)lo);
+					for (float v : dom) {
+						int b = (int)(((double)v - (double)lo) * invW);
+						if (b < 0) b = 0; else if (b >= kBins) b = kBins - 1;
+						++hist[(size_t)b];
+					}
+					const uint64_t need = (uint64_t)(kBandFrac * (double)dom.size());
+					int bestLo = 0, bestHi = kBins - 1;
+					uint64_t acc = 0;
+					int l = 0;
+					for (int r = 0; r < kBins; ++r) {
+						acc += hist[(size_t)r];
+						while (acc - hist[(size_t)l] >= need) { acc -= hist[(size_t)l]; ++l; }
+						if (acc >= need && (r - l) < (bestHi - bestLo)) { bestLo = l; bestHi = r; }
+					}
+					const double binW = ((double)hi - (double)lo) / (double)kBins;
+					const double bandLo = (double)lo + bestLo * binW;
+					const double bandHi = (double)lo + (bestHi + 1) * binW;
+					const double bandSpan = bandHi - bandLo;
+					const double rawSpan = (double)hi - (double)lo;
+					VERBOSE("[MESH-EXTENT] densest band holding %.3f of points on axis %c:"
+						" [%.6g .. %.6g] span %.4g of raw %.4g -> cube could shrink x%.2f"
+						" (cell and every downstream size improve by the same factor)",
+						kBandFrac, (domAxis == 0) ? 'x' : ((domAxis == 1) ? 'y' : 'z'),
+						bandLo, bandHi, bandSpan, rawSpan,
+						(bandSpan > 0.0) ? rawSpan / bandSpan : 1.0);
+				}
+			}
+			VERBOSE("[MESH-EXTENT] dominant axis %c ladder:"
+				" p0=%.4g p1=%.4g p5=%.4g p25=%.4g p50=%.4g p75=%.4g p95=%.4g p99=%.4g p100=%.4g"
+				" | core p5-p95 spans %.4g of the raw %.4g",
+				(domAxis == 0) ? 'x' : ((domAxis == 1) ? 'y' : 'z'),
+				pctOf(dom, 0.0), pctOf(dom, 0.01), pctOf(dom, 0.05), pctOf(dom, 0.25),
+				pctOf(dom, 0.50), pctOf(dom, 0.75), pctOf(dom, 0.95), pctOf(dom, 0.99),
+				pctOf(dom, 1.0),
+				pctOf(dom, 0.95) - pctOf(dom, 0.05),
+				(domAxis == 0) ? (maxx - minx) : ((domAxis == 1) ? (maxy - miny) : (maxz - minz)));
+		}
+	}
 
 	// 2) median nearest-neighbour spacing on a deterministic stride-sampled subset,
 	// each queried against the FULL cloud (so the spacing is the true local one).
@@ -3480,27 +4485,37 @@ static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
 		uint32_t idx[2]; float d2[2];
 		const size_t found = index.knnSearch((const float*)&pts[i], 2, idx, d2);
 		if (found >= 2 && d2[1] > 0.f)
-			pSp[q] = std::sqrt(d2[1]); // d2[0] is the query point itself
+			pSp[q] = FastSqrtS(d2[1]); // d2[0] is the query point itself
 	}
 	std::vector<float> valid;
 	valid.reserve(nq);
 	for (size_t q = 0; q < nq; ++q)
 		if (pSp[q] > 0.f) valid.push_back(pSp[q]);
 	if (valid.empty())
-		return (minDepth + maxDepth) / 2;
+		return finish(0);
 	std::nth_element(valid.begin(), valid.begin() + valid.size() / 2, valid.end());
 	const float s = valid[valid.size() / 2];
 	if (!(s > 0.f))
-		return (minDepth + maxDepth) / 2;
+		return finish(0);
+	pol.spacing = s;
 
-	// 3) depth whose finest voxel matches the median spacing, clamped.
-	int depth = (int)std::lround(std::log2((scaleFactor * ext) / s));
-	if (depth < minDepth) depth = minDepth;
-	if (depth > maxDepth) depth = maxDepth;
-	VERBOSE("Poisson: cloud extent %.4g, median point spacing %.4g -> auto depth %d",
-		ext, s, depth);
-	return depth;
-} // EstimatePoissonDepth
+	// Data-limited ceiling: the depth whose finest cell matches the measured point
+	// spacing. finish() takes min(this, budget-limited).
+	const int depthData = (int)std::lround(std::log2((scaleFactor * ext) / s));
+	return finish(depthData);
+} // ComputeMeshPolicy
+/*----------------------------------------------------------------*/
+
+// Back-compatible thin wrapper: the depth alone, with default budget/roughness.
+// Prefer ComputeMeshPolicy() at call sites that can also consume cell/tiles/
+// refineLevel -- those are what let RefineMesh and TextureMesh agree with the mesh
+// instead of each picking its own resolution.
+static int EstimatePoissonDepth(const float* ptsRaw, size_t numPoints,
+	float scaleFactor = 1.1f, int minDepth = 8, int maxDepth = 14)
+{
+	return ComputeMeshPolicy(ptsRaw, numPoints, scaleFactor,
+		0.f, 0.0, 0.f, 0.f, minDepth, maxDepth).depth;
+}
 /*----------------------------------------------------------------*/
 
 // Tier 2 Poisson surface reconstruction via Kazhdan's PoissonRecon +
@@ -3627,11 +4642,358 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		}
 	}
 
-	// auto-select the octree depth from the cloud's actual point spacing when the
-	// caller passes depth <= 0 -- let the data, not a fixed guess, set the detail.
-	// Uses the already-filtered poissonPts (all finite, no NaN in kd-tree).
-	if (depth <= 0)
-		depth = EstimatePoissonDepth(poissonPts, poissonCount);
+	// auto-select the mesh resolution policy when the caller passes depth <= 0 --
+	// let the data, not a fixed guess, set the detail. Uses the already-filtered
+	// poissonPts (all finite, no NaN in kd-tree).
+	//
+	// Only `depth` is consumed here. The policy also derives the cell size, whether
+	// the requested cell needs tiled meshing, and the RefineMesh resolution-level
+	// that MATCHES this mesh -- refining a 26 cm surface against full-resolution
+	// imagery streams tens of GB to adjust geometry that cannot represent it. Those
+	// are logged for the orchestrator to pick up until the later stages read them
+	// directly; see the [MESH-POLICY] lines.
+	// meshCell is also needed by the input subsample below, so it is resolved on
+	// both paths -- via the policy when auto-selecting, or from a cheap bounding-box
+	// pass (no kd-tree) when the caller pinned the depth.
+	float meshCell = 0.f;
+	// Probe's predicted k, kept so the post-solve check can score the PROBE rather than
+	// re-deriving a depth under a single ceiling that may not have been the binding one.
+	double probeK = 0.0;
+	if (depth <= 0) {
+		const float gsd = EstimateSceneGSD(images, poissonPts, poissonCount);
+		if (!(gsd > 0.f))
+			VERBOSE("[MESH-POLICY] warning: could not measure GSD (no valid poses?);"
+				" refineLevel will be reported as unknown");
+		// Views and RefineMesh affordability, both needed BEFORE the depth is chosen.
+		// The whole loaded cloud is released before RefineMesh/TextureMesh run (they are
+		// separate processes), so add it back when sizing their budgets.
+		const size_t cloudBytesFreed =
+			(size_t)((double)poissonCount * POISSON_CLOUD_LOADED_BYTES_PER_POINT);
+		size_t nViewsValid = 0;
+		double totalViewPixels = 0.0, refineAllowBytes = 0.0;
+		const int lvlAfford = RefineFinestAffordableLevel(
+			images, cloudBytesFreed, nViewsValid, totalViewPixels, refineAllowBytes);
+		// TextureMesh is bounded by two independent resources, and either can be the
+		// tighter one: RAM (scales with VIEW COUNT -- observations per face) and the
+		// atlas (scales with nothing -- a pure hardware ceiling). A 109-view scene on a
+		// big box is atlas-bound; a 1940-view scene is RAM-bound. Take the min so the
+		// same build is correct on both without knowing which it is.
+		const double texCapMem   = ComputeTextureFaceBudget(nViewsValid, cloudBytesFreed);
+		const double texCapAtlas = ComputeAtlasFaceBudget(0);
+		// REPORT-ONLY here, deliberately. The atlas cap is a face count, and turning a
+		// face count into a DEPTH goes through k -- which is the least reliable number in
+		// this file. MEASURED: applying it to depthTexture drops the 1251 m / 227-view
+		// scene from depth 12 to 11 (cell 0.336 -> 0.672 m), purely because its k is
+		// estimated at 2.118 against a true 0.474. The cap itself is right (that scene's
+		// final mesh is 2.66M against a 4.07M atlas budget, comfortably inside); the k it
+		// would be divided by is not.
+		//
+		// So the atlas bound is enforced where the face count is known EXACTLY and no k
+		// is involved -- the decimation cap in ReconstructMesh.cpp, which sees the solved
+		// mesh. Same ceiling, applied where it cannot be corrupted by an estimate.
+		// Revisit binding it here once k prediction is trustworthy.
+		const double texCap = texCapMem;
+		VERBOSE("[MESH-ATLAS] texture face cap: memory %.1fM (%u views) vs atlas %.1fM"
+			" (%d px, %.0f texels/face) -> %s-bound at decimation"
+			" | depth ceiling uses memory only (k too noisy to divide by)",
+			texCapMem * 1e-6, (unsigned)nViewsValid, texCapAtlas * 1e-6,
+			(int)POISSON_ATLAS_MAX_DIM, (double)POISSON_ATLAS_TEXELS_PER_FACE,
+			(texCapAtlas < texCapMem) ? "ATLAS" : "RAM");
+
+		// How much subdivision headroom to leave RefineMesh.
+		//
+		// The two stages can both produce detail, but not equally well: RefineMesh
+		// splits only faces whose PROJECTED area exceeds the threshold, so it adds
+		// geometry where the imagery supports it, while Poisson at a finer depth adds it
+		// everywhere -- including where there is nothing but noise. At equal face counts
+		// adaptive wins.
+		//
+		// MEASURED on a 276 m / 368-view scene: depth 10 + heavy RefineMesh subdivision
+		// and depth 11 + almost none produced visually indistinguishable results, but the
+		// depth-11 route cost 5x the faces, pushed atlas padding from ~1.3x to ~1.75x
+		// (158 -> 277 Mpx against ~223 Mpx capacity, i.e. from fitting to downscaling),
+		// and took 5 minutes longer. So hand the work to RefineMesh whenever it will run.
+		//
+		// The test is non-circular because affordability does not depend on the mesh. At
+		// headroom H the cell is ~H x the reliability floor, so the signal reaches level
+		// log2(H); with H = 4 that is level 2. If the finest affordable level is within
+		// that, RefineMesh will have both signal and memory at the coarse depth.
+		const double refineHeadroom = (lvlAfford <= 2)
+			? POISSON_REFINE_HEADROOM_ADAPTIVE   // RefineMesh will run: build coarse
+			: POISSON_REFINE_HEADROOM;           // it cannot: Poisson must do the work
+
+		MeshPolicy pol = ComputeMeshPolicy(poissonPts, poissonCount,
+			1.1f,   // scale: must match PoissonReconLib's octree cube scale
+			0.f,    // targetCell: 0 = best cell reachable in one untiled mesh
+			0.0,    // facesBudget: 0 = auto from available RAM
+			0.f,    // faceDensityK: 0 = auto (probe below), else default
+			gsd, 8, 14, 0.f, 0.f,
+			texCap, refineHeadroom);
+
+		// CALIBRATION PROBE. The face-density coefficient k (terrain roughness) is a
+		// per-dataset property and CANNOT be derived from the cloud: median nearest-
+		// neighbour spacing under-predicts true surface area by a dataset-dependent
+		// factor, because multi-view fusion leaves near-coincident points (measured
+		// 3.4x low on a 974 m aerial site). So measure it: reconstruct once at a
+		// coarse depth, read k off the face count, then re-decide.
+		//
+		//     faces = k * (2^depth / scale)^2   =>   k = faces * scale^2 / 4^depth
+		//
+		// Probe depth is target-2 rather than something fixed, to keep the
+		// extrapolation short. MEASURED direction of the drift: k comes out HIGHER at
+		// coarse depth (1.575 at depth 9 vs a true 1.046 at depth 12 on the 974 m
+		// site), because a coarse octree's face count is inflated by bounding-box and
+		// boundary structure relative to (2^depth/scale)^2. That over-prediction
+		// selects a SHALLOWER depth, so the error is in the safe direction -- but it
+		// does cost resolution, which is why the offset is kept small. The re-decide
+		// reuses the already-measured extent/spacing, so it costs no second kd-tree.
+#if POISSON_CALIBRATION_PROBE
+		// Below this the probe costs more than the information is worth, and a
+		// shallow scene's k is dominated by the bounding box rather than terrain.
+		constexpr int kProbeFloor = 9;
+
+		// SECOND gate: can a better k change the answer at all?
+		//
+		// depth = min(budget, data, texture, pixels), and only budget and texture are
+		// functions of k. The default k is deliberately HIGH (see PoissonFaceDensityK),
+		// so measuring it almost always LOWERS k, which RAISES those two ceilings. If
+		// they are already at or above the k-independent pair, raising them further
+		// cannot move the minimum -- the probe is pure cost.
+		//
+		// Strictly-less, so a TIE skips: a tie means the k-independent ceiling already
+		// caps the depth, and raising a co-binding ceiling changes nothing.
+		//
+		// MEASURED, 3 for 3 -- the probe changed no depth and cost 15-60 s each time:
+		//   aerial 1940 views  budget=12 data=15 texture=12 pixels=12  (12 vs 12, tie)
+		//   1251 m 227 views   budget=12 data=13 texture=12 pixels=12  (12 vs 12, tie)
+		//   ...and on the second the probe was wrong by +347%, printing a MISPREDICTED
+		//   warning about a number that could not have mattered.
+		//
+		// Residual risk: if the true k is HIGHER than the default, these ceilings drop
+		// instead of rise and could become binding unnoticed. Bounded and small -- the
+		// measured range across every dataset is 0.47 to 3.7 against a 3.0 default, so
+		// the worst case is 23% more faces than budgeted at the chosen depth, well
+		// inside POISSON_MEMORY_FRACTION. Dropping a whole depth level would take a 4x
+		// error in k, which has never been observed.
+		const int kDepDepth   = std::min(pol.depthBudget, pol.depthTexture);
+		const int kIndepDepth = std::min(pol.depthData,   pol.depthPixels);
+		const bool kCanBind   = kDepDepth < kIndepDepth;
+		if (!kCanBind)
+			VERBOSE("[MESH-CALIB] probe skipped: depth is set by the %s ceiling (%d),"
+				" which does not depend on k (budget=%d texture=%d)",
+				(pol.depthPixels <= pol.depthData) ? "pixel" : "data",
+				kIndepDepth, pol.depthBudget, pol.depthTexture);
+
+		if (kCanBind && pol.depth > kProbeFloor) {
+			const int probeDepth = std::max(kProbeFloor, pol.depth - 2);
+			PoissonReconLib::Mesh probe;
+			PoissonReconLib::ReconParams rp;
+			rp.depth          = probeDepth;
+			rp.samplesPerNode = samplesPerNode;
+			rp.pointWeight    = pointWeight;
+			rp.density        = false;   // not needed; skips a pass
+			rp.verbose        = false;
+			VERBOSE("[MESH-CALIB] probing at depth %d to measure k...", probeDepth);
+			if (PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp, probe)
+				&& probe.TriangleCount() > 0)
+			{
+				const double sc2   = 1.1 * 1.1;
+				const double kRaw  = (double)probe.TriangleCount() * sc2
+					/ std::pow(4.0, (double)probeDepth);
+				double kMeas = kRaw;
+
+				// SLOPE PROBE -- measurement only, does NOT change kMeas.
+				//
+				// POISSON_K_DEPTH_DECAY is one constant calibrated on one site, and the
+				// required value spans 7x across datasets: 0.10/level on the dense 974 m
+				// aerial set (263M points), 0.75/level on the sparse 1251 m Marco Ulises
+				// set (3.09M points), where the probe overshot by +347%. The obvious fix
+				// -- probe twice and use the measured slope -- is NOT safe as written,
+				// which is why this only reports:
+				//
+				//   lambda is not constant WITHIN a dataset either; it falls with depth.
+				//   From the four measurements above: 9->10 gives 0.200, 10->12 gives
+				//   0.105, 12->13 gives 0.081. Two SHALLOW probes therefore measure the
+				//   STEEPEST slope and over-decay when extrapolated forward. On the aerial
+				//   set that predicts k=1.055 against a true ~1.161 (-9.2%), versus the
+				//   current constant's +11.1% -- same magnitude, but flipped to the UNSAFE
+				//   direction, since under-predicting k allows a DEEPER solve than the
+				//   budget intended.
+				//
+				// So measure lambda across datasets first and decide with data. The second
+				// probe is one level shallower, hence ~1/4 the cost of the first (~+25% on
+				// probe time, measured ~5 s on a 21 s aerial probe).
+				//
+				// What to look for: if lambda_measured tracks the value that would have
+				// predicted the true k (reported by the [MESH-CALIB] solve line), the slope
+				// is usable. If it consistently over-decays on dense scenes, the mechanism
+				// is depth-dependent and needs a convex model (3 probes) or a
+				// points-per-cell predictor -- lambda correlates with octree occupancy:
+				// ~1214 points/cell on the aerial (lambda 0.12) vs ~3.6 on Marco (0.85).
+#if POISSON_K_SLOPE_PROBE
+				if (probeDepth - 1 >= 6) {
+					PoissonReconLib::Mesh probe2;
+					PoissonReconLib::ReconParams rp2 = rp;
+					rp2.depth = probeDepth - 1;
+					if (PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp2, probe2)
+						&& probe2.TriangleCount() > 0)
+					{
+						const double kRaw2 = (double)probe2.TriangleCount() * sc2
+							/ std::pow(4.0, (double)rp2.depth);
+						if (kRaw2 > 0.0 && kRaw > 0.0) {
+							const double lambda = std::log(kRaw2 / kRaw); // per level, d-1 -> d
+							const int off = pol.depth - probeDepth;
+							VERBOSE("[MESH-SLOPE] k(%d)=%.3f k(%d)=%.3f -> lambda=%.3f/level"
+								" (assumed %.3f) | at depth %d predicts %.3f vs assumed-constant %.3f"
+								" | %.0f points/cell at probe depth | MEASUREMENT ONLY",
+								rp2.depth, kRaw2, probeDepth, kRaw, lambda,
+								(double)POISSON_K_DEPTH_DECAY, pol.depth,
+								kRaw * std::exp(-lambda * (double)off),
+								kRaw * std::exp(-POISSON_K_DEPTH_DECAY * (double)off),
+								(double)poissonCount * sc2 / std::pow(4.0, (double)probeDepth));
+						}
+					} else {
+						VERBOSE("[MESH-SLOPE] second probe failed; no slope measured");
+					}
+				}
+#endif
+				// Correct for k's drift with depth. MEASURED on the 974 m site:
+				//   depth  9 -> 1.575
+				//   depth 10 -> 1.289
+				//   depth 12 -> 1.046
+				//   depth 13 -> 0.965
+				// i.e. ln(k) falls by ~0.1 per level over the useful range, because a
+				// coarse octree's face count carries proportionally more bounding-box
+				// and boundary structure. Extrapolating the probe forward turns a 23-33%
+				// over-prediction into ~1%: 1.289 * exp(-0.2) = 1.056 vs a true 1.046.
+				// Without this the probe reliably costs a whole depth level.
+				const int probeOffset = pol.depth - probeDepth;
+				if (POISSON_K_DEPTH_DECAY > 0.0 && probeOffset > 0)
+					kMeas *= std::exp(-POISSON_K_DEPTH_DECAY * (double)probeOffset);
+				if (kMeas > 0.0) {
+					probeK = kMeas;
+					const MeshPolicy pol2 = ComputeMeshPolicy(poissonPts, poissonCount,
+						1.1f, 0.f, 0.0, (float)kMeas, gsd, 8, 14,
+						pol.extent, pol.spacing,    // reuse measurements
+						texCap, refineHeadroom);
+					VERBOSE("[MESH-CALIB] probe faces=%u -> k=%.3f (assumed %.3f);"
+						" depth %d -> %d, cell %.4g -> %.4g",
+						(unsigned)probe.TriangleCount(), kMeas, pol.k,
+						pol.depth, pol2.depth, pol.cell, pol2.cell);
+					pol = pol2;
+				}
+			} else {
+				VERBOSE("[MESH-CALIB] probe failed; keeping the assumed k");
+			}
+		}
+#endif
+		// Is RefineMesh worth running on the mesh we are about to build?
+		//
+		// It only adds GEOMETRY where --max-face-area triggers subdivision, i.e.
+		// where its subdivision floor falls below the mesh cell:
+		//     floor(level) = sqrt(maxFaceArea) * GSD * 2^level
+		// Below that threshold it merely nudges vertex positions -- a small gain for
+		// a large bill. Meanwhile its cost is driven by VIEW COUNT, not face count:
+		// every iteration streams nViews * imagePixels * bytes/px / 4^level.
+		//
+		// So the decision is whether the deepest level that still subdivides is also
+		// affordable. NOT whether the depth is some particular number -- depth is
+		// scene-relative, and the same depth means millimetre cells on an object scan
+		// and decimetre cells on an aerial site.
+		bool refineRun = false;
+		if (gsd > 0.f && pol.cell > 0.f && !images.IsEmpty()) {
+			const double totalPixels = totalViewPixels;
+			const size_t nValid = nViewsValid;
+			if (nValid > 0 && totalPixels > 0.0) {
+				// Coarsest level whose working GSD is still FINER than the mesh cell,
+				// i.e. the level beyond which there is no sub-face image detail left to
+				// refine against.
+				//
+				// NOTE this was originally the level at which --max-face-area triggers
+				// SUBDIVISION, which was too strict: RefineMesh's main job is
+				// photoconsistency-driven vertex refinement -- flattening noise on
+				// planar surfaces and sharpening real edges -- and that works whether or
+				// not any face gets split. Keying on subdivision skipped the stage on a
+				// 109-view scene where it cost ~10 GB and would have fixed exactly the
+				// lumpy-road / melted-edge artefacts it was meant to prevent.
+				// The floor is sqrt(--max-face-area) pixels per face, not 1: vertex
+				// refinement needs texture INSIDE a face to align against, and it is
+				// refining against the very images that produced the depth maps Poisson
+				// already fitted. MEASURED, both datasets sit below it -- 3.7 px/face on
+				// the 109-view residential scene, 2.3 px at the affordable level on the
+				// 1940-view aerial one -- so both correctly SKIP. An earlier revision
+				// used a 1-pixel floor and turned those into runs that could not have
+				// helped. Coarse mesh + fine imagery (tens of px/face) is the regime this
+				// stage exists for.
+				const int lvlSignal = (int)std::floor(
+					std::log2((double)pol.cell / (POISSON_REFINE_SUBDIV_FACTOR * (double)gsd)));
+				// Affordability was already resolved above (it does not depend on the
+				// mesh) and fed into the headroom choice.
+				const double allow = refineAllowBytes;
+				refineRun = (lvlAfford <= lvlSignal);
+				// Run at the level that MATCHES the mesh, not the finest affordable one.
+				// "Finest affordable" cost 4 minutes on a 368-view scene for no visible
+				// change: level 1 instead of the cell-matched level 2 quadruples the view
+				// data for detail the mesh cannot express. Raise to lvlAfford only when
+				// memory forces it coarser.
+				if (refineRun) {
+					const int lvlMatched = (int)std::lround(
+						std::log2((double)pol.cell / (8.0 * (double)gsd)));
+					pol.refineLevel = std::clamp(std::max(lvlMatched, lvlAfford), 0, 4);
+				}
+				const double bytesAtAfford =
+					totalPixels * POISSON_REFINE_BYTES_PER_PIXEL / std::pow(4.0, (double)lvlAfford);
+				// MPix/view is printed because it is NOT redundant with the scene-load
+				// banner: that banner reports whatever resolution the dense scene stored,
+				// while RefineMesh reloads from the ORIGINAL files. A 16x gap between the
+				// two (densify --resolution-level 2, i.e. Image::scale 1/4) is invisible
+				// otherwise, and it moves lvlAfford by two whole levels.
+				VERBOSE("[MESH-REFINE] cell=%.4g gsd=%.4g views=%u @ %.2f MPix headroom=%.1f"
+					" | signal down to level %d | finest affordable level %d"
+					" (%.1f GB of %.1f GB allowed) => %s at level %d",
+					pol.cell, gsd, (unsigned)nValid,
+					totalPixels / (1.0e6 * (double)nValid), refineHeadroom, lvlSignal,
+					lvlAfford, bytesAtAfford * 1e-9, allow * 1e-9,
+					refineRun ? "RUN RefineMesh" : "SKIP RefineMesh (affordable level has no signal)",
+					pol.refineLevel);
+			}
+		}
+
+		// MACHINE-READABLE PLAN -- the hand-off across the process boundary. This tool
+		// decides the detail settings from the data; the stages after it (RefineMesh,
+		// TextureMesh) need those decisions, and they run as separate processes.
+		//
+		// Written to a FILE rather than left in the log: the log's name, location and
+		// verbosity all depend on how we were invoked, so parsing it is fragile. The
+		// working folder is passed explicitly by the caller (--working-folder), so
+		// MAKE_PATH gives a path both sides can compute without agreeing on anything
+		// else. Keep the key names and ordering stable.
+		//
+		// Single file per working folder: with scene clustering (several bins meshed
+		// into one folder) the last bin's plan wins. The values are dataset-level
+		// properties, so that is acceptable -- but it is why the consumer should read
+		// it once after the reconstruct loop rather than per bin.
+		{
+			char planLine[512];
+			snprintf(planLine, sizeof(planLine),
+				"[MESH-PLAN] depth=%d cell=%.6g tiles=%d gsd=%.6g refine=%s"
+				" refine_level=%d texture_level=0\n",
+				pol.depth, (double)pol.cell, pol.tilesPerAxis, (double)gsd,
+				refineRun ? "RUN" : "SKIP", pol.refineLevel);
+			VERBOSE("%s", planLine);
+			const String planPath(MAKE_PATH("mesh_plan.txt"));
+			std::ofstream planOut(planPath.c_str(), std::ios::out | std::ios::trunc);
+			if (planOut)
+				planOut << planLine;
+			else
+				VERBOSE("warning: could not write the mesh plan to %s", planPath.c_str());
+		}
+
+		depth    = pol.depth;
+		meshCell = pol.cell;
+	} else {
+		meshCell = PoissonCellSizeAtDepth(poissonPts, poissonCount, 1.1f, depth);
+	}
 
 	// Compact to xyz+normals only, then release the full cloud before the solve
 	// (see releasePointCloud in the header comment above). Done AFTER
@@ -3656,6 +5018,41 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			(unsigned)poissonCount, (unsigned)((poissonCount * 6 * sizeof(float)) >> 20));
 	}
 
+	// Voxel-subsample the SOLVE INPUT only. The full poissonPts/poissonNrm stay
+	// intact for the adaptive-trim and cull paths below, whose accuracy depends on
+	// querying every real sample -- this trims only what PoissonRecon would merge
+	// away itself. Voxel is derived from meshCell, so it scales with the dataset.
+	std::vector<float> subPts, subNrm;
+	const float* reconPts   = poissonPts;
+	const float* reconNrm   = poissonNrm;
+	size_t       reconCount = poissonCount;
+	if (POISSON_INPUT_SUBSAMPLE &&
+		meshCell > 0.f && poissonCount >= (size_t)POISSON_INPUT_SUBSAMPLE_MIN_POINTS) {
+		const float voxel = meshCell / (float)(1u << POISSON_INPUT_SUBSAMPLE_SHIFT);
+		const size_t kept = VoxelSubsampleOrientedPoints(
+			poissonPts, poissonNrm, poissonCount, voxel, subPts, subNrm);
+		// Require a real reduction AND a sane floor. A cloud that is not spatially
+		// sorted keeps almost everything (see the function comment); in that case
+		// discard the copy and solve on the full cloud rather than pay for both.
+		if (kept >= (size_t)POISSON_INPUT_SUBSAMPLE_FLOOR &&
+			kept <= poissonCount - poissonCount / 4)
+		{
+			reconPts = subPts.data(); reconNrm = subNrm.data(); reconCount = kept;
+			VERBOSE("Poisson: solve input subsampled at voxel %.4g (cell/%u):"
+				" %u -> %u points (%.1fx), %u MB",
+				voxel, 1u << POISSON_INPUT_SUBSAMPLE_SHIFT,
+				(unsigned)poissonCount, (unsigned)kept,
+				(double)poissonCount / (double)std::max<size_t>(kept, 1),
+				(unsigned)((kept * 6 * sizeof(float)) >> 20));
+		} else {
+			subPts.clear(); subPts.shrink_to_fit();
+			subNrm.clear(); subNrm.shrink_to_fit();
+			VERBOSE("Poisson: solve-input subsample rejected (kept %u of %u);"
+				" cloud may not be spatially sorted -- using the full cloud",
+				(unsigned)kept, (unsigned)poissonCount);
+		}
+	}
+
 	// 1) In-process screened-Poisson reconstruction (replaces PoissonRecon.exe),
 	// with per-vertex density so the trimmer can threshold by it.
 	PoissonReconLib::Mesh pmesh;
@@ -3667,9 +5064,49 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		rp.density        = true;
 		rp.verbose        = true;
 		VERBOSE("Poisson: running PoissonRecon (depth=%d)...", depth);
-		if (!PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp, pmesh) || pmesh.TriangleCount() == 0) {
+		if (!PoissonReconLib::Reconstruct(reconPts, reconNrm, reconCount, rp, pmesh) || pmesh.TriangleCount() == 0) {
 			VERBOSE("error: Poisson reconstruction failed");
 			return false;
+		}
+	}
+	// The solve is done; the subsample is dead weight during trim/cull.
+	subPts.clear(); subPts.shrink_to_fit();
+	subNrm.clear(); subNrm.shrink_to_fit();
+
+	// Self-calibration. k is a per-dataset property (terrain roughness) and cannot
+	// be derived from the cloud -- median NN spacing under-predicts true surface
+	// area by a dataset-dependent factor, because multi-view fusion leaves
+	// near-coincident points. But it falls straight out of the RAW (pre-trim) face
+	// count of the solve we just ran:
+	//     faces = k * (2^depth / scale)^2   =>   k = faces * scale^2 / 4^depth
+	// Report it, and the depth it would have selected, so the next run on this site
+	// is calibrated instead of guessed. Pass it back via OPENMVS_POISSON_FACE_K.
+	{
+		const double sc2  = 1.1 * 1.1;
+		const double kMeas = (double)pmesh.TriangleCount() * sc2 / std::pow(4.0, (double)depth);
+		if (kMeas > 0.0) {
+			// Score the PROBE against the truth, not two depths derived under different
+			// ceilings. The earlier version recomputed a depth from the budget ceiling
+			// alone and flagged any disagreement -- but the budget is frequently NOT the
+			// binding ceiling (pixels and texture usually bind first), so it reported
+			// "PROBE MISPREDICTED" on runs where the probe was accurate to 2.5%. A
+			// diagnostic that cries wolf is worse than none: the depth-10 clamp survived
+			// for months behind exactly that kind of noise.
+			//
+			// A whole depth level is 4x in faces, hence 4x in k, so only a large relative
+			// error can move the chosen depth. Flag on that, not on incidental drift.
+			if (probeK > 0.0) {
+				const double errPct = (probeK - kMeas) / kMeas * 100.0;
+				VERBOSE("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f;"
+					" probe predicted %.3f (%+.1f%%)%s",
+					(unsigned)pmesh.TriangleCount(), depth, kMeas, probeK, errPct,
+					(std::fabs(errPct) > POISSON_PROBE_ERROR_WARN_PCT)
+						? " -- PROBE MISPREDICTED" : "");
+			} else {
+				VERBOSE("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f"
+					" (no probe ran; set OPENMVS_POISSON_FACE_K=%.3f to use it)",
+					(unsigned)pmesh.TriangleCount(), depth, kMeas, kMeas);
+			}
 		}
 	}
 
@@ -3792,11 +5229,28 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				if (cy < 0) cy = 0; else if (cy >= gh) cy = gh - 1;
 			};
 			const size_t nCells = (size_t)gw * gh;
-			std::vector<uint8_t> occ(nCells, 0);
+			// Occupancy requires a MINIMUM POINT COUNT per cell, not merely one point.
+			//
+			// This is the difference between a footprint meaning "anywhere there is data"
+			// and one meaning "the well-surveyed area". Binary occupancy marks a cell
+			// occupied for a single stray sample, so the footprint swallows exactly the
+			// sparse extrapolated fringe this pass exists to cut, and the computed
+			// perimeter ends up tracing the OUTSIDE of the lobes. MEASURED on the
+			// 115-view OKState corridor: the lobes sit on real (spurious) dense-matching
+			// points -- which is also why POISSON_DISTANCE_CULL found nothing and why
+			// SurfaceTrimmer's density trim cannot reach them. Any criterion of the form
+			// "is there data here" answers yes. A criterion of the form "is there ENOUGH
+			// data here" is what separates surveyed ground from extrapolation.
+			std::vector<uint32_t> cnt(nCells, 0);
 			for (size_t i = 0; i < poissonCount; ++i) {
 				int cx, cy; cellOf(cloud[i].x, cloud[i].y, cx, cy);
-				occ[(size_t)cy * gw + cx] = 1;
+				++cnt[(size_t)cy * gw + cx];
 			}
+			std::vector<uint8_t> occ(nCells, 0);
+			size_t nOcc = 0;
+			for (size_t k = 0; k < nCells; ++k)
+				if (cnt[k] >= (uint32_t)POISSON_TRIM_MIN_PTS_PER_CELL) { occ[k] = 1; ++nOcc; }
+			std::vector<uint32_t>().swap(cnt);
 			// dilate to bridge thin shoreline gaps
 			std::vector<uint8_t> occD = occ;
 			const int dr = POISSON_TRIM_CLOSE_CELLS;
@@ -3852,6 +5306,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// per-vertex local threshold (e=0 deep interior -> e=1 at perimeter)
 			const Mesh::Vertex* __restrict pVtx = mesh.vertices.GetData();
 			std::vector<float> vTrim(numV);
+			std::vector<uint8_t> vOut(numV, 0); // 1 = this vertex's XY cell is OUTSIDE the footprint
 #ifdef _USE_OPENMP
 			#pragma omp parallel for schedule(static)
 #endif
@@ -3860,18 +5315,72 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				const float dcell = dist[(size_t)cy * gw + cx];
 				float e = 1.f - dcell / ramp; if (e < 0.f) e = 0.f; else if (e > 1.f) e = 1.f;
 				vTrim[v] = trimInterior + e * (trimEdge - trimInterior);
+				vOut[v] = (dcell <= 0.f) ? 1 : 0; // exterior cells were seeded to 0
+			}
+
+			// DENSITY DISTRIBUTION -- so the interior/edge pair can be set FROM THE DATA
+			// instead of guessed. MEASURED: at depth 11 interior=1/edge=4 removed 816 of
+			// 3,672,117 faces (fraction 0.000, i.e. inert) while at depth 10 interior=2/edge=8
+			// removed 4.2% and at depth 12 the same pair removed 0.8%. The Poisson density scale
+			// is NOT portable across octree depths, so a threshold carried over from another
+			// depth is silently a no-op -- which is invisible without this line.
+			//
+			// Read it as: to cut roughly the top X% of low-density surface, set the EDGE
+			// threshold near pX. The interior should sit near p1-p5 so the well-surveyed middle
+			// keeps its coverage.
+			{
+				std::vector<float> ds;
+				const size_t dstride = std::max<size_t>(1, (size_t)numV / 200000);
+				ds.reserve((size_t)numV / dstride + 1);
+				for (Mesh::VIndex v = 0; v < numV; v += (Mesh::VIndex)dstride)
+					ds.push_back(pv[(size_t)v * 4 + 3]);
+				if (!ds.empty()) {
+					std::sort(ds.begin(), ds.end());
+					const auto pct = [&](double q) {
+						const size_t k = (size_t)(q * (double)(ds.size() - 1) + 0.5);
+						return (double)ds[k];
+					};
+					VERBOSE("Poisson: vertex density percentiles (n=%zu of %u sampled):"
+						" p1=%.3g p5=%.3g p25=%.3g p50=%.3g p75=%.3g p95=%.3g p99=%.3g max=%.3g"
+						" | current interior=%.2f edge=%.2f -- set these from THIS distribution,"
+						" they do not transfer across depths",
+						ds.size(), (unsigned)numV,
+						pct(0.01), pct(0.05), pct(0.25), pct(0.50), pct(0.75),
+						pct(0.95), pct(0.99), (double)ds.back(),
+						trimInterior, trimEdge);
+				}
 			}
 
 			// cull faces: keep iff avg density >= avg local threshold
 			const Mesh::FIndex numF = mesh.faces.GetSize();
 			std::vector<uint8_t> keepV(numV, 0);
 			Mesh::FaceArr newFaces; newFaces.Reserve(numF);
-			size_t culled = 0;
+			size_t culled = 0, culledOutside = 0;
 			FOREACH(f, mesh.faces) {
 				const Mesh::Face& face = mesh.faces[f];
 				const float dAvg = (pv[(size_t)face[0] * 4 + 3] + pv[(size_t)face[1] * 4 + 3] +
 				                    pv[(size_t)face[2] * 4 + 3]) * (1.f / 3.f);
 				const float tAvg = (vTrim[face[0]] + vTrim[face[1]] + vTrim[face[2]]) * (1.f / 3.f);
+				// HARD FOOTPRINT CUT: a face whose ALL THREE vertices sit in cells OUTSIDE the
+				// surveyed footprint is extrapolation into space the survey never covered, and it
+				// goes regardless of density.
+				//
+				// This is the region decision the threshold machinery was standing in for and
+				// failing to make. Poisson density is not comparable across octree depths -- the
+				// same interior/edge pair removed 4.2% at depth 10, 0.8% at 12 and 0.02% at 11 --
+				// so a value fitted at one depth is silently inert at another. The FOOTPRINT has
+				// no such problem: it is a point-count occupancy grid (measured at 26% of the bbox
+				// at >=20 pts/cell on this data) and it is depth-independent.
+				//
+				// Conservative by construction: the footprint is already dilated by
+				// POISSON_TRIM_CLOSE_CELLS (2 cells ~ 3 units here) so it reaches BEYOND the data,
+				// and requiring all three vertices outside keeps every face that straddles the
+				// boundary -- so the cut lands just outside real surface rather than into it.
+				// Set POISSON_TRIM_HARD_OUTSIDE to 0 to disable.
+				if (POISSON_TRIM_HARD_OUTSIDE &&
+					vOut[face[0]] && vOut[face[1]] && vOut[face[2]]) {
+					++culledOutside; ++culled; continue;
+				}
 				if (dAvg < tAvg) { ++culled; continue; }
 				keepV[face[0]] = keepV[face[1]] = keepV[face[2]] = 1;
 				newFaces.Insert(face);
@@ -3895,8 +5404,17 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				mesh.vertices.Swap(nvarr);
 				mesh.faces.Swap(newFaces);
 			}
-			VERBOSE("Poisson: adaptive footprint trim removed %u faces (interior=%.2f edge=%.2f, ramp=%d, grid %dx%d cell=%.4g) [%s]",
-				(unsigned)culled, trimInterior, trimEdge, POISSON_TRIM_RAMP_CELLS, gw, gh, cellSz, TD_TIMER_GET_FMT().c_str());
+			VERBOSE("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f)"
+				" | interior=%.2f edge=%.2f ramp=%d cells (%.4g units)"
+				" | grid %dx%d cell=%.4g, %zu of %zu cells occupied (fraction %.3f)"
+				" at >=%d pts/cell | outside-footprint cut %zu faces [%s]",
+				(unsigned)culled, (unsigned)numF,
+				numF ? (double)culled / (double)numF : 0.0,
+				trimInterior, trimEdge, POISSON_TRIM_RAMP_CELLS,
+				(double)(POISSON_TRIM_RAMP_CELLS * cellSz),
+				gw, gh, cellSz, nOcc, nCells,
+				nCells ? (double)nOcc / (double)nCells : 0.0,
+				(int)POISSON_TRIM_MIN_PTS_PER_CELL, culledOutside, TD_TIMER_GET_FMT().c_str());
 		}
 	}
 #endif // POISSON_ADAPTIVE_TRIM
@@ -4018,23 +5536,88 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			std::nth_element(validSp.begin(), validSp.begin() + validSp.size() / 2, validSp.end());
 			const float medianSpacing = validSp[validSp.size() / 2];
 			const float factor = float(POISSON_CULL_FACTOR_X100) / 100.0f;
-			const float thr = factor * medianSpacing;
-			const float thrSq = thr * thr;
+			const float globalThr = factor * medianSpacing;
 
-			// Per-vertex: nearest-input-point distance > threshold?
+			// LOCALLY ADAPTIVE threshold -- the "local-density-adaptive replacement"
+			// the macro comment above demands before this cull can be switched on.
+			//
+			// The global version compares every vertex against a threshold derived from
+			// the median (i.e. DENSEST-region) NN spacing. Point density varies by orders
+			// of magnitude across a scene -- obliquely-viewed walls, distant ground,
+			// canopy fringe -- so real surface in a sparse region sits many global-medians
+			// from its nearest sample and is culled along with the invented skirts.
+			// MEASURED: ~13.5% of faces removed at 3.5x, most of them good geometry. That
+			// is the "trimming makes datasets less complete" failure, and it is a property
+			// of the THRESHOLD, not of the criterion.
+			//
+			// Fix: measure the spacing where the vertex actually is. For points spread on
+			// a 2D surface the distance to the K-th nearest neighbour grows as
+			// s_local * sqrt(K), so s_local ~= d_K / sqrt(K) is a local density estimate
+			// that costs one wider kd-tree query and no extra passes.
+			//
+			//   dense, well-sampled surface : d_1 ~ 0                -> keep
+			//   sparse but REAL surface     : d_1 ~ s_local (large)  -> keep
+			//   invented skirt / balloon    : d_1 >> s_local         -> cull
+			//
+			// Scale-invariant per region, which is exactly what a global threshold cannot
+			// be. The global threshold is retained as a FLOOR so that a pathologically
+			// tight local cluster cannot produce a threshold near zero and cull surface
+			// sitting a few millimetres off its own samples.
+			constexpr uint32_t kLocalK = 8;
+			// Never let the adaptive threshold fall below this fraction of the global one.
+			const float thrFloor = 0.5f * globalThr;
+
 			const Mesh::VIndex numV = mesh.vertices.GetSize();
 			std::vector<uint8_t> farV(numV);
+			std::vector<float> ratioV(numV, 0.f);   // d1/s_local, for the diagnostic below
 			const Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
 			uint8_t* __restrict pFar = farV.data();
+			float* __restrict pRatio = ratioV.data();
 #ifdef _USE_OPENMP
 			#pragma omp parallel for schedule(static)
 #endif
 			for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v) {
 				const Mesh::Vertex& X = pV[v];
 				const float qp[3] = { X.x, X.y, X.z };
-				uint32_t nIdx; float nD2;
-				const size_t found = index.knnSearch(qp, 1, &nIdx, &nD2);
-				pFar[v] = (found >= 1 && nD2 > thrSq) ? 1 : 0;
+				uint32_t nIdx[kLocalK]; float nD2[kLocalK];
+				const size_t found = index.knnSearch(qp, kLocalK, nIdx, nD2);
+				if (found < 1) { pFar[v] = 0; continue; }   // no data at all: keep
+				const float d1 = std::sqrt(nD2[0]);
+				// d_K over however many were actually returned.
+				const float dK = std::sqrt(nD2[found - 1]);
+				const float sLocal = dK / std::sqrt((float)found);
+				float thr = factor * sLocal;
+				if (thr < thrFloor) thr = thrFloor;
+				pFar[v] = (d1 > thr) ? 1 : 0;
+				pRatio[v] = (sLocal > 0.f) ? (d1 / sLocal) : 0.f;
+			}
+
+			// Is there anything separable at ANY threshold? The cull firing zero times
+			// says nothing sits past 3.5x local spacing, but not whether a lower cutoff
+			// would find a real population of detached surface or would just start eating
+			// into the body of the distribution.
+			//
+			// A distance cull can only work if d1/s_local is BIMODAL -- a bulk near zero
+			// (vertices sitting on their samples) plus a separated tail (invented surface).
+			// If the high percentiles sit just above the bulk with no gap, there is no
+			// detached geometry to find and NO threshold works: every setting trades real
+			// surface for invented surface at roughly one-for-one. That is the difference
+			// between "tune the factor" and "abandon this approach", and it cannot be read
+			// off a single pass/fail count.
+			{
+				std::vector<float> r(pRatio, pRatio + numV);
+				const auto pct = [&r](double p) -> float {
+					if (r.empty()) return 0.f;
+					size_t i = (size_t)(p * (double)(r.size() - 1));
+					std::nth_element(r.begin(), r.begin() + i, r.end());
+					return r[i];
+				};
+				const float p50 = pct(0.50), p90 = pct(0.90), p99 = pct(0.99);
+				const float p999 = pct(0.999), pMax = pct(1.0);
+				VERBOSE("[MESH-CULL] d1/s_local distribution over %u vertices:"
+					" p50=%.2f p90=%.2f p99=%.2f p99.9=%.2f max=%.2f (cull fires above %.2f)"
+					" -- a usable cull needs a GAP between the bulk and the tail",
+					(unsigned)numV, p50, p90, p99, p999, pMax, factor);
 			}
 
 			// Cull faces with ALL THREE vertices far; mark surviving vertices.
@@ -4050,6 +5633,34 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				}
 				keepV[face[0]] = keepV[face[1]] = keepV[face[2]] = 1;
 				newFaces.Insert(face);
+			}
+
+			// SAFETY GUARD. This cull is the one stage that can make a dataset LESS
+			// COMPLETE, and incompleteness is far worse than a little surplus geometry --
+			// a hole is a missing deliverable, extra skirt is a cosmetic defect. So bound
+			// the damage: if the threshold wants to remove an implausible share of the
+			// mesh, the threshold is wrong for this scene, not the mesh. Abandon the cull
+			// entirely and say so, rather than shipping a gutted surface.
+			//
+			// Calibrated against the failure this replaces: the GLOBAL threshold removed
+			// ~13.5% on an aerial scene, most of it good geometry. A correct adaptive
+			// threshold should be targeting the ~8% of faces no camera observes, and in
+			// practice a subset of those. Anything past this bound means the local density
+			// estimate is not working on this data.
+			const double culledFrac = mesh.faces.IsEmpty()
+				? 0.0 : (double)culled / (double)mesh.faces.GetSize();
+			bool cullAbandoned = false;
+			if (culledFrac > POISSON_CULL_MAX_FRACTION) {
+				cullAbandoned = true;
+				// No percent signs in this format -- they do not survive the log macro
+				// (see the [ATLAS-FIT] note in SceneTexture.cpp). Fractions instead.
+				VERBOSE("[MESH-CULL] distance cull wanted %u of %u faces"
+					" (fraction %.3f > cap %.3f) -- ABANDONED, keeping the full mesh."
+					" The local density estimate is not discriminating on this scene;"
+					" raise POISSON_CULL_FACTOR_X100 (now %.2fx) or set POISSON_DISTANCE_CULL 0.",
+					(unsigned)culled, (unsigned)mesh.faces.GetSize(),
+					culledFrac, (double)POISSON_CULL_MAX_FRACTION, factor);
+				culled = 0;
 			}
 
 			if (culled > 0) {
@@ -4083,12 +5694,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				const size_t keptFaces = newFaces.GetSize();
 				mesh.vertices.Swap(newVerts);
 				mesh.faces.Swap(newFaces);
-				VERBOSE("Poisson: distance cull removed %u/%u faces (thr=%.4g = %.2fx median spacing %.4g) [%s]",
+				VERBOSE("[MESH-CULL] distance cull removed %u/%u faces"
+					" (%.2fx LOCAL spacing, floor %.4g = 0.5 x %.2fx global median %.4g) [%s]",
 					(unsigned)culled, (unsigned)(culled + keptFaces),
-					thr, factor, medianSpacing, TD_TIMER_GET_FMT().c_str());
-			} else {
-				VERBOSE("Poisson: distance cull removed no faces (thr=%.4g = %.2fx median spacing %.4g)",
-					thr, factor, medianSpacing);
+					factor, 0.5f * globalThr, factor, medianSpacing,
+					TD_TIMER_GET_FMT().c_str());
+			} else if (!cullAbandoned) {
+				VERBOSE("[MESH-CULL] distance cull removed no faces"
+					" (%.2fx LOCAL spacing, global median %.4g)", factor, medianSpacing);
 			}
 		}
 	}

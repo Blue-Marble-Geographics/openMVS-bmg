@@ -492,7 +492,79 @@ int main(int argc, LPCTSTR* argv)
 			VERBOSE("Mesh trimmed to ROI: %u vertices and %u faces removed (%s)",
 				numVertices-scene.mesh.vertices.size(), numFaces-scene.mesh.faces.size(), TD_TIMER_GET_FMT().c_str());
 		}
-		const float fDecimate(OPT::nTargetFaceNum ? static_cast<float>(OPT::nTargetFaceNum) / scene.mesh.faces.size() : OPT::fDecimateMesh);
+		// AUTO FACE CAP for the stages after this one.
+		//
+		// TextureMesh is by far the most memory-constrained stage in the chain. It holds
+		// ~132 observations per face on a 1940-view scene (measured: 975,795,624 obs
+		// over 7,388,176 faces) across two structures at 44 B/obs -- perViewOut at 24 B
+		// plus facesDatas at 20 B -- so roughly 5.8 KB per FACE. That is ~21x the Poisson
+		// solve's measured ~272 B/face, so a mesh that builds comfortably in 22 GB here
+		// can need hundreds of GB to texture.
+		//
+		// Observations per face scale with VIEW COUNT, not with face count: a face is
+		// seen by however many cameras happen to cover it, and making faces smaller does
+		// not reduce that. So the coefficient is per-view:
+		//     obsPerFace ~= kObsPerFacePerView * nViews
+		//
+		// This is why the cap belongs HERE rather than in the caller: a fixed 132 taken
+		// from a 1940-view aerial scene over-decimated a 109-view residential scene by
+		// 6x, visibly rounding roof ridges and kerbs. At 109 views the real budget is
+		// ~90M faces, i.e. no decimation at all.
+		//
+		// Only applied when the caller requested neither an explicit target nor a ratio.
+		// Applies whenever the caller gave no explicit --target-face-num, INCLUDING when
+		// they also gave a --decimate ratio. The two express different intents -- a
+		// deliverable-size preference versus a hard downstream memory limit -- so they
+		// must coexist rather than one disabling the other, and the more restrictive of
+		// the two wins. Previously a --decimate below 1 switched the cap off entirely,
+		// which meant a small-scene size preference silently removed the protection the
+		// large scenes depend on.
+		double capRatio = 1.0;
+		if (OPT::nTargetFaceNum == 0 && !scene.mesh.faces.empty()) {
+			size_t nViews = 0;
+			for (size_t i = 0; i < (size_t)scene.images.GetSize(); ++i)
+				if (scene.images[(IIndex)i].IsValid())
+					++nViews;
+			// Same definition the depth policy bounded itself by, so the two cannot
+			// disagree -- see ComputeTextureFaceBudget in SceneReconstruct.cpp, which is
+			// at global scope there (that file does `using namespace MVS`, it is not
+			// inside the namespace). Declared locally rather than in a header to keep the
+			// whole memory model in one translation unit.
+			extern double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage);
+			// The atlas ceiling, which the RAM one knows nothing about: a face below a
+			// few atlas texels carries no texture, so the hardware bounds how many faces
+			// are worth keeping regardless of how much memory is free. Surface area
+			// cancels out of it, so it holds at any scene scale.
+			extern double ComputeAtlasFaceBudget(int atlasMaxDim);
+			// 0: the dense cloud has already been released by this point, so availPhys
+			// here is what TextureMesh will genuinely see.
+			const double budgetMem   = ComputeTextureFaceBudget(nViews, 0);
+			const double budgetAtlas = ComputeAtlasFaceBudget(0);
+			const double budget = (budgetMem > 0.0 && budgetAtlas > 0.0)
+				? std::min(budgetMem, budgetAtlas)
+				: std::max(budgetMem, budgetAtlas);
+			if (budget > 0.0) {
+				const double nFaces = (double)scene.mesh.faces.size();
+				const char* which = (budgetAtlas < budgetMem) ? "ATLAS" : "RAM";
+				if (budget < nFaces) {
+					capRatio = budget / nFaces;
+					VERBOSE("[MESH-CAP] %u views -> texture budget %.1fM faces"
+						" (memory %.1fM, atlas %.1fM -> %s-bound);"
+						" cap ratio %.3f against %u faces",
+						(unsigned)nViews, budget * 1e-6, budgetMem * 1e-6,
+						budgetAtlas * 1e-6, which, capRatio, (unsigned)nFaces);
+				} else {
+					VERBOSE("[MESH-CAP] %u views -> texture budget %.1fM faces"
+						" (memory %.1fM, atlas %.1fM -> %s-bound);"
+						" mesh has %u -- cap not binding",
+						(unsigned)nViews, budget * 1e-6, budgetMem * 1e-6,
+						budgetAtlas * 1e-6, which, (unsigned)nFaces);
+				}
+			}
+		}
+		float fDecimate(OPT::nTargetFaceNum ? static_cast<float>(OPT::nTargetFaceNum) / scene.mesh.faces.size() : OPT::fDecimateMesh);
+		if ((float)capRatio < fDecimate)
+			fDecimate = (float)capRatio;
 		// Under --poisson, skip ONLY the graph-cut-oriented spurious (long-edge)
 		// removal -- the Poisson surface is coherently oriented, and skipping it also
 		// preserves the edge extrapolation. Hole-closing STAYS ON: SurfaceTrimmer

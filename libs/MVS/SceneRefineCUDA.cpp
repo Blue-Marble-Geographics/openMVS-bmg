@@ -2566,6 +2566,17 @@ bool MeshRefineCUDA::InitKernels(int device)
 {
 	STATIC_ASSERT(sizeof(CameraCUDA) == 176);
 
+	// This whole path is built on the pre-CUDA-12 driver API: KernelRT for the
+	// launches and TextureRT/SurfaceRT for the bindings, against hand-written
+	// .target sm_20 PTX (see g_szMeshRefineModule). CUDA 12.0 removed those
+	// entry points, so refuse up front on such a driver and let
+	// Scene::RefineMeshCUDA return false -- RefineMesh.cpp then falls through to
+	// the CPU Scene::RefineMesh, which is the supported path there anyway.
+	// Without this the sm_20 module JIT would fail a few lines below and we
+	// would reach the same place by accident rather than by design.
+	if (!SEACAVE::CUDA::HasLegacyDriverAPI())
+		return false;
+
 	// initialize CUDA device if needed
 	if (SEACAVE::CUDA::devices.IsEmpty() && SEACAVE::CUDA::initDevice(device) != CUDA_SUCCESS)
 		return false;

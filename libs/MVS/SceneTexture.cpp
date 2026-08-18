@@ -173,6 +173,158 @@ namespace { namespace texprof {
 #define TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS 40
 #endif
 
+// TEXTURE_DELETE_BOUNDARY_UNOBSERVED: delete the unobserved regions that touch the
+// mesh BORDER (the Poisson skirt over water at the survey edge) instead of
+// data-colouring them, while keeping every ENCLOSED unobserved region (textureless
+// roofs, interior water, small tears) which is what the data-colour fill is for.
+//
+// Camera visibility is the only signal that separates these two. VERIFIED on a
+// 1940-view aerial river survey: the skirt sits on real (spurious) dense-matching
+// points, so SurfaceTrimmer sees ordinary density (--poisson-trim cannot reach it
+// without eating real sparse terrain) and the distance-to-cloud cull measures
+// ordinary proximity (it removed ZERO faces). But no camera validates the skirt --
+// the geometry is in the wrong place, so the depth test fails in every view, which
+// is precisely why it lands in the no-view set rather than in a texture patch.
+//
+// Also recovers atlas budget: those faces no longer get data-colour rows appended
+// (measured 2559 rows, ~15% of a 13599-px atlas, for 212,357 unobserved faces).
+#ifndef TEXTURE_DELETE_BOUNDARY_UNOBSERVED
+#define TEXTURE_DELETE_BOUNDARY_UNOBSERVED 1
+#endif
+// How much synthetic edging to keep, as a MULTIPLE OF THE MEDIAN EDGE LENGTH measured
+// inward from the last observed surface.
+//
+// Expressed in world units (via the median edge) rather than in face hops: hop count
+// produces a band that is wide where triangles are large and narrow where they are
+// small, with an edge that zigzags along the tessellation -- the "jaggedy" look. A
+// metric band has uniform physical width regardless of triangulation. Scaling by the
+// median edge keeps it scene-scale invariant.
+//
+// 3.0 is deliberately modest: a hard cut at the data limit reads worse than a small
+// dressed margin, but the first version (8 face hops, ~6-10 m) was far too much.
+// 0 = cut flush.
+#ifndef TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES
+#define TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES 3.0
+#endif
+// Majority-filter passes over face adjacency applied to the cut boundary. Removes the
+// single-face spikes and notches a per-triangle threshold always leaves behind; a face
+// in the interior of either region has all three neighbours agreeing and never moves,
+// so this smooths the contour without shifting the band. 0 = raw threshold.
+#ifndef TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES
+#define TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES 3
+#endif
+// Rim-peel passes over the boundary this cut creates. A face joined to the mesh by a
+// single edge has TWO border edges -- a dangling sliver, which is what the leftover
+// "spikes" along the cut are. Mesh::Clean's alpha-tighten removes exactly these but ran
+// in ReconstructMesh, before this boundary existed, so nothing downstream tidies it.
+//
+// This is the one step that peels OBSERVED faces too: a two-border-edge triangle is
+// degenerate boundary geometry whether or not a camera saw it. A normal rim face has
+// ONE border edge and is never touched, so the real survey edge cannot be eroded --
+// each pass only removes what is already dangling. 0 = disable.
+#ifndef TEXTURE_UNOBSERVED_RIM_PEEL_PASSES
+#define TEXTURE_UNOBSERVED_RIM_PEEL_PASSES 6
+#endif
+// Orphaned-component removal, applied to the boundary this stage's cuts create. A
+// component of the SURVIVING surface is kept only if its face count is at least this
+// fraction of the largest component's; smaller ones are floating islands and are
+// deleted with the rest. Thousandths of a percent, same rule and same units as
+// MESH_KEEP_COMPONENT_PCT_X1000 in Mesh.cpp, so the two stages behave identically.
+// Higher removes more (and risks dropping a genuinely isolated real structure);
+// 0 disables the filter.
+//
+// WHY THIS IS HERE AND NOT ONLY IN Mesh::Clean: every cut above is a PER-FACE
+// decision (no camera, outside the margin, dangling sliver) and none of them consider
+// connectivity, so when the deleted set was the only thing joining a patch of surface
+// to the body, that patch is left floating. Mesh::Clean re-runs its component filter
+// after each pass that can sever a neck (rim-erode, alpha-tighten); this stage severs
+// necks harder than either and had no equivalent, so its islands reached the product.
+//
+// MEASURED, 115-view corridor survey: ReconstructMesh emitted ONE connected component
+// (1,322,827 faces -- "DIAG component sizes (top of 1)") with no islands visible in
+// the mesh, yet islands appeared after texturing. Marginal blobs were connected
+// THROUGH the low-confidence boundary sheet, so deleting that sheet -- the very thing
+// that gives this stage its clean edging -- cut them loose.
+// RAISED from 100 (0.1%) to 2000 (2%) after the first field test: the filter cut the
+// component count from 18 to 4, but the three survivors were each well above the 576-face
+// floor that 0.1% produced on a 576,320-face body, and they were still visible as
+// detached blobs in the render.
+//
+// A 2% floor (~11,500 faces there) is defensible on this class of data specifically: a
+// single-site aerial survey is ONE contiguous surface, so anything this stage's cuts leave
+// disconnected is junk essentially by definition and there is no legitimately separate
+// structure for the threshold to destroy. That argument does NOT hold for a scene that is
+// genuinely several separate objects -- lower it back toward 100 if that is ever the input.
+// RAISED AGAIN, 2000 -> 4000, and this time the size distribution picked the value
+// instead of a guess. MEASURED on the same scene with the distribution line above:
+//
+//   533056 | 16628 11586 9430 5605 | 1331 983 714 636 490 349 254 ...
+//
+// There is a clear SLAB tier of four components (16.6k down to 5.6k) and then a ~4x drop
+// to the speck tier. At 2% the floor landed at 10,661 -- mid-slab -- so the two largest
+// slabs survived and were still visible as islands. 4% puts the floor at ~21.3k, above
+// the whole slab tier and inside the real gap, so the cut is not arbitrary.
+//
+// Prefer reading the distribution to raising this blind: if a future scene shows no gap
+// (a smooth ramp from the body down), then no floor is the right tool and the fix belongs
+// upstream, exactly as the distance-cull attempt in SceneReconstruct.cpp concluded.
+// LOWERED 4000 -> 1000, provisionally. 4000 (a ~21,000-face floor) was chosen from a
+// component distribution measured while TEXTURE_DATACOLOR_MIN_VIEW_COS was 0.35 and
+// fragmenting the surface; that condition is gone, so the distribution it was fitted to no
+// longer describes the input. Re-read the "component sizes (top of N)" line above and pick
+// a value that lands in a real GAP before raising it again.
+//
+// Erring low on purpose: an island that survives is visible and fixable, whereas a
+// legitimate structure deleted by an over-large floor is a silent loss of deliverable.
+#ifndef TEXTURE_ORPHAN_COMPONENT_PCT_X1000
+#define TEXTURE_ORPHAN_COMPONENT_PCT_X1000 1000
+#endif
+
+// STOP TUNING THE PERCENTAGE -- when the INPUT mesh was a single connected component,
+// the percentage is the wrong instrument entirely and this flag replaces it.
+//
+// The argument is structural, not statistical. Every cut in this stage is a per-face
+// decision on a mesh that arrived as ONE surface, so any component this stage ends up
+// with beyond the largest was manufactured HERE by severing a neck. There is no
+// legitimately-separate structure for a floor to protect, because there was no separate
+// structure in the input. Keeping only the largest component is therefore exact, and it
+// needs no scene-specific number.
+//
+// MEASURED, 117-view OKState corridor (2026-08-18 06:48 run), which is what forced this:
+//   ReconstructMesh -> RefineMesh emitted 681,390 faces in ONE component (verified by
+//   flooding scene_0_dense_mesh_refine.ply directly: "CONNECTED COMPONENTS: 1").
+//   This stage's cuts then produced 24:
+//     [TEX-SHEET] component sizes (top of 24): 555377 21224 6014 3325 2361 1652 ...
+//   The 1% floor (5,553 faces) dropped 21 of them and KEPT 21,224 and 6,014, which are
+//   the two islands visible in the render -- the 21,224 one centred at X=+230.7, the
+//   right-hand blob. It is 3.822% of the body, so every floor tried so far (0.1%, 1%,
+//   2%) passes it, and 4% would clear it by only 4.5% margin on this scene alone.
+//   Below the body the distribution is a smooth ramp (26x gap to 21k, then 3.5x, 1.8x,
+//   1.4x...), which is exactly the "no clear gap -> a floor is not the right tool"
+//   condition this file already warns about.
+//
+// The percentage path is kept for the case the premise does not hold: if the input was
+// genuinely several objects, the largest-only rule would delete the smaller ones, so we
+// fall back to the floor. The input component count is measured, not assumed.
+//
+// Set to 0 to disable and use TEXTURE_ORPHAN_COMPONENT_PCT_X1000 unconditionally.
+#ifndef TEXTURE_ORPHAN_KEEP_LARGEST_IF_INPUT_SINGLE
+#define TEXTURE_ORPHAN_KEEP_LARGEST_IF_INPUT_SINGLE 1
+#endif
+// Minimum border-loop bounding-box diagonal, as a fraction of the whole-mesh diagonal,
+// for that loop to count as the OUTER silhouette rather than an interior hole.
+//
+// Border edges form closed loops: one huge one around the survey outline and potentially
+// thousands of tiny ones around canopy gaps. Only components reaching an OUTER loop are
+// candidates for boundary-sheet deletion -- treating every hole rim as "the boundary"
+// deleted unobserved patches beside canopy gaps that used to data-colour correctly, and
+// punched visible holes through vegetation. Same shape of rule as
+// MESH_HOLE_MAX_DIAG_FRAC_X1000 in Mesh.cpp, which separates real edge from interior hole
+// the same way.
+#ifndef TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC
+#define TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC 0.10
+#endif
+
 // TEXTURE_DATACOLOR_TILE_NORMAL_COS: the component-tile bake projects each connected
 // no-view region onto ONE plane (its average face normal). If a connected fill wraps
 // around a multi-faceted object (e.g. the top AND sides of a box), faces steeply angled
@@ -412,6 +564,21 @@ namespace { namespace texprof {
 #ifndef TEXTURE_DATACOLOR_FILL_RES
 #define TEXTURE_DATACOLOR_FILL_RES 192
 #endif
+// TEXTURE_DATACOLOR_DENSITY_SCALE: fill tile density as a fraction of the REAL texture
+// density it abuts. 1.0 matches the surrounding texture; lower is coarser and cheaper.
+//
+// These fills are water that does not reconstruct -- a smooth field from nearest-fill
+// plus seam smoothing, carrying no detail at any resolution. Matching real-texture
+// density is far more than they need, and the cost is not marginal: MEASURED, 22,027 fill
+// tiles took 6,194 atlas rows, 27.9% of the atlas, on a scene whose real texture was
+// already 3.4x under-resolved. Worse, appending those rows pushed the atlas from 16,007
+// to 22,201 rows against a 16,384 cap, triggering a 0.738x downscale of EVERYTHING.
+//
+// 0.35 keeps the fill visibly smooth against its neighbours while returning most of that
+// budget to terrain. Raise toward 1.0 if fill/real seams read as blocky.
+#ifndef TEXTURE_DATACOLOR_DENSITY_SCALE
+#define TEXTURE_DATACOLOR_DENSITY_SCALE 0.35
+#endif
 #ifndef TEXTURE_DATACOLOR_FILL_MAX_TILE
 #define TEXTURE_DATACOLOR_FILL_MAX_TILE 384
 #endif
@@ -547,6 +714,27 @@ namespace { namespace texprof {
 // decode pass (~25 s on 367 imgs). 0 = keep all full-res images resident (previous behaviour).
 #ifndef TEXTURE_CROP_IMAGES
 #define TEXTURE_CROP_IMAGES 1
+#endif
+
+// TEXTURE_CROP_OVERSAMPLE: cap crop extraction at this multiple (LINEAR) of the texel
+// density the atlas can actually hold. 0 disables the cap (extract at source density).
+//
+// Crops are extracted at source resolution and AdaptiveFitPatches then discards most of
+// it. MEASURED on a 942,700 unit^2 site: 2,792.9 Mpx of crops -- ~8.4 GB -- extracted to
+// fill a 247.4 Mpx atlas, so 91% is decoded, rectified and thrown away at full peak cost.
+//
+// 2.0 is chosen so the change is VISUALLY NEUTRAL, not just cheaper. Extract-then-filter
+// is supersampling, and INTER_AREA over a 2x oversampled source is indistinguishable from
+// the same filter over an 11x one -- the benefit saturates around 2x. Do NOT drop this to
+// 1.0: at small downscale ratios (a 1.77x scene measured elsewhere) the second resample
+// genuinely antialiases better than extracting straight at target density.
+//
+// The cap is derived from capacity/totalWorldArea, which UNDERSTATES the density the fit
+// finally settles on (patches already under the ceiling are left alone, so the bisection
+// lands higher). Measured actual-to-estimate ratios: 1.00 and 1.32; a 2x linear cap is 4x
+// in area, clear of both.
+#ifndef TEXTURE_CROP_OVERSAMPLE
+#define TEXTURE_CROP_OVERSAMPLE 2.0
 #endif
 
 // TEXTURE_KEEP_IMAGES_RESIDENT: skip the second decode pass when RAM allows.
@@ -1155,6 +1343,12 @@ public:
 	// store found texture patches
 	TexturePatchArr texturePatches;
 
+	// Boundary-sheet faces selected for removal (see TEXTURE_DELETE_BOUNDARY_UNOBSERVED).
+	// Collected during the data-colour pass but applied only AFTER texturing finishes:
+	// texturePatches, components and faceTexcoords are all face-indexed, so deleting
+	// mid-pipeline would invalidate them.
+	std::vector<FIndex> unobservedToDelete;
+
 	// used to compute the seam leveling
 	PairIdxArr seamEdges; // the (face-face) edges connecting different texture patches
 	Mesh::FaceIdxArr components; // for each face, stores the texture patch index to which belongs
@@ -1744,7 +1938,20 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			// visibility is the depth buffer (this face won the pixel), not the
 			// smoothed-normal sign; keep grazing/back-normal faces as a floored-
 			// quality last resort instead of demoting them to synthesized fill
-			if (rawCosFaceCam == 0.f)
+			//
+			// ...EXCEPT past TEXTURE_DATACOLOR_MIN_VIEW_COS, which this wires (it was a
+			// dead macro -- see its comment). Rejecting the OBSERVATION rather than the
+			// face is what makes it safe: a face that has any acceptable view keeps it,
+			// and only one whose every view is this grazing ends up with no candidates
+			// and falls through to NO_ID, where the data-colour fill and the
+			// boundary-sheet delete can finally act on it.
+			//
+			// The ternary keeps a 0 threshold bit-identical to the previous behaviour
+			// (only an exactly-zero cosine dropped, back-normal observations retained),
+			// so the macro is a clean A/B rather than a rewrite of the default path.
+			const float minViewCos = TEXTURE_DATACOLOR_MIN_VIEW_COS;
+			if (minViewCos > 0.f ? (rawCosFaceCam < minViewCos)
+			                     : (rawCosFaceCam == 0.f))
 				continue;
 			a.quality *= SQUARE(MAXF(rawCosFaceCam, 0.05f));
 #else
@@ -1784,6 +1991,8 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 
 		++progress;
 	}
+
+	progress.close();
 
 #ifdef TEXOPT_USE_OPENMP
 	if (bAbort)
@@ -1879,8 +2088,6 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			((size_t)facesDatas.GetSize()*sizeof(FaceDataArr))*G);
 		LogPeakMem("LCF: after merge (facesDatas full)");
 	}
-
-	progress.close();
 
 	// Restore cv's ability to thread.
 	cv::setNumThreads(prevCvThreads);
@@ -2913,6 +3120,17 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				const auto undefinedCost =
 					LBPInference::MaxEnergy * 3.0f;
 
+				// Faces with no candidate view at all: they only ever get label 0, so
+				// they are the hard floor for the "undefined=" figure the LBP reports
+				// per sweep. undefined ~= this count means the solve is discarding
+				// nothing; undefined well above it means textureable faces are being
+				// pulled into undefined patches by the smoothness term (label 0 is a
+				// free match against itself under INCREASE_PATCHES) and end up NO_ID.
+				// Plain counter, not a reduction: this "omp for" is orphaned (no
+				// enclosing parallel region), so it runs serially -- same reason the
+				// shared "order" scratch above is safe.
+				size_t numUnobservedFaces = 0;
+
 #pragma omp for schedule(dynamic, 128)
 				for (int64_t f = 0; f < (int64_t)numFaces; ++f) {
 					const FaceDataArr& faceDatas = facesDatas[f];
@@ -2931,8 +3149,10 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 					node.labels.push_back(0);
 					node.dataCosts.push_back(undefinedCost);
 
-					if (nFD == 0)
+					if (nFD == 0) {
+						++numUnobservedFaces;
 						continue;
+					}
 
 					order.resize(nFD);
 
@@ -2975,6 +3195,11 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 					}
 				}
 				TEX_PROFILE_END(_tFvsLbpBuild, "FaceViewSelection: LBP build graph+datacost");
+
+				// Floor for the per-sweep "undefined=" count printed by the LBP below.
+				DEBUG_EXTRA("[LBP-DIAG] faces=%u unobserved=%zu (%.2f%%) -- faces with no candidate view; 'undefined' cannot go below this",
+					(unsigned)numFaces, numUnobservedFaces,
+					numFaces ? 100.0 * (double)numUnobservedFaces / (double)numFaces : 0.0);
 
 				TEX_PROFILE_BEGIN(_tFvsLbpOpt);
 				inference.Optimize();
@@ -6101,8 +6326,38 @@ static int GetOpenGLMaxTextureSize()
 // Fraction of nMaxTextureSize^2 the adaptive-fit target aims for on its first
 // attempt, leaving slack for the shelf packer's imperfect packing efficiency
 // (rects rarely tile a square with zero waste). Tightened automatically on retry.
+//
+// This fraction IS the deliverable's texture resolution. AdaptiveFitPatches caps every
+// patch to a uniform texel density chosen so the total lands exactly on this budget --
+// MEASURED on a 1940-view aerial site, realized area came in at 100% of budget, i.e.
+// the margin binds directly and the leftover 15% of the atlas is never used. Texel size
+// scales as 1/sqrt(margin), so 0.85 -> 0.97 is ~6% finer texture for free.
+//
+// Start HIGH and step down gently rather than low and collapse. Each attempt shrinks
+// monotonically from the previous attempt's state, so arriving at 0.82 through four
+// tries is byte-identical to going straight there -- a failed high attempt costs only
+// repack time, never quality. The old ladder (0.85 x 0.85 per retry -> 0.72, 0.61)
+// could only ever undershoot, and never tested whether the packer had room to spare.
 #ifndef TEXTURE_ATLAS_FIT_MARGIN
-#define TEXTURE_ATLAS_FIT_MARGIN 0.85
+#define TEXTURE_ATLAS_FIT_MARGIN 0.97
+#endif
+// Multiplicative step between adaptive-fit attempts.
+//
+// RAISED 0.95 -> 0.85 (and attempts 4 -> 8). The margin is not a safety fudge, it is a
+// PACKING-EFFICIENCY estimate: 0.97 assumes a near-perfect pack, whereas shelf packing tens
+// of thousands of heterogeneous rects realistically achieves 60-85% occupancy. The old
+// ladder (0.97 / 0.92 / 0.88 / 0.83) never reached that range, so on a scene whose total
+// patch AREA fit while the PACK did not, no attempt ever trimmed anything and the stage
+// failed. 0.85 over 8 attempts walks 0.97 down to ~0.31, which covers any real packer.
+// Quality is unaffected on scenes that pack at the first try; a failed high attempt costs
+// only repack time.
+#ifndef TEXTURE_ATLAS_FIT_MARGIN_STEP
+#define TEXTURE_ATLAS_FIT_MARGIN_STEP 0.85
+#endif
+// Number of shrink-and-repack attempts. Each costs one pack pass, which is cheap next to
+// failing the whole stage after 28 s of texturing.
+#ifndef TEXTURE_ATLAS_FIT_ATTEMPTS
+#define TEXTURE_ATLAS_FIT_ATTEMPTS 8
 #endif
 // When --max-texture-size is 0 (deliberately unbounded, no GPU ceiling to respect),
 // the atlas still has to be built in memory, so derive a RAM-safe packing dimension
@@ -6213,7 +6468,11 @@ unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatch
 		}
 	}
 	if (totalAreaPx <= (double)budgetAreaPixels || maxDensity <= 0.0)
-		return numScaled; // area already fits (step 1 may still have clamped an outlier dimension)
+		// Area fits the budget -- but the CALLER only gets here after a pack FAILURE, so
+		// this does not mean the pack will now succeed: packing efficiency, not total area,
+		// is what failed. The caller must respond by lowering the budget (margin) and
+		// calling again, NOT by giving up on a 0 return.
+		return numScaled; // (step 1 may still have clamped an outlier dimension)
 
 	// Binary search the density ceiling D: total(D) = sum(min(areaPx[p], D*areaWorld[p]))
 	// is monotonically non-decreasing in D, so bisection converges directly to the
@@ -6246,6 +6505,33 @@ unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatch
 		const double scale = std::sqrt(targetArea / areaPx[p]);
 		ResizePatch(tp, (int)std::lround(tp.rect.width * scale), (int)std::lround(tp.rect.height * scale));
 		++numScaled;
+	}
+
+	// REALIZED area, not the theoretical target: ResizePatch rounds both dimensions to
+	// whole pixels and refuses to grow, so the outcome can land under the budget. How
+	// far under is the question that matters -- every pixel between the realized total
+	// and the budget is atlas capacity the deliverable never gets, and unlike the
+	// budget it cannot be recovered later (ResizePatch destroys the source pixels).
+	//
+	// D is a texel density in world units, so 1/sqrt(D) is the world size of one texel:
+	// the achievable texture GSD for this mesh at this atlas size. Compare it against
+	// the imagery GSD to see how much resolution the atlas ceiling is costing.
+	{
+		double realizedPx = 0.0, totalWorld = 0.0;
+		for (unsigned p = 0; p < numPatches; ++p) {
+			realizedPx += (double)texturePatches[p].rect.width * (double)texturePatches[p].rect.height;
+			totalWorld += areaWorld[p];
+		}
+		// No percent sign anywhere in this format. A literal percent is not portable
+		// across this codebase's log macros: plain %% rendered as garbage here (its %
+		// merged with the following " of" into an octal conversion that ate the next
+		// argument), while %%%% rendered as a literal "%%". A ratio says the same thing
+		// and cannot be misparsed.
+		DEBUG("[ATLAS-FIT] budget=%.1f Mpx | patch area %.1f -> %.1f Mpx (x%.3f of budget)"
+			" | density ceiling D=%.1f px/unit^2 -> texel %.4g world units | surface %.4g unit^2",
+			(double)budgetAreaPixels * 1e-6, totalAreaPx * 1e-6, realizedPx * 1e-6,
+			budgetAreaPixels ? realizedPx / (double)budgetAreaPixels : 0.0,
+			D, (D > 0.0) ? 1.0 / std::sqrt(D) : 0.0, totalWorld);
 	}
 	return numScaled;
 #endif // TEXTURE_CROP_IMAGES
@@ -6372,6 +6658,52 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		// list, and the app-side _heapmin() cannot decommit a different module's heap, so
 		// the freed 20 GB stayed committed under every later stage. The tiny crops
 		// (~0.6 GB total) are cloned out and kept; the scratch is freed right after.
+		// CROP EXTRACTION DENSITY CAP.
+		//
+		// Crops are extracted at SOURCE resolution and AdaptiveFitPatches then throws most
+		// of it away to fit the atlas. MEASURED on a 942,700 unit^2 site: 2,792.9 Mpx of
+		// crops (~8.4 GB) extracted to fill a 247.4 Mpx atlas -- 91% decoded, rectified and
+		// discarded, and the peak memory is paid in full.
+		//
+		// Extracting at a bounded multiple of the density the atlas can actually hold is
+		// VISUALLY NEUTRAL, not merely cheaper: the two-stage path is supersampling, and
+		// INTER_AREA from a 2x oversampled source is indistinguishable from the same filter
+		// over an 11x oversampled one. The benefit saturates at ~2x. (It is NOT neutral at
+		// small ratios -- at the 1.77x downscale of a different scene, extract-then-filter
+		// genuinely antialiases better than a single pass, which is why this is a CAP at 2x
+		// rather than extraction straight at target density.)
+		//
+		// Safety margin: the cap is set from capacity/totalWorldArea, which UNDERSTATES the
+		// density AdaptiveFitPatches finally settles on (patches already below the ceiling
+		// are left untouched, so the bisection lands higher). Measured ratios of actual to
+		// this estimate: 1.00 and 1.32. The 2x linear cap is 4x in area -- comfortably clear
+		// of both, so this can only ever remove detail the atlas could never have shown.
+		std::vector<float> patchWorldArea;
+		float cropMaxDensity = FLT_MAX;   // px per world unit, LINEAR
+#if TEXTURE_CROP_IMAGES
+		if (TEXTURE_CROP_OVERSAMPLE > 0.0) {
+			patchWorldArea.assign(texturePatches.GetSize(), 0.f);
+			double totalWorld = 0.0;
+			for (uint32_t p = 0; p < texturePatches.GetSize(); ++p) {
+				double a = 0.0;
+				for (const FIndex f : texturePatches[p].faces) {
+					const Face& fc = faces[f];
+					a += ComputeTriangleArea(vertices[fc[0]], vertices[fc[1]], vertices[fc[2]]);
+				}
+				patchWorldArea[p] = (float)a;
+				totalWorld += a;
+			}
+			const double dim = (nMaxTextureSize > 0) ? (double)nMaxTextureSize : 16384.0;
+			const double capacity = dim * dim * TEXTURE_ATLAS_FIT_MARGIN;
+			if (totalWorld > 1e-9)
+				cropMaxDensity = (float)(TEXTURE_CROP_OVERSAMPLE * std::sqrt(capacity / totalWorld));
+			DEBUG_EXTRA("[CROP-CAP] atlas capacity %.1f Mpx over %.4g unit^2 -> atlas density"
+				" %.2f px/unit; extracting at up to %.1fx that = %.2f px/unit",
+				capacity * 1e-6, totalWorld, std::sqrt(capacity / std::max(1e-9, totalWorld)),
+				(double)TEXTURE_CROP_OVERSAMPLE, cropMaxDensity);
+		}
+#endif
+
 		const int T = std::max(1, omp_get_max_threads());
 		std::vector<Image8U3> reloadScratch((size_t)T);
 #ifdef TEXOPT_USE_OPENMP
@@ -6418,8 +6750,31 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				if (r.x + r.width > srcW) r.width = srcW - r.x;
 				if (r.y + r.height > srcH) r.height = srcH - r.y;
 				if (r.width <= 0 || r.height <= 0) { tp.rect = cv::Rect(0, 0, 0, 0); continue; }
-				tp.image = srcImage(r).clone();             // private full-res crop
-				tp.rect = cv::Rect(0, 0, r.width, r.height); // rebase to its own origin
+				// Density cap (see [CROP-CAP] above): resize STRAIGHT OUT of the source
+				// rather than cloning full-res and shrinking after, so the full-resolution
+				// crop is never allocated and the saving shows up in peak memory.
+				float cropScale = 1.f;
+				if (cropMaxDensity < FLT_MAX && p < patchWorldArea.size() && patchWorldArea[p] > 1e-9f) {
+					const float d = std::sqrt((float)r.width * (float)r.height / patchWorldArea[p]);
+					if (d > cropMaxDensity)
+						cropScale = cropMaxDensity / d;
+				}
+				const int newW = std::max(1, (int)std::lround(r.width  * cropScale));
+				const int newH = std::max(1, (int)std::lround(r.height * cropScale));
+				if (newW < r.width || newH < r.height) {
+					cv::resize(srcImage(r), tp.image, cv::Size(newW, newH), 0, 0, cv::INTER_AREA);
+					// Rescale by the REALIZED integer ratio, matching ResizePatch: rounding to
+					// whole pixels must never leave a texcoord outside the resized buffer.
+					const float sx = (float)newW / (float)r.width;
+					const float sy = (float)newH / (float)r.height;
+					for (const FIndex idxFace : tp.faces) {
+						TexCoord* tc = faceTexcoords.data() + idxFace * 3;
+						for (int v = 0; v < 3; ++v) { tc[v].x *= sx; tc[v].y *= sy; }
+					}
+				} else {
+					tp.image = srcImage(r).clone();         // private full-res crop
+				}
+				tp.rect = cv::Rect(0, 0, newW, newH);        // rebase to its own origin
 			}
 			// Crops are cloned, and with TEXTURE_CROP_IMAGES every downstream read goes
 			// through PatchSrcImage() -> the patch's own buffer, so the full image is dead
@@ -6565,7 +6920,8 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			// denser than the mesh geometry actually needs (AdaptiveFitPatches), then
 			// retry packing at the SAME hardMaxDim -- the atlas dimension never moves.
 			double margin = TEXTURE_ATLAS_FIT_MARGIN;
-			for (int attempt = 0; attempt < 3 && !ok; ++attempt, margin *= 0.85) {
+			for (int attempt = 0; attempt < TEXTURE_ATLAS_FIT_ATTEMPTS && !ok;
+				++attempt, margin *= TEXTURE_ATLAS_FIT_MARGIN_STEP) {
 				const uint64_t budgetAreaPixels = (uint64_t)((double)hardMaxDim * (double)hardMaxDim * margin);
 				const unsigned numFit = AdaptiveFitPatches(budgetAreaPixels, hardMaxDim);
 				DEBUG_EXTRA("GenerateTexture: atlas overflow at %d px -- adaptively downscaled %u/%u patches to fit (attempt %d, margin %.2f)",
@@ -6573,8 +6929,19 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i)
 					rects[i] = texturePatches[(uint32_t)i].rect;
 				ok = PackShelfReasonablySquare(rects, (int)nTextureSizeMultiple, hardMaxDim, placed, atlasW, atlasH);
-				if (numFit == 0)
-					break; // nothing left to trim (TEXTURE_CROP_IMAGES off, or already minimal) -- further attempts can't help
+				// numFit == 0 is NOT a reason to stop. Its usual cause is that the total
+				// patch AREA already fits the budget while the PACK still fails -- see the
+				// early-out in AdaptiveFitPatches. Area fitting does not imply packability:
+				// FIELD-OBSERVED at 30,321 patches, where the area sat inside 0.97 of the
+				// atlas yet shelf packing could not place them, and breaking here reported
+				// FATAL after downscaling nothing. The remedy is a SMALLER budget, which is
+				// precisely what the next iteration supplies.
+#if !TEXTURE_CROP_IMAGES
+				// The one genuine "nothing to trim" case: patches share the source image
+				// buffer, so there is no private crop to shrink and no budget will change
+				// that. Retrying would only repeat the pack.
+				break;
+#endif
 			}
 		}
 
@@ -6904,6 +7271,490 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				for (FIndex f = 0; f < (FIndex)faces.size(); ++f)
 					if (!covered[f])
 						noViewFaces.push_back(f);
+
+				// ------------------------------------------------------------
+				// INTERIOR FILL vs BOUNDARY SHEET.
+				//
+				// Unobserved regions come in two topologically distinct kinds, and they
+				// want opposite treatment:
+				//
+				//   ENCLOSED  -- ringed entirely by observed surface (textureless roofs,
+				//                water inside the survey, small tears). Data-colouring
+				//                these is the whole point of the feature: it closes a hole
+				//                with locally-correct colour. KEEP.
+				//
+				//   BOUNDARY  -- touches the mesh border and extends outward. This is the
+				//                Poisson skirt over water at the survey edge: geometry in
+				//                the WRONG PLACE, which is exactly why no camera validates
+				//                it (the depth test fails in every view) and why it ends up
+				//                here rather than in a patch. Data-colouring it dresses a
+				//                fabricated sheet up as finished surface. DELETE -- except
+				//                for a deliberate margin, because a little synthetic edging
+				//                reads better than a hard cut at the data limit.
+				//
+				// Density-based trimming cannot make this distinction: the sheet sits ON
+				// real (spurious) points, so SurfaceTrimmer sees ordinary density and the
+				// distance cull measures ordinary proximity -- both verified on this data.
+				// Camera visibility is the only signal that separates them, and it only
+				// exists here.
+				std::vector<FIndex>& deleteFaces = unobservedToDelete;
+#if TEXTURE_DELETE_BOUNDARY_UNOBSERVED
+				if (!noViewFaces.empty() && faceFaces.size() == faces.size()) {
+					const FIndex nF = (FIndex)faces.size();
+					const auto centroid = [&](FIndex f) {
+						const Face& fc = faces[f];
+						return (vertices[fc[0]] + vertices[fc[1]] + vertices[fc[2]]) / 3.f;
+					};
+					// Explicit 3D length: norm() is only exercised on 2D TexCoord in this
+					// translation unit, so do not rely on a 3D overload being visible.
+					const auto len3 = [](const Point3f& d) {
+						return std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+					};
+					// METRIC geodesic distance from the observed surface, not a hop count.
+					//
+					// Hop count makes a JAGGED band: its iso-contours follow triangle
+					// adjacency, and triangle size varies across the mesh, so the kept band
+					// comes out wide where triangles are large, narrow where they are small,
+					// and its edge zigzags along the tessellation. Distance in world units
+					// gives a band of uniform physical width whose contour does not care how
+					// the surface happens to be triangulated.
+					constexpr float kUnreached = FLT_MAX;
+					std::vector<float> dist(nF, kUnreached);
+					// Median edge length, so the margin can be expressed as a multiple of the
+					// mesh's own resolution and behave the same on any scene scale.
+					float medianEdge = 0.f;
+					{
+						std::vector<float> el;
+						el.reserve(std::min<size_t>(faces.size(), 20000));
+						const size_t step = std::max<size_t>(1, faces.size() / 20000);
+						for (size_t f = 0; f < faces.size(); f += step) {
+							const Face& fc = faces[(FIndex)f];
+							el.push_back(len3(vertices[fc[1]] - vertices[fc[0]]));
+						}
+						if (!el.empty()) {
+							std::nth_element(el.begin(), el.begin() + el.size()/2, el.end());
+							medianEdge = el[el.size()/2];
+						}
+					}
+					const float marginDist = (medianEdge > 0.f)
+						? (float)TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES * medianEdge : 0.f;
+					// Shared by the distance relaxation and the border flood below.
+					std::vector<FIndex> cur, next;
+					{
+						// Label-correcting relaxation rather than a priority queue: <queue>
+						// is not included here, and the band is only a few median edges wide
+						// so this converges in a handful of rounds. Bounded by marginDist, so
+						// the work scales with the band, not with the whole no-view set.
+						for (const FIndex f : noViewFaces) {
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							for (int e = 0; e < 3; ++e)
+								if (ff[e] != NO_ID && covered[ff[e]]) { dist[f] = 0.f; cur.push_back(f); break; }
+						}
+						for (int round = 0; round < 64 && !cur.empty(); ++round) {
+							next.clear();
+							for (const FIndex f : cur) {
+								const float df = dist[f];
+								if (df > marginDist)
+									continue;
+								const Point3f cf = centroid(f);
+								const Mesh::FaceFaces& ff = faceFaces[f];
+								for (int e = 0; e < 3; ++e) {
+									const FIndex g = ff[e];
+									if (g == NO_ID || covered[g])
+										continue;
+									const float nd = df + len3(centroid(g) - cf);
+									if (nd < dist[g]) { dist[g] = nd; next.push_back(g); }
+								}
+							}
+							cur.swap(next);
+						}
+					}
+					// A component counts as BOUNDARY-touching only if it reaches the OUTER
+					// silhouette -- not merely any border edge.
+					//
+					// REGRESSION THIS FIXES: seeding from every NO_ID neighbour treated the rim
+					// of every INTERIOR hole as "the boundary". Tree canopy is full of small
+					// pre-existing holes, so unobserved patches beside them were classified as
+					// boundary sheet and deleted instead of filled -- punching visible holes
+					// through vegetation that previously data-coloured correctly.
+					//
+					// Border edges form closed loops: one huge loop around the survey outline
+					// (plus any large interior void) and thousands of tiny ones around canopy
+					// gaps. Union-find the border vertices into loops, measure each loop's
+					// bounding box, and seed only from loops that are a meaningful fraction of
+					// the whole mesh. Same shape of rule as the hole-closing gate, which also
+					// separates "real edge" from "interior hole" by size against the mesh
+					// diagonal.
+					std::vector<uint8_t> touchesBorder(nF, 0);
+					{
+						// Plain arrays and an iterative union-find: no AABB3f / unordered_map /
+						// std::function / 3D norm(), none of which are known-available here.
+						const size_t nV = vertices.size();
+						std::vector<uint32_t> uf(nV);
+						for (size_t v = 0; v < nV; ++v) uf[v] = (uint32_t)v;
+						const auto find = [&uf](uint32_t a) {
+							while (uf[a] != a) { uf[a] = uf[uf[a]]; a = uf[a]; }
+							return a;
+						};
+						const auto unite = [&](uint32_t a, uint32_t b) {
+							a = find(a); b = find(b); if (a != b) uf[b] = a;
+						};
+						for (FIndex f = 0; f < nF; ++f) {
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							const Face& fc = faces[f];
+							for (int e = 0; e < 3; ++e)
+								if (ff[e] == NO_ID)
+									unite(fc[e], fc[(e + 1) % 3]);
+						}
+						// Per-loop bbox, indexed by union-find root.
+						std::vector<float> bxLo(nV, FLT_MAX), byLo(nV, FLT_MAX), bzLo(nV, FLT_MAX);
+						std::vector<float> bxHi(nV, -FLT_MAX), byHi(nV, -FLT_MAX), bzHi(nV, -FLT_MAX);
+						std::vector<uint8_t> isLoopRoot(nV, 0);
+						const auto addToLoop = [&](uint32_t root, const Point3f& p) {
+							isLoopRoot[root] = 1;
+							if (p.x < bxLo[root]) bxLo[root] = p.x;
+							if (p.y < byLo[root]) byLo[root] = p.y;
+							if (p.z < bzLo[root]) bzLo[root] = p.z;
+							if (p.x > bxHi[root]) bxHi[root] = p.x;
+							if (p.y > byHi[root]) byHi[root] = p.y;
+							if (p.z > bzHi[root]) bzHi[root] = p.z;
+						};
+						for (FIndex f = 0; f < nF; ++f) {
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							const Face& fc = faces[f];
+							for (int e = 0; e < 3; ++e) {
+								if (ff[e] != NO_ID)
+									continue;
+								const uint32_t r = find(fc[e]);
+								addToLoop(r, vertices[fc[e]]);
+								addToLoop(r, vertices[fc[(e + 1) % 3]]);
+							}
+						}
+						const auto loopDiag = [&](uint32_t root) {
+							if (!isLoopRoot[root]) return 0.f;
+							return len3(Point3f(bxHi[root]-bxLo[root],
+							                    byHi[root]-byLo[root],
+							                    bzHi[root]-bzLo[root]));
+						};
+						float mnx = FLT_MAX, mny = FLT_MAX, mnz = FLT_MAX;
+						float mxx = -FLT_MAX, mxy = -FLT_MAX, mxz = -FLT_MAX;
+						for (size_t v = 0; v < nV; ++v) {
+							const Point3f& p = vertices[(Mesh::VIndex)v];
+							if (p.x < mnx) mnx = p.x;  if (p.x > mxx) mxx = p.x;
+							if (p.y < mny) mny = p.y;  if (p.y > mxy) mxy = p.y;
+							if (p.z < mnz) mnz = p.z;  if (p.z > mxz) mxz = p.z;
+						}
+						const float meshDiag = len3(Point3f(mxx-mnx, mxy-mny, mxz-mnz));
+						const float minLoopDiag =
+							(float)TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC * meshDiag;
+						size_t nLoops = 0, nOuterLoops = 0;
+						for (size_t v = 0; v < nV; ++v) {
+							if (!isLoopRoot[v]) continue;
+							++nLoops;
+							if (loopDiag((uint32_t)v) >= minLoopDiag) ++nOuterLoops;
+						}
+						cur.clear();
+						for (const FIndex f : noViewFaces) {
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							const Face& fc = faces[f];
+							for (int e = 0; e < 3; ++e) {
+								if (ff[e] != NO_ID)
+									continue;
+								if (loopDiag(find(fc[e])) >= minLoopDiag) {
+									touchesBorder[f] = 1; cur.push_back(f); break;
+								}
+							}
+						}
+						DEBUG("[TEX-SHEET] border loops: %zu total, %zu qualify as outer"
+							" (bbox diag >= %.3g = %.3g of mesh diag %.4g)",
+							nLoops, nOuterLoops, minLoopDiag,
+							(double)TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC, meshDiag);
+					}
+					while (!cur.empty()) {
+						next.clear();
+						for (const FIndex f : cur) {
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							for (int e = 0; e < 3; ++e) {
+								const FIndex g = ff[e];
+								if (g != NO_ID && !covered[g] && !touchesBorder[g]) {
+									touchesBorder[g] = 1; next.push_back(g);
+								}
+							}
+						}
+						cur.swap(next);
+					}
+					// Per-face keep/drop, before smoothing.
+					std::vector<uint8_t> keepF(nF, 0);
+					for (const FIndex f : noViewFaces) {
+						// Enclosed -> always keep (interior fill). Boundary component -> keep
+						// the metric margin nearest real surface. dist stays kUnreached for a
+						// component that never reaches an observed face at all: a detached
+						// island with no real texture to blend from, always dropped.
+						if (!touchesBorder[f] || (dist[f] != kUnreached && dist[f] <= marginDist))
+							keepF[f] = 1;
+					}
+
+					// BOUNDARY REGULARIZATION -- majority filter over face adjacency.
+					//
+					// Even with a metric band the cut is a threshold on a field sampled per
+					// triangle, so it still leaves single-face spikes sticking out and
+					// single-face notches bitten in: the "jaggedy" edge. Nothing downstream
+					// fixes it -- Mesh::Clean's alpha-tighten and Taubin boundary smoothing
+					// run back in ReconstructMesh, long before this cut exists.
+					//
+					// A face whose neighbours mostly disagree with it is exactly such a spike
+					// or notch, so flip it. Two or three passes remove them without moving the
+					// band as a whole (a face in the interior of either region has all three
+					// neighbours agreeing and never flips). Applied ONLY to unobserved faces
+					// in boundary components -- observed faces and interior fill are never
+					// touched.
+					for (int pass = 0; pass < TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES; ++pass) {
+						std::vector<uint8_t> upd(keepF);
+						for (const FIndex f : noViewFaces) {
+							if (!touchesBorder[f])
+								continue;   // interior fill: not ours to reshape
+							const Mesh::FaceFaces& ff = faceFaces[f];
+							int agree = 0, disagree = 0;
+							for (int e = 0; e < 3; ++e) {
+								const FIndex g = ff[e];
+								if (g == NO_ID)
+									continue;
+								// An observed neighbour counts as "keep": the band should hug
+								// real surface, never pull away from it.
+								const uint8_t gk = covered[g] ? 1 : keepF[g];
+								if (gk == keepF[f]) ++agree; else ++disagree;
+							}
+							if (disagree > agree)
+								upd[f] = keepF[f] ? 0 : 1;
+						}
+						keepF.swap(upd);
+					}
+
+					// RIM PEEL on the boundary this cut just created.
+					//
+					// A face joined to the mesh by a single edge has TWO border edges: a
+					// sliver hanging off the rim, which is what the leftover "spikes" along
+					// the cut are. Mesh::Clean's alpha-tighten removes exactly these, but it
+					// ran in ReconstructMesh -- long before this boundary existed -- so the
+					// new rim is raw and nothing downstream will tidy it.
+					//
+					// Unlike everything above this peels OBSERVED faces too: a two-border-edge
+					// triangle is degenerate boundary geometry regardless of whether a camera
+					// happened to see it, and leaving textured spikes behind was the visible
+					// defect. A normal rim face has ONE border edge and is never touched, so
+					// this cannot erode the real survey edge -- it only removes what is
+					// already dangling.
+					size_t nPeeled = 0, nOrphanFaces = 0, nOrphanComps = 0;
+					{
+						// survives = will still be in the mesh: observed faces, plus the
+						// unobserved ones the band decided to keep.
+						//
+						// This scope is UNCONDITIONAL (the peel loop below is already a no-op
+						// when its pass count is 0) because the orphan-component filter that
+						// follows needs `alive` regardless of whether the peel is enabled --
+						// the margin cut alone severs necks even with the peel off.
+						std::vector<uint8_t> alive(nF, 0);
+						for (FIndex f = 0; f < nF; ++f)
+							alive[f] = (covered[f] || keepF[f]) ? 1 : 0;
+						for (int pass = 0; pass < TEXTURE_UNOBSERVED_RIM_PEEL_PASSES; ++pass) {
+							std::vector<FIndex> doomed;
+							for (FIndex f = 0; f < nF; ++f) {
+								if (!alive[f])
+									continue;
+								const Mesh::FaceFaces& ff = faceFaces[f];
+								int border = 0;
+								bool anyNew = false;
+								for (int e = 0; e < 3; ++e) {
+									const FIndex g = ff[e];
+									if (g == NO_ID) {
+										++border;            // pre-existing hole rim
+									} else if (!alive[g]) {
+										++border; anyNew = true;  // border WE just created
+									}
+								}
+								// Require at least one NEWLY created border edge.
+								//
+								// REGRESSION THIS FIXES: without it, a face sitting between two
+								// pre-existing holes already has two border edges, so it peels,
+								// which exposes more such faces -- six passes of that erodes tree
+								// canopy (dense with small gaps) into visible holes. Confining
+								// the peel to borders this cut produced keeps it doing its job on
+								// the new rim while leaving existing topology untouched.
+								if (border >= 2 && anyNew)
+									doomed.push_back(f);
+							}
+							if (doomed.empty())
+								break;
+							for (const FIndex f : doomed) { alive[f] = 0; ++nPeeled; }
+						}
+
+						// ORPHANED-COMPONENT REMOVAL -- the islands these cuts create.
+						//
+						// Runs LAST, after the margin cut, the majority filter and the peel, so it
+						// sees the final surviving surface: any of the three can be the pass that
+						// severs the last neck holding a blob on. See
+						// TEXTURE_ORPHAN_COMPONENT_PCT_X1000 for the measurement behind it.
+						//
+						// CAVEAT, inherited from the relative-to-largest rule: a genuinely separate
+						// small structure is indistinguishable from debris by size alone and will be
+						// dropped with it. That is why the component and face counts are logged
+						// rather than silently applied -- a large number means the threshold is
+						// wrong for this scene, not that the mesh was dirty.
+#if TEXTURE_ORPHAN_COMPONENT_PCT_X1000 > 0
+						{
+							// Flood the surviving faces over the same adjacency the cuts used.
+							// Explicit stack, not recursion: a component here can be the whole
+							// mesh (hundreds of thousands of faces deep).
+							std::vector<int32_t> comp(nF, -1);
+							std::vector<uint32_t> compSize;
+							std::vector<FIndex> compStack;
+
+							// How many components did we START with? Same flood, over the
+							// ORIGINAL adjacency, ignoring `alive` -- this is the input mesh
+							// as ReconstructMesh/RefineMesh handed it over. One component here
+							// means every extra component below was manufactured by this
+							// stage's cuts, which licenses the largest-only rule.
+							size_t nInputComps = 0;
+							{
+								std::vector<int32_t> icomp(nF, -1);
+								for (FIndex s = 0; s < nF; ++s) {
+									if (icomp[s] != -1)
+										continue;
+									const int32_t c = (int32_t)nInputComps++;
+									icomp[s] = c;
+									compStack.push_back(s);
+									while (!compStack.empty()) {
+										const FIndex f = compStack.back();
+										compStack.pop_back();
+										const Mesh::FaceFaces& ff = faceFaces[f];
+										for (int e = 0; e < 3; ++e) {
+											const FIndex g = ff[e];
+											if (g != NO_ID && icomp[g] == -1) {
+												icomp[g] = c;
+												compStack.push_back(g);
+											}
+										}
+									}
+								}
+							}
+
+							for (FIndex s = 0; s < nF; ++s) {
+								if (!alive[s] || comp[s] != -1)
+									continue;
+								const int32_t c = (int32_t)compSize.size();
+								compSize.push_back(0);
+								comp[s] = c;
+								compStack.push_back(s);
+								while (!compStack.empty()) {
+									const FIndex f = compStack.back();
+									compStack.pop_back();
+									++compSize[c];
+									const Mesh::FaceFaces& ff = faceFaces[f];
+									for (int e = 0; e < 3; ++e) {
+										const FIndex g = ff[e];
+										if (g != NO_ID && alive[g] && comp[g] == -1) {
+											comp[g] = c;
+											compStack.push_back(g);
+										}
+									}
+								}
+							}
+							uint32_t largest = 0;
+							for (const uint32_t sz : compSize)
+								if (sz > largest)
+									largest = sz;
+							// Size distribution, descending. This is the line that says whether the
+							// threshold is even the right tool: if the runners-up after the body are
+							// LARGE, the survivors are real slabs of surface and no size floor
+							// removes them safely; if they are all tiny, the cut is only shedding
+							// specks and the floor is doing its job. Same idiom as
+							// "DIAG component sizes" in Mesh.cpp.
+							{
+								std::vector<uint32_t> sorted(compSize);
+								std::sort(sorted.begin(), sorted.end(),
+									[](uint32_t a, uint32_t b) { return a > b; });
+								std::string dist;
+								for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
+									dist += std::to_string(sorted[i]);
+									dist += ' ';
+								}
+								DEBUG("[TEX-SHEET] component sizes (top of %zu): %s",
+									compSize.size(), dist.c_str());
+							}
+							if (compSize.size() > 1 && largest > 0) {
+								// Input was one surface -> every other component is our own
+								// doing; keep only the largest. minKeep == largest drops
+								// everything strictly smaller (a size tie survives, which is
+								// the safe direction).
+								const bool bKeepLargestOnly =
+									TEXTURE_ORPHAN_KEEP_LARGEST_IF_INPUT_SINGLE && nInputComps == 1;
+								const uint32_t minKeep = bKeepLargestOnly ? largest
+									: std::max<uint32_t>(1, (uint32_t)(
+										(double)largest
+										* (double)TEXTURE_ORPHAN_COMPONENT_PCT_X1000 / 100000.0));
+								for (const uint32_t sz : compSize)
+									if (sz < minKeep)
+										++nOrphanComps;
+								for (FIndex f = 0; f < nF; ++f) {
+									if (alive[f] && compSize[comp[f]] < minKeep) {
+										alive[f] = 0;
+										++nOrphanFaces;
+									}
+								}
+								if (bKeepLargestOnly) {
+									DEBUG("[TEX-SHEET] orphan filter: input was 1 component,"
+										" this stage's cuts made %zu -> keeping only the largest"
+										" (%u faces), dropped %zu components (%zu faces)",
+										compSize.size(), largest, nOrphanComps, nOrphanFaces);
+								} 
+								else {
+									DEBUG("[TEX-SHEET] orphan filter: input had %zu components,"
+										" %zu survive the cut, largest %u faces -> dropped %zu"
+										" components (%zu faces) under %u faces (%.3g%% of largest)",
+										nInputComps, compSize.size(), largest, nOrphanComps,
+										nOrphanFaces, minKeep,
+										(double)TEXTURE_ORPHAN_COMPONENT_PCT_X1000 / 1000.0);
+								}
+							} else {
+								DEBUG("[TEX-SHEET] orphan filter: surface is a single component"
+									" (%u faces) -- nothing to drop", largest);
+							}
+						}
+#endif
+
+						// Fold the peel and the orphan filter back in. Only OBSERVED faces are
+						// queued here: a dropped UNOBSERVED face just has its keepF cleared and
+						// the loop below picks it up, so queueing it here too would double-count
+						// it.
+						for (FIndex f = 0; f < nF; ++f) {
+							if (alive[f])
+								continue;
+							if (covered[f])
+								deleteFaces.push_back(f);
+							keepF[f] = 0;
+						}
+					}
+
+					std::vector<FIndex> keep;
+					keep.reserve(noViewFaces.size());
+					size_t nEnclosed = 0, nMargin = 0;
+					for (const FIndex f : noViewFaces) {
+						if (!keepF[f]) { deleteFaces.push_back(f); continue; }
+						keep.push_back(f);
+						if (touchesBorder[f]) ++nMargin; else ++nEnclosed;
+					}
+					DEBUG("[TEX-SHEET] unobserved %zu faces -> keep %zu enclosed (interior fill)"
+						" + %zu within %.3g-unit edge margin (%.1f x median edge %.3g,"
+						" %d smoothing passes) | rim peel removed %zu 2-border-edge slivers"
+						" | orphan filter removed %zu faces in %zu islands"
+						" | DELETE %zu faces total",
+						noViewFaces.size(), nEnclosed, nMargin, marginDist,
+						(double)TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES, medianEdge,
+						(int)TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES, nPeeled,
+						nOrphanFaces, nOrphanComps, deleteFaces.size());
+					noViewFaces.swap(keep);
+				}
+#endif
 				if (!noViewFaces.empty()) {
 					// PER-VERTEX color so shared vertices get ONE color -> the per-face
 					// gradient baked below is C0-continuous across shared edges (no facet
@@ -7182,6 +8033,47 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					const float targetMaxPx = (float)TEXTURE_DATACOLOR_FILL_RES;
 					const int maxTilePx = TEXTURE_DATACOLOR_FILL_MAX_TILE;
 					const int minTileDim = 2 + 2 * gutter;
+
+					// TEXEL DENSITY OF THE REAL TEXTURE, in px per world unit.
+					//
+					// targetMaxPx alone gives EVERY component a tile of the same pixel size
+					// regardless of how much world it covers, so the atlas cost scales with
+					// the NUMBER of components rather than their area. MEASURED on a 437-view
+					// scene: 1252 fill components took 2559 atlas rows -- 17.8% of the atlas
+					// for 3.3% of the faces, i.e. 613 px per filled face against 95 px per
+					// real textured face. Most of that goes to small slivers being handed a
+					// full-size tile.
+					//
+					// These fills are water that does not reconstruct, so they carry no detail
+					// at any resolution; baking them denser than the texture they sit next to
+					// buys nothing. Matching that density is the correct target -- sharper is
+					// waste, blurrier shows a discontinuity at the seam.
+					//
+					// Used as a CAP only (min with the existing budget), so no tile ever grows
+					// and the change cannot introduce a quality regression -- large components
+					// still stop at targetMaxPx, small ones stop at real-texture density.
+					float texelDensity = FLT_MAX;
+					{
+						double pxArea = 0.0, worldArea = 0.0;
+						for (const TexturePatch& tp : texturePatches) {
+							pxArea += (double)tp.rect.width * (double)tp.rect.height;
+							for (const FIndex f : tp.faces) {
+								const Face& fc = faces[f];
+								worldArea += ComputeTriangleArea(
+									vertices[fc[0]], vertices[fc[1]], vertices[fc[2]]);
+							}
+						}
+						if (worldArea > 1e-9 && pxArea > 0.0)
+							texelDensity = (float)std::sqrt(pxArea / worldArea);
+						// These fills are water that does not reconstruct: a smooth field
+						// produced by nearest-fill plus seam smoothing, carrying no detail at
+						// ANY resolution. Matching real-texture density is still far more than
+						// they need, and the atlas cost is not marginal -- MEASURED, 22,027
+						// fill tiles took 6,194 rows, 27.9% of the atlas, on a scene whose real
+						// texture is already 3.4x under-resolved. Every row spent here is taken
+						// from terrain that could have used it.
+						texelDensity *= (float)TEXTURE_DATACOLOR_DENSITY_SCALE;
+					}
 					// 1) connected components of the no-view faces (edge adjacency), split at
 					//    sharp creases so each tile stays near-planar (avoids the single-plane
 					//    projection foldover that turns steep faces into degenerate tile triangles
@@ -7253,7 +8145,11 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						}
 						const float eu = std::max(0.f, umax - umin), ev = std::max(0.f, vmax - vmin);
 						const float ext = std::max(eu, ev);
-						const float scale = (ext > 1e-9f) ? (targetMaxPx / ext) : 1.f;
+						// px per world unit: the fixed per-component budget, capped at the
+						// density of the real texture this fill abuts (see texelDensity).
+						float scale = (ext > 1e-9f) ? (targetMaxPx / ext) : 1.f;
+						if (scale > texelDensity)
+							scale = texelDensity;
 						int w = std::min(std::max((int)std::ceil(eu * scale) + 2 * gutter, minTileDim), maxTilePx);
 						int h = std::min(std::max((int)std::ceil(ev * scale) + 2 * gutter, minTileDim), maxTilePx);
 						if (w > cols) w = cols;
@@ -7267,7 +8163,50 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						T.x = shelfX; T.y = oldRows + shelfY;
 						shelfX += T.w; shelfH = std::max(shelfH, T.h);
 					}
-					const int extraRows = shelfY + shelfH;
+					int extraRows = shelfY + shelfH;
+
+					// HARD CLAMP: the fill must not push the atlas past nMaxTextureSize.
+					//
+					// Fill rows are APPENDED after the patch pack, and the final resize scales
+					// the WHOLE atlas -- real texture included -- if the total exceeds the
+					// ceiling. MEASURED: 16,007 packed rows + 6,194 fill rows = 22,201 against
+					// a 16,384 cap, i.e. a silent 0.738x linear hit on ALL terrain to make room
+					// for water fill. That is strictly the wrong trade: the fill is a smooth
+					// field with no detail, terrain is the deliverable.
+					//
+					// So absorb the overflow in the FILL instead. Shrink the tiles and re-pack
+					// until they fit the rows that remain. Worst case the fill degrades to
+					// near-flat per-component colour, which for water is what it already looks
+					// like -- and the global downscale never fires.
+					if (nMaxTextureSize > 0 && oldRows + extraRows > nMaxTextureSize) {
+						const int avail = std::max(0, nMaxTextureSize - oldRows);
+						const int wanted = extraRows;
+						for (int attempt = 0; attempt < 8 && oldRows + extraRows > nMaxTextureSize; ++attempt) {
+							if (avail <= 0)
+								break;
+							const float shrink = std::sqrt(
+								(float)avail / (float)std::max(1, extraRows)) * 0.95f;
+							for (int cc = 0; cc < nComp; ++cc) {
+								Tile& T = tiles[cc];
+								T.scale *= shrink;
+								T.w = std::max((int)std::lround(T.w * shrink), minTileDim);
+								T.h = std::max((int)std::lround(T.h * shrink), minTileDim);
+								if (T.w > cols) T.w = cols;
+							}
+							shelfX = 0; shelfY = 0; shelfH = 0;
+							for (int cc = 0; cc < nComp; ++cc) {
+								Tile& T = tiles[cc];
+								if (shelfX + T.w > cols) { shelfY += shelfH; shelfX = 0; shelfH = 0; }
+								T.x = shelfX; T.y = oldRows + shelfY;
+								shelfX += T.w; shelfH = std::max(shelfH, T.h);
+							}
+							extraRows = shelfY + shelfH;
+						}
+						DEBUG("[DATACOLOR-CLAMP] fill wanted %d rows on top of %d packed"
+							" (cap %d) -> shrunk to %d rows. Global atlas downscale avoided;"
+							" the loss is taken by the flat fill, not by real texture.",
+							wanted, oldRows, nMaxTextureSize, extraRows);
+					}
 					cv::Mat newTex(oldRows + extraRows, cols, CV_8UC3, cv::Scalar(colEmpty.b, colEmpty.g, colEmpty.r));
 					textureDiffuse.copyTo(newTex(cv::Rect(0, 0, cols, oldRows)));
 					// Cache newTex base pointer + row stride once (shared read-only across the
@@ -7711,7 +8650,12 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					}
 #endif // TEXTURE_DATACOLOR_FEATHER_RINGS
 					textureDiffuse = newTex;
-					DEBUG("Data-colored %d unobserved faces in %d component tiles (%d atlas rows, nearest-fill + %d seam-smooth iters)", N, nComp, extraRows, (int)TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS);
+					DEBUG("Data-colored %d unobserved faces in %d component tiles (%d atlas rows"
+						" = %.3f of atlas, capped at real-texture density %.1f px/unit,"
+						" nearest-fill + %d seam-smooth iters)",
+						N, nComp, extraRows,
+						(oldRows + extraRows) > 0 ? (double)extraRows / (double)(oldRows + extraRows) : 0.0,
+						texelDensity, (int)TEXTURE_DATACOLOR_SEAM_SMOOTH_ITERS);
 #else
 					// PN-triangle (quadratic Bezier) edge control colours -- this is what
 					// removes the residual triangle BANDING. A linear barycentric blend of
@@ -7953,6 +8897,38 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 		if (!texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize))
 			return false;
 		DEBUG_EXTRA("Generating texture atlas and image completed: %u patches, %u image size (%s)", texture.texturePatches.GetSize(), mesh.textureDiffuse.width(), TD_TIMER_GET_FMT().c_str());
+
+		// Apply the boundary-sheet removal decided during the data-colour pass. Done
+		// HERE, after texturing, because texturePatches / components / faceTexcoords are
+		// all face-indexed and deleting mid-pipeline would invalidate them. The atlas is
+		// already final; these faces simply stop referencing it (and never consumed
+		// data-colour rows in the first place, which is where the atlas saving comes from).
+		if (!texture.unobservedToDelete.empty()) {
+			const Mesh::FIndex nF = mesh.faces.GetSize();
+			std::vector<uint8_t> drop(nF, 0);
+			for (const Mesh::FIndex f : texture.unobservedToDelete)
+				if (f < nF) drop[f] = 1;
+			const bool hasUV = (mesh.faceTexcoords.GetSize() == nF * 3);
+			Mesh::FaceArr keptFaces;      keptFaces.Reserve(nF);
+			Mesh::TexCoordArr keptUV;     if (hasUV) keptUV.Reserve(nF * 3);
+			for (Mesh::FIndex f = 0; f < nF; ++f) {
+				if (drop[f])
+					continue;
+				keptFaces.Insert(mesh.faces[f]);
+				if (hasUV)
+					for (int k = 0; k < 3; ++k)
+						keptUV.Insert(mesh.faceTexcoords[f * 3 + k]);
+			}
+			const Mesh::FIndex removed = nF - keptFaces.GetSize();
+			mesh.faces.Swap(keptFaces);
+			if (hasUV)
+				mesh.faceTexcoords.Swap(keptUV);
+			// Vertices left unreferenced are harmless (no consumer indexes by vertex
+			// count here, and nothing runs Clean after texturing), so they are not
+			// compacted -- doing so would mean remapping every face index for no gain.
+			DEBUG("[TEX-SHEET] removed %u boundary-sheet faces after texturing"
+				" -> %u faces remain", (unsigned)removed, (unsigned)mesh.faces.GetSize());
+		}
 	}
 	LogPeakMem("after GenerateTexture");
 

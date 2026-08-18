@@ -5302,6 +5302,41 @@ struct RadiusCounter {
 // local point set (Pauly et al.). 0 => perfectly planar/thin neighborhood,
 // ~0.33 => isotropic 3D blob. Closed-form smallest eigenvalue of a symmetric 3x3
 // (a=Cxx b=Cyy c=Czz d=Cxy e=Cxz f=Cyz) so no Eigen dependency / build surprises.
+// Linearity of a neighborhood's covariance: (l1 - l2) / l1 with l1>=l2>=l3.
+//
+// WHY THIS EXISTS ALONGSIDE SurfaceVariation3x3: that returns l3/trace, which is ~0 for a
+// LINE just as it is for a PLANE, so it can only detect isotropic blobs. Depth-map spray is
+// scattered along the parallel viewing rays of a nadir camera, i.e. locally a 1D SMEAR --
+// exactly the shape l3/trace is blind to, which is why the floating-fuzz pass kept it.
+// Linearity separates the two cleanly: ~1 for a ray smear, ~0 for a genuine thin surface
+// patch. Same closed-form symmetric-3x3 solve; the largest eigenvalue is the other root.
+static inline float Linearity3x3(double a, double b, double c, double d, double e, double f)
+{
+	const double trace = a + b + c;
+	if (trace <= 1e-30) return 0.f;
+	const double p1 = d * d + e * e + f * f;
+	double l1, l3;
+	if (p1 <= 1e-30 * trace * trace) {
+		l1 = std::max(a, std::max(b, c)); // already diagonal
+		l3 = std::min(a, std::min(b, c));
+	} else {
+		const double q = trace / 3.0;
+		const double p2 = (a - q) * (a - q) + (b - q) * (b - q) + (c - q) * (c - q) + 2.0 * p1;
+		const double p = std::sqrt(p2 / 6.0);
+		const double ba = (a - q) / p, bb = (b - q) / p, bc = (c - q) / p;
+		const double bd = d / p, be = e / p, bf = f / p;
+		double r = 0.5 * (ba * (bb * bc - bf * bf) - bd * (bd * bc - bf * be) + be * (bd * bf - bb * be));
+		if (r <= -1.0) r = -1.0; else if (r >= 1.0) r = 1.0;
+		const double phi = std::acos(r) / 3.0;
+		l1 = q + 2.0 * p * std::cos(phi);                       // largest
+		l3 = q + 2.0 * p * std::cos(phi + 2.09439510239319549); // smallest (2*pi/3)
+	}
+	if (l1 <= 0.0) return 0.f;
+	double l2 = trace - l1 - l3; // trace == l1+l2+l3
+	if (l2 < 0.0) l2 = 0.0;
+	return (float)((l1 - l2) / l1);
+}
+
 static inline float SurfaceVariation3x3(double a, double b, double c, double d, double e, double f)
 {
 	const double trace = a + b + c;
@@ -5529,10 +5564,16 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 // while keeping thin/planar ones. This clears the floating cloud so reconstruct can
 // bridge the gap into a flat plane (the nMinViewsFuse=3 outcome) without destroying
 // genuine sparse 2-view surfaces. kPCA = neighborhood size for the PCA.
-static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned minViews, unsigned supportMin, float radiusMul, float planarityMax, int kPCA)
+static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned minViews, unsigned supportMin, float radiusMul, float planarityMax, float linearityMin, int kPCA)
 {
 	const size_t n = pc.NumPoints();
-	if (supportMin == 0 || radiusMul <= 0.f || n < 2 || pc.pointViewsSizes.empty())
+	// Shape-only operation is valid: the support test and the shape tests are INDEPENDENT
+	// criteria and either may run alone. Requiring supportMin > 0 used to gate the shape
+	// tests behind it, which meant the only way to stop the support test deleting building
+	// WALLS was to disable ray-smear removal along with it.
+	const bool doShapeAny = (planarityMax > 0.f || linearityMin > 0.f) && kPCA >= 4;
+	if ((supportMin == 0 && !doShapeAny) || (supportMin > 0 && radiusMul <= 0.f) ||
+	    n < 2 || pc.pointViewsSizes.empty())
 		return 0;
 
 	using namespace nanoflann;
@@ -5540,7 +5581,7 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 
 	const float* __restrict xyz = pc.pointsXYZ.data();
 	const uint32_t* __restrict viewSize = pc.pointViewsSizes.data();
-	const bool doPlanarity = (planarityMax > 0.f && kPCA >= 4);
+	const bool doShape = doShapeAny; // either shape test enabled
 
 	// gather the higher-view "surface" points (the geometry a global nMinViewsFuse+1
 	// would keep) into their own contiguous coordinate array + KD-tree. Candidates
@@ -5593,7 +5634,7 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 	// candidates. Built lazily so the common support-only path pays nothing for it.
 	FlatXYZAdaptor fAdaptor{ xyz, n };
 	std::unique_ptr<KDTree> fIndex;
-	if (doPlanarity) {
+	if (doShape) {
 		fIndex.reset(new KDTree(3, fAdaptor, KDTreeSingleIndexAdaptorParams(64)));
 		fIndex->buildIndex();
 	}
@@ -5607,6 +5648,7 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 	// real surface at all (so support-based removal can never touch it).
 	size_t dCand = 0, dWithin1 = 0, dWithin4 = 0, dWithin16 = 0, dWithin64 = 0, dBeyond = 0;
 	size_t dPlanarRemoved = 0, dPlanarKept = 0;
+	size_t dLinearRemoved = 0, dSupportRemoved = 0;
 #ifdef DENSE_USE_OPENMP
 #pragma omp parallel for schedule(static, 1024) reduction(+:dCand,dWithin1,dWithin4,dWithin16,dWithin64,dBeyond,dPlanarRemoved,dPlanarKept)
 #endif
@@ -5629,17 +5671,29 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 		else if (ratio <= 16.f) ++dWithin16;
 		else if (ratio <= 64.f) ++dWithin64;
 		else                    ++dBeyond;
-		const float r = radiusMul * localScale;
-		const float radius2 = r * r; // L2_Simple returns squared distances
-		RadiusCounter rs(radius2, supportMin);
-		hIndex.findNeighbors(rs, q, sp);
-		if (rs.count >= supportMin) {
-			outlier[i] = 1; // redundant min-view fuzz over a real higher-view surface
-			continue;
+		// PASS 1 -- "a min-view point with well-supported surface nearby is redundant".
+		// DISABLED BY DEFAULT NOW: the premise fails on structured scenes. A building WALL is
+		// seen by few views (occluded from most angles), so it is a min-view candidate, and the
+		// many-view roof above it and ground below it sit within radiusMul local spacings --
+		// so the wall is deleted as "redundant" when it is not redundant at all, merely
+		// adjacent. FIELD-OBSERVED as missing facades on every building, and a large share of
+		// the 21.7% of points this pass removed.
+		// The shape tests below reject genuine off-surface fuzz without that confusion, because
+		// a wall is PLANAR while a ray smear is LINEAR.
+		if (supportMin > 0) {
+			const float r = radiusMul * localScale;
+			const float radius2 = r * r; // L2_Simple returns squared distances
+			RadiusCounter rs(radius2, supportMin);
+			hIndex.findNeighbors(rs, q, sp);
+			if (rs.count >= supportMin) {
+				outlier[i] = 1; // redundant min-view fuzz over a real higher-view surface
+				++dSupportRemoved;
+				continue;
+			}
 		}
 		// unsupported (no real surface nearby): keep genuine sparse 2-view surface
 		// (thin/planar) but delete floating fuzz (volumetric scatter) via local PCA.
-		if (doPlanarity) {
+		if (doShape) {
 			constexpr int kMaxPCA = 64;
 			int kq = kPCA + 1; // +1 for the query point itself
 			if (kq > kMaxPCA) kq = kMaxPCA;
@@ -5662,23 +5716,32 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 					cxy += dx * dy; cxz += dx * dz; cyz += dy * dz;
 				}
 				const float variation = SurfaceVariation3x3(cxx, cyy, czz, cxy, cxz, cyz);
+				const float linearity = Linearity3x3(cxx, cyy, czz, cxy, cxz, cyz);
+				// Two distinct off-surface shapes, and l3/trace only sees the first:
+				//   isotropic blob  -> variation ~0.33  (volumetric fuzz)
+				//   1D ray smear    -> variation ~0 but linearity ~1  (depth error along the
+				//                      viewing ray -- the "spray beneath the surface")
+				// A genuine thin/planar sparse surface is low on BOTH and is kept.
 				if (variation > planarityMax) {
 					outlier[i] = 1; // volumetric floating fuzz -> remove
 					++dPlanarRemoved;
+				} else if (linearityMin > 0.f && linearity > linearityMin) {
+					outlier[i] = 1; // ray-aligned smear -> remove
+					++dLinearRemoved;
 				} else {
 					++dPlanarKept; // thin/planar genuine sparse surface -> keep
 				}
 			}
 		}
 	}
-	VERBOSE("Low-view filter diag: %u candidates, nearest-surface distance (in local-spacings): <=1: %.1f%%%%, <=4: %.1f%%%%, <=16: %.1f%%%%, <=64: %.1f%%%%, >64: %.1f%%%% (surface pts: %u/%u; planarity removed %u, kept %u)",
+	VERBOSE("Low-view filter diag: %u candidates, nearest-surface distance (in local-spacings): <=1: %.1f%%%%, <=4: %.1f%%%%, <=16: %.1f%%%%, <=64: %.1f%%%%, >64: %.1f%%%% (surface pts: %u/%u; support removed %u, planarity removed %u, linear-smear removed %u, kept %u)",
 		(unsigned)dCand,
 		dCand ? 100.0 * dWithin1  / dCand : 0.0,
 		dCand ? 100.0 * dWithin4  / dCand : 0.0,
 		dCand ? 100.0 * dWithin16 / dCand : 0.0,
 		dCand ? 100.0 * dWithin64 / dCand : 0.0,
 		dCand ? 100.0 * dBeyond   / dCand : 0.0,
-		(unsigned)nh, (unsigned)n, (unsigned)dPlanarRemoved, (unsigned)dPlanarKept);
+		(unsigned)nh, (unsigned)n, (unsigned)dSupportRemoved, (unsigned)dPlanarRemoved, (unsigned)dLinearRemoved, (unsigned)dPlanarKept);
 
 	// compact every parallel stream in lockstep, keeping only the survivors
 	const bool hasNormals = !pc.normalsXYZ.empty();
@@ -5933,10 +5996,13 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 	// higher-view surface exists (e.g. the low-overlap pavement edge) without the
 	// global data loss raising nMinViewsFuse would cause on 2-view-only datasets.
 	// Disabled when nLowViewSupportCut == 0.
-	if (!pointcloud.IsEmpty() && OPTDENSE::nLowViewSupportCut > 0 && OPTDENSE::nMinViewsFuse >= 2) {
+	// Runs when EITHER the support test or a shape test is enabled -- they are independent.
+	if (!pointcloud.IsEmpty() && OPTDENSE::nMinViewsFuse >= 2 &&
+		(OPTDENSE::nLowViewSupportCut > 0 || OPTDENSE::fLowViewPlanarityMax > 0.f ||
+		 OPTDENSE::fLowViewLinearityMin > 0.f)) {
 		TD_TIMER_START();
 		const size_t numBefore = pointcloud.NumPoints();
-		const size_t removed = FilterRedundantLowViewPoints(pointcloud, OPTDENSE::nMinViewsFuse, OPTDENSE::nLowViewSupportCut, OPTDENSE::fLowViewSupportRadius, OPTDENSE::fLowViewPlanarityMax, (int)OPTDENSE::nOutlierFilterKNN);
+		const size_t removed = FilterRedundantLowViewPoints(pointcloud, OPTDENSE::nMinViewsFuse, OPTDENSE::nLowViewSupportCut, OPTDENSE::fLowViewSupportRadius, OPTDENSE::fLowViewPlanarityMax, OPTDENSE::fLowViewLinearityMin, (int)OPTDENSE::nOutlierFilterKNN);
 		VERBOSE("Low-view consensus filter: %u/%u points removed (%.2f%%%%) (%s)",
 			(unsigned)removed, (unsigned)numBefore,
 			numBefore ? 100.0 * (double)removed / (double)numBefore : 0.0,
@@ -5959,16 +6025,12 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 
 	if (!pointcloud.IsEmpty()) {
 		if (bCrop2ROI && IsBounded()) {
-#if 1 // JPB WIP BUG
-			throw std::runtime_error("Unsupported");
-#else
 			TD_TIMER_START();
 			const size_t numPoints = pointcloud.GetSize();
 			const OBB3f ROI(fBorderROI == 0 ? obb : (fBorderROI > 0 ? OBB3f(obb).EnlargePercent(fBorderROI) : OBB3f(obb).Enlarge(-fBorderROI)));
 			pointcloud.RemovePointsOutside(ROI);
 			VERBOSE("Point-cloud trimmed to ROI: %u points removed (%s)",
 				numPoints-pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
-#endif
 		}
 		if (!pointcloud.ColorStream() && OPTDENSE::nEstimateColors == 1)
 			EstimatePointColors(images, pointcloud);
