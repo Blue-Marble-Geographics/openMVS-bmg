@@ -127,7 +127,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		("scales", boost::program_options::value(&OPT::nScales)->default_value(3), "how many iterations to run mesh optimization on multi-scale images")
 		("scale-step", boost::program_options::value(&OPT::fScaleStep)->default_value(0.5f), "image scale factor used at each mesh optimization step")
 		("reduce-memory", boost::program_options::value(&OPT::nReduceMemory)->default_value(1), "recompute some data in order to reduce memory requirements")
-		("alternate-pair", boost::program_options::value(&OPT::nAlternatePair)->default_value(0), "refine mesh using an image pair alternatively as reference (0 - both, 1 - alternate, 2 - only left, 3 - only right)")
+		("alternate-pair", boost::program_options::value(&OPT::nAlternatePair)->default_value(0), "refine mesh using an image pair alternatively as reference (0 - both, 1 - alternate, 2 - only left, 3 - only right; applies to the CPU and GPU paths alike. 1X selects mode X on the GPU while leaving the CPU on 'both')")
 		("regularity-weight", boost::program_options::value(&OPT::fRegularityWeight)->default_value(0.2f), "scalar regularity weight to balance between photo-consistency and regularization terms during mesh optimization")
 		("rigidity-elasticity-ratio", boost::program_options::value(&OPT::fRatioRigidityElasticity)->default_value(0.9f), "scalar ratio used to compute the regularity gradient as a combination of rigidity and elasticity")
 		("gradient-step", boost::program_options::value(&OPT::fGradientStep)->default_value(45.05/* JPB WIP BUG 45.05*/), "gradient step to be used instead (0 - auto)")
@@ -267,15 +267,40 @@ int main(int argc, LPCTSTR* argv)
 	TD_TIMER_START();
 	try {
 	#ifdef _USE_CUDA
-	if (SEACAVE::CUDA::desiredDeviceID < -1 ||
-		!scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
+	// RefineMeshCUDA() decimates, subdivides and displaces scene.mesh in place and
+	// can bail out at any scale (e.g. the finest one does not fit this GPU's VRAM),
+	// so the CPU path below would otherwise resume from a half-refined, already
+	// subdivided mesh and subdivide it again. Snapshot the input geometry and put
+	// it back before falling through -- everything else on Mesh is derived data
+	// that the CPU path rebuilds itself.
+	Mesh::VertexArr meshVerticesBackup;
+	Mesh::FaceArr meshFacesBackup;
+	const bool bTryCUDA(SEACAVE::CUDA::desiredDeviceID >= -1);
+	if (bTryCUDA) {
+		meshVerticesBackup.CopyOf(scene.mesh.vertices);
+		meshFacesBackup.CopyOf(scene.mesh.faces);
+	}
+	bool bRefinedCUDA(false);
+	if (bTryCUDA)
+		bRefinedCUDA = scene.RefineMeshCUDA(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 							  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,
 							  OPT::nMaxFaceArea,
 							  OPT::nScales, OPT::fScaleStep,
-							  OPT::nAlternatePair>10 ? OPT::nAlternatePair%10 : 0,
+							  // alternate-pair applies to this path too. The legacy 1X form
+							  // (11/12/13 - mode X on the GPU, "both" on the CPU) still means
+							  // what it did; a plain 0..3 now reaches the GPU instead of being
+							  // silently demoted to 0 (= both directions, twice the pair work).
+							  OPT::nAlternatePair>10 ? OPT::nAlternatePair%10 : OPT::nAlternatePair,
 							  OPT::fRegularityWeight,
 							  OPT::fRatioRigidityElasticity,
-							  OPT::fGradientStep))
+							  OPT::fGradientStep);
+	if (bTryCUDA && !bRefinedCUDA) {
+		VERBOSE("GPU mesh refinement did not complete; restoring the input mesh and refining on the CPU");
+		scene.mesh.EmptyExtra();
+		scene.mesh.vertices.CopyOfRemove(meshVerticesBackup);
+		scene.mesh.faces.CopyOfRemove(meshFacesBackup);
+	}
+	if (!bRefinedCUDA)
 	#endif
 	if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 						  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,

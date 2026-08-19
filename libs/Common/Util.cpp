@@ -578,7 +578,7 @@ void Util::LogBuild()
 		}
 		LOG(_T("Build date: %s"), buildTime.c_str());
 	}
-	LOG(_T("CPU: %s (%u cores)"), Util::GetCPUInfo().c_str(), Thread::hardwareConcurrency());
+	LOG(_T("CPU: %s (%u threads)"), Util::GetCPUInfo().c_str(), Thread::hardwareConcurrency());
 	LOG((_T("RAM: ") + Util::GetRAMInfo()).c_str());
 	LOG((_T("OS: ") + Util::GetOSInfo()).c_str());
 	#ifdef _SUPPORT_CPP17

@@ -825,13 +825,36 @@ void Mesh::ListBoundaryVertices()
 
 
 // compute normal for all faces
+// Unit face normal that is SAFE on a degenerate face.
+//
+// normalized() is cv::normalize(), i.e. v * (1/norm(v)), divided unguarded -- so a
+// zero-area face gives 0/0 = NaN. MEASURED: a 3,152,587-face refined mesh carried 24
+// faces with an exactly zero-length cross product.
+//
+// A NaN normal is not a local defect. Any consumer that AVERAGES normals over a region
+// spreads it across that whole region, and the usual `if (len < eps)` fallbacks are
+// FALSE for NaN, so they never fire. SceneTexture's data-colour fill sums face normals
+// per connected component to build the tile's projection basis: two of those 24 faces
+// landed in large no-view components and turned 79,059 vertices' texcoords into NaN,
+// i.e. two tree-canopy-sized BLACK blobs in the atlas.
+//
+// A zero normal instead of NaN is the containable failure: it sums benignly, and every
+// existing length guard in the codebase already handles it.
+static inline Mesh::Normal SafeNormalizeFaceNormal(const Mesh::Normal& n)
+{
+	const float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+	// `> 0` (not `< eps` negated) so NaN, which compares false against everything,
+	// takes the fallback branch rather than sailing through it.
+	return (len > 0.f) ? Mesh::Normal(n.x/len, n.y/len, n.z/len) : Mesh::Normal(0,0,0);
+}
+
 void Mesh::ComputeNormalFaces()
 {
 	faceNormals.Resize(faces.GetSize());
 	#ifndef _USE_CUDA
 		#pragma omp parallel for schedule(static)
 			for (int i = 0; i < (int)faces.size(); ++i)
-				faceNormals[i] = normalized(FaceNormal(faces[i]));
+				faceNormals[i] = SafeNormalizeFaceNormal(FaceNormal(faces[i]));
 	#else
 	if (kernelComputeFaceNormal.IsValid()) {
 		reportCudaError(kernelComputeFaceNormal((int)faces.size(),
@@ -844,9 +867,18 @@ void Mesh::ComputeNormalFaces()
 			faceNormals
 		));
 		kernelComputeFaceNormal.Reset();
+		// The device kernel normalizes unguarded too, so scrub the same degenerate case
+		// out of its result -- otherwise the CUDA and CPU paths disagree on exactly the
+		// input that causes the damage (see SafeNormalizeFaceNormal).
+		#pragma omp parallel for schedule(static)
+		for (int i = 0; i < (int)faceNormals.size(); ++i) {
+			const Normal& n = faceNormals[i];
+			if (!(std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z) > 0.f))
+				faceNormals[i] = Normal(0,0,0);
+		}
 	} else {
 		FOREACH(idxFace, faces)
-			faceNormals[idxFace] = normalized(FaceNormal(faces[idxFace]));
+			faceNormals[idxFace] = SafeNormalizeFaceNormal(FaceNormal(faces[idxFace]));
 	}
 	#endif
 }

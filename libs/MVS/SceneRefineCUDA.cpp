@@ -33,6 +33,7 @@
 #include "Scene.h"
 #include <algorithm>
 #include <vector>
+#include <cstdlib>
 
 using namespace MVS;
 
@@ -122,6 +123,60 @@ using namespace MVS;
 // the saving is (cull share of an iteration) x (1 - reculls/iters).
 #ifndef MESHOPT_CUDA_PROFILE
 #define MESHOPT_CUDA_PROFILE 1
+#endif
+// Synchronize before reading the profile clocks. Every CUDA call on this path is
+// asynchronous on the default stream, so without this the "project" bucket only
+// measures LAUNCH overhead and all the deferred GPU work lands in whatever bucket
+// happens to contain the next blocking call (photoGrad.GetData() at the end of
+// ScoreMesh) -- i.e. "pairs" silently absorbs the whole ProjectMesh round. Costs
+// one extra sync per iteration, so it is tied to the profile switch, not free.
+#if MESHOPT_CUDA_PROFILE
+#define MESHOPT_CUDA_PROFILE_SYNC() reportCudaError(cuCtxSynchronize())
+#else
+#define MESHOPT_CUDA_PROFILE_SYNC() ((void)0)
+#endif
+// Also time the per-reference re-projections on the reference-local layout. Unlike
+// the two syncs above (once per iteration each, free), this one fires once per
+// reference GROUP -- numImages times per iteration -- so it serializes the launch
+// pipeline at every group boundary. Keep it on while validating what rung 1 costs;
+// set it to 0 for production runs and the "refproj" bucket folds back into "pairs"
+// while its COUNT stays exact.
+#ifndef MESHOPT_CUDA_PROFILE_REFPROJ
+#define MESHOPT_CUDA_PROFILE_REFPROJ 1
+#endif
+
+// Reference-local face/bary residency -- "rung 1" of the VRAM ladder.
+//
+// Per view, InitImages() allocates image (2 B/px) + depthMap (4 B/px) +
+// faceMap (4 B/px) + baryMap (6 B/px) = 16 B/px, resident for ALL views for the
+// whole scale. But the consumers do not need all of it per view:
+//   image     - read for both the reference A and the neighbour B
+//   depthMap  - read for both A and B (ImageMeshWarp)
+//   faceMap   - read for A only (ComputePhotometricGradient)
+//   baryMap   - read for A only (ComputePhotometricGradient)
+// and ScoreMesh() processes the directed pairs grouped by reference image, so
+// exactly ONE view is the reference at any instant. That makes 10 of the 16
+// B/px reference-local: they can live in a single shared pair of buffers instead
+// of one pair per view, taking a scale's per-view cost from 16 to 6 B/px.
+//
+// The cost is that the reference's face/bary maps must be re-projected when it
+// becomes the reference, since the bulk ProjectMesh round overwrote the shared
+// buffers: ProjectMesh runs (numImages + numReferences) times per iteration
+// instead of numImages, i.e. ~2x. That is a pure speed-for-memory trade with a
+// bit-identical result, so it is enabled only when the flat layout does not fit
+// (see ResolveResidency); 0 = always flat, the previous behaviour.
+#ifndef MESHOPT_CUDA_REFLOCAL_FACEBARY
+#define MESHOPT_CUDA_REFLOCAL_FACEBARY 1
+#endif
+
+// VRAM headroom left unclaimed for the display, the driver, other processes and
+// allocator fragmentation. A flat 512 MB is ~12% of a 4 GB laptop card but ~1%
+// of a 48 GB workstation card, so take whichever of the two is larger.
+#ifndef MESHOPT_CUDA_VRAM_RESERVE_MB
+#define MESHOPT_CUDA_VRAM_RESERVE_MB 512
+#endif
+#ifndef MESHOPT_CUDA_VRAM_RESERVE_FRACTION
+#define MESHOPT_CUDA_VRAM_RESERVE_FRACTION 0.08
 #endif
 
 
@@ -2425,6 +2480,21 @@ public:
 		const CameraFaces& cameraFaces,
 		const Camera& camera, const Image8U::Size& size, uint32_t idxImage);
 	void ProcessPair(uint32_t idxImageA, uint32_t idxImageB);
+
+	// where the face/bary maps of the given view live: its own buffers on the flat
+	// layout, the single shared pair on the reference-local one (rung 1)
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	inline SEACAVE::CUDA::MemDevice& FaceMapOf(uint32_t idxImage) { return bRefLocalFaceBary ? faceMapRef : views[idxImage].faceMap; }
+	inline SEACAVE::CUDA::MemDevice& BaryMapOf(uint32_t idxImage) { return bRefLocalFaceBary ? baryMapRef : views[idxImage].baryMap; }
+	// make the shared face/bary maps describe this view; no-op when they already
+	// do, and no-op entirely on the flat layout
+	void EnsureReferenceProjected(uint32_t idxImage);
+#else
+	inline SEACAVE::CUDA::MemDevice& FaceMapOf(uint32_t idxImage) { return views[idxImage].faceMap; }
+	inline SEACAVE::CUDA::MemDevice& BaryMapOf(uint32_t idxImage) { return views[idxImage].baryMap; }
+	inline void EnsureReferenceProjected(uint32_t /*idxImage*/) {}
+#endif
+	bool ResolveResidency(uint64_t totalPixels, uint64_t maxPixels);
 	void ImageMeshWarp(
 		const Camera& cameraA, const Camera& cameraB, const Image8U::Size& size,
 		uint32_t idxImageA, uint32_t idxImageB);
@@ -2457,15 +2527,31 @@ public:
 	void OnVerticesDisplaced(float maxDisp) { accumDispSinceCull += maxDisp; lastIterMaxDisp = maxDisp; }
 	// the mesh topology or the image dimensions changed: the cached lists no
 	// longer index the current faces (or were culled against the wrong frustums)
-	void InvalidateVisibilityCache() { candidateCacheValid = false; accumDispSinceCull = 0.f; lastIterMaxDisp = 0.f; }
+	void InvalidateVisibilityCache() { candidateCacheValid = false; accumDispSinceCull = 0.f; lastIterMaxDisp = 0.f; InvalidateReferenceProjection(); }
 #else
 	void OnVerticesDisplaced(float /*maxDisp*/) {}
-	void InvalidateVisibilityCache() {}
+	void InvalidateVisibilityCache() { InvalidateReferenceProjection(); }
+#endif
+	// the shared face/bary maps index faces that may no longer exist; same hook,
+	// because a topology change invalidates both caches for the same reason
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	void InvalidateReferenceProjection() { idxRefProjected = NO_ID; }
+#else
+	void InvalidateReferenceProjection() {}
+#endif
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	// rung 1: this scale keeps face/bary for the current reference only, in the
+	// shared buffers below, instead of one pair per view (see
+	// MESHOPT_CUDA_REFLOCAL_FACEBARY). Decided per scale by ResolveResidency().
+	bool bRefLocalFaceBary = false;
+	uint32_t idxRefProjected = NO_ID; // view currently described by faceMapRef/baryMapRef
 #endif
 #if MESHOPT_CUDA_PROFILE
-	double tCullMs = 0.0;    // host-side octree build + frustum cull, last ScoreMesh
-	double tProjectMs = 0.0; // ProjectMesh round (all views), last ScoreMesh
-	unsigned numReculls = 0; // reculls so far at this scale
+	double tCullMs = 0.0;      // host-side octree build + frustum cull, last ScoreMesh
+	double tProjectMs = 0.0;   // ProjectMesh round (all views), last ScoreMesh
+	double tRefProjMs = 0.0;   // re-projections for the reference groups, last ScoreMesh
+	unsigned numReculls = 0;   // reculls so far at this scale
+	unsigned numRefProj = 0;   // reference re-projections, last ScoreMesh
 #endif
 
 	Scene& scene; // the mesh vertices and faces
@@ -2519,6 +2605,12 @@ public:
 	SEACAVE::CUDA::MemDevice vertexVerticesPointers;
 	SEACAVE::CUDA::MemDevice smoothGrad1;
 	SEACAVE::CUDA::MemDevice smoothGrad2;
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	// shared face/bary maps, allocated at the largest view size; describe the view
+	// named by idxRefProjected (see MESHOPT_CUDA_REFLOCAL_FACEBARY)
+	SEACAVE::CUDA::MemDevice faceMapRef;
+	SEACAVE::CUDA::MemDevice baryMapRef;
+#endif
 
 	enum { HalfSize = 2 }; // half window size used to compute ZNCC
 };
@@ -2650,6 +2742,151 @@ bool MeshRefineCUDA::InitKernels(int device)
 	return true;
 }
 
+// V R A M   C O S T   M O D E L ///////////////////////////////////
+
+// Single source of truth for "how much device memory does this scale need".
+// The per-tier constants below MUST mirror the allocations in InitImages() and
+// ListVertexFacesPost() exactly -- the whole point of keeping them here is that
+// there is one formula rather than two that can drift apart (the same discipline
+// as kStreamBytesPerPixel on the CPU path in SceneRefine.cpp).
+namespace {
+
+// per-view, per-pixel, by residency tier
+constexpr uint64_t kViewBytesT1 = sizeof(hfloat);                        // image        (ref + neighbour)
+constexpr uint64_t kViewBytesT2 = sizeof(float);                         // depthMap     (ref + neighbour)
+constexpr uint64_t kViewBytesT3 = sizeof(FIndex) + 3*sizeof(hfloat);     // faceMap+baryMap (ref only)
+constexpr uint64_t kViewBytesFlat = kViewBytesT1 + kViewBytesT2 + kViewBytesT3;
+
+// scratch buffers, allocated once at the largest view size
+constexpr uint64_t kScratchBytesPerPixel =
+	  sizeof(uint8_t)      // mask
+	+ sizeof(float)        // imageMeanA
+	+ sizeof(float)        // imageVarA
+	+ sizeof(hfloat)       // imageAB
+	+ sizeof(float)        // imageMeanAB
+	+ sizeof(float)        // imageVarAB
+	+ sizeof(float)        // imageCov
+	+ sizeof(float)        // imageZNCC
+	+ sizeof(float);       // imageDZNCC
+
+// mesh-resident arrays sized by vertex/face count (ListVertexFacesPost + the
+// per-vertex gradient buffers). vertexVerticesCont is data-dependent; 6 entries
+// per vertex is the regular-valence figure and is what the host reservation uses.
+static uint64_t MeshDeviceBytes(uint64_t V, uint64_t F)
+{
+	return V * (3*sizeof(float)      // vertices
+			  + 3*sizeof(float)      // photoGrad
+			  +   sizeof(float)      // photoGradNorm
+			  +   sizeof(float)      // photoGradPixels
+			  + 3*sizeof(float)      // smoothGrad1
+			  + 3*sizeof(float)      // smoothGrad2
+			  + 6*sizeof(uint32_t)   // vertexVerticesCont (valence ~6)
+			  +   sizeof(uint32_t)   // vertexVerticesSizes
+			  +   sizeof(uint32_t))  // vertexVerticesPointers
+		 + F * (3*sizeof(uint32_t)   // faces
+			  + 3*sizeof(float));    // faceNormals
+}
+
+// InitImages() runs BEFORE SubdivideMesh() for this scale, so the counts it can
+// see are the pre-subdivision ones. Subdivision splits a face into at most four,
+// so budget for that; the mesh term is ~2% of a scale's footprint, which is why a
+// conservative allowance here is cheaper than being clever.
+constexpr uint64_t kMeshGrowthAllowance = 4;
+
+} // namespace
+
+// Decide this scale's residency layout against what the device actually has free,
+// and report it. Returns false only if not even the cheapest layout implemented
+// here fits, which is the caller's cue to fall back to the CPU path.
+//
+// This check is deliberately PREDICTIVE rather than allocate-and-see-if-it-fails:
+// on Windows/WDDM an over-budget allocation does not fail, it silently gets backed
+// by host memory over PCIe and every kernel that touches it runs at a fraction of
+// the speed. An allocator-based check cannot see that; only sizing up front can.
+bool MeshRefineCUDA::ResolveResidency(uint64_t totalPixels, uint64_t maxPixels)
+{
+	constexpr uint64_t MB = 1024ull*1024ull;
+	const uint64_t fixedBytes =
+		  kScratchBytesPerPixel * maxPixels
+		+ MeshDeviceBytes(scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize()) * kMeshGrowthAllowance;
+	const uint64_t flatBytes = fixedBytes + kViewBytesFlat * totalPixels;
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	const uint64_t refLocalBytes = fixedBytes + (kViewBytesT1+kViewBytesT2) * totalPixels + kViewBytesT3 * maxPixels;
+#endif
+
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	// Validation override: OPENMVS_REFINE_RESIDENCY=flat|reflocal pins the layout
+	// regardless of the budget. Rungs 0 and 1 are supposed to produce an identical
+	// mesh, so pinning "reflocal" on a scene that fits flat and diffing the two
+	// outputs is the A/B that proves it -- there is no other way to test the claim
+	// on a scene where the flat layout is the only one that would ever be chosen.
+	int forcedResidency(0); // 0 - auto, 1 - flat, 2 - reference-local
+	if (const char* v = std::getenv("OPENMVS_REFINE_RESIDENCY")) {
+		if (_tcsicmp(v, "flat") == 0)
+			forcedResidency = 1;
+		else if (_tcsicmp(v, "reflocal") == 0)
+			forcedResidency = 2;
+		else
+			VERBOSE("warning: OPENMVS_REFINE_RESIDENCY='%s' not understood; expected 'flat' or 'reflocal'", v);
+	}
+#endif
+	// budget from FREE device memory, not total: it respects the display, the
+	// driver's own reservation, and any other process already on this GPU
+	size_t freeMem = 0, totalMem = 0;
+	if (cuMemGetInfo(&freeMem, &totalMem) != CUDA_SUCCESS || freeMem == 0) {
+		// no reading available: keep the previous behaviour rather than guess
+		DEBUG_EXTRA("[CUDA] cuMemGetInfo unavailable; skipping the VRAM budget check");
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+		bRefLocalFaceBary = (forcedResidency == 2);
+		idxRefProjected = NO_ID;
+#endif
+		return true;
+	}
+	const uint64_t reserve = MAXF((uint64_t)(MESHOPT_CUDA_VRAM_RESERVE_MB*MB),
+								  (uint64_t)((double)totalMem*MESHOPT_CUDA_VRAM_RESERVE_FRACTION));
+	const uint64_t budget = (freeMem > reserve ? (uint64_t)freeMem - reserve : 0);
+
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	bRefLocalFaceBary = (forcedResidency ? forcedResidency == 2 : flatBytes > budget);
+	if (forcedResidency)
+		VERBOSE("GPU memory: residency layout pinned to '%s' by OPENMVS_REFINE_RESIDENCY (budget check bypassed)",
+			bRefLocalFaceBary ? "reflocal" : "flat");
+	idxRefProjected = NO_ID;
+	const uint64_t needBytes = (bRefLocalFaceBary ? refLocalBytes : flatBytes);
+	DEBUG_EXTRA("[CUDA] VRAM budget: need %s (%s layout) | free %s, reserve %s, budget %s",
+		Util::formatBytes(needBytes).c_str(),
+		bRefLocalFaceBary ? "reference-local face/bary" : "flat",
+		Util::formatBytes(freeMem).c_str(), Util::formatBytes(reserve).c_str(), Util::formatBytes(budget).c_str());
+	if (bRefLocalFaceBary)
+		VERBOSE("GPU memory: the flat layout would need %s but only %s is available; keeping face/bary for "
+				"the current reference view only -- %s instead (identical result, ~2x ProjectMesh work)",
+			Util::formatBytes(flatBytes).c_str(), Util::formatBytes(budget).c_str(),
+			Util::formatBytes(refLocalBytes).c_str());
+#else
+	const uint64_t needBytes = flatBytes;
+	DEBUG_EXTRA("[CUDA] VRAM budget: need %s (flat layout) | free %s, reserve %s, budget %s",
+		Util::formatBytes(needBytes).c_str(),
+		Util::formatBytes(freeMem).c_str(), Util::formatBytes(reserve).c_str(), Util::formatBytes(budget).c_str());
+#endif
+	if (needBytes > budget) {
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+		if (forcedResidency) {
+			// pinned for an A/B: run it anyway, which is the point -- reproducing the
+			// over-budget behaviour is how you measure what the budget check buys
+			VERBOSE("warning: the pinned layout needs %s but only %s is available; running it anyway "
+					"because OPENMVS_REFINE_RESIDENCY is set -- expect host-memory spill and a large slowdown",
+				Util::formatBytes(needBytes).c_str(), Util::formatBytes(budget).c_str());
+			return true;
+		}
+#endif
+		VERBOSE("warning: this scale needs %s of device memory but only %s is available on this GPU; "
+				"falling back to the CPU refinement path",
+			Util::formatBytes(needBytes).c_str(), Util::formatBytes(budget).c_str());
+		return false;
+	}
+	return true;
+}
+
 // load and initialize all images at the given scale
 // and compute the gradient for each input image
 // optional: blur them using the given sigma
@@ -2698,41 +2935,107 @@ bool MeshRefineCUDA::InitImages(float scale, float sigma)
 	if (bAbort)
 		return false;
 	#endif
-	// init GPU memory
+	// measure this scale before allocating anything for it: the residency layout
+	// is chosen from the totals, and on WDDM an over-budget allocation succeeds
+	// (backed by host memory over PCIe) instead of failing, so the decision has to
+	// be made up front -- see ResolveResidency()
 	Image8U::Size maxSize(0,0);
+	uint64_t totalPixels(0);
 	FOREACH(idxImage, views) {
 		View& view = views[idxImage];
 		if (view.imageHost.empty())
 			continue;
 		Image8U::Size& size(view.size);
 		size = view.imageHost.size();
-		reportCudaError(view.image.Reset(size, CUDA_ARRAY3D_SURFACE_LDST));
-		reportCudaError(view.image.SetData(cvtImage<float,hfloat>(view.imageHost)));
-		view.imageHost.release();
-		const size_t area((size_t)size.area());
-		reportCudaError(view.depthMap.Reset(sizeof(float)*area));
-		reportCudaError(view.faceMap.Reset(sizeof(FIndex)*area));
-		reportCudaError(view.baryMap.Reset(sizeof(hfloat)*3*area));
+		totalPixels += (uint64_t)size.area();
 		if (maxSize.width < size.width)
 			maxSize.width = size.width;
 		if (maxSize.height < size.height)
 			maxSize.height = size.height;
 	}
+	if (totalPixels == 0)
+		return false;
+	if (!ResolveResidency(totalPixels, (uint64_t)maxSize.area()))
+		return false;
+
+	// init GPU memory; every allocation is checked, because a silent failure here
+	// leaves a null device pointer that the kernels would happily write through
 	const size_t area(maxSize.area());
-	reportCudaError(mask.Reset(sizeof(uint8_t)*area));
-	reportCudaError(imageMeanA.Reset(sizeof(float)*area));
-	reportCudaError(imageVarA.Reset(sizeof(float)*area));
-	reportCudaError(imageAB.Reset(maxSize, CUDA_ARRAY3D_SURFACE_LDST));
-	reportCudaError(imageMeanAB.Reset(sizeof(float)*area));
-	reportCudaError(imageVarAB.Reset(sizeof(float)*area));
-	reportCudaError(imageCov.Reset(sizeof(float)*area));
-	reportCudaError(imageZNCC.Reset(sizeof(float)*area));
-	reportCudaError(imageDZNCC.Reset(sizeof(float)*area));
+	const auto allocateScale = [&]() -> bool {
+		FOREACH(idxImage, views) {
+			View& view = views[idxImage];
+			if (view.imageHost.empty())
+				continue;
+			const Image8U::Size& size(view.size);
+			const size_t viewArea((size_t)size.area());
+			if (view.image.Reset(size, CUDA_ARRAY3D_SURFACE_LDST) != CUDA_SUCCESS ||
+				view.image.SetData(cvtImage<float,hfloat>(view.imageHost)) != CUDA_SUCCESS ||
+				view.depthMap.Reset(sizeof(float)*viewArea) != CUDA_SUCCESS)
+				return false;
+		#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+			if (bRefLocalFaceBary) {
+				// reference-local: these live in faceMapRef/baryMapRef instead
+				view.faceMap.Release();
+				view.baryMap.Release();
+			} else
+		#endif
+			if (view.faceMap.Reset(sizeof(FIndex)*viewArea) != CUDA_SUCCESS ||
+				view.baryMap.Reset(sizeof(hfloat)*3*viewArea) != CUDA_SUCCESS)
+				return false;
+		}
+	#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+		if (bRefLocalFaceBary) {
+			if (faceMapRef.Reset(sizeof(FIndex)*area) != CUDA_SUCCESS ||
+				baryMapRef.Reset(sizeof(hfloat)*3*area) != CUDA_SUCCESS)
+				return false;
+		} else {
+			faceMapRef.Release();
+			baryMapRef.Release();
+		}
+	#endif
+		return mask.Reset(sizeof(uint8_t)*area) == CUDA_SUCCESS
+			&& imageMeanA.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageVarA.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageAB.Reset(maxSize, CUDA_ARRAY3D_SURFACE_LDST) == CUDA_SUCCESS
+			&& imageMeanAB.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageVarAB.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageCov.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageZNCC.Reset(sizeof(float)*area) == CUDA_SUCCESS
+			&& imageDZNCC.Reset(sizeof(float)*area) == CUDA_SUCCESS;
+	};
+	bool bAllocated(allocateScale());
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	if (!bAllocated && !bRefLocalFaceBary) {
+		// the estimate cleared the budget but the allocator disagreed (fragmentation,
+		// or another process took memory since); drop a rung and retry once before
+		// handing the scale to the CPU path. imageHost is still populated at this
+		// point, so the retry can re-upload the images.
+		VERBOSE("warning: device allocation failed on the flat layout despite fitting the budget; "
+				"retrying with reference-local face/bary");
+		bRefLocalFaceBary = true;
+		idxRefProjected = NO_ID;
+		FOREACH(idxImage, views) {
+			views[idxImage].faceMap.Release();
+			views[idxImage].baryMap.Release();
+		}
+		bAllocated = allocateScale();
+	}
+#endif
+	if (!bAllocated) {
+		VERBOSE("error: out of device memory initializing the refinement scale");
+		return false;
+	}
+	// the host copies are only needed to feed view.image above
+	FOREACH(idxImage, views)
+		views[idxImage].imageHost.release();
 	surfImageProjRef.Bind(imageAB);
 	iteration = 0;
 	// the images were rescaled and the cameras updated, so the cached candidate
 	// lists were culled against the wrong frustums
 	InvalidateVisibilityCache();
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	idxRefProjected = NO_ID;
+#endif
 #if MESHOPT_CUDA_PROFILE
 	numReculls = 0;
 #endif
@@ -2879,7 +3182,18 @@ void MeshRefineCUDA::ListCameraFaces()
 		if (imageData.IsValid())
 			ProjectMesh(arrCameraFaces[idxImage], imageData.camera, views[idxImage].size, idxImage);
 	}
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	// every view above wrote face/bary through the same shared buffers, so what is
+	// left there describes whichever view happened to be projected last; only the
+	// per-view depth maps survive this round. ProcessPair() re-projects the
+	// reference it needs (see EnsureReferenceProjected).
+	if (bRefLocalFaceBary)
+		idxRefProjected = NO_ID;
+#endif
 #if MESHOPT_CUDA_PROFILE
+	// the launches above are asynchronous; without this the bucket measures launch
+	// overhead only and the real work lands in "pairs"
+	MESHOPT_CUDA_PROFILE_SYNC();
 	tProjectMs = std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tProj0).count();
 #endif
 #if !MESHOPT_CUDA_VISIBILITY_REUSE
@@ -2904,9 +3218,13 @@ void MeshRefineCUDA::ListFaceAreas(Mesh::AreaArr& maxAreas)
 		Mesh::AreaArr& areas = viewAreas[idxImage];
 		areas.Resize(scene.mesh.faces.GetSize());
 		areas.Memset(0);
-		// get faceMap from the GPU memory
+		// get faceMap from the GPU memory; on the reference-local layout the bulk
+		// ProjectMesh round left only the last view described in the shared buffers,
+		// so materialize this one first (once per view per scale -- this runs from
+		// SubdivideMesh, not from the iteration loop)
+		EnsureReferenceProjected(idxImage);
 		TImage<FIndex> faceMap(imageData.height, imageData.width);
-		views[idxImage].faceMap.GetData(faceMap);
+		FaceMapOf(idxImage).GetData(faceMap);
 		// compute area covered by all vertices (incident faces) viewed by this image
 		for (int j=0; j<faceMap.rows; ++j) {
 			for (int i=0; i<faceMap.cols; ++i) {
@@ -3045,6 +3363,10 @@ void MeshRefineCUDA::ComputeNormalFaces()
 // and compute vertices gradient using analytical method
 void MeshRefineCUDA::ScoreMesh(float* gradients)
 {
+#if MESHOPT_CUDA_PROFILE
+	tRefProjMs = 0.0;
+	numRefProj = 0;
+#endif
 	// extract array of faces viewed by each camera
 	ListCameraFaces();
 
@@ -3136,6 +3458,10 @@ void MeshRefineCUDA::ProjectMesh(
 	const Camera& camera, const Image8U::Size& size, uint32_t idxImage)
 {
 	View& view = views[idxImage];
+	// face/bary go to this view's own buffers on the flat layout, or to the single
+	// shared pair on the reference-local one (see MESHOPT_CUDA_REFLOCAL_FACEBARY)
+	SEACAVE::CUDA::MemDevice& faceMap(FaceMapOf(idxImage));
+	SEACAVE::CUDA::MemDevice& baryMap(BaryMapOf(idxImage));
 	// init depth-map
 	const float fltMax(FLT_MAX);
 	reportCudaError(cuMemsetD32(view.depthMap, (uint32_t&)fltMax, size.area()));
@@ -3149,8 +3475,8 @@ void MeshRefineCUDA::ProjectMesh(
 			faces,
 			view.faceIDs,
 			view.depthMap,
-			view.faceMap,
-			view.baryMap,
+			faceMap,
+			baryMap,
 			CameraCUDA(camera, size),
 			view.numFaceIDs
 		));
@@ -3166,8 +3492,8 @@ void MeshRefineCUDA::ProjectMesh(
 			faces,
 			cameraFaces,
 			view.depthMap,
-			view.faceMap,
-			view.baryMap,
+			faceMap,
+			baryMap,
 			CameraCUDA(camera, size),
 			cameraFaces.GetSize()
 		));
@@ -3176,7 +3502,7 @@ void MeshRefineCUDA::ProjectMesh(
 	// cross-check valid depth and face index
 	reportCudaError(kernelCrossCheckProjection(size,
 		view.depthMap,
-		view.faceMap,
+		faceMap,
 		size.width, size.height
 	));
 	#if 0
@@ -3191,8 +3517,42 @@ void MeshRefineCUDA::ProjectMesh(
 	#endif
 }
 
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+// Make the shared face/bary maps describe idxImage.
+//
+// The bulk ProjectMesh round in ListCameraFaces() gives every view its own depth
+// map, but on the reference-local layout they all write face/bary through the
+// same shared buffers, so only the last view projected is left described there.
+// ScoreMesh() walks the directed pairs grouped by reference image, so this fires
+// once per group: re-projecting the reference rewrites its depth map with the
+// same values (same mesh, same camera) and fills face/bary for it.
+void MeshRefineCUDA::EnsureReferenceProjected(uint32_t idxImage)
+{
+	if (!bRefLocalFaceBary || idxRefProjected == idxImage)
+		return;
+	const Image& imageData = images[idxImage];
+	ASSERT(imageData.IsValid());
+#if MESHOPT_CUDA_PROFILE && MESHOPT_CUDA_PROFILE_REFPROJ
+	const auto tRef0(std::chrono::steady_clock::now());
+#endif
+	ProjectMesh(arrCameraFaces[idxImage], imageData.camera, views[idxImage].size, idxImage);
+	idxRefProjected = idxImage;
+#if MESHOPT_CUDA_PROFILE
+	#if MESHOPT_CUDA_PROFILE_REFPROJ
+	MESHOPT_CUDA_PROFILE_SYNC();
+	tRefProjMs += std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-tRef0).count();
+	#endif
+	++numRefProj;
+#endif
+}
+#endif
+
 void MeshRefineCUDA::ProcessPair(uint32_t idxImageA, uint32_t idxImageB)
 {
+	// the photometric-gradient kernel reads face/bary for the reference view only,
+	// so on the reference-local layout they are materialized here (no-op when the
+	// shared buffers already describe A, and on the flat layout)
+	EnsureReferenceProjected(idxImageA);
 	// fetch view A data
 	const Image& imageDataA = images[idxImageA];
 	ASSERT(imageDataA.IsValid());
@@ -3345,11 +3705,15 @@ void MeshRefineCUDA::ComputePhotometricGradient(const Camera& cameraA, const Cam
 #if !MESHCUDAOPT_FUSED_KERNELS
 	reportCudaError(cuMemsetD32(photoGradPixels, 0, numVertices));
 #endif
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	// ProcessPair() must have materialized the reference's face/bary by now
+	ASSERT(!bRefLocalFaceBary || idxRefProjected == idxImageA);
+#endif
 	reportCudaError(kernelComputePhotometricGradient(size,
 		faces, faceNormals,
 		views[idxImageA].depthMap,
-		views[idxImageA].faceMap,
-		views[idxImageA].baryMap,
+		FaceMapOf(idxImageA),
+		BaryMapOf(idxImageA),
 		imageDZNCC,
 		mask,
 		photoGrad, photoGradPixels,
@@ -3528,8 +3892,9 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 			refine.OnVerticesDisplaced(maxGradNorm*gstep);
 			DEBUG_EXTRA("\t%2d. g: %.5f (%.3e - %.3e)\ts: %.3f", iter+1, gradients.norm(), gradients.norm()/mesh.vertices.GetSize(), gv/mesh.vertices.GetSize(), gstep);
 			#if MESHOPT_CUDA_PROFILE
-			DEBUG_EXTRA("\t    [CUDA] ScoreMesh %.0f ms = cull %.0f ms + project %.0f ms + pairs %.0f ms (reculls %u at this scale)",
-				tScoreMs, refine.tCullMs, refine.tProjectMs, tScoreMs-refine.tCullMs-refine.tProjectMs, refine.numReculls);
+			DEBUG_EXTRA("\t    [CUDA] ScoreMesh %.0f ms = cull %.0f ms + project %.0f ms + refproj %.0f ms (%u) + pairs %.0f ms (reculls %u at this scale)",
+				tScoreMs, refine.tCullMs, refine.tProjectMs, refine.tRefProjMs, refine.numRefProj,
+				tScoreMs-refine.tCullMs-refine.tProjectMs-refine.tRefProjMs, refine.numReculls);
 			#endif
 			gstep *= 0.98f;
 			progress.display(iter);
