@@ -96,6 +96,7 @@ static inline void TrimHeap() {
 
 #if TEXTURE_PROFILE
 #include <chrono>
+#include <atomic>
 namespace { namespace texprof {
 	using Clock = std::chrono::steady_clock;
 	static inline void Log(const char* name, Clock::time_point t0) {
@@ -189,7 +190,16 @@ namespace { namespace texprof {
 // Also recovers atlas budget: those faces no longer get data-colour rows appended
 // (measured 2559 rows, ~15% of a 13599-px atlas, for 212,357 unobserved faces).
 #ifndef TEXTURE_DELETE_BOUNDARY_UNOBSERVED
-#define TEXTURE_DELETE_BOUNDARY_UNOBSERVED 1
+#define TEXTURE_DELETE_BOUNDARY_UNOBSERVED 0   // OFF deliberately, and this is an ARCHITECTURAL
+                                               // change: this pass existed to delete the Poisson
+                                               // skirt that ReconstructMesh was not removing. Now
+                                               // POISSON_TRIM_HARD_OUTSIDE removes it upstream, so
+                                               // re-carving here only replaces a smooth
+                                               // footprint-following boundary with the ragged
+                                               // per-face camera-visibility contour. Turning it off
+                                               // also disables the rim peel, contour majority
+                                               // filter and orphan filter, which live in its #if.
+                                               // (was 1)
 #endif
 // How much synthetic edging to keep, as a MULTIPLE OF THE MEDIAN EDGE LENGTH measured
 // inward from the last observed surface.
@@ -203,15 +213,92 @@ namespace { namespace texprof {
 // 3.0 is deliberately modest: a hard cut at the data limit reads worse than a small
 // dressed margin, but the first version (8 face hops, ~6-10 m) was far too much.
 // 0 = cut flush.
+//
+// REVERTED 1.0 -> 3.0. Lowering it was a mistake and made the reported artifact WORSE, for a
+// reason worth recording: this is not a cosmetic band, it is a GEODESIC DILATION of the cut.
+// keep = enclosed OR dist <= marginDist, where dist is distance-along-the-surface from the
+// observed frontier -- and level sets of a distance field get SMOOTHER the further out they
+// sit, because small features in the frontier are absorbed. So a WIDE margin hides a ragged
+// visibility contour and a NARROW one exposes it. At 1.0 the cut hugged the raw contour and the
+// fringe of fingers became more visible, not less.
+//
+// The fingers themselves are not this band. They are the shape of the camera-visibility cut
+// over WATER, where the depth test succeeds patchily (glint, grazing incidence, a moving
+// surface). PROVEN by elimination on the SchnellTests corridor: ReconstructMesh hands over a
+// NEAR-CLOSED envelope --
+//     DIAG decimate input: 1384601 live verts, 1264 border verts (0.1%), 1270 border edges
+//     DIAG component sizes (top of 1): 2768196
+// a 1,270-edge loop (~885 units of perimeter) on an 883-unit site, i.e. almost no boundary at
+// all to be ragged -- and RefineMesh only subdivides (601,182 -> 621,750 verts, no deletion).
+// The open, ragged silhouette is therefore created HERE, by the boundary-sheet delete
+// (41,895 faces), not upstream. That is why every ReconstructMesh knob tried against it
+// (SurfaceTrimmer trim, alpha-tighten, rim erode) failed to move it.
+//
+// WHY IT GOT WORSE WITHOUT THIS VALUE CHANGING: the width is `N * median edge`, so it is the
+// fourth threshold in this pipeline expressed relative to MESH RESOLUTION rather than in world
+// units -- alongside the Poisson trim density, TEXTURE_DATACOLOR_FEATHER_RINGS (face rings)
+// and MESH_ALPHA_TIGHTEN_K_X100 (K * median edge). All four silently change meaning whenever
+// the depth policy moves, which is why each needed hand-repair after the depth fix rather than
+// simply working. The durable fix for all of them is to express the quantity in world units --
+// here, a multiple of the point cloud's median NN spacing or the Poisson cell, both already
+// computed upstream -- so this value stops depending on how finely the mesh happens to be
+// tessellated. Until that is done, re-read the "within X-unit edge margin" figure in
+// [TEX-SHEET] after any depth or decimation change.
+//
+// Also note this band interacts with ReconstructMesh's band refine, which subdivides the edge
+// band two levels AFTER alpha-tighten -- so whatever fringe survives arrives here at ~4x the
+// interior face density, which is what makes it read as wisps of polygons rather than a clean
+// edge. Narrowing the margin treats the symptom; the ordering there is the other half.
+// NOW 0 (flush cut), because the PREMISE CHANGED -- this is not a reversal of the revert above,
+// it is a response to a different upstream mesh.
+//
+// The revert to 3.0 was right while ReconstructMesh handed over a near-closed envelope whose
+// only boundary was the one THIS cut carved out of camera visibility: that contour is ragged
+// (visibility over water is patchy), and the margin's geodesic dilation was genuinely smoothing
+// it. Once POISSON_ADAPTIVE_TRIM was enabled, the geometry arrives with a clean, deliberate
+// boundary derived from density + data footprint -- so there is nothing ragged left to dress,
+// and the dressing became the only artifact.
+//
+// MEASURED, same scene, before vs after enabling the adaptive trim:
+//     faces deleted here      44530 -> 33230   (11,300 FEWER removed)
+//     margin faces kept        8778 -> 11675
+//     ring-0 seeded by rim     2053 ->  6809   (3.3x -- the envelope is now open)
+//     feather band            26604 -> 47387
+// i.e. the trim opened the envelope, and this margin then retained 11,675 unobserved,
+// data-coloured faces hanging off the newly-clean rim. Those are the "spikey under parts": the
+// texture stage putting back a softened copy of what ReconstructMesh had just removed.
+//
+// 0 cuts flush to the observed surface, which is the correct behaviour once the geometric
+// boundary is itself trustworthy. Raise it again ONLY if the upstream trim is disabled, since
+// then the ragged-visibility problem returns and the dilation is worth its cost.
 #ifndef TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES
-#define TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES 3.0
+#define TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES 0.0
 #endif
 // Majority-filter passes over face adjacency applied to the cut boundary. Removes the
 // single-face spikes and notches a per-triangle threshold always leaves behind; a face
 // in the interior of either region has all three neighbours agreeing and never moves,
 // so this smooths the contour without shifting the band. 0 = raw threshold.
+// RAISED 3 -> 8. This is the pass that owns the "choppy edge", and it became the load-bearing
+// one when TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES went to 0: the margin's geodesic dilation used to
+// smooth the contour implicitly (level sets of a distance field get smoother the further out they
+// sit), and cutting flush removed that, exposing the raw per-face camera-visibility boundary.
+// Visibility is decided per triangle, so that boundary is choppy by construction.
+//
+// A majority filter is the right instrument and 3 passes is simply too few: each pass can only
+// remove a feature about ONE face wide, so a 6-face notch needs ~6 passes. It also cleans single
+// and double-face spikes, which is the same artifact reported as "slivers" on this contour --
+// so one change addresses both symptoms.
+//
+// Safe by construction, independent of the count: only a face whose neighbours mostly DISAGREE
+// can flip, so a face in the interior of either region never moves and the band as a whole does
+// not shift. It also cannot reach observed faces or interior fill.
+//
+// TUNE FROM THE NEW LOG LINE, not by eye: "contour majority filter: N passes, flips per pass:
+// ..." should DECAY toward ~0. Converged (e.g. 900 400 120 40 10 3 1 0) means the contour is
+// clean and extra passes are free but pointless. Still large on the last pass means it is eating
+// into the boundary rather than removing spikes -- lower it.
 #ifndef TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES
-#define TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES 3
+#define TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES 8
 #endif
 // Rim-peel passes over the boundary this cut creates. A face joined to the mesh by a
 // single edge has TWO border edges -- a dangling sliver, which is what the leftover
@@ -395,8 +482,26 @@ namespace { namespace texprof {
 // (1 = frontal/nadir, 0 = edge-on). 0 disables the demotion (pre-existing behaviour).
 // 0.20 ~= demote observations more grazing than ~78deg; raise to demote more of the
 // rim, lower to keep more grazing-but-real texture.
+//
+// SET TO 0: at 0.20 this was culling real roof/wall faces, not just the rim. DIAG_TINT
+// showed the white edges are the feather band (GREEN) wrapped around genuine no-view
+// fill cores (MAGENTA) sitting mid-roof and mid-wall -- i.e. those faces reached the
+// data-colour path because this gate threw away EVERY one of their observations. Two
+// reasons it lands on real surface: the threshold is compared against the per-face
+// normal from scene.mesh.faceNormals, whose noise on a Poisson mesh is comparable to
+// the gap between 0.20 and a genuinely grazing view (so neighbouring faces flip across
+// it -> blobby, not banded); and geometry under eaves / on dormer cheeks legitimately
+// has no better-than-78deg view in any camera.
+//
+// Note this gate fights TEXTURE_RASTER_NO_BACKFACE_CULL, added one commit earlier to
+// cure the SAME symptom ("the magenta wall") by letting the depth buffer decide
+// visibility instead of the normal sign. That comment promised the paired rawCos reject
+// would become "a floored-quality last resort"; the code below is still a hard
+// `continue`, so the demotion came back through a different door. 0 is documented as
+// bit-identical to the pre-wiring behaviour (see the ternary at the use site), which
+// makes this a clean revert rather than a new tuning value.
 #ifndef TEXTURE_DATACOLOR_MIN_VIEW_COS
-#define TEXTURE_DATACOLOR_MIN_VIEW_COS 0.20f
+#define TEXTURE_DATACOLOR_MIN_VIEW_COS 0.f
 #endif
 
 // TEXTURE_DATACOLOR_SEED_MIN_COS: quality gate on which OBSERVED boundary faces are
@@ -442,8 +547,48 @@ namespace { namespace texprof {
 // buffer decides visibility; the paired rawCos hard-reject in ListCameraFaces is
 // relaxed to a floored-quality last resort so these depth-visible faces keep their
 // real (grazing) texture instead of the fill. 0 = stock cull behaviour.
+// NEGATIVE RESULT (2026-08-19) -- do not set this to 0 again without new evidence.
+// Tested at 0 to reproduce the visibility pipeline of 4669f06c (2026-07-26), the last
+// revision reported to render this scene sharp. The result was MUCH WORSE: markedly more
+// pale bleeding across the walls and eaves, and the porch roof smeared badly. So the
+// grazing-wall loss this switch's comment describes is the dominant effect on this data --
+// with the stock cull ON, walls whose projected winding flips are culled in EVERY view,
+// land in the no-view set, and get fill + feather. Keeping the cull off and letting the
+// depth buffer decide visibility is load-bearing here, not a refinement.
+//
+// The competing theory it was meant to test -- that back-facing Poisson flaps under the
+// eaves write depth and occlude real surface -- is NOT supported: if it dominated, turning
+// the cull on would have improved those areas. It did the reverse.
+//
+// Corollary worth keeping: the 7/26 "was sharp" anchor cannot be reproduced by reverting
+// THIS file's visibility switches, which points the search at the mesh instead (a1d7d613
+// reworked the mesh resolution/memory policy, and a different mesh gives a different
+// no-view set no matter what texturing does).
 #ifndef TEXTURE_RASTER_NO_BACKFACE_CULL
 #define TEXTURE_RASTER_NO_BACKFACE_CULL 1
+#endif
+
+// TEXTURE_FAST_RASTER: rasterize each view's faceMap/depthMap with the same
+// inlined, incremental-barycentric walk MeshRefine::ProjectMesh uses, instead of
+// TRasterMesh::Project + TImage::RasterizeTriangleBary. Output semantics are
+// unchanged (see RasterizeCameraFacesFast); what goes away is the redundant
+// double-precision per-face vertex transform, the per-pixel edge-function
+// re-evaluation over the whole bounding box, and the per-pixel PARSER callback.
+// 0 = previous TRasterMesh path (kept for A/B).
+// PARTIAL NEGATIVE RESULT (2026-08-19): tested at 0 (stock TRasterMesh path, as on 7/26)
+// TOGETHER WITH TEXTURE_RASTER_NO_BACKFACE_CULL 0, and the combination was much worse. That
+// test does NOT exonerate this rasterizer on its own -- the two were changed together, and
+// the cull switch alone is sufficient to explain the regression (see its NEGATIVE RESULT
+// note). This one remains UNVERIFIED against the stock path: it is uncommitted work that
+// decides which face wins each pixel, hence the no-view set, and its header's claim that
+// output semantics are unchanged has never been checked on real data.
+//
+// To test it cleanly, set THIS to 0 while leaving NO_BACKFACE_CULL at 1 -- note that pairing
+// needs the stock RasterMesh::Project override, which is already conditioned on the cull
+// switch, so the combination is meaningful. Restored to 1 meanwhile so the working
+// configuration is the fast path.
+#ifndef TEXTURE_FAST_RASTER
+#define TEXTURE_FAST_RASTER 1
 #endif
 
 // TEXTURE_DATACOLOR_BAKE: master switch for the actual data-color FILL/bake step in
@@ -487,8 +632,50 @@ namespace { namespace texprof {
 // RAISED to 14: the fill is heavily blurred, so a wide observed band gives the real
 // texture room to dissolve gradually into it; combined with the smoothstep ramp in the
 // blend, the point where real detail returns is imperceptible (no visible inner edge).
+//
+// LOWERED 14 -> 4. RINGS is the knob that controls how FAR the fill colour reaches into
+// real texture; STRENGTH controls whether a SEAM appears at the boundary. Those are not
+// interchangeable, and the reported defect is reach, not a seam:
+//   * At alpha 1.0 the ring-0 texel is 100% fill colour, which is the entire reason the
+//     shared mesh edge has no discontinuity -- both sides evaluate the same value there
+//     (see the CONTINUITY BLEND note at the blend site). Lowering STRENGTH would buy a
+//     dimmer halo by re-introducing exactly the step this pass exists to remove.
+//   * RINGS costs nothing at the boundary. Cutting it leaves ring 0 untouched (still
+//     alpha 1, still seamless) and simply ends the ramp sooner, so the pale wash stops
+//     ~4 faces in instead of ~14.
+// 14 was chosen to dissolve into a fill baked at DENSITY_SCALE 0.35 -- i.e. deliberately
+// blurrier than its surroundings -- so a wide band was needed to match frequency. That
+// reasoning still holds; it just does not justify 14 rings once the fill regions
+// themselves are small. The file's own guidance says 4-8 is the reasonable range.
+//
+// If a crisp inner edge ever becomes visible where real detail returns, raise this (6-8)
+// rather than touching STRENGTH.
+//
+// KNOWN UNIT PROBLEM, not yet fixed: this is a BFS depth over FACE ADJACENCY, so its
+// physical width is K triangles, whatever those happen to measure. The geometry chain runs
+// at --resolution-level 2 while texturing runs at 0, so the mesh is coarse relative to the
+// atlas and each ring is wide -- wider still wherever the local triangles are large, which
+// is why the band does not read as a uniform-width border.
+//
+// This is the same mistake TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES already corrected for the
+// boundary margin cut: "hop count produces a band that is wide where triangles are large
+// and narrow where they are small ... A metric band has uniform physical width regardless
+// of triangulation." The real fix is to ramp alpha on the per-vertex GEODESIC DISTANCE from
+// the boundary (scaled by the median edge, as the margin cut does) instead of on vRing.
+// Deliberately NOT done yet: shrinking the band only hides a feather that should not be
+// firing on that surface at all -- see the covered[f] note at the boundary-sheet cut.
+//
+// BACK TO 4. Briefly restored to 14 for the 7/26 bracketing test; that test came back worse
+// for an unrelated reason (see the NEGATIVE RESULT at TEXTURE_RASTER_NO_BACKFACE_CULL), so 14
+// is not vindicated by it. 4 remains the best value measured on this data: at 14 the band
+// visibly washed the walls out along the eaves, at 4 it was "much better" with no crisp inner
+// edge reported.
+//
+// Still masking rather than fixing, and worth remembering as such: the band only appears where
+// a face borders the no-view set, so every ring of it is a symptom. The fix is to stop those
+// eave/roof faces being unobserved in the first place.
 #ifndef TEXTURE_DATACOLOR_FEATHER_RINGS
-#define TEXTURE_DATACOLOR_FEATHER_RINGS 14
+#define TEXTURE_DATACOLOR_FEATHER_RINGS 4
 #endif
 
 // TEXTURE_DATACOLOR_FEATHER_STRENGTH: scales the maximum smear (at the boundary). 1.0 = the
@@ -509,8 +696,283 @@ namespace { namespace texprof {
 // right up to the boundary, so the sharp/blurry mismatch still read as a clear separation.
 // If this ever becomes a bake-time bottleneck, switch the smear to a single pre-blurred
 // atlas + blend-by-ramp (O(atlas) instead of O(band*radius^2)); costs one atlas-sized temp.
+//
+// DEAD MACRO -- nothing reads it. The box-blur smear this described was replaced by the
+// CONTINUITY BLEND (blend observed toward the fill's own pinned vr/vg/vb field), which
+// has no blur radius: the smoothness comes from the fill field being smooth, not from
+// averaging the observed atlas. Its value has no effect at any setting; the live levers
+// are RINGS (how far the band reaches) and STRENGTH (alpha at the boundary). Left in
+// place only so the two paragraphs above still document what the old smear did.
 #ifndef TEXTURE_DATACOLOR_FEATHER_BLUR_PX
 #define TEXTURE_DATACOLOR_FEATHER_BLUR_PX 18
+#endif
+
+// TEXTURE_FEATHER_CUT_SILHOUETTE: whether the silhouette created by THIS stage's own cuts
+// (boundary-sheet margin cut, rim peel, orphan-component filter) is treated as a feather
+// boundary, by clearing covered[f] on every face queued for deletion.
+//
+// 1 = clear it (the behaviour added alongside the coverage gutter). The feather seeds ring 0
+//     wherever a neighbour is NO_ID or not covered, so clearing the flag makes each surviving
+//     neighbour of a deleted face a ring-0 boundary face at alpha 1 -- i.e. its texture is
+//     replaced outright by the fill colour field and smeared K rings inward.
+// 0 = leave it set. The cut leaves a crisp edge, and the surviving faces keep their real
+//     observed texture.
+//
+// DEFAULTS TO 0, and the reason is that the justification for 1 does not survive this
+// configuration. Three reasons were given for clearing the flag; two are dead code here:
+//   * the fill tiles' DETAIL donor search reads covered -- but TEXTURE_DATACOLOR_DETAIL_GAIN
+//     is 0.0f, so no detail is transplanted at all;
+//   * the MIRROR donor search reads covered -- but TEXTURE_DATACOLOR_MIRROR_GAIN is 0.0f,
+//     likewise inert.
+// So in this build the ONLY live effect is the third one: feathering the cut silhouette. And
+// that is a net loss on this data -- these cuts run along the mesh rim (eaves, roof edges,
+// the survey boundary), which is real, well-observed, sharp texture. Flattening a K-ring band
+// of it to a diffused fill colour to soften an edge that the renderer clips anyway trades
+// detail people can see for a seam they cannot. A crisp edge at a deliberate cut is the
+// correct output, not a defect.
+//
+// Set to 1 only if the detail/mirror gains are re-enabled, or if a hard rim edge is ever
+// judged worse than losing the band -- and note the band width is in FACE RINGS, so how much
+// texture it costs depends on the mesh resolution (see TEXTURE_DATACOLOR_FEATHER_RINGS).
+#ifndef TEXTURE_FEATHER_CUT_SILHOUETTE
+#define TEXTURE_FEATHER_CUT_SILHOUETTE 0
+#endif
+
+// TEXTURE_FEATHER_SKIP_HIDDEN_FILL: don't let HIDDEN geometry seed the seam feather.
+//
+// THE PROBLEM THIS FIXES, measured on the Niwot house (496,114 faces):
+//   [DATACOLOR-DIAG] noView=29942 nComp=479 band=193381
+//   [SEAM-OUTSET]    feather band 193381 faces -> 61762467 texels written
+//   Data-colored 29942 unobserved faces in 479 component tiles (351 atlas rows = 0.022)
+// The synthesized fill occupies 2.2% of the atlas, yet the feather it triggers rewrote
+// 61.8M of 266.9M texels -- 23% of the atlas -- and pulled 193,381 faces, 39% OF THE WHOLE
+// MESH, into the band. The multiplier is the COMPONENT COUNT: 29,942 no-view faces are
+// scattered across 479 separate blobs averaging 62 faces each, and every blob grows its own
+// K-ring band, dragging ~404 real faces in apiece. At that scale the feather stops being a
+// boundary treatment and becomes a mesh-wide wash over good texture.
+//
+// Lowering TEXTURE_DATACOLOR_FEATHER_RINGS cannot fix it. Ring 0 is alpha 1.0 at EVERY K
+// (t = (K-1-vRing)/(K-1) is 1 when vRing is 0), by design, because that is what makes the
+// shared edge seamless -- so the faces immediately around all 479 blobs are replaced
+// outright no matter how short the ramp is.
+//
+// The real distinction is WHY a face has no view, which [TEX-VIEWCLASS] measures:
+//   back-winding-cull = 17670  -- never projected front-wound in any view
+//   occluded/subpix   =  9845  -- projected front-wound, never won a pixel
+// The first group is inverted/interior geometry: flaps sitting behind the real surface,
+// which lose the depth test in every view and are therefore INVISIBLE in the render.
+// Softening the transition into something nobody can see buys nothing and costs a full
+// alpha-1 ring plus K-1 rings of ramp on the real texture wrapped around it.
+//
+// So with this on, a no-view neighbour only seeds ring 0 if everFrontWound says a camera
+// could have seen it head-on. Genuine textureless surface, interior holes and tears still
+// feather exactly as before; hidden flaps get a crisp edge nobody will ever look at.
+//
+// NOTE this changes only what FEATHERS. The faces are still kept and still filled -- see
+// the deletion option discussed at TEXTURE_DELETE_BOUNDARY_UNOBSERVED, which would remove
+// them from the mesh outright and is the stronger (but non-reversible) form of this fix.
+// An OPEN mesh edge (faceFaces == NO_ID) always seeds, regardless of this switch: that is
+// the true silhouette, not a fill region.
+// 0 = previous behaviour (every no-view neighbour seeds the band).
+#ifndef TEXTURE_FEATHER_SKIP_HIDDEN_FILL
+#define TEXTURE_FEATHER_SKIP_HIDDEN_FILL 1
+#endif
+
+// TEXTURE_DELETE_HIDDEN_UNOBSERVED: delete unobserved faces that are hidden GEOMETRY, instead of
+// data-colouring them as if they were textureless surface.
+//
+// The keep/delete rule below classifies unobserved regions by TOPOLOGY: ENCLOSED (ringed by
+// observed surface) is assumed to be a textureless roof, interior water or a small tear and is
+// kept and filled; only regions reaching the outer border loop are candidates for deletion. That
+// assumption breaks on a Poisson mesh, because Poisson returns a near-CLOSED envelope --
+// MEASURED on SchnellTests, `DIAG decimate input: ... 1562 border verts (0.1%)` even after the
+// adaptive trim. The envelope therefore has a whole inward-facing UNDERSIDE, most of it not
+// reachable from the one qualifying outer loop, so it classifies as "enclosed" and gets dressed
+// in synthesized colour. That is what shows up as spikes hanging off the silhouette in the
+// textured render while the untextured mesh looks clean -- the geometry was always there; only
+// texturing made it opaque.
+//
+// The distinguishing signal already exists: everFrontWound (built in ListCameraFaces for
+// TEXTURE_FEATHER_SKIP_HIDDEN_FILL).
+//   everFrontWound = 1 -> some camera could see this face HEAD-ON. If it is still unobserved it
+//                         was occluded or too poorly seen to win a pixel: genuine surface, fill it.
+//   everFrontWound = 0 -> never front-wound in ANY view, i.e. inward-facing. Invisible in every
+//                         render. Delete it; there is nothing for a fill colour to represent.
+// A flat roof or a lake inside the survey faces the cameras and is front-wound, so neither is
+// affected. MEASURED share of the unobserved set that is back-wound only:
+// `[TEX-VIEWCLASS] ... back-winding-cull=36844` of 72,416 unobserved, i.e. about half.
+//
+// NOTE this is a stronger action than TEXTURE_FEATHER_SKIP_HIDDEN_FILL, which used the same
+// signal only to stop such faces SEEDING the feather. Here they leave the mesh. That is the
+// intent -- they are invisible -- but it is a geometry deletion, so it is gated separately and
+// logged ("hidden-geometry filter: N of M ... dropped instead of filled"). 0 restores the old
+// keep-everything-enclosed behaviour.
+// NEGATIVE RESULT (2026-08-19) -- do not re-enable without a DIFFERENT signal. Winding is not a
+// sound test for "inward-facing" on this data, and the reason is already documented one macro
+// group away, at TEXTURE_RASTER_NO_BACKFACE_CULL: "a near-vertical/grazing wall projects to ~0
+// signed area, so tiny per-face normal noise flips it negative and it is culled in EVERY view".
+// Quarry faces, steep slopes and vegetation are exactly that -- genuinely visible surface that
+// happens to be back-wound everywhere. Deleting it re-creates the "magenta wall" artifact that
+// enabling NO_BACKFACE_CULL was introduced to cure.
+//
+// MEASURED, in two steps, which is what makes the diagnosis solid rather than a guess:
+//   v1 (everFrontWound only): dropped 63,662 of 71,223 unobserved -- exactly back-winding 42,935
+//      PLUS off-frustum 20,725, i.e. it also deleted faces outside every frustum that were never
+//      TESTED. Scattered holes through real terrain.
+//   v2 (+ everProjected, so "never tested" fails safe to keep): dropped 42,937 -- precisely the
+//      back-winding bucket, the conflation fixed. keep-enclosed stayed at 5,123 (from 22,927),
+//      so the ~17,800 removed really were back-wound-only -- AND THE HOLES REMAINED. That is the
+//      proof: back-wound-only is not the same as invisible.
+//
+// The underside problem this was aimed at is therefore still open, but it needs a signal that
+// does not rely on projected winding. Depth-buffer occlusion is too small a bucket here
+// (occluded/subpix was only 7,563 of 71,223), and a geometric "below the observed surface at the
+// same XY" test is the MESH_DOWN_CULL family, which is recorded as removing building walls.
+// 0 = keep the topological enclosed/boundary rule alone.
+#ifndef TEXTURE_DELETE_HIDDEN_UNOBSERVED
+#define TEXTURE_DELETE_HIDDEN_UNOBSERVED 0
+#endif
+
+// TEXTURE_FILL_MIN_COMPONENT_FACES: minimum face count for an ENCLOSED unobserved region to be
+// kept and data-coloured. Smaller ones are chopped.
+//
+// The keep rule classifies unobserved regions purely by TOPOLOGY: anything not reachable from a
+// qualifying outer border loop counts as "enclosed" and is assumed to be a textureless roof,
+// interior water or a small tear worth filling. That is right for a lake and wrong for a tongue,
+// and topology cannot tell them apart -- but SIZE can. A lake is thousands of faces; the synthetic
+// clutter along the edge is specks and slivers.
+//
+// This is the "just chop them off" rule. It is deliberately NOT a visibility test: the previous
+// attempt at one (TEXTURE_DELETE_HIDDEN_UNOBSERVED, using projected winding) deleted near-vertical
+// REAL surface, because a grazing wall projects to ~0 signed area and flips winding on noise -- see
+// its NEGATIVE RESULT note. Region size carries no such ambiguity.
+//
+// 256 is PROVISIONAL. The companion log line prints the full component-size distribution, so pick
+// the value from a real GAP between the big regions and the speck tier rather than trusting this
+// default -- the same discipline the orphan filter's own comment insists on ("Prefer reading the
+// distribution to raising this blind"). If the tongues turn out to be large connected regions,
+// size will not separate them either and this is the wrong instrument.
+// 0 disables (keep every enclosed region, previous behaviour).
+// NEGATIVE RESULT (2026-08-19) -- tested at 256 and DISABLED. It did not reduce the edge clutter
+// and it punched holes: DELETE went 45,158 -> 64,562 faces, close to the 69,096 that produced
+// scattered holes when TEXTURE_DELETE_HIDDEN_UNOBSERVED was briefly on.
+//
+// The companion distribution line is why, and it was decisive: 1279 components sized
+//     10391 3990 2444 2268 2263 2228 2217 1951 1596 1315 1306 1286 ...
+// a SMOOTH RAMP with no break. Any threshold on that is arbitrary -- it sweeps the tail while
+// leaving every thousand-face region, and at that scale a water body and a tongue are the same
+// size. This is exactly the condition the orphan filter's comment warns about: 'if a future scene
+// shows no gap (a smooth ramp from the body down), then no floor is the right tool and the fix
+// belongs upstream.'
+//
+// Keep the code and the distribution log -- reading that line is how you tell in one run whether
+// a scene HAS a gap -- but do not re-enable without seeing one. Size is the third downstream
+// criterion to fail here, after projected winding (deleted near-vertical real walls) and topology
+// (calls tongues 'enclosed'). The separating signal is density at the data perimeter, upstream:
+// see POISSON_TRIM_EDGE_MULT_X100 in SceneReconstruct.cpp.
+#ifndef TEXTURE_FILL_MIN_COMPONENT_FACES
+#define TEXTURE_FILL_MIN_COMPONENT_FACES 0
+#endif
+
+// TEXTURE_BOUNDARY_SMOOTH_*: Taubin-smooth the FINAL silhouette, after the boundary-sheet delete.
+//
+// WHY A NEW PASS IS NEEDED AT ALL. The visible outline of the deliverable is the silhouette of
+// the OBSERVED region, decided per-triangle by camera visibility when the patches were built, and
+// nothing reshapes it:
+//   * the contour majority filter below only rewrites keepF for UNOBSERVED faces -- its own
+//     comment says observed faces are never touched -- so it dresses the fringe AGAINST that
+//     outline rather than straightening it. It also cannot straighten in principle: a face needs
+//     MOST of its neighbours to disagree before it flips, so a one-face STAIRCASE is a stable
+//     fixed point. Converged output measured as `1842 64 15 3 1 0` and the edge stayed choppy.
+//   * Mesh::Clean's alpha-tighten, rim-erode and its own Phase-10 Taubin pass all run back in
+//     ReconstructMesh, long before this cut exists -- the comment on the majority filter says so
+//     explicitly. They polish a boundary that no longer bounds the visible surface.
+//   * raising TEXTURE_UNOBSERVED_EDGE_MARGIN_EDGES does smooth it (a geodesic dilation's level
+//     sets get smoother with distance) but pays in synthesized edging, which is the artifact that
+//     margin was set to 0 to remove.
+//
+// So this is the same Taubin curve smoother as Mesh.cpp Phase 10, re-implemented against
+// MVS::Mesh and run at the only point where the final boundary exists. For each boundary vertex
+// with exactly TWO border-curve neighbours, move toward their midpoint by +lambda, then away by
+// -mu; the alternating pair cancels the curve-shortening of plain Laplacian smoothing, so the
+// outline gets smoother WITHOUT receding and no coverage is lost. Pinch/junction vertices (>2
+// border neighbours) and every interior vertex are never moved, and no face is added or removed,
+// so topology is untouched.
+//
+// COST, stated plainly: this moves vertices AFTER texturing. Texcoords are per-face and stay
+// attached, so nothing is remapped, but the texture stretches very slightly right at the edge.
+// At sub-edge-length movement that is invisible, and the atlas gutter already covers sampling
+// past the triangles. Genuine sharp corners in the survey outline will also round off along with
+// the noise -- ITERS is the knob for that.
+#ifndef TEXTURE_BOUNDARY_SMOOTH_ENABLED
+#define TEXTURE_BOUNDARY_SMOOTH_ENABLED 0   // OFF: it polished the visibility contour this stage
+                                            // used to carve. With that delete disabled there is no
+                                            // new boundary here to smooth. (was 1)
+#endif
+// lambda+mu pairs. More = smoother outline and more rounding of real corners.
+#ifndef TEXTURE_BOUNDARY_SMOOTH_ITERS
+#define TEXTURE_BOUNDARY_SMOOTH_ITERS 10   // 20 measured: mean 0.0858 -> 0.1084 (+26%) for 2x work, no visible gain -- Taubin is at its fixed point, so extra pairs only round real corners
+#endif
+// Taubin shrink step, x100. Matches Mesh.cpp Phase 10.
+#ifndef TEXTURE_BOUNDARY_SMOOTH_LAMBDA_X100
+#define TEXTURE_BOUNDARY_SMOOTH_LAMBDA_X100 50
+#endif
+// Taubin inflate step MAGNITUDE, x100; must exceed lambda or the curve still shrinks.
+#ifndef TEXTURE_BOUNDARY_SMOOTH_MU_X100
+#define TEXTURE_BOUNDARY_SMOOTH_MU_X100 53
+#endif
+
+// TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED: don't offer label 0 (UNDEFINED) to a face that has
+// at least one candidate view. Stops the MRF from RECRUITING textureable faces into the
+// synthesized fill.
+//
+// THE DEFECT. The two SmoothnessPottsStrong variants disagree on one clause:
+//     #ifdef INCREASE_PATCHES   if (l1 == l2)                       return 0;
+//     #else                     if (l1 == l2 && l1 != 0 && l2 != 0) return 0;
+// The stock form deliberately EXCLUDES label 0 so two undefined neighbours pay the pair
+// penalty like anyone else. The INCREASE_PATCHES form (the active one) lost that guard, so
+// an undefined<->undefined edge is FREE. Undefined regions therefore become energetically
+// self-reinforcing: once a blob exists, a bordering face that has a real view finds it
+// cheaper to join the blob (0 smoothness) than to keep its label and pay the switch penalty
+// at the blob edge.
+//
+// MEASURED on the Niwot house -- and note the file's own [LBP-DIAG] counter was added to
+// catch precisely this ("undefined well above [the floor] means textureable faces are being
+// pulled into undefined patches by the smoothness term"):
+//     faces=496114 unobserved=24720   <- hard floor: faces with NO candidate view at all
+//     iter=1  undefined=26998
+//     iter=10 undefined=29737
+//     iter=50 undefined=29984         <- monotonic climb, never recovers
+// 29,984 - 24,720 = 5,264 faces (17.6% of the no-view set) had usable views and were
+// discarded anyway. Each then costs twice: a data-colour fill tile, AND a seam-feather band
+// smeared over the real texture around it.
+//
+// WHY THE FIX IS HERE AND NOT IN THE SMOOTHNESS TERM. Restoring the missing `l1 != 0` guard
+// looks like the obvious one-line fix and is a silent no-op: SetPottsSmoothness(true) makes
+// LBP.h sample the pairwise term ONCE per edge as fncSmoothCost(n1, n2, 0, 1) and then
+// hardcode "0 when l1 == l2", so that branch is never evaluated during the solve. Turning the
+// flag off is not an option either -- "0 == 0 costs W but A == A costs 0" is not a Potts
+// model, and the general path re-evaluates fncSmoothCost L1*L2 times per directed edge per
+// sweep (~5.8e9 normal dot-products on this scene). See the note above SmoothnessPottsStrong.
+//
+// Removing the label instead is exact and needs no tuning: a face with a candidate view
+// simply cannot be assigned undefined, so `undefined` can only equal the genuine floor. It
+// touches no energy value, so the Potts structure and its fast path are untouched.
+//
+// TRADE-OFF, stated plainly: a face whose only view is poor now gets that view's (possibly
+// stretched, grazing) texture instead of synthesized fill. That is the same call already made
+// by setting TEXTURE_DATACOLOR_MIN_VIEW_COS to 0, and it is the direction this scene wants --
+// the areas in question were sharp in earlier builds. It does remove the MRF's ability to
+// reject a lone outlier view; FaceOutlierDetection upstream is the mechanism for that, not
+// label 0, which can only replace the face with blurred fill.
+//
+// WATCH ON THE NEXT RUN: `undefined=` should sit at the floor (24720) and stop climbing across
+// sweeps, noView should fall by ~5k, and the feather band with it. gSmoothnessWeight (2000)
+// was tuned WITH the defect present, so patch structure will shift -- check the patch count
+// and finalEnergy, and if large flat areas fragment, gSmoothnessWeight is the knob, not this.
+// 0 = previous behaviour (every face offered label 0).
+#ifndef TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED
+#define TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED 1
 #endif
 
 // TEXTURE_DATACOLOR_BAKE_OUTSET_PX: how far OUTSIDE each triangle, in atlas pixels, the
@@ -584,6 +1046,14 @@ namespace { namespace texprof {
 // The residual it reports is the one number that says whether the feather actually lands
 // on the fill colour at the seam; every seam fix so far has been evaluated by eye. Set
 // back to 0 once the seam is settled if the extra log line is unwanted.
+// RE-ENABLED (numeric only; DIAG_TINT stays 0 so output texels are unchanged). With
+// MIN_VIEW_COS at 0 the fill regions shrank but did not vanish, and the question left is
+// WHY the survivors have no view -- which is precisely what the [TEX-VIEWCLASS] line and
+// the TexViewClass.ply this switch produces answer, per face:
+//   observed / angle-rejected / occluded-or-subpixel / back-winding-culled / off-frustum
+// Guessing between those five is what the last three rounds did. Set back to 0 once the
+// residual is understood; it costs one extra double-precision reprojection of every
+// candidate face per view, plus the PLY write.
 #ifndef TEXTURE_DATACOLOR_DIAG
 #define TEXTURE_DATACOLOR_DIAG 1
 #endif
@@ -736,6 +1206,11 @@ namespace { namespace texprof {
 // FIXED working set. LocalSeamLeveling resizes its buffers per patch across 15k patches of
 // wildly varying size, and it is that realloc churn -- not streaming volume alone -- that
 // makes it contend. Reverted; only the seam pass is capped.
+// (Since TEXTURE_FUSED_GRADIENT, the two mGrad planes are gone and that private scratch is
+// ~12 B/px -- imageGradMag, faceMap, depthMap -- plus ~46 B per candidate face for the
+// raster binning; see the accounting at the per-view declarations. The loop IS bandwidth-
+// bound, as later profiling showed, but capping workers is still not the lever: cutting
+// bytes moved per view is.)
 
 // TEXTURE_CROP_IMAGES: after view-selection, each source image only contributes the
 // bounding box of the faces assigned to it (~0.6 MP of an ~18.6 MP original), yet the
@@ -843,6 +1318,49 @@ LBPInference::EnergyType STCALL SmoothnessPotts(LBPInference::NodeID, LBPInferen
 
 static LBPInference::EnergyType gSmoothnessWeight = 2000;
 
+// TEXTURE_LBP_PENALIZE_UNDEFINED_AGREEMENT: stop label 0 (UNDEFINED) from being a free
+// match against itself in the INCREASE_PATCHES smoothness term.
+//
+// THE DEFECT. The two SmoothnessPottsStrong variants below disagree on one clause:
+//     #ifdef INCREASE_PATCHES   if (l1 == l2)                      return 0;
+//     #else                     if (l1 == l2 && l1 != 0 && l2 != 0) return 0;
+// The stock (non-INCREASE_PATCHES) form deliberately EXCLUDES label 0, so two undefined
+// neighbours pay the pair penalty like any other. The INCREASE_PATCHES form lost that
+// guard, so an undefined<->undefined edge costs NOTHING -- which makes undefined regions
+// energetically self-reinforcing: once a blob exists, a bordering face with a real view
+// available finds it cheaper to join the blob (0 smoothness) than to keep its label and
+// pay the switch penalty at the blob edge. Faces that HAVE usable views get recruited into
+// the fill.
+//
+// MEASURED on the Niwot house, and the file's own [LBP-DIAG] counter was added to catch
+// exactly this ("undefined well above [the floor] means textureable faces are being pulled
+// into undefined patches by the smoothness term"):
+//     faces=496114 unobserved=24720   <- hard floor: faces with NO candidate view at all
+//     iter=1  undefined=26998
+//     iter=10 undefined=29737
+//     iter=50 undefined=29984         <- monotonic climb, never recovers
+// 29,984 - 24,720 = 5,264 faces (17.6% of the no-view set) had usable views and were
+// discarded anyway. Each one then gets a data-colour fill tile AND a seam-feather band on
+// the real texture around it, so the cost is paid twice over.
+//
+// WHY THE FIX IS NOT HERE -- do not "restore the missing l1 != 0 guard" in this function.
+// It cannot work, and it fails SILENTLY, which is worse than not trying.
+//
+// FaceViewSelection calls inference.SetPottsSmoothness(true). Under that flag LBP.h treats
+// the pairwise term as a strict Potts model: it samples the per-edge constant EXACTLY ONCE,
+// as fncSmoothCost(n1, n2, 0, 1) (a DISTINCT pair) in PrepareTopology, and its message fast
+// path then hardcodes "0 when l1 == l2, edgeWeight otherwise". So the l1 == l2 branch of
+// this function is never evaluated during the solve, and any change to it is a no-op.
+//
+// Nor can the flag simply be turned off. "0 == 0 costs W but A == A costs 0" is not a Potts
+// model, so the fast path structurally cannot express it, and the general O(L1*L2) path
+// evaluates fncSmoothCost L1*L2 times per directed edge per sweep. On this scene that is
+// edges=1,485,746 x avgLabels 8.84^2 x 50 sweeps ~= 5.8e9 normal dot-products -- the exact
+// hot spot the fast path was introduced to remove.
+//
+// The fix lives in the DATA cost instead, where it is exact and needs no tuning: a face that
+// HAS a candidate view is simply not offered label 0. See
+// TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED at the node-setup loop in FaceViewSelection.
 #ifdef INCREASE_PATCHES
 static LBPInference::EnergyType SmoothnessPottsStrong(
 	LBPInference::NodeID n1,
@@ -1387,6 +1905,32 @@ public:
 	// mid-pipeline would invalidate them.
 	std::vector<FIndex> unobservedToDelete;
 
+	// Per face: did it EVER project with FRONT winding in ANY view? Filled by
+	// ListCameraFaces, read by the data-colour stage (see
+	// TEXTURE_FEATHER_SKIP_HIDDEN_FILL). Separates the two very different reasons a face
+	// can end up with no view:
+	//   1 = real surface a camera could have seen head-on, but it lost the depth test
+	//       (occluded) or was too small / too poorly seen to win a pixel. Feathering the
+	//       transition into it is meaningful -- it abuts texture the viewer sees.
+	//   0 = never front-wound anywhere, i.e. inverted or interior geometry (a flap behind
+	//       the real surface). Invisible in every render, so nothing about its edge needs
+	//       softening. On Niwot this is 17,670 of 29,942 no-view faces.
+	// Empty if ListCameraFaces has not run, which every consumer treats as "no info".
+	std::vector<uint8_t> everFrontWound;
+
+	// Per face: did it EVER project in-bounds and in front of a camera in ANY view, EITHER
+	// winding? Needed because everFrontWound == 0 is ambiguous on its own and conflates two
+	// completely different situations:
+	//   everProjected=1, everFrontWound=0 -> it WAS tested, and every time it faced away.
+	//                                        Inward-facing geometry. Safe to delete.
+	//   everProjected=0                   -> NEVER tested (outside every frustum). No evidence
+	//                                        either way; this is real surface at the edge of
+	//                                        coverage and must be KEPT.
+	// MEASURED why this matters: treating the two alike dropped 63,662 of 71,223 unobserved
+	// faces (89%) on SchnellTests -- exactly back-winding-cull 42,935 + off-frustum 20,725 --
+	// and the off-frustum share punched scattered holes through real terrain.
+	std::vector<uint8_t> everProjected;
+
 	// used to compute the seam leveling
 	PairIdxArr seamEdges; // the (face-face) edges connecting different texture patches
 	Mesh::FaceIdxArr components; // for each face, stores the texture patch index to which belongs
@@ -1606,9 +2150,10 @@ void UpdateCameraVertsAndNormals(
 		float yc = M10 * v.x + M11 * v.y + M12 * v.z + M13;
 		float zc = M20 * v.x + M21 * v.y + M22 * v.z + M23;
 
-		if (zc < 1e-6f) zc = 1e-6f;
-
-		out.verts[i] = { xc, yc, zc, 1.f / zc };
+		// invZ == 0 is the "not in front of the camera" sentinel the rasterizer
+		// tests. Do NOT clamp zc positive: that would project a vertex behind the
+		// near plane to a finite in-front coordinate instead of rejecting it.
+		out.verts[i] = { xc, yc, zc, zc > 1e-6f ? 1.f / zc : 0.f };
 	}
 }
 
@@ -1630,6 +2175,394 @@ inline int CeilPos(float y) {
 	int iy = (int)y;
 	return iy + (y > float(iy));
 }
+
+// TEXTURE_FUSED_GRADIENT: build the per-view gradient-magnitude plane in one pass
+// over a rolling 3-row window instead of toGray -> Sobel x -> Sobel y -> combine.
+//
+// The staged version is 34.4% of ListCameraFaces' per-view loop, and almost all of
+// that is DRAM traffic on intermediates nothing outside the stage ever reads. At
+// 20 MP: toGray writes an 80 MB float plane, each Sobel reads it and writes another
+// 80 MB, and the Eigen combine reads both back to write 80 MB -- ~740 MB per view to
+// produce a plane that is 80. The two Sobel planes are also freshly allocated and
+// released per view (160 MB of first-touch page faults each time round).
+//
+// Fused, the same plane costs "read the BGR image once, write the result once"
+// (~140 MB), with the gray row, the horizontally-filtered rows, and the 3-row window
+// all inside ~140 KB of L2. 0 = previous staged path (kept for A/B).
+#ifndef TEXTURE_FUSED_GRADIENT
+#define TEXTURE_FUSED_GRADIENT 1
+#endif
+
+#if TEXTURE_FUSED_GRADIENT
+// Gradient magnitude of the grayscale image, |Sobel3x3|, fused into one pass.
+//
+// Numerically this is the staged chain it replaces, term for term:
+//  * gray = (0.114*B + 0.587*G + 0.299*R) / 255, in float, associated left to right
+//    -- exactly TImage::toGray(COLOR_BGR2GRAY, bNormalize=true, bSRGB=false);
+//  * Sobel is applied separably, the way cv::Sobel does it (getDerivKernels(1,0,3)
+//    is [-1,0,1] across and [1,2,1] down; dy swaps them), so each row keeps a
+//    horizontal derivative hD and a horizontal smooth hS, and the vertical pass
+//    reads the 3-row window: gx = (hD[y-1] + 2*hD[y] + hD[y+1])/8,
+//    gy = (hS[y+1] - hS[y-1])/8. OpenCV correlates rather than convolves, hence
+//    these signs -- irrelevant here anyway, only the magnitude is kept;
+//  * borders are BORDER_REFLECT_101 (cv::Sobel's BORDER_DEFAULT): row -1 mirrors to
+//    row 1, column -1 to column 1, and likewise at the far edge.
+// Only the float rounding order differs from OpenCV's separable pass, in the last
+// ulp of a value that is then averaged over a face's ~150 pixels to rank views.
+static void ComputeGradientMagnitudeFused(
+	const Image8U3& image, TImage<float>& gradMag, std::vector<float>& ring)
+{
+	const int W = image.cols, H = image.rows;
+	gradMag.create(H, W);
+	if (W < 2 || H < 2) {
+		gradMag.memset(0); // no 3x3 neighbourhood exists; the staged path would too
+		return;
+	}
+
+	// one gray row + 3 rows each of hD and hS: 7 x W floats, ~140 KB at 5000 px
+	ring.resize((size_t)W * 7);
+	float* const gray = ring.data(); // no __restrict: it is captured by the lambda below
+	float* const hD[3] = { ring.data() + (size_t)W * 1, ring.data() + (size_t)W * 2, ring.data() + (size_t)W * 3 };
+	float* const hS[3] = { ring.data() + (size_t)W * 4, ring.data() + (size_t)W * 5, ring.data() + (size_t)W * 6 };
+
+	constexpr float cb = 0.114f, cg = 0.587f, cr = 0.299f;
+	constexpr float inv255 = 1.f / 255.f;
+	constexpr float scale = 1.f / 8.f;
+
+	// gray-convert source row y (reflect_101 if outside) and horizontally filter it
+	// into ring slot `slot`
+	const auto LoadRow = [&](int y, int slot) {
+		if (y < 0) y = -y;                     // -1 -> 1
+		else if (y >= H) y = 2 * (H - 1) - y;  // H -> H-2
+		const uint8_t* __restrict const s = image.ptr<uint8_t>(y);
+		for (int x = 0; x < W; ++x)
+			gray[x] = (cb * s[x * 3 + 0] + cg * s[x * 3 + 1] + cr * s[x * 3 + 2]) * inv255;
+		float* __restrict const d = hD[slot];
+		float* __restrict const t = hS[slot];
+		// column reflect_101: gray[-1] -> gray[1], gray[W] -> gray[W-2]
+		d[0] = 0.f; // gray[1] - gray[1]
+		t[0] = gray[1] + 2.f * gray[0] + gray[1];
+		for (int x = 1; x < W - 1; ++x) {
+			d[x] = gray[x + 1] - gray[x - 1];
+			t[x] = gray[x - 1] + 2.f * gray[x] + gray[x + 1];
+		}
+		d[W - 1] = 0.f;
+		t[W - 1] = gray[W - 2] + 2.f * gray[W - 1] + gray[W - 2];
+	};
+
+	// row r lives in slot (r+1)%3, so the window for row y is slots y, y+1, y+2 (mod 3)
+	LoadRow(-1, 0);
+	LoadRow(0, 1);
+	for (int y = 0; y < H; ++y) {
+		LoadRow(y + 1, (y + 2) % 3); // overwrites row y-2, which has aged out
+		const float* __restrict const dm = hD[(y + 0) % 3]; // row y-1
+		const float* __restrict const dc = hD[(y + 1) % 3]; // row y
+		const float* __restrict const dp = hD[(y + 2) % 3]; // row y+1
+		const float* __restrict const tm = hS[(y + 0) % 3];
+		const float* __restrict const tp = hS[(y + 2) % 3];
+		float* __restrict const out = gradMag.ptr<float>(y);
+		for (int x = 0; x < W; ++x) {
+			const float gx = (dm[x] + 2.f * dc[x] + dp[x]) * scale;
+			const float gy = (tp[x] - tm[x]) * scale;
+			out[x] = FastSqrtS(gx * gx + gy * gy);
+		}
+	}
+}
+#endif
+
+#if TEXTURE_FAST_RASTER
+// Rasterize one view's faces into faceMap (LOCAL cameraFaces index of the nearest
+// face covering each pixel) + depthMap (that face's depth). Replaces
+// TRasterMesh::Project + TImage::RasterizeTriangleBary in ListCameraFaces.
+//
+// PROFILED, not guessed. On a 367-view / 20 MP scene the straight face-order walk
+// (this function's first version, and the stock path before it) cost 44.7 ns per
+// frame pixel, while the sequential accumulation scan right after it -- same buffers,
+// same threads, MORE bytes touched per pixel -- cost 4.9. A 9x gap on identical
+// hardware is not arithmetic, it is misses: faceMap+depthMap are 8 B x 20 MP = 160 MB
+// per view, a face covers ~150 px spread over ~12 rows, and consecutive faces land
+// anywhere in the frame. Every triangle row is a cold line in each of two buffers,
+// and 40k pages per buffer thrashes the L2 TLB on top. Cutting ALU work off that
+// (which the first version did: unique-vertex float transforms instead of ~6x
+// redundant double ones, incremental barycentrics instead of three edge functions
+// per bbox pixel, no per-pixel PARSER callback) barely moved the stage, because the
+// arithmetic was already hiding behind the stalls.
+//
+// So the faces are BINNED INTO SCREEN TILES and rasterized tile by tile. A tile's
+// slice of both buffers is TEXTURE_RASTER_TILE^2 x 8 B (128 KB at 128 px), which
+// lives in L2 for the whole time faces are drawn into it. Two consequences:
+//  * every depth read-modify-write after the first hits cache, not DRAM;
+//  * the tile's CLEAR moves inside the loop, so the buffers are written once and
+//    never read back. That drops the raster's DRAM traffic from ~3 passes over
+//    160 MB (memset, then read depth, then write depth+face) to ~1.
+//
+// Output is BIT-IDENTICAL to the untiled walk: pixels belong to exactly one tile,
+// and a tile's bin is filled in ascending face order, so each pixel still sees its
+// covering faces in the same relative order and the `d > z` first-wins tie goes the
+// same way. Set TEXTURE_RASTER_TILE to 0 to collapse this to a single frame-sized
+// tile (i.e. the untiled walk) for A/B.
+//
+// Costs kept from the first version, all still worth having once the misses are gone:
+//  * each UNIQUE vertex is transformed once, in float, through the pre-composed P
+//    matrix (camera.Pf) -- ProjectVertex ran TransformPointW2C + TransformPointC2I
+//    in REAL (double) for all three vertices of EVERY face, so a vertex shared by
+//    ~6 faces was transformed ~6 times per view;
+//  * barycentrics are evaluated once per row segment and stepped across it, instead
+//    of three edge functions at every bbox pixel including the ~half that miss;
+//  * PerspectiveCorrectBarycentricCoordinates + ComputeDepth (six products and a
+//    divide, behind a callback) collapse to z = 1 / (w0/z0 + w1/z1 + w2/z2).
+//
+// Behaviour preserved from the stock path: whole-triangle reject unless all three
+// vertices are in front of the camera AND project inside the image with a 3 px
+// border (the test is written positively, so NaN coordinates fail it, as they did
+// through isInsideWithBorder); both windings rasterize under
+// TEXTURE_RASTER_NO_BACKFACE_CULL, positive-area winding only otherwise (note
+// EdgeFunction2 is the negation of Common's EdgeFunction, hence the flipped
+// comparison); nearest depth wins, ties keep the earlier face.
+// One deliberate difference: exactly-zero-area triangles are dropped. The stock path
+// divided by that zero, and the resulting NaN barycentrics passed its negativity
+// rejects, letting a degenerate face scribble over its bounding box.
+
+// Screen-tile edge in pixels. Both buffer slices of one tile must fit L2 alongside
+// whatever the co-resident SMT sibling is doing: 128 px -> 128 KB, comfortable
+// everywhere. 0 = one frame-sized tile (untiled walk, for A/B).
+#ifndef TEXTURE_RASTER_TILE
+#define TEXTURE_RASTER_TILE 128
+#endif
+
+// Per-thread scratch for the tiled rasterizer. Held by the caller (OpenMP-private)
+// so the buffers grow once per thread rather than per view. ~21 B per candidate
+// face: 16 for the clipped bbox, ~4.4 for the CSR bin payload at ~1.1 tiles/face.
+struct RasterScratch {
+	std::vector<int32_t> boxes;       // 4/face: minX,minY,maxX,maxY (minX > maxX = culled)
+	std::vector<uint32_t> tileStart;  // CSR offsets, numTiles+1
+	std::vector<uint32_t> tileCursor; // per-tile write cursor while scattering
+	std::vector<uint32_t> tileFaces;  // CSR payload: local face indices, ascending per tile
+};
+
+// One face's projected triangle. Recomputed in the tile pass rather than cached: it
+// is 3 loads + 6 multiplies against a verts array that stays hot, versus ~90 B per
+// face of extra streamed state.
+struct TriProj {
+	Point2f v[3];
+	const CamVert* c[3];
+	float area;
+};
+
+// Project one face and apply the stock culls. False = this face draws nothing.
+static inline bool ProjectCameraFace(const CameraRenderData& rd, size_t fi,
+	float minB, float maxBX, float maxBY, TriProj& t)
+{
+	const Face& face = rd.faces[fi];
+	t.c[0] = &rd.verts[face[0]];
+	t.c[1] = &rd.verts[face[1]];
+	t.c[2] = &rd.verts[face[2]];
+	for (int i = 0; i < 3; ++i) {
+		const CamVert& c = *t.c[i];
+		// in front of the camera? (invZ == 0 is the behind/at-camera sentinel
+		// UpdateCameraVertsAndNormals sets)
+		if (c.invZ == 0.f)
+			return false;
+		t.v[i] = Point2f(c.x * c.invZ, c.y * c.invZ);
+		// inside the image with the 3 px border? (isInsideWithBorder<float,3>)
+		if (!(t.v[i].x >= minB && t.v[i].x <= maxBX && t.v[i].y >= minB && t.v[i].y <= maxBY))
+			return false;
+	}
+	t.area = EdgeFunction2(t.v[0], t.v[1], t.v[2]);
+#if TEXTURE_RASTER_NO_BACKFACE_CULL
+	return t.area != 0.f; // degenerate only: invArea would be infinite
+#else
+	return t.area < 0.f;  // back-oriented (EdgeFunction2 == -EdgeFunction)
+#endif
+}
+
+static void RasterizeCameraFacesFast(
+	const CameraRenderData& rd,
+	TImage<cuint32_t>& faceMap,
+	DepthMap& depthMap,
+	RasterScratch& scratch)
+{
+	const int width = depthMap.cols;
+	const int height = depthMap.rows;
+	static_assert(NO_ID == (uint32_t)0xFFFFFFFF, "faceMap clear assumes NO_ID is all-bits-1");
+	if (width <= 0 || height <= 0)
+		return;
+
+	// isInsideWithBorder<float,3>: pt >= 3 and pt <= size-4, inclusive both ends
+	constexpr int border = 3;
+	const float minB = (float)border;
+	const float maxBX = (float)(width - (border + 1));
+	const float maxBY = (float)(height - (border + 1));
+
+	Depth* __restrict const depthPtr = depthMap.ptr<Depth>(0);
+	cuint32_t* __restrict const facePtr = faceMap.ptr<cuint32_t>(0);
+
+#if TEXTURE_RASTER_TILE > 0
+	// constexpr so the tile-index divisions below fold to shifts: pass 1 and pass 2
+	// each do four of them per face, and idiv is ~20-40 cycles
+	constexpr int tileSize = TEXTURE_RASTER_TILE;
+#else
+	const int tileSize = MAXF(width, height); // one frame-sized tile (untiled A/B)
+#endif
+	const int tilesX = (width + tileSize - 1) / tileSize;
+	const int tilesY = (height + tileSize - 1) / tileSize;
+	const size_t numTiles = (size_t)tilesX * (size_t)tilesY;
+	const size_t numFaces = rd.faces.size();
+
+	// an image narrower than the border, or no candidates: the maps must still come
+	// back cleared, so pass 3 runs regardless and only the binning is skipped
+	const bool anyFaces = (maxBX >= minB && maxBY >= minB && numFaces > 0);
+
+	scratch.tileStart.assign(numTiles + 1, 0);
+	if (anyFaces) {
+		// ---- pass 1: project + cull once, keep the bbox, count per-tile hits ------
+		scratch.boxes.resize(numFaces * 4);
+		int32_t* __restrict const boxes = scratch.boxes.data();
+		// deliberately NOT __restrict: the prefix sum below walks the same storage
+		// through scratch.tileStart while this pointer is still in scope
+		uint32_t* const counts = scratch.tileStart.data();
+		TriProj t;
+		for (size_t fi = 0; fi < numFaces; ++fi) {
+			int32_t* __restrict const box = boxes + fi * 4;
+			if (!ProjectCameraFace(rd, fi, minB, maxBX, maxBY, t)) {
+				box[0] = 1; box[2] = 0; // minX > maxX marks it culled
+				continue;
+			}
+			float boxMinX = t.v[0].x, boxMaxX = t.v[0].x;
+			float boxMinY = t.v[0].y, boxMaxY = t.v[0].y;
+			for (int i = 1; i < 3; ++i) {
+				if (t.v[i].x < boxMinX) boxMinX = t.v[i].x;
+				if (t.v[i].x > boxMaxX) boxMaxX = t.v[i].x;
+				if (t.v[i].y < boxMinY) boxMinY = t.v[i].y;
+				if (t.v[i].y > boxMaxY) boxMaxY = t.v[i].y;
+			}
+			// every vertex is inside the border, so the box needs no clipping;
+			// coordinates are >= border > 0, so truncation is floor
+			box[0] = (int32_t)boxMinX;
+			box[1] = (int32_t)boxMinY;
+			box[2] = (int32_t)CeilPos(boxMaxX); // inclusive, as RasterizeTriangleBary
+			box[3] = (int32_t)CeilPos(boxMaxY);
+			const int tx0 = box[0] / tileSize, tx1 = box[2] / tileSize;
+			const int ty0 = box[1] / tileSize, ty1 = box[3] / tileSize;
+			for (int ty = ty0; ty <= ty1; ++ty)
+				for (int tx = tx0; tx <= tx1; ++tx)
+					++counts[(size_t)ty * tilesX + tx + 1];
+		}
+
+		// ---- pass 2: prefix-sum the counts, scatter face indices into the bins ----
+		for (size_t tl = 1; tl <= numTiles; ++tl)
+			scratch.tileStart[tl] += scratch.tileStart[tl - 1];
+		scratch.tileFaces.resize(scratch.tileStart[numTiles]);
+		scratch.tileCursor.assign(scratch.tileStart.begin(), scratch.tileStart.end() - 1);
+		uint32_t* __restrict const cursor = scratch.tileCursor.data();
+		uint32_t* __restrict const bins = scratch.tileFaces.data();
+		for (size_t fi = 0; fi < numFaces; ++fi) {
+			const int32_t* __restrict const box = boxes + fi * 4;
+			if (box[0] > box[2])
+				continue;
+			const int tx0 = box[0] / tileSize, tx1 = box[2] / tileSize;
+			const int ty0 = box[1] / tileSize, ty1 = box[3] / tileSize;
+			for (int ty = ty0; ty <= ty1; ++ty)
+				for (int tx = tx0; tx <= tx1; ++tx)
+					bins[cursor[(size_t)ty * tilesX + tx]++] = (uint32_t)fi;
+		}
+	}
+
+	// ---- pass 3: clear and rasterize one tile at a time, both hot in L2 -----------
+	const uint32_t* __restrict const bins = (anyFaces && !scratch.tileFaces.empty()) ? scratch.tileFaces.data() : nullptr;
+	const int32_t* __restrict const boxes = anyFaces ? scratch.boxes.data() : nullptr;
+	TriProj t;
+	for (int tyi = 0; tyi < tilesY; ++tyi) {
+		const int ty0 = tyi * tileSize;
+		const int ty1 = MINF(ty0 + tileSize, height) - 1;
+		for (int txi = 0; txi < tilesX; ++txi) {
+			const int tx0 = txi * tileSize;
+			const int tx1 = MINF(tx0 + tileSize, width) - 1;
+			const size_t tileW = (size_t)(tx1 - tx0 + 1);
+
+			// Clear this tile's slice HERE rather than memsetting the whole frame up
+			// front: the lines stay in L2 for the faces drawn into them right below,
+			// so the depth read-modify-write never goes back to DRAM.
+			for (int y = ty0; y <= ty1; ++y) {
+				const size_t off = (size_t)y * (size_t)width + (size_t)tx0;
+				::memset(depthPtr + off, 0, tileW * sizeof(Depth));
+				::memset(facePtr + off, 0xFF, tileW * sizeof(cuint32_t));
+			}
+
+			if (bins == nullptr)
+				continue;
+			const size_t tile = (size_t)tyi * tilesX + txi;
+			const uint32_t binBeg = scratch.tileStart[tile], binEnd = scratch.tileStart[tile + 1];
+			for (uint32_t b = binBeg; b < binEnd; ++b) {
+				const uint32_t fi = bins[b];
+				// it passed the culls in pass 1, so this cannot fail
+				(void)ProjectCameraFace(rd, fi, minB, maxBX, maxBY, t);
+				const Point2f& v0 = t.v[0];
+				const Point2f& v1 = t.v[1];
+				const Point2f& v2 = t.v[2];
+				const float invArea = 1.f / t.area;
+
+				const int32_t* __restrict const box = boxes + (size_t)fi * 4;
+				const int colMin = MAXF((int)box[0], tx0), colMax = MINF((int)box[2], tx1);
+				const int rowMin = MAXF((int)box[1], ty0), rowMax = MINF((int)box[3], ty1);
+
+				// per-pixel barycentric gradient along a row (w_i weights vertex i)
+				const float w0_dx = (v1.y - v2.y) * invArea;
+				const float w1_dx = (v2.y - v0.y) * invArea;
+				const float w2_dx = (v0.y - v1.y) * invArea;
+
+				// only the reciprocals are needed: the perspective-correct depth is
+				// 1/sum(w_i/z_i), so the z_i themselves cancel out
+				const float iz0 = t.c[0]->invZ, iz1 = t.c[1]->invZ, iz2 = t.c[2]->invZ;
+
+				for (int y = rowMin; y <= rowMax; ++y) {
+					const size_t base = (size_t)y * (size_t)width;
+					Depth* __restrict const depthRow = depthPtr + base;
+					cuint32_t* __restrict const faceRow = facePtr + base;
+
+					// Each row segment's starting barycentrics are evaluated exactly,
+					// not carried by w_row += w_dy: three edge functions per ROW is
+					// noise next to that row's pixels, and it keeps the incremental
+					// error bounded by the segment width instead of by width*height.
+					// Unlike the refine rasterizer, whose faces are subdivided to
+					// ~32 px^2, a texturing face (a floor, a facade) can project across
+					// thousands of rows. The stock path sampled at integer pixel
+					// coordinates (Cast<T>(pt)) rather than pixel centers, so match it.
+					const Point2f pRow((float)colMin, (float)y);
+					float w0 = EdgeFunction2(v1, v2, pRow) * invArea;
+					float w1 = EdgeFunction2(v2, v0, pRow) * invArea;
+					float w2 = EdgeFunction2(v0, v1, pRow) * invArea;
+
+					// skip the leading run of pixels outside the triangle (adds only)
+					int x = colMin;
+					while (x <= colMax && !(w0 >= 0.f && w1 >= 0.f && w0 + w1 <= 1.f)) {
+						w0 += w0_dx;
+						w1 += w1_dx;
+						w2 += w2_dx;
+						++x;
+					}
+					// the covered span is contiguous, so the segment ends when it does
+					for (; x <= colMax; ++x) {
+						// perspective-correct depth: PerspectiveCorrectBarycentric-
+						// Coordinates then ComputeDepth is exactly 1/sum(w_i/z_i)
+						const float z = 1.f / (w0 * iz0 + w1 * iz1 + w2 * iz2);
+						const Depth d = depthRow[x];
+						if (d == 0 || d > z) {
+							depthRow[x] = z;
+							faceRow[x] = (cuint32_t)fi;
+						}
+						w0 += w0_dx;
+						w1 += w1_dx;
+						w2 += w2_dx;
+						if (w0 < 0.f || w1 < 0.f || w0 + w1 > 1.f)
+							break;
+					}
+				}
+			}
+		}
+	}
+}
+#endif
 
 // extract array of faces viewed by each image
 // Cap on candidate views (observations) kept per face in ListCameraFaces. On
@@ -1719,12 +2652,34 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		std::iota(views.begin(), views.end(), IIndex(0));
 	}
 	facesDatas.Resize(faces.size());
+#if TEXTURE_FEATHER_SKIP_HIDDEN_FILL
+	// see the member declarations; written per view below, read by the data-colour stage
+	everFrontWound.assign(faces.size(), 0);
+	everProjected.assign(faces.size(), 0);
+#endif
 	Util::Progress progress(_T("Initialized views"), views.size());
 	typedef float real;
 	TImage<real> imageGradMag;
 	TImage<real>::EMat mGrad[2];
 	FaceMap faceMap;
 	DepthMap depthMap;
+#if TEXTURE_FAST_RASTER
+	// Per-thread scratch for the fast rasterizer: the compacted (unique) camera-space
+	// vertices + local faces of the view being rasterized. Declared here so the
+	// OpenMP private() clause below gives each thread one that is reused across all
+	// the views it handles (buffers grow once) and is destroyed at the end of the
+	// region. Costs ~24 B per candidate face per THREAD (16 B/unique vertex for the
+	// projected verts, 16 B/face for the local face + global-face index), on top of
+	// the 4 B/face cameraFaces already holds; that is the price of not re-projecting
+	// every shared vertex ~6 times in double precision.
+	CameraRenderData camRender;
+	// binning + bbox scratch for the tiled raster; ~21 B per candidate face per thread
+	RasterScratch rasterScratch;
+#endif
+#if TEXTURE_FUSED_GRADIENT
+	// rolling window for the fused gradient pass: 7 image rows of float, per thread
+	std::vector<float> gradRing;
+#endif
 
 	struct FaceAccum {
 		float quality;
@@ -1808,6 +2763,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	static std::vector<Point3f> gFaceCenter;
 	gFaceCenter.resize(faces.size());
 
+	constexpr float oneThird = 1.0f / 3.0f;
 #pragma omp parallel for schedule(static)
 	for (int64_t f = 0; f < (int64_t)faces.size(); ++f) {
 		const Face& fc = faces[(size_t)f];
@@ -1815,17 +2771,37 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		const Vertex& b = vertices[fc[1]];
 		const Vertex& c = vertices[fc[2]];
 		gFaceCenter[(size_t)f] = Point3f(
-			(a.x + b.x + c.x) * (1.0f / 3.0f),
-			(a.y + b.y + c.y) * (1.0f / 3.0f),
-			(a.z + b.z + c.z) * (1.0f / 3.0f)
+			(a.x + b.x + c.x) * oneThird,
+			(a.y + b.y + c.y) * oneThird,
+			(a.z + b.z + c.z) * oneThird
 		);
 	}
 	TEX_PROFILE_END(_tLcfCenters, "ListCameraFaces: face centers");
 
 	TEX_PROFILE_BEGIN(_tLcfPerView);
+#if TEXTURE_PROFILE
+	// The single stage timer around this loop cannot say whether the per-view time is
+	// image filtering, the raster, or the full-frame accumulation scan -- and without
+	// that split, optimizing the raster is guesswork. These counters accumulate CPU
+	// nanoseconds per sub-stage ACROSS all worker threads (so the sum is ~nThreads x
+	// the wall time of the loop) and are reported once, after it. ~8 clock reads per
+	// view, i.e. free at this granularity.
+	std::atomic<uint64_t> _pfDecode(0), _pfGrad(0), _pfBlur(0), _pfCull(0),
+		_pfPrep(0), _pfRaster(0), _pfAccum(0), _pfOut(0);
+	std::atomic<uint64_t> _pfRasterPix(0), _pfRasterFaces(0);
+	#define LCF_TICK(v) const texprof::Clock::time_point v(texprof::Clock::now())
+	#define LCF_TOCK(v, acc) (acc).fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(texprof::Clock::now() - (v)).count(), std::memory_order_relaxed)
+#else
+	#define LCF_TICK(v) ((void)0)
+	#define LCF_TOCK(v, acc) ((void)0)
+#endif
 #ifdef TEXOPT_USE_OPENMP
 	bool bAbort(false);
+#if TEXTURE_FAST_RASTER
+#pragma omp parallel for private(imageGradMag, mGrad, faceMap, depthMap, camRender, rasterScratch, gradRing)
+#else
 #pragma omp parallel for private(imageGradMag, mGrad, faceMap, depthMap)
+#endif
 	for (int_t idx = 0; idx < (int_t)views.size(); ++idx) {
 #pragma omp flush (bAbort)
 		if (bAbort) {
@@ -1842,6 +2818,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			continue;
 		}
 		// load image
+		LCF_TICK(_t0);
 		unsigned level(nResolutionLevel);
 		const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
 		if ((imageData.image.empty() || MAXF(imageData.width, imageData.height) != imageSize) && !imageData.ReloadImage(imageSize)) {
@@ -1853,8 +2830,15 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			return false;
 #endif
 		}
+		LCF_TOCK(_t0, _pfDecode);
 		imageData.UpdateCamera(scene.platforms);
 		// compute gradient magnitude
+		LCF_TICK(_t1);
+#if TEXTURE_FUSED_GRADIENT
+		ComputeGradientMagnitudeFused(imageData.image, imageGradMag, gradRing);
+		// mGrad stays empty on this path: the two full-res Sobel planes it held are
+		// exactly the intermediates the fused pass keeps in L2 instead
+#else
 		imageData.image.toGray(imageGradMag, cv::COLOR_BGR2GRAY, true);
 		cv::Mat grad[2];
 		mGrad[0].resize(imageGradMag.rows, imageGradMag.cols);
@@ -1879,29 +2863,105 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		// rasterization (faceMap/depthMap) below lowers the multi-thread memory peak.
 		// Re-grown by resize() on the next image (1 alloc/image, negligible).
 		{ TImage<real>::EMat empty0, empty1; mGrad[0].swap(empty0); mGrad[1].swap(empty1); }
+#endif
+		LCF_TOCK(_t1, _pfGrad);
 		// apply some blur on the gradient to lower noise/glossiness effects onto face-quality score
+		LCF_TICK(_t2);
 		cv::GaussianBlur(imageGradMag, imageGradMag, cv::Size(15, 15), 0, 0, cv::BORDER_DEFAULT);
+		LCF_TOCK(_t2, _pfBlur);
 		// select faces inside view frustum
+		LCF_TICK(_t3);
 		Mesh::FaceIdxArr cameraFaces;
 		Mesh::FacesInserter inserter(cameraFaces);
 		typedef TFrustum<float, 5> Frustum;
 		const Frustum frustum(Frustum::MATRIX3x4(((PMatrix::CEMatMap)imageData.camera.P).cast<float>()), (float)imageData.width, (float)imageData.height);
 		octree.Traverse(frustum, inserter);
+		LCF_TOCK(_t3, _pfCull);
 		// project all triangles in this view and keep the closest ones
 		faceMap.create(imageData.height, imageData.width);
 		depthMap.create(imageData.height, imageData.width);
-		RasterMesh rasterer(vertices, imageData.camera, depthMap, faceMap);
-		rasterer.Clear();
 		// Rasterize storing a LOCAL face index (position in cameraFaces) into faceMap
 		// instead of the global face id. This lets the per-pixel accumulation below
 		// index a dense, cameraFaces-sized array directly instead of hashing every
 		// rasterized pixel into a robin_map (millions of hash ops per view otherwise).
 		const uint32_t numCameraFaces((uint32_t)cameraFaces.size());
+#if TEXTURE_FAST_RASTER
+		// PreprocessCameraFaces walks cameraFaces in order, so a face's index in
+		// camRender.faces IS the local index the accumulation below indexes by.
+		LCF_TICK(_t4);
+		PreprocessCameraFaces(cameraFaces, faces, vertices, camRender);
+		UpdateCameraVertsAndNormals(vertices, imageData.camera, camRender);
+		LCF_TOCK(_t4, _pfPrep);
+		LCF_TICK(_t5);
+		RasterizeCameraFacesFast(camRender, faceMap, depthMap, rasterScratch);
+		LCF_TOCK(_t5, _pfRaster);
+#else
+		LCF_TICK(_t5);
+		RasterMesh rasterer(vertices, imageData.camera, depthMap, faceMap);
+		rasterer.Clear();
 		for (uint32_t li = 0; li < numCameraFaces; ++li) {
 			const Face& facet = faces[cameraFaces[li]];
 			rasterer.idxFace = (FIndex)li;
 			rasterer.Project(facet);
 		}
+		LCF_TOCK(_t5, _pfRaster);
+#endif
+#if TEXTURE_PROFILE
+		_pfRasterFaces.fetch_add(numCameraFaces, std::memory_order_relaxed);
+		_pfRasterPix.fetch_add((uint64_t)faceMap.rows * (uint64_t)faceMap.cols, std::memory_order_relaxed);
+#endif
+#if TEXTURE_FEATHER_SKIP_HIDDEN_FILL
+		// FRONT-WOUND RECORD -- always on, and deliberately cheap. See the everFrontWound
+		// member and TEXTURE_FEATHER_SKIP_HIDDEN_FILL. Benign race: every writer stores 1.
+		{
+			uint8_t* const __restrict pFW = everFrontWound.data();
+			uint8_t* const __restrict pEP = everProjected.data();
+#if TEXTURE_FAST_RASTER
+			// Reuses the camera-space verts UpdateCameraVertsAndNormals just produced for
+			// this view, so the whole record costs one edge function per candidate face and
+			// no reprojection at all. Bounds are the rasterizer's own
+			// (isInsideWithBorder<float,3>), so a face counts here exactly when the raster
+			// would have considered it.
+			const float fwMinB = 3.f;
+			const float fwMaxBX = (float)((int)imageData.width - 4);
+			const float fwMaxBY = (float)((int)imageData.height - 4);
+			const size_t nLocalFaces = camRender.faces.size();
+			TriProj fwT;
+			for (size_t li = 0; li < nLocalFaces; ++li) {
+				if (!ProjectCameraFace(camRender, li, fwMinB, fwMaxBX, fwMaxBY, fwT))
+					continue;
+				// It projected in-bounds and in front, whatever its winding: this face HAS been
+				// tested, which is what distinguishes it from one outside every frustum.
+				pEP[camRender.globalFace[li]] = 1;
+				// EdgeFunction2 is the negation of Common's EdgeFunction, so FRONT winding
+				// (EdgeFunction > 0) is area < 0 here -- the same sign test
+				// ProjectCameraFace applies when back-face culling is enabled.
+				if (fwT.area < 0.f)
+					pFW[camRender.globalFace[li]] = 1;
+			}
+#else
+			// stock path: no pre-transformed verts to reuse, so project as the classifier
+			// below does (this branch is only for A/B, where the extra cost is irrelevant)
+			for (uint32_t li = 0; li < numCameraFaces; ++li) {
+				const FIndex idxFace = cameraFaces[li];
+				const Face& facet = faces[idxFace];
+				Point2f pf[3];
+				bool ok = true;
+				for (int v = 0; v < 3; ++v) {
+					const Point3 Xc(imageData.camera.TransformPointW2C(Cast<REAL>(vertices[facet[v]])));
+					if (Xc.z <= 0) { ok = false; break; }
+					pf[v] = imageData.camera.TransformPointC2I(Xc);
+					if (!depthMap.isInsideWithBorder<float, 3>(pf[v])) { ok = false; break; }
+				}
+				if (!ok)
+					continue;
+				pEP[idxFace] = 1; // tested, whatever the winding
+				if (EdgeFunction(pf[0], pf[1], pf[2]) > 0.f)
+					pFW[idxFace] = 1;
+			}
+#endif
+		}
+#endif
 #if TEXTURE_DATACOLOR_DIAG
 		// classify projection/winding of each candidate face (same math as the
 		// rasterizer's ProjectVertex + EdgeFunction cull) to sub-bucket NO_ID faces
@@ -1927,6 +2987,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 
 		// accumulate per-face quality/area/color over the rasterized pixels; the dense
 		// buffer is indexed by the local face index written into faceMap above.
+		LCF_TICK(_t6);
 		std::vector<FaceAccum> acc(numCameraFaces); // Value initializes acc as well.
 
 		for (int j = 0; j < faceMap.rows; ++j) {
@@ -1953,8 +3014,10 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			}
 		}
 
+		LCF_TOCK(_t6, _pfAccum);
 		// ---- angle adjustment per face ----
 		// Build output list for this view:
+		LCF_TICK(_t7);
 		std::vector<FaceOut> out;
 		out.reserve(numCameraFaces);
 		for (uint32_t li = 0; li < numCameraFaces; ++li) {
@@ -2014,6 +3077,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		}
 
 		perViewOut[(size_t)idx].swap(out);
+		LCF_TOCK(_t7, _pfOut);
 
 #if TEXTURE_CROP_IMAGES
 		// Crop-images mode: this view's pixels are fully consumed. Free them now so
@@ -2037,6 +3101,32 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		return false;
 #endif
 	TEX_PROFILE_END(_tLcfPerView, "ListCameraFaces: per-view rasterize+quality");
+#if TEXTURE_PROFILE
+	{
+		// Summed over threads, so read these as SHARES of the loop, not wall time.
+		// "raster" is what TEXTURE_FAST_RASTER touches; if it is a small slice of the
+		// total, a faster rasterizer cannot move this stage no matter how fast it is.
+		const double ms = 1e-6;
+		const double dec = _pfDecode.load() * ms, gra = _pfGrad.load() * ms, blu = _pfBlur.load() * ms,
+			cul = _pfCull.load() * ms, pre = _pfPrep.load() * ms, ras = _pfRaster.load() * ms,
+			acc = _pfAccum.load() * ms, out = _pfOut.load() * ms;
+		const double tot = dec + gra + blu + cul + pre + ras + acc + out;
+		const double inv = tot > 0 ? 100.0 / tot : 0.0;
+		DEBUG_EXTRA("[PROFILE] LCF per-view CPU-ms summed over threads (total %.0f):", tot);
+		DEBUG_EXTRA("[PROFILE]   decode/reload %9.0f (%4.1f%%) | toGray+Sobel %9.0f (%4.1f%%) | blur15x15 %9.0f (%4.1f%%)",
+			dec, dec * inv, gra, gra * inv, blu, blu * inv);
+		DEBUG_EXTRA("[PROFILE]   frustum cull  %9.0f (%4.1f%%) | raster prep  %9.0f (%4.1f%%) | RASTER     %9.0f (%4.1f%%)",
+			cul, cul * inv, pre, pre * inv, ras, ras * inv);
+		DEBUG_EXTRA("[PROFILE]   accum scan    %9.0f (%4.1f%%) | face-out     %9.0f (%4.1f%%)",
+			acc, acc * inv, out, out * inv);
+		const uint64_t nf = _pfRasterFaces.load(), np = _pfRasterPix.load();
+		DEBUG_EXTRA("[PROFILE]   raster: %llu candidate faces, %llu frame px over %u views -> %.1f ns/face, %.2f ns/frame-px",
+			(unsigned long long)nf, (unsigned long long)np, (unsigned)views.size(),
+			nf ? _pfRaster.load() / (double)nf : 0.0, np ? _pfRaster.load() / (double)np : 0.0);
+	}
+#endif
+#undef LCF_TICK
+#undef LCF_TOCK
 
 	// [MEM-DECOMP] TEMPORARY: decompose the ListCameraFaces resident footprint so we
 	// can target the ~20 GB base that stage-level probes leave unexplained. Measures
@@ -3183,6 +4273,20 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 					//node.labels.reserve(nFD + 1);
 					//node.dataCosts.reserve(nFD + 1);
 
+#if TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED
+					// ---- undefined label: ONLY for a face with no candidate view ----
+					// Offering it to a face that HAS a view lets the free undefined<->undefined
+					// smoothness edge recruit that face into a fill blob (5,264 faces measured).
+					// See TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED, including why this cannot be
+					// fixed in SmoothnessPottsStrong. nFD >= 1 below, so the node still has at
+					// least one label, as LBP requires.
+					if (nFD == 0) {
+						node.labels.push_back(0);
+						node.dataCosts.push_back(undefinedCost);
+						++numUnobservedFaces;
+						continue;
+					}
+#else
 					// ---- undefined label first ----
 					node.labels.push_back(0);
 					node.dataCosts.push_back(undefinedCost);
@@ -3191,6 +4295,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 						++numUnobservedFaces;
 						continue;
 					}
+#endif
 
 					order.resize(nFD);
 
@@ -6866,7 +7971,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				// crop is never allocated and the saving shows up in peak memory.
 				float cropScale = 1.f;
 				if (cropMaxDensity < FLT_MAX && p < patchWorldArea.size() && patchWorldArea[p] > 1e-9f) {
-					const float d = std::sqrt((float)r.width * (float)r.height / patchWorldArea[p]);
+					const float d = FastSqrtS((float)r.width * (float)r.height / patchWorldArea[p]);
 					if (d > cropMaxDensity)
 						cropScale = cropMaxDensity / d;
 				}
@@ -7608,16 +8713,95 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						}
 						cur.swap(next);
 					}
+					// CONNECTED COMPONENTS of the unobserved set. The keep rule below judges an
+					// ENCLOSED region by TOPOLOGY alone, which cannot tell a lake from a tongue; its
+					// SIZE can. See TEXTURE_FILL_MIN_COMPONENT_FACES. Same flood/label/report idiom as
+					// the orphan filter above, so the distribution can be read before choosing a value.
+					std::vector<int32_t> fComp(nF, -1);
+					std::vector<uint32_t> compSizeNV;
+					{
+						std::vector<uint8_t> isNV(nF, 0);
+						for (const FIndex f : noViewFaces) isNV[f] = 1;
+						std::vector<FIndex> stk;
+						for (const FIndex f0 : noViewFaces) {
+							if (fComp[f0] != -1) continue;
+							const int32_t c = (int32_t)compSizeNV.size();
+							compSizeNV.push_back(0);
+							fComp[f0] = c; stk.push_back(f0);
+							while (!stk.empty()) {
+								const FIndex f = stk.back(); stk.pop_back();
+								++compSizeNV[c];
+								const Mesh::FaceFaces& ffc = faceFaces[f];
+								for (int e = 0; e < 3; ++e) {
+									const FIndex g = ffc[e];
+									if (g != NO_ID && isNV[g] && fComp[g] == -1) { fComp[g] = c; stk.push_back(g); }
+								}
+							}
+						}
+						std::vector<uint32_t> srt(compSizeNV);
+						std::sort(srt.begin(), srt.end(), [](uint32_t a, uint32_t b) { return a > b; });
+						std::string szStr;
+						for (size_t i = 0; i < srt.size() && i < 12; ++i) { szStr += std::to_string(srt[i]); szStr += ' '; }
+						DEBUG("[TEX-SHEET] unobserved components: %zu total, sizes (top of %zu): %s"
+							"| ENCLOSED kept only at >= %d faces -- read this distribution and pick a"
+							" value in a real GAP between the big regions (lakes, textureless roofs) and"
+							" the speck/tongue tier",
+							compSizeNV.size(), srt.size(), szStr.c_str(),
+							(int)TEXTURE_FILL_MIN_COMPONENT_FACES);
+					}
 					// Per-face keep/drop, before smoothing.
 					std::vector<uint8_t> keepF(nF, 0);
+					size_t nHiddenDropped = 0, nSmallDropped = 0;
+#if TEXTURE_DELETE_HIDDEN_UNOBSERVED
+					// See TEXTURE_DELETE_HIDDEN_UNOBSERVED. Reuses the everFrontWound record built
+					// in ListCameraFaces; empty means it did not run, so fall through to the
+					// previous keep-everything-enclosed behaviour rather than deleting blindly.
+					const uint8_t* const pFWkeep =
+						(everFrontWound.size() == faces.size()) ? everFrontWound.data() : nullptr;
+					const uint8_t* const pEPkeep =
+						(everProjected.size() == faces.size()) ? everProjected.data() : nullptr;
+#endif
 					for (const FIndex f : noViewFaces) {
+#if TEXTURE_DELETE_HIDDEN_UNOBSERVED
+						// HIDDEN GEOMETRY, not textureless surface. A face that never projected
+						// FRONT-WOUND in any view is part of the envelope's inward-facing side --
+						// invisible in every render, and on a near-closed Poisson mesh that is the
+						// UNDERSIDE. Dressing it with synthesized colour is what makes it show up
+						// as spikes hanging off the silhouette. Genuine textureless surface (a flat
+						// roof, water inside the survey) faces the cameras and IS front-wound, so
+						// it still reaches the fill below.
+						//
+						// everProjected is REQUIRED here. Without it the test also catches faces
+						// outside every frustum, which were never tested at all -- and deleting
+						// those punched scattered holes through real terrain (63,662 of 71,223
+						// dropped, i.e. back-winding 42,935 PLUS off-frustum 20,725). "Never
+						// tested" must fail safe to KEEP.
+						if (pFWkeep && pEPkeep && pEPkeep[f] && !pFWkeep[f]) { ++nHiddenDropped; continue; }
+#endif
 						// Enclosed -> always keep (interior fill). Boundary component -> keep
 						// the metric margin nearest real surface. dist stays kUnreached for a
 						// component that never reaches an observed face at all: a detached
 						// island with no real texture to blend from, always dropped.
-						if (!touchesBorder[f] || (dist[f] != kUnreached && dist[f] <= marginDist))
+						const bool bEnclosed = !touchesBorder[f];
+#if TEXTURE_FILL_MIN_COMPONENT_FACES > 0
+						// A SMALL enclosed region is not a lake or a textureless roof -- it is a speck or
+						// a tongue of synthetic surface, which is what reads as clutter at the edge. Chop
+						// it rather than dress it. Large enclosed regions (the water) are untouched.
+						if (bEnclosed && fComp[f] >= 0 &&
+							compSizeNV[(size_t)fComp[f]] < (uint32_t)TEXTURE_FILL_MIN_COMPONENT_FACES) {
+							++nSmallDropped;
+							continue;
+						}
+#endif
+						if (bEnclosed || (dist[f] != kUnreached && dist[f] <= marginDist))
 							keepF[f] = 1;
 					}
+					DEBUG("[TEX-SHEET] hidden-geometry filter: %zu of %zu unobserved faces never"
+						" projected front-wound in any view -> dropped instead of filled",
+						nHiddenDropped, noViewFaces.size());
+					DEBUG("[TEX-SHEET] small-component filter: %zu unobserved faces dropped as"
+						" enclosed components under %d faces", nSmallDropped,
+						(int)TEXTURE_FILL_MIN_COMPONENT_FACES);
 
 					// BOUNDARY REGULARIZATION -- majority filter over face adjacency.
 					//
@@ -7633,8 +8817,28 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					// neighbours agreeing and never flips). Applied ONLY to unobserved faces
 					// in boundary components -- observed faces and interior fill are never
 					// touched.
+					// Per-pass flip count, logged below. Without it there is no way to tell a pass
+					// count that has CONVERGED (flips falling to ~0, more passes would be free but
+					// pointless) from one that is still cutting into the contour every pass -- and
+					// that is exactly the question when raising this knob.
+					// SEQUENTIAL (Gauss-Seidel) UPDATE, not synchronous (Jacobi). This was a real
+					// bug, and the flip counter is what exposed it: with a Jacobi update the pass
+					// read the OLD keepF and wrote a separate `upd`, so two adjacent faces could
+					// each see the other disagreeing, both flip together, and both flip back on the
+					// next pass -- forever. MEASURED before the fix:
+					//     flips per pass: 3072 2585 2555 2549 2547 2547 2546 2546
+					// i.e. ~2,546 faces oscillating with period 2 and no convergence at any pass
+					// count. The contour was never being smoothed, it was thrashing, and the result
+					// depended on whether the pass count happened to be even or odd -- which is why
+					// both 3 and 8 passes left it choppy.
+					//
+					// Writing in place makes each face see its neighbours' ALREADY-UPDATED values,
+					// which breaks the two-face symmetry that sustains the cycle: every flip then
+					// strictly reduces local disagreement, so the filter descends to a fixed point.
+					// Order is the fixed noViewFaces order, so the result stays deterministic.
+					std::string smoothFlips;
 					for (int pass = 0; pass < TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES; ++pass) {
-						std::vector<uint8_t> upd(keepF);
+						size_t nFlips = 0;
 						for (const FIndex f : noViewFaces) {
 							if (!touchesBorder[f])
 								continue;   // interior fill: not ours to reshape
@@ -7649,11 +8853,21 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								const uint8_t gk = covered[g] ? 1 : keepF[g];
 								if (gk == keepF[f]) ++agree; else ++disagree;
 							}
-							if (disagree > agree)
-								upd[f] = keepF[f] ? 0 : 1;
+							if (disagree > agree) {
+								keepF[f] = keepF[f] ? 0 : 1; // in place: see the note above
+								++nFlips;
+							}
 						}
-						keepF.swap(upd);
+						smoothFlips += (pass ? " " : "");
+						smoothFlips += std::to_string(nFlips);
+						if (nFlips == 0)
+							break; // fixed point reached; further passes cannot change anything
 					}
+					DEBUG("[TEX-SHEET] contour majority filter: %d passes, flips per pass: %s"
+						" -- falling to ~0 means the contour has converged and more passes are"
+						" pointless; still large on the last pass means it is eating into the"
+						" boundary rather than removing spikes",
+						(int)TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES, smoothFlips.c_str());
 
 					// RIM PEEL on the boundary this cut just created.
 					//
@@ -7856,6 +9070,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								continue;
 							if (covered[f]) {
 								deleteFaces.push_back(f);
+#if TEXTURE_FEATHER_CUT_SILHOUETTE
 								// Stop counting it as real texture: it is leaving the mesh.
 								// The seam feather seeds its ring 0 on `covered` (a face is a
 								// boundary face when a neighbour is NO_ID or not covered), so
@@ -7865,6 +9080,14 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								// and mirror donor search reads `covered` too, and would
 								// otherwise transplant texture from a face about to vanish.
 								covered[f] = 0;
+#endif
+								// Left SET by default: every surviving neighbour of this face
+								// would otherwise become a ring-0 feather boundary at alpha 1,
+								// flattening real rim texture (eaves, roof edges) to the fill
+								// colour field. See TEXTURE_FEATHER_CUT_SILHOUETTE for why the
+								// two donor-search reasons above are inert in this build.
+								// NOTE the face is still queued for deletion either way -- this
+								// controls only whether the cut FEATHERS, never what is cut.
 							}
 							keepF[f] = 0;
 						}
@@ -8677,16 +9900,48 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						//    observed<->fill seam. One O(faces) scan.
 						std::vector<int> fRing(faces.size(), -1);
 						std::vector<FIndex> cur, nxt, bandFaces;
+						size_t nHiddenLinksSkipped = 0, nSeedRim = 0, nSeedFill = 0;
+#if TEXTURE_FEATHER_SKIP_HIDDEN_FILL
+						// A no-view neighbour earns a feather only if a camera could actually
+						// have seen it head-on. One that never projected front-wound anywhere
+						// is an inverted/interior flap behind the surface -- invisible in every
+						// render -- so softening the transition into it buys nothing while
+						// costing an alpha-1 ring plus K-1 rings of ramp on real texture.
+						// See TEXTURE_FEATHER_SKIP_HIDDEN_FILL for the measurements.
+						// An empty vector means ListCameraFaces did not fill it in: fall back
+						// to the old "every no-view neighbour seeds" behaviour rather than
+						// silently feathering nothing.
+						const uint8_t* const pFW =
+							(everFrontWound.size() == faces.size()) ? everFrontWound.data() : nullptr;
+						// same "never tested != inward-facing" distinction as the keep/delete rule:
+						// a face outside every frustum is genuine unobserved surface and SHOULD
+						// seed a feather band, unlike an inward-facing flap.
+						const uint8_t* const pEP =
+							(everProjected.size() == faces.size()) ? everProjected.data() : nullptr;
+#endif
 						for (FIndex f = 0; f < (FIndex)faces.size(); ++f) {
 							if (!covered[f]) continue;
 							const Mesh::FaceFaces& adj = faceFaces[f];
 							bool boundary = false;
 							for (int k = 0; k < 3; ++k) {
 								const FIndex fn = adj[k];
-								if (fn == NO_ID || !covered[fn]) { boundary = true; break; }
+								// An OPEN mesh edge is the true silhouette, not a fill region,
+								// and always seeds -- this switch is only about fill.
+								if (fn == NO_ID) { boundary = true; ++nSeedRim; break; }
+								if (covered[fn]) continue;
+#if TEXTURE_FEATHER_SKIP_HIDDEN_FILL
+								if (pFW && pEP && pEP[fn] && !pFW[fn]) { ++nHiddenLinksSkipped; continue; }
+#endif
+								boundary = true;
+								++nSeedFill;
+								break;
 							}
 							if (boundary) { fRing[f] = 0; cur.push_back(f); bandFaces.push_back(f); }
 						}
+						DEBUG("[SEAM-SKIP] feather ring 0 = %zu faces (%zu seeded by an open mesh"
+							" edge, %zu by a visible no-view neighbour); %zu neighbour links"
+							" skipped as hidden geometry (never front-wound in any view)",
+							cur.size(), nSeedRim, nSeedFill, nHiddenLinksSkipped);
 						for (int r = 1; r < K && !cur.empty(); ++r) {
 							nxt.clear();
 							for (const FIndex f : cur) {
@@ -8822,9 +10077,9 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								// colour, so the extrapolated rim matches the fill face across the
 								// edge instead of stepping away from it.
 								const float ad = fabsf(denom);
-								const float ot0 = (ad > 1e-6f) ? bakeOutset * std::sqrt((ax[1]-ax[2])*(ax[1]-ax[2]) + (ay[1]-ay[2])*(ay[1]-ay[2])) / ad : 0.01f;
-								const float ot1 = (ad > 1e-6f) ? bakeOutset * std::sqrt((ax[2]-ax[0])*(ax[2]-ax[0]) + (ay[2]-ay[0])*(ay[2]-ay[0])) / ad : 0.01f;
-								const float ot2 = (ad > 1e-6f) ? bakeOutset * std::sqrt((ax[0]-ax[1])*(ax[0]-ax[1]) + (ay[0]-ay[1])*(ay[0]-ay[1])) / ad : 0.01f;
+								const float ot0 = (ad > 1e-6f) ? bakeOutset * FastSqrtS((ax[1]-ax[2])*(ax[1]-ax[2]) + (ay[1]-ay[2])*(ay[1]-ay[2])) / ad : 0.01f;
+								const float ot1 = (ad > 1e-6f) ? bakeOutset * FastSqrtS((ax[2]-ax[0])*(ax[2]-ax[0]) + (ay[2]-ay[0])*(ay[2]-ay[0])) / ad : 0.01f;
+								const float ot2 = (ad > 1e-6f) ? bakeOutset * FastSqrtS((ax[0]-ax[1])*(ax[0]-ax[1]) + (ay[0]-ay[1])*(ay[0]-ay[1])) / ad : 0.01f;
 								const float obb = bakeOutset + 1.f;
 								int minx = (int)std::floor(std::min(ax[0], std::min(ax[1], ax[2])) - obb);
 								int maxx = (int)std::ceil (std::max(ax[0], std::max(ax[1], ax[2])) + obb);
@@ -8868,14 +10123,15 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 										int ir = (int)((float)obs[2] + a * (tR - (float)obs[2]) + 0.5f); ir = ir < 0 ? 0 : (ir > 255 ? 255 : ir);
 #if TEXTURE_DATACOLOR_DIAG
 										{
-											const double tl = ((double)tR + tG + tB) * (1.0 / 3.0);
-											const double ol = ((double)obs[0] + obs[1] + obs[2]) * (1.0 / 3.0);
-											const double rl = ((double)ib + ig + ir) * (1.0 / 3.0);
+											constexpr double oneThird = 1.0 / 3.0;
+											const double tl = ((double)tR + tG + tB) * oneThird;
+											const double ol = ((double)obs[0] + obs[1] + obs[2]) * oneThird;
+											const double rl = ((double)ib + ig + ir) * oneThird;
 											++dgWritten;
 											if (a > 0.9f) { // near the ring-0 boundary
 												++dgBoundN;
-												const double ds = std::fabs(ol - tl); dgSumStep += ds; if (ds > dgMaxStep) dgMaxStep = ds;
-												const double rs = std::fabs(rl - tl); dgSumResid += rs; if (rs > dgMaxResid) dgMaxResid = rs;
+												const double ds = FastAbsD(ol - tl); dgSumStep += ds; if (ds > dgMaxStep) dgMaxStep = ds;
+												const double rs = FastAbsD(rl - tl); dgSumResid += rs; if (rs > dgMaxResid) dgMaxResid = rs;
 											}
 										}
 #endif
@@ -9493,6 +10749,109 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 			DEBUG("[TEX-SHEET] removed %u boundary-sheet faces after texturing"
 				" -> %u faces remain", (unsigned)removed, (unsigned)mesh.faces.GetSize());
 		}
+
+#if TEXTURE_BOUNDARY_SMOOTH_ENABLED
+		// FINAL SILHOUETTE POLISH -- see TEXTURE_BOUNDARY_SMOOTH_*. Runs here because this is the
+		// only point at which the boundary the viewer actually sees exists: patch-building fixed
+		// the observed region per-triangle, and the delete above finished carving it.
+		{
+			TD_TIMER_STARTD();
+			// Adjacency MUST be rebuilt -- the face array was just rewritten above, so any
+			// previously-computed faceFaces refers to the old indices.
+			//
+			// Do NOT reach for Mesh::EmptyExtra() here, however tempting the symmetry with
+			// ListVertexFaces is: it clears faceTexcoords AND releases textureDiffuse, i.e. it
+			// would silently throw away the entire texture this stage just produced. Only the two
+			// adjacency arrays are invalid, so only those are rebuilt. ListIncidenteFaceFaces
+			// asserts vertexFaces.size() == vertices.size(), hence the order.
+			mesh.vertexFaces.Empty();
+			mesh.faceFaces.Empty();
+			mesh.ListIncidenteFaces();
+			mesh.ListIncidenteFaceFaces();
+			const Mesh::FIndex nF = mesh.faces.GetSize();
+			const size_t NV = mesh.vertices.GetSize();
+			if (nF > 0 && NV > 0 && mesh.faceFaces.GetSize() == nF) {
+				// Border-curve neighbours per vertex. Edge e of face f joins fc[e] and
+				// fc[(e+1)%3] -- the same convention the border-loop union-find above uses --
+				// and an edge is on the border exactly when faceFaces[f][e] == NO_ID.
+				// cnt == 2 is a clean curve vertex; cnt > 2 is a pinch/junction and is skipped.
+				std::vector<uint32_t> nb0(NV, NO_ID), nb1(NV, NO_ID);
+				std::vector<uint8_t> cnt(NV, 0);
+				for (Mesh::FIndex f = 0; f < nF; ++f) {
+					const Mesh::FaceFaces& ff = mesh.faceFaces[f];
+					const Mesh::Face& fc = mesh.faces[f];
+					for (int e = 0; e < 3; ++e) {
+						if (ff[e] != NO_ID)
+							continue;
+						const uint32_t ab[2] = { fc[e], fc[(e + 1) % 3] };
+						for (int s = 0; s < 2; ++s) {
+							const uint32_t v = ab[s], w = ab[1 - s];
+							if (v >= NV || w >= NV)
+								continue;
+							if (cnt[v] == 0) { nb0[v] = w; cnt[v] = 1; }
+							else if (cnt[v] == 1) { if (nb0[v] != w) { nb1[v] = w; cnt[v] = 2; } }
+							else if (cnt[v] == 2) { if (nb0[v] != w && nb1[v] != w) cnt[v] = 3; }
+						}
+					}
+				}
+				size_t nCurve = 0, nJunction = 0;
+				for (size_t v = 0; v < NV; ++v) {
+					if (cnt[v] == 2) ++nCurve;
+					else if (cnt[v] > 2) ++nJunction;
+				}
+				if (nCurve > 0) {
+					const float lambda = float(TEXTURE_BOUNDARY_SMOOTH_LAMBDA_X100) / 100.f;
+					const float mu = -float(TEXTURE_BOUNDARY_SMOOTH_MU_X100) / 100.f;
+					// SIMULTANEOUS (Jacobi) update, deliberately -- unlike the contour majority
+					// filter, which needed sequential updates to stop oscillating. A curve
+					// smoother must read one consistent state or vertices chase their
+					// already-moved neighbours and the whole outline creeps along itself.
+					std::vector<Mesh::Vertex> cur(NV), nxt(NV);
+					for (size_t v = 0; v < NV; ++v)
+						cur[v] = mesh.vertices[(Mesh::VIndex)v];
+					nxt = cur;
+					for (int it = 0; it < TEXTURE_BOUNDARY_SMOOTH_ITERS * 2; ++it) {
+						const float step = (it & 1) ? mu : lambda;
+						for (size_t v = 0; v < NV; ++v) {
+							if (cnt[v] != 2)
+								continue;
+							const Mesh::Vertex& p = cur[v];
+							const Mesh::Vertex& a = cur[nb0[v]];
+							const Mesh::Vertex& b = cur[nb1[v]];
+							nxt[v] = Mesh::Vertex(
+								p.x + step * ((a.x + b.x) * 0.5f - p.x),
+								p.y + step * ((a.y + b.y) * 0.5f - p.y),
+								p.z + step * ((a.z + b.z) * 0.5f - p.z));
+						}
+						cur.swap(nxt);
+					}
+					// Commit ONLY the curve vertices: everything else is bit-identical anyway,
+					// and this makes it impossible for the pass to disturb interior geometry.
+					double moved = 0.0, movedMax = 0.0;
+					for (size_t v = 0; v < NV; ++v) {
+						if (cnt[v] != 2)
+							continue;
+						const Mesh::Vertex& o = mesh.vertices[(Mesh::VIndex)v];
+						const Mesh::Vertex& n = cur[v];
+						const double d = std::sqrt((double)SQUARE(n.x - o.x) +
+							(double)SQUARE(n.y - o.y) + (double)SQUARE(n.z - o.z));
+						moved += d;
+						if (d > movedMax) movedMax = d;
+						mesh.vertices[(Mesh::VIndex)v] = n;
+					}
+					DEBUG("[TEX-SMOOTH] silhouette Taubin: %zu curve vertices moved"
+						" (mean %.4g, max %.4g world units), %zu junction vertices skipped,"
+						" %d lambda/mu pairs (%.2f/%.2f) (%s)",
+						nCurve, moved / (double)nCurve, movedMax, nJunction,
+						(int)TEXTURE_BOUNDARY_SMOOTH_ITERS, lambda, mu,
+						TD_TIMER_GET_FMT().c_str());
+				} else {
+					DEBUG("[TEX-SMOOTH] silhouette Taubin: no clean border-curve vertices"
+						" (%zu junctions) -- nothing to smooth", nJunction);
+				}
+			}
+		}
+#endif // TEXTURE_BOUNDARY_SMOOTH_ENABLED
 	}
 	LogPeakMem("after GenerateTexture");
 

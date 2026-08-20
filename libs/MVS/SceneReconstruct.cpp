@@ -323,6 +323,54 @@
 // Backed by POISSON_CULL_MAX_FRACTION: if the cull wants more than that share of
 // the mesh, it is abandoned wholesale rather than gutting the surface, so the
 // worst case is a no-op.
+//
+// ENABLED (0 -> 1). The recorded negative result for this pass -- "removed ZERO faces,
+// d1/s_local max 2.82 vs 3.50, no gap" -- was measured on the OKState corridor, where the
+// spurious lobes SAT ON REAL (if wrong) dense-matching points. A distance-to-cloud test can
+// obviously find nothing when there is data underneath, so that result says nothing about a
+// scene where the lobes have no point support at all.
+//
+// MEASURED AND REVERTED (2026-08-19). The reasoning below was wrong, and the new [MESH-CULL]
+// distribution line shows exactly why -- the failure is STRUCTURAL, not scene-specific:
+//     d1/s_local over 1384602 vertices: p50=0.97 p90=2.40 p99=2.76 p99.9=2.81 max=2.83
+//     (cull fires above 3.50) -> removed no faces
+// on a scene where the dense cloud was inspected and has NO POINTS under the lobes at all. The
+// LOCAL normalization defeats the test: s_local is the spacing measured at the NEAREST cloud
+// point, so inside a void d1 and s_local grow TOGETHER and the ratio stays bounded. The pass
+// therefore cannot separate "far from data in a sparse region" from "close to data in a dense
+// region" -- the one distinction it exists to make. Nor can the factor be lowered into range:
+// with p50=0.97 and p90=2.40 there is no gap between bulk and tail, so anything under 2.83
+// starts cutting ordinary surface indiscriminately. The diagnostic says it outright: "a usable
+// cull needs a GAP between the bulk and the tail."
+//
+// Fixing it would mean referencing the distance to a GLOBAL or footprint-derived scale rather
+// than to the local spacing at the nearest point -- i.e. the occupancy test, not this one.
+//
+// Superseded on this data by simply setting --poisson-trim from the density distribution, which
+// the new percentile line makes possible: the trim was BINDING (min 5.47 vs threshold 5.50), not
+// inert, and the lobes survive only because their density sits above 5.5 while real terrain
+// occupies a tight 11.7-13.4 band. Raising the trim into the 8.8 (p5) region removes the tail.
+//
+// (The original note below is retained for the record; the OKState zero-removal result it
+// discusses is now known to be the same structural failure, not a data-support difference.)
+// Every other criterion tried on this scene failed for a structural reason:
+//   * SurfaceTrimmer density trim  -- removes LOW-density surface; extrapolated lobes can
+//     carry ordinary density, and a 1/3/7 sweep moved only 0.9-2.5%
+//   * aRatio 0.01 -> 0.001         -- merge knob only, ~2.8x on a 2.5% base, no visible change
+//   * alpha-tighten, rim erode     -- both touch BORDER faces only, and the mesh arrives
+//     near-closed (1264 border verts, 0.1%), so there is no rim for them to work on
+//   * --number-views-fuse, low-view filters -- nothing to filter; there are no points there
+//
+// SAFETY: the cull is conservative twice over. A face goes only when ALL THREE vertices are
+// beyond the threshold (so boundary faces straddling the data edge are kept), the threshold is
+// LOCAL (compared against the point spacing measured where each vertex sits, so sparse-but-real
+// regions are judged on their own scale rather than against the dense interior), and
+// POISSON_CULL_MAX_FRACTION abandons the whole pass if it wants more than 6% of the mesh. Worst
+// case is therefore a logged no-op, not a gutted surface.
+//
+// WATCH: the cull's own log line reports the removed count and fraction. If it self-abandons at
+// the 6% guard, that is the signal to check whether it is reaching real geometry before simply
+// raising POISSON_CULL_MAX_FRACTION.
 #ifndef POISSON_DISTANCE_CULL
 #define POISSON_DISTANCE_CULL 0
 #endif
@@ -360,29 +408,306 @@
 // (perimeter). A face is culled when its average vertex density is below the
 // average local threshold of its 3 vertices. trimThreshold is still the
 // interior baseline. Set to 0 to disable (use the stock SurfaceTrimmer).
+//
+// ENABLED (0 -> 1), and the data now justifies it precisely. A single GLOBAL trim provably
+// cannot satisfy this scene. Measured on SchnellTests at depth 11, post-trim density is
+//     min 5.47 | p1 7.43 | p5 8.8 | p25 11.7 | p50 12.4 | p95 13 | max 13.4
+// so real terrain occupies a tight 11.7-13.4 band with a long thin extrapolation tail running
+// from 5.47 up to ~8.8. Empirically, on the same mesh:
+//     --poisson-trim 5.5 -> keeps the water, keeps the ragged extrapolation fringe
+//     --poisson-trim 9   -> removes the fringe, ALSO removes the water, loses completeness
+// Those are the two ends of one knob, and the deliverable needs both behaviours in different
+// PLACES. That is exactly what this pass provides: interior = trimThreshold, ramping to
+// trimThreshold * POISSON_TRIM_EDGE_MULT_X100/100 at the perimeter. With the interior back at
+// 5.5 the edge lands on 5.5 * 1.60 = 8.8 -- the measured p5 that removed the fringe -- applied
+// only where the survey actually ran out of data.
+//
+// SET --poisson-trim BACK TO 5.5. Under this pass it is the INTERIOR threshold, not a global one.
+//
+// This REPLACES the SurfaceTrimmer call, so --poisson-island-ratio / --removeIslands no longer
+// apply; isolated junk is handled by the component filters in Mesh::Clean and the texture-stage
+// orphan filter, both active and logged. POISSON_TRIM_HARD_OUTSIDE stays 0 -- see its note; the
+// ramped threshold does the useful work and, being a density test, cannot sever the surface.
 #ifndef POISSON_ADAPTIVE_TRIM
-#define POISSON_ADAPTIVE_TRIM 0
+#define POISSON_ADAPTIVE_TRIM 1   // (was briefly 0 for an A/B; the footprint path lives here)
+//                                 NOTE disabling this takes the
+                                  // FOOTPRINT machinery with it: the whole block, including
+                                  // POISSON_TRIM_HARD_OUTSIDE and the escalating guard, is
+                                  // inside #if POISSON_ADAPTIVE_TRIM. What runs instead is the
+                                  // stock SurfaceTrimmer at a GLOBAL --poisson-trim.
 #endif
 // NOTE: releasing the dense point cloud before the Poisson solve is a RUNTIME
 // option (`--release-pointcloud`, the releasePointCloud argument below), not a
 // compile-time gate -- see ReconstructMeshPoisson.
 // Edge threshold as a multiple of the interior (passed) trimThreshold, x100.
 // 160 = edge threshold is 1.60x the interior threshold (e.g. 5.5 -> 8.8).
+// RAISED 160 -> 180 (edge threshold 5.5 * 1.80 = 9.9), chosen from the measured density
+// distribution rather than guessed:
+//     min 5.47 | p1 7.31 | p5 8.75 | p25 11.6 | p50 12.4 | p95 13 | max 13.4
+// Real terrain is the tight 11.6-13.4 band; the extrapolation tail runs 5.47 to ~8.8. At 160 the
+// edge threshold sat on p5 (8.8) and the adaptive trim removed only 0.4% of faces, leaving the
+// tongues. A GLOBAL --poisson-trim 9 was separately measured to remove the fringe properly -- it
+// just also ate the water, because it applied everywhere. 1.80 puts the PERIMETER threshold at
+// 9.9, past that known-good global value, while the deep interior stays at 5.5 and keeps the
+// water. That is the whole point of having a ramp.
+//
+// This is the right place for the fix. Every DOWNSTREAM criterion has now failed to separate
+// fabricated surface from real, for a documented reason each time: projected winding deletes
+// near-vertical real walls, topology calls tongues 'enclosed', and component size shows no gap
+// (1279 components ramping 10391/3990/2444/2268/... with no break). Density near the data
+// perimeter is the one signal that does separate them.
+//
+// Headroom before this eats real ground: p25 is 11.6, so 9.9 still sits below the bulk. If the
+// edge starts losing genuine shoreline step back toward 170; if tongues persist, 190-200 is still
+// under p25 but getting close, and past that the interior/edge split stops protecting you.
 #ifndef POISSON_TRIM_EDGE_MULT_X100
-#define POISSON_TRIM_EDGE_MULT_X100 160
+// FLATTENED TO 100 (edge == interior, i.e. no ramp). The elevated perimeter threshold is now
+// REDUNDANT AND HARMFUL:
+//   * redundant -- it existed to remove perimeter extrapolation via DENSITY, before the footprint
+//     cut existed. POISSON_TRIM_HARD_OUTSIDE now does that on OCCUPANCY, which actually
+//     discriminates fabricated from real surface where density cannot.
+//   * harmful -- density near a survey perimeter is genuinely low for REAL surface too, so the ramp
+//     cuts real ground first. Measured twice: RAMP_CELLS 16 doubled removal but lost shoreline while
+//     tongues survived, and at interior 5.63 the perimeter threshold of 5.63 x 1.80 = 10.13 punched
+//     a hole through a water body sitting near the survey edge -- water fill cannot survive 10.
+//
+// At 100 the density test is uniform at the percentile-derived interior value, which is exactly the
+// behaviour the hand-tuned 5.5-5.75 / 6.5 values were calibrated against (a single GLOBAL trim). So
+// density handles interior low-confidence surface, the footprint cut handles the boundary, and
+// neither is asked to do the other's job.
+//
+// Raise it again ONLY if POISSON_TRIM_HARD_OUTSIDE is disabled, since then density is once more the
+// only boundary mechanism and the ramp is the least-bad way to bias it outward.
+#define POISSON_TRIM_EDGE_MULT_X100 100
 #endif
 // Ramp width (in grid cells) over which the threshold blends interior->edge.
+// RAISED 6 -> 16 (7.4 -> 19.7 world units at a 1.232 cell). This is the knob that decides how far
+// INWARD from the data perimeter the elevated edge threshold reaches, and it was the real
+// bottleneck -- not the edge multiplier.
+//
+// MEASURED: raising POISSON_TRIM_EDGE_MULT_X100 160 -> 180 (edge 8.8 -> 9.9) moved removal only
+// 11,597 -> 12,394 faces, +7%, still 0.4% of the mesh. Yet ~12-15% of VERTICES sit below 9.9
+// (it falls between p5=8.75 and p25=11.6). That gap is the proof: the low-density material is
+// almost all INSIDE the footprint, where e = 1 - dist/ramp has already decayed the threshold back
+// toward the 5.50 interior value. Only the thin band actually outside the footprint ever saw 9.9.
+//
+// The tongues extend tens of units, while the elevated band was 7.4 units deep starting from a
+// perimeter that CLOSE_CELLS dilation had already pushed 9.9 units outward -- so their bases sat
+// at ~5.50 and survived every edge-threshold increase. 16 cells covers ~20 units inward, which is
+// the scale of the artifact.
+//
+// TRADE, and it is the same one as always: this elevates the threshold on anything within ~20
+// units of the perimeter, INCLUDING near-shore water. Deep interior (a lake centre) is unaffected
+// and still sits at 5.50. If shoreline starts disappearing, step back to 10-12; the deep-interior
+// protection is what distinguishes this from the global --poisson-trim 9 that ate the water.
 #ifndef POISSON_TRIM_RAMP_CELLS
 #define POISSON_TRIM_RAMP_CELLS 6
 #endif
+//
+// NEGATIVE RESULT (2026-08-19): tested at 16 (19.7 units) and REVERTED to 6. It doubled removal
+// (12,394 -> 23,506 faces, vs only +7% from raising the edge multiplier), so the mechanism was
+// real -- the band's DEPTH was the constraint, not its height. But the outcome was a bad trade:
+// shoreline was lost in areas with little synthetic geometry, while many tongues survived.
+//
+// WHY, and it generalises: distance-from-perimeter is ORTHOGONAL to whether geometry is
+// fabricated. It raises the threshold uniformly along the whole boundary, and the real survey edge
+// is genuinely low-density there (fewer views at the coverage limit), so it is cut first --
+// while a tongue carrying ordinary density survives. Density x distance cannot separate them.
+//
+// That is the fourth downstream criterion to fail on this artifact, after projected winding
+// (deletes near-vertical real walls), topology (calls tongues 'enclosed') and component size (no
+// gap in the distribution). The reason is structural: at the survey boundary, real surface and
+// extrapolated surface share every property these tests measure. The only true discriminator is
+// whether there are POINTS underneath -- confirmed absent under the tongues on this scene -- which
+// means the occupancy/footprint test, not another threshold.
 // Footprint grid cell size as a multiple of median NN spacing, x100. 300 = 3x.
+// RAISED 300 -> 2000 (20x median spacing), the value this footprint machinery was actually
+// FITTED with -- the live file had drifted to 300, which is a different lineage. It matters a
+// lot: the occupancy test needs >= POISSON_TRIM_MIN_PTS_PER_CELL points per cell, so 3x-spacing
+// cells (0.18 units on SchnellTests) almost never reach 20 points and the footprint fragments
+// into noise -- which makes nearly everything read as "near the perimeter" and applies the EDGE
+// threshold everywhere, i.e. exactly the global-trim behaviour this pass exists to avoid.
+// 20x gives 1.23-unit cells there, ~50 points/cell average against a 20 minimum.
+// VERIFY on new data via the "X of Y cells occupied (fraction Z)" field in the trim log: near
+// 1.0 means the min-count is too low and the footprint is swallowing the fringe.
 #ifndef POISSON_TRIM_CELL_FACTOR_X100
-#define POISSON_TRIM_CELL_FACTOR_X100 300
+#define POISSON_TRIM_CELL_FACTOR_X100 2000
+#endif
+// Minimum points in a grid cell for it to count as inside the surveyed footprint. This is the
+// "is there ENOUGH data here" test -- the one criterion that separates fabricated surface from
+// real, since both can carry ordinary density and both can face any direction. Fitted with
+// POISSON_TRIM_CELL_FACTOR_X100 2000; the two must be tuned together (halving the cell area
+// quarters the expected count).
+// LOWERED 20 -> 8 to close the residual interior holes, and the fringe cannot come back with it.
+// The two artifacts have DIFFERENT point counts, which is what makes this separable:
+//   * the extrapolated fringe has ZERO points (verified by inspecting the dense cloud), so ANY
+//     threshold >= 1 excludes it from the footprint -- lowering this cannot resurrect it;
+//   * the holes are in rough/vegetated terrain that has SOME coverage but under 20 points per
+//     cell, so it fell outside the footprint, was treated as perimeter, and got the 8.80 edge
+//     threshold instead of the 5.50 interior one.
+// Scale check: at median spacing 0.0616 a fully-sampled 1.232-unit cell holds (1.232/0.0616)^2
+// ~= 400 points, so 20 was demanding 5% of nominal density and 8 asks for 2% -- still decisively
+// "there is data here", just no longer excluding sparsely-imaged real ground.
+//
+// MEASURED at 20: trim removed 28691 of 2839730 faces (1.0%), occupancy 27898 of 89075 cells
+// (0.313). Occupancy well below 1.0 is the headroom that makes this safe -- per the tuning note
+// above, only a fraction NEAR 1.0 means the min-count is too low and the footprint has started
+// swallowing the fringe. Re-check that field after this change.
+//
+// NOTE this lever only reaches holes with NON-ZERO coverage. A hole over a small POND has no
+// points at all, so no min-count helps; those depend on the exterior flood-fill failing to reach
+// them, i.e. on POISSON_TRIM_CLOSE_CELLS dilation sealing the channel. If holes persist over
+// water specifically, raise CLOSE_CELLS instead.
+#ifndef POISSON_TRIM_MIN_PTS_PER_CELL
+#define POISSON_TRIM_MIN_PTS_PER_CELL 8
+#endif
+// Hard cut: remove a face when ALL THREE vertices sit in cells OUTSIDE the footprint,
+// regardless of density.
+//
+// STAYS 0. It is CONNECTIVITY-BLIND and severs large scenes: measured on a 1228-unit corridor it
+// removed only 1.5% of faces but produced 4,844 small components and left the bottom half of the
+// model hanging off the top by a single sliver (setting it to 0 restored it, confirming the
+// cause). The exterior flood-fill protects ENCLOSED gaps, but a low-coverage CHANNEL reaching in
+// from the side of a corridor floods as exterior and is cut, isthmus included. SchnellTests is
+// the same class (883 units, 1:14.4 aspect), so this must not be turned on here.
+//
+// Re-enable only with the escalating-dilation + connected-component guard described at
+// POISSON_TRIM_CLOSE_CELLS, so a scene dilates as far as it needs instead of paying one global
+// value everywhere. The RAMPED THRESHOLD below (interior vs edge) does the useful work without
+// this, and cannot sever anything because it is still a density test.
+// ENABLED (0 -> 1), now that the escalating-dilation + connected-component guard the note above
+// asks for actually exists. The cut itself is unchanged and still connectivity-blind; what is new
+// is that its damage is MEASURED before it is committed. Each attempt builds the footprint at a
+// dilation, counts the components of the surface that would survive, and accepts the cut only if
+// that stays inside a budget relative to the uncut baseline; otherwise the dilation doubles and it
+// tries again. If no dilation passes, the cut is skipped for that scene and logged. Worst case is
+// the previous behaviour (density ramp only), never a severed model.
+//
+// WHY THIS INSTRUMENT, having exhausted four others on this artifact. Downstream, fabricated and
+// real surface are indistinguishable: projected winding deletes near-vertical real walls, topology
+// calls tongues "enclosed", component size shows no gap in the distribution, and density x
+// distance-from-perimeter cuts the genuinely low-density real survey edge first. The one property
+// that DOES differ is whether there is data underneath -- and this is the OCCUPANCY form of that
+// test, which unlike POISSON_DISTANCE_CULL is not defeated by local normalisation.
+//
+// It also produces the right SHAPE of boundary: the outline follows the data footprint at grid
+// resolution instead of Poisson's ragged isosurface, which the original note calls "a
+// competitor-style smooth outline rather than a feathery fringe". POISSON_TRIM_CLOSE_CELLS then
+// becomes the "how much invented coverage do we accept" knob -- raise it for MORE synthetic surface
+// with a smoother outline, which appears to be what the competitor does on this dataset.
+#ifndef POISSON_TRIM_HARD_OUTSIDE
+#define POISSON_TRIM_HARD_OUTSIDE 1
+#endif
+// Guard on the hard cut. ATTEMPTS doubles the dilation each time; the component budget is
+// baseline * RATIO/100 + SLACK. The corridor failure that originally disabled this cut showed 4,844
+// components against ~880 baseline, so 1.5x + 32 rejects it decisively while tolerating the handful
+// of specks a healthy cut sheds (measured 895 vs 880 on a scene where it worked).
+#ifndef POISSON_TRIM_GUARD_ATTEMPTS
+#define POISSON_TRIM_GUARD_ATTEMPTS 5
+#endif
+#ifndef POISSON_TRIM_GUARD_COMP_RATIO_X100
+#define POISSON_TRIM_GUARD_COMP_RATIO_X100 150
+#endif
+#ifndef POISSON_TRIM_GUARD_COMP_SLACK
+#define POISSON_TRIM_GUARD_COMP_SLACK 32
 #endif
 // Morphological dilation radius (cells) to bridge thin shoreline gaps before
 // the interior-hole flood fill. 0 disables.
+// RAISED 2 -> 8, the fitted value. With POISSON_TRIM_HARD_OUTSIDE off its role here is to keep
+// the WATER on the interior side of the ramp: water has no points, so its cells are unoccupied,
+// and it only receives the low interior threshold if the exterior flood-fill cannot REACH it.
+// Dilating the occupied region closes narrow shore channels, so a lake connected to the survey
+// edge by a gap narrower than ~2x the dilation becomes enclosed and is kept. 8 cells is ~9.9
+// units at a 1.23-unit cell.
+//
+// TENSION: dilation grows the footprint, so extrapolation within ~9.9 units of the real data
+// edge is also treated as interior and survives. That is the direct trade against fringe
+// removal -- LOWER this if the fringe persists, RAISE it if water or shoreline is lost.
 #ifndef POISSON_TRIM_CLOSE_CELLS
-#define POISSON_TRIM_CLOSE_CELLS 2
+// LOWERED 8 -> 4 (9.86 -> 4.93 units) to PULL THE BOUNDARY IN. With the hard cut active this is the
+// knob that positions the outline: the footprint reaches this far past the real data, so the cut
+// lands there. 8 gave the smoothness the user wants but too much synthetic margin.
+//
+// The guard makes this safe to try: it counted components 370 -> 369 at dilation 8 against a 587
+// budget, i.e. no severing at all with room to spare, and if 4 does sever it will DOUBLE back to 8
+// automatically. What the guard does NOT check is water loss -- a lake joined to the exterior by a
+// channel wider than the dilation floods as exterior and is cut outright, with the component count
+// still looking healthy. So check the lake visually at each step, not just the log.
+#define POISSON_TRIM_CLOSE_CELLS 8
+#endif
+// POISSON_TRIM_MARGIN_CELLS: how many cells of footprint to keep BEYOND the data, i.e. how much
+// synthetic margin the hard cut leaves. Now independent of the seal radius above -- see the
+// morphological-closing note in buildExt. This is the "pull the boundary in/out" dial, and the
+// guard escalates it (not the seal radius) when a cut would sever the surface.
+// 2 cells ~= 2.5 units at a 1.232 cell.
+#ifndef POISSON_TRIM_MARGIN_CELLS
+#define POISSON_TRIM_MARGIN_CELLS 5   // ~6.2 units at a 1.232 cell; was 2 (~2.5)
+#endif
+// POISSON_TRIM_PERCENTILE_X100: take the INTERIOR trim threshold as this percentile of the scene's
+// own density distribution instead of from --poisson-trim. Units are hundredths of a percent, so
+// 50 = the 0.50th percentile. Depth- and dataset-invariant, which a raw density value is not.
+//
+// CALIBRATED AT p0.20 against three scenes' own low-tail ladders (2026-08-19). The claim of this
+// knob is that ONE percentile reproduces thresholds that previously had to be hand-tuned per scene:
+//
+// CAUTION when re-tuning: only A and B were tuned by EYE ("looks best at..."). Every other raw
+// value in the log is just whatever the pipeline happened to pass, and those defaults have moved
+// over time (one scene ran 6.50 while newer builds pass 5.50). A default is not a target -- treating
+// one as evidence nearly caused a recalibration of this knob away from two genuinely tuned scenes.
+//
+//   scene              depth  hand-tuned    p0.1   p0.2   p0.35  p0.5   p50
+//   A (fills water)     11    5.5 - 5.75    4.95   5.63*  6.19   6.61   12.4
+//   B                   12    ~6.5, or a    5.33   6.28*  7.1    7.51    9.8
+//                             little lower
+//   C                   --    (see note)    4.0    4.44   4.98   5.13    9.89
+//   D                   10    --            --     5.60   --     --      11.3
+//   E                   10    --            4.67   5.26   5.87   6.09    11.8
+//
+// UNRESOLVED, and previously mis-attributed here: scene E's ugly water was observed to DROP on the
+// p0.20 build, and this comment claimed that as evidence the percentile orders scenes correctly.
+// That claim does not survive its own arithmetic -- E resolves to 5.26 against the 5.50 it had been
+// running, and a LOWER threshold can only remove LESS. So the density test cannot be what dropped
+// that water.
+//
+// The likely cause is POISSON_TRIM_HARD_OUTSIDE, which removes surface with no data underneath
+// REGARDLESS of density. Water has no points, so whether it survives is decided by footprint
+// TOPOLOGY, not by any threshold: enclosed (the exterior flood cannot reach it) -> kept, as on scene
+// A; reachable through a shore channel -> outside the footprint -> cut, which would explain E.
+//
+// TO SETTLE IT read the adaptive-trim line: "removed N ... | outside-footprint cut M". If M accounts
+// for the water, occupancy did it and the percentile is irrelevant to that outcome. Do not restate
+// the opposite-outcomes claim without that number.
+//
+// Four of the five land in 5.26-6.28 at p0.20 while their p50 ranges 9.8-12.4, so this point is a
+// stable feature of the distribution even when the bulk shifts ~25%. Note also that the two scenes
+// with a LOW bulk (B and C, p50 9.8/9.89) are the ones needing the highest/lowest absolute values --
+// further evidence the absolute scale is not comparable across scenes and the percentile is.
+//
+// p0.20 lands mid-window on A and just under target on B -- both hand-tuned values from a single
+// setting. Note how far the ABSOLUTE value moves for the same percentile (5.63 / 6.28 / 4.44) and
+// how differently the distributions sit (p50 12.4 / 9.8 / 9.89). That spread is precisely why a raw
+// --poisson-trim could not be carried across depths or datasets, and why 35/45/50 all looked alike:
+// they over-trim relative to these targets, in a range where the footprint cut already owns the
+// boundary.
+//
+// SCENE C DOES NOT WANT A HIGHER PERCENTILE. Its complaint was a floating blob in a corner, and at
+// p0.20 it gets 4.44 -- less trimming than the 5.0 it had been running. That is the right call
+// anyway: a blob is a DISCONNECTED COMPONENT and belongs to MESH_KEEP_COMPONENT_PCT_X1000, not to a
+// density threshold. Raising the percentile far enough to dissolve it would badly over-trim A and B,
+// since C's whole distribution sits ~2.5 lower. Read "post-tighten component filter: removed N faces
+// in M blobs (threshold T faces)" and raise that filter instead.
+//
+// (Earlier note, superseded: 50 was calibrated against the single field-tuned value then available --
+// on
+// distribution was min 3 / p1 7.31 / p5 8.75, and 5.75 was reported as looking good -- which sits
+// between min and p1, i.e. around the half-percent mark. The edge threshold is still this x
+// POISSON_TRIM_EDGE_MULT_X100.
+//
+// RAISE it to trim more everywhere (p1 = 7.31 here, p5 = 8.75); note the file's own warning that a
+// threshold AT p1 "cuts the lowest 1% everywhere and speckles the middle with holes", so this wants
+// to sit BELOW p1. 0 disables and restores the raw --poisson-trim value.
+#ifndef POISSON_TRIM_PERCENTILE_X100
+#define POISSON_TRIM_PERCENTILE_X100 20   // p0.20 -- calibrated, see table above
 #endif
 
 // Easier to configure this here.
@@ -3585,6 +3910,42 @@ static bool LoadPoissonMeshPLY(const String& path, Mesh& mesh)
 #define POISSON_REFINE_HEADROOM_ADAPTIVE 2.3
 #endif
 
+// POISSON_DEPTH_PIXELS_TOL: rounding tolerance, in log2 units, on the PIXEL ceiling only.
+//
+// WHY A SCALAR HEADROOM CANNOT BE CALIBRATED. depthPixels is
+//     log2(scaleFactor * extent / (headroom * SUBDIV_FACTOR * gsd))
+// floored to an integer. The fractional part therefore MOVES WITH log2(extent), so no single
+// headroom holds it on the same side of an integer across scenes of different size. Measured
+// on the three scenes we have numbers for, all of which want depth 10:
+//     132.2 m, gsd 1.114 cm  ->  9.970  @H=2.3 -> 9  WRONG    | @H=2.0 -> 10.172 -> 10 ok
+//     142   m, gsd 1.116 cm  -> 10.070  @H=2.3 -> 10 ok       | @H=2.0 -> 10.272 -> 10 ok
+//     276   m, gsd 1.191 cm  -> 10.935  @H=2.3 -> 10 ok       | @H=2.0 -> 11.137 -> 11 WRONG
+// H=2.3 fails the first, H=2.0 fails the third. The two-scene calibration that produced 2.3
+// (see above) landed it at the very top of the 142 m scene's window, and a 132 m scene of the
+// same camera class falls just outside -- 0.030 in log2, i.e. a cell 2.1% coarser than depth
+// 10 needs. floor() then drops a whole level: cell 0.2841 instead of 0.1420, and ~4x fewer
+// faces (measured: 802k raw at depth 9 where depth 10 gives ~3.2M).
+//
+// THE ASYMMETRY THAT JUSTIFIES A TOLERANCE. This ceiling is a SOFT quality target assembled
+// from two estimates (gsd and extent) whose own error this file puts at 0.6-2%. Overshooting
+// it by a few percent costs a few percent of per-face pixels; undershooting by one level
+// costs 100% of the cell size and 4x the geometry. So the two directions are not
+// symmetric and should not be treated as if a hard floor were the safe choice.
+//
+// 0.05 (3.5% in cell size, inside the acknowledged estimate error) puts all three scenes on
+// depth 10:  9.970 -> 10.020,  10.070 -> 10.120,  10.935 -> 10.985. Margin to the next
+// boundary is ~0.02 on both sides, so re-check this if a fourth scene lands near a boundary
+// -- the [MESH-POLICY] line now prints the unfloored value so that is a log read, not a
+// rebuild.
+//
+// DELIBERATELY NOT APPLIED to depthBudget or depthTexture. Those are HARD ceilings (memory
+// envelope, atlas capacity) where floor is correct and the existing comment says so: "faces
+// scale 4x per level, so rounding up can overshoot the budget by nearly 2x". Only the soft
+// pixel target gets the tolerance. 0 restores the strict floor.
+#ifndef POISSON_DEPTH_PIXELS_TOL
+#define POISSON_DEPTH_PIXELS_TOL 0.05
+#endif
+
 #ifndef POISSON_REFINE_SUBDIV_FACTOR
 #define POISSON_REFINE_SUBDIV_FACTOR 5.66
 #endif
@@ -3843,6 +4204,12 @@ struct MeshPolicy {
 	int    depthData    = 0;
 	int    depthTexture = 0;
 	int    depthPixels  = 0;
+	// depthPixels BEFORE flooring. The pixel ceiling is the binding one on most scenes,
+	// and its fractional part decides a 2x cell / 4x face outcome, so the raw value is the
+	// number to read when a scene comes out coarser than expected: a value like 9.97 means
+	// the scene missed the next level by 3% of a cell, not by a level's worth of quality.
+	// See POISSON_DEPTH_PIXELS_TOL.
+	float  depthPixelsRaw = 0.f;
 };
 
 // targetCell   : desired output cell size; <=0 means "best single mesh"
@@ -4154,11 +4521,17 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 		chosen = std::min(chosen, depthTexture);
 		// Deepest depth whose cell is still >= minCellForTexture.
 		int depthPixels = maxDepth;
+		double depthPixelsRaw = 0.0; // unfloored, logged so a near-boundary scene is visible
 		if (minCellForTexture > 0.0 && pol.extent > 0.f) {
-			depthPixels = (int)std::floor(
-				std::log2((double)scaleFactor * (double)pol.extent / minCellForTexture));
+			depthPixelsRaw =
+				std::log2((double)scaleFactor * (double)pol.extent / minCellForTexture);
+			// Tolerance on this ceiling ONLY -- it is a soft quality target, not a hard
+			// resource limit, and its fractional part moves with log2(extent) so a scalar
+			// headroom cannot keep it off an integer boundary. See POISSON_DEPTH_PIXELS_TOL.
+			depthPixels = (int)std::floor(depthPixelsRaw + POISSON_DEPTH_PIXELS_TOL);
 			chosen = std::min(chosen, depthPixels);
 		}
+		pol.depthPixelsRaw = (float)depthPixelsRaw;
 		pol.depth        = std::clamp(chosen, minDepth, maxDepth);
 		pol.depthBudget  = depthBudget;
 		// Normalized to maxDepth when unmeasurable (degenerate cloud, no GSD) so that
@@ -4184,12 +4557,28 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 
 		VERBOSE("[MESH-POLICY] ext=%.4g spacing=%.4g k=%.2f budget=%.1fM faces",
 			pol.extent, pol.spacing, pol.k, pol.facesBudget * 1e-6);
-		VERBOSE("[MESH-POLICY] depth: budget=%d data=%d texture=%d pixels=%d -> %d%s"
+		VERBOSE("[MESH-POLICY] depth: budget=%d data=%d texture=%d pixels=%d (raw %.3f"
+			" +tol %.2f) -> %d%s"
 			" | cell_single=%.4g target=%.4g tiles=%dx%d cell=%.4g | refineLevel=%d",
-			depthBudget, depthData, depthTexture, depthPixels, pol.depth,
+			depthBudget, depthData, depthTexture, depthPixels,
+			depthPixelsRaw, (double)POISSON_DEPTH_PIXELS_TOL, pol.depth,
 			(pol.depth != chosen) ? " (CLAMPED)" : "",
 			pol.cellSingle, desired, pol.tilesPerAxis, pol.tilesPerAxis, pol.cell,
 			pol.refineLevel);
+		// The pixel ceiling binds on most scenes and its FRACTIONAL part decides a 2x cell /
+		// 4x face outcome, so say so out loud when a scene is sitting near a boundary --
+		// that is the difference between "this scene wants depth N" and "this scene missed
+		// depth N+1 by 3% of a cell". Threshold is twice the tolerance, i.e. the band where
+		// re-reading POISSON_DEPTH_PIXELS_TOL is a reasonable response.
+		if (depthPixelsRaw > 0.0 && depthPixels == chosen) {
+			const double frac = depthPixelsRaw - std::floor(depthPixelsRaw);
+			if (frac > 1.0 - 2.0 * (double)POISSON_DEPTH_PIXELS_TOL)
+				VERBOSE("[MESH-POLICY] NOTE: pixel ceiling is %.3f -- within %.1f%% of a cell"
+					" of depth %d. The tolerance (%.2f) decided this; a scene this close to a"
+					" boundary is where the headroom calibration is least reliable.",
+					depthPixelsRaw, 100.0 * (std::pow(2.0, 1.0 - frac) - 1.0),
+					(int)std::floor(depthPixelsRaw) + 1, (double)POISSON_DEPTH_PIXELS_TOL);
+		}
 		if (pol.tilesPerAxis > 1)
 			VERBOSE("[MESH-POLICY] cell %.4g needs %dx%d tiled meshing; an untiled run"
 				" delivers %.4g instead", desired, pol.tilesPerAxis, pol.tilesPerAxis,
@@ -5151,6 +5540,66 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		for (ptrdiff_t i = 0; i < (ptrdiff_t)nv; ++i)
 			memcpy(&dst[i], pv + i * 4, 3 * sizeof(float));
 
+		// DENSITY DISTRIBUTION -- logged on EVERY path, including Tier 2 / SurfaceTrimmer.
+		//
+		// The Poisson per-vertex density that --poisson-trim thresholds against is on an
+		// ARBITRARY scale that shifts with octree depth and with the dataset, so a trim value
+		// fitted on one scene or one depth is silently either a no-op or destructive. That
+		// failure is invisible in the log, and it has already cost real debugging time on this
+		// pipeline: a --poisson-trim 1 that sat BELOW THE ENTIRE DISTRIBUTION looked like a weak
+		// trim for hours when it was structurally inert (13 faces of 103,291).
+		//
+		// Until now the percentile line existed only inside POISSON_ADAPTIVE_TRIM, which is
+		// compiled out -- so the shipped configuration is exactly the one that cannot see this.
+		// The data is present either way (pmesh is stride-4 x,y,z,density on every path), so
+		// this is pure instrumentation: no threshold, no geometry, nothing else reads it.
+		//
+		// HOW TO READ IT ON THE TIER-2 PATH: SurfaceTrimmer has ALREADY run, so these are the
+		// SURVIVING vertices. That makes `min` the diagnostic:
+		//   min >~ trim  -> the trim was BINDING (it removed everything below the threshold)
+		//   min <<  trim -> the threshold never applied; the surviving surface sits below it,
+		//                   so the trim is inert on this scene at this depth and the number
+		//                   needs re-picking from these percentiles, not nudging.
+		// To cut roughly the lowest X% of surface, aim the threshold near pX.
+		if (nv > 0) {
+			std::vector<float> ds;
+			const size_t dstride = std::max<size_t>(1, (size_t)nv / 200000);
+			ds.reserve((size_t)nv / dstride + 1);
+			for (size_t i = 0; i < (size_t)nv; i += dstride)
+				ds.push_back(pv[i * 4 + 3]);
+			if (!ds.empty()) {
+				std::sort(ds.begin(), ds.end());
+				const auto pct = [&](double q) {
+					const size_t k = (size_t)(q * (double)(ds.size() - 1) + 0.5);
+					return (double)ds[k];
+				};
+				// The label matters: this block sits BEFORE the adaptive trim but AFTER the
+				// SurfaceTrimmer call, so which one it is depends on the build. Getting this
+				// wrong sends you hunting a "min=3" that is simply the untrimmed minimum.
+#if POISSON_ADAPTIVE_TRIM
+				static const char* const kTrimStage = "PRE-trim, adaptive trim runs next";
+#else
+				static const char* const kTrimStage = "POST-trim";
+#endif
+				// LOW-TAIL LADDER as well as the coarse percentiles. The useful trim values live
+				// BELOW p1 -- a field-tuned 5.75 on a depth-11 scene sat between min 3 and
+				// p1 7.31 -- and p1 is far too coarse to calibrate
+				// POISSON_TRIM_PERCENTILE_X100 against. These are the numbers to read when
+				// matching a known-good raw threshold to a portable percentile.
+				VERBOSE("Poisson: vertex density percentiles (n=%zu of %zu sampled, %s):"
+					" min=%.3g | LOW TAIL p0.1=%.3g p0.2=%.3g p0.35=%.3g p0.5=%.3g p0.75=%.3g"
+					" p1=%.3g p2=%.3g | p5=%.3g p25=%.3g p50=%.3g p75=%.3g p95=%.3g p99=%.3g"
+					" max=%.3g | --poisson-trim %.2f -- this scale shifts with depth and"
+					" dataset, so set the trim from THIS line; min far below the trim means"
+					" the trim is inert here",
+					ds.size(), (size_t)nv, kTrimStage, (double)ds.front(),
+					pct(0.001), pct(0.002), pct(0.0035), pct(0.005), pct(0.0075),
+					pct(0.01), pct(0.02),
+					pct(0.05), pct(0.25), pct(0.50), pct(0.75),
+					pct(0.95), pct(0.99), (double)ds.back(), (double)trimThreshold);
+			}
+		}
+
 #if !POISSON_ADAPTIVE_TRIM
 		// The Poisson vertex array (16 B/vertex: x,y,z,density) is dead once the
 		// positions are copied out, so release it BEFORE allocating the face
@@ -5251,32 +5700,135 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			for (size_t k = 0; k < nCells; ++k)
 				if (cnt[k] >= (uint32_t)POISSON_TRIM_MIN_PTS_PER_CELL) { occ[k] = 1; ++nOcc; }
 			std::vector<uint32_t>().swap(cnt);
-			// dilate to bridge thin shoreline gaps
-			std::vector<uint8_t> occD = occ;
-			const int dr = POISSON_TRIM_CLOSE_CELLS;
-			if (dr > 0) {
-				for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
-					if (!occ[(size_t)cy * gw + cx]) continue;
-					for (int dy = -dr; dy <= dr; ++dy) { int ny = cy + dy; if (ny < 0 || ny >= gh) continue;
-						for (int dx = -dr; dx <= dr; ++dx) { int nx = cx + dx; if (nx < 0 || nx >= gw) continue;
-							occD[(size_t)ny * gw + nx] = 1; } }
-				}
-			}
-			// exterior = flood fill of empty cells from the border; footprint
-			// (interior, incl. enclosed water holes) = NOT exterior.
+			// ---------------------------------------------------------------
+			// FOOTPRINT: occupancy -> dilate -> flood the EXTERIOR so enclosed low-coverage
+			// regions (water) count as inside. Built inside an ESCALATING-DILATION loop guarded
+			// by a connectivity check, which is what makes the hard outside-footprint cut safe
+			// to use at all -- see POISSON_TRIM_HARD_OUTSIDE.
+			// ---------------------------------------------------------------
 			std::vector<uint8_t> ext(nCells, 0);
-			std::vector<int> stk;
-			auto pushIf = [&](int cx, int cy) {
-				const size_t k = (size_t)cy * gw + cx;
-				if (!occD[k] && !ext[k]) { ext[k] = 1; stk.push_back((int)k); }
-			};
-			for (int cx = 0; cx < gw; ++cx) { pushIf(cx, 0); pushIf(cx, gh - 1); }
-			for (int cy = 0; cy < gh; ++cy) { pushIf(0, cy); pushIf(gw - 1, cy); }
-			while (!stk.empty()) {
-				const int k = stk.back(); stk.pop_back();
-				const int cx = k % gw, cy = k / gw;
-				if (cx > 0) pushIf(cx - 1, cy);  if (cx < gw - 1) pushIf(cx + 1, cy);
-				if (cy > 0) pushIf(cx, cy - 1);  if (cy < gh - 1) pushIf(cx, cy + 1);
+			int drUsed = POISSON_TRIM_CLOSE_CELLS;
+			bool bHardCutOK = false;
+			{
+				const auto buildExt = [&](int margin, std::vector<uint8_t>& extOut) {
+					// MORPHOLOGICAL CLOSING, not plain dilation. POISSON_TRIM_CLOSE_CELLS is the
+					// SEAL radius: it exists so the exterior flood cannot reach a lake through a
+					// narrow shore channel. Dilating and never eroding back ALSO pushes the outer
+					// boundary that far past the data -- a separate concern, and one number cannot
+					// serve both. Sealing wants a large radius; a tight boundary wants a small one,
+					// which is exactly why holes and excess margin traded against each other.
+					// So: dilate by the seal radius, flood the exterior (classification is then
+					// fixed, lake included), then erode the footprint back to leave only `margin`
+					// cells beyond the data. The lake survives because it sits in the footprint
+					// INTERIOR, far from the rind the erosion removes.
+					const int dr = POISSON_TRIM_CLOSE_CELLS;
+					std::vector<uint8_t> occD(occ);
+					if (dr > 0) {
+						for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
+							if (!occ[(size_t)cy * gw + cx]) continue;
+							for (int dy = -dr; dy <= dr; ++dy) { int ny = cy + dy; if (ny < 0 || ny >= gh) continue;
+								for (int dx = -dr; dx <= dr; ++dx) { int nx = cx + dx; if (nx < 0 || nx >= gw) continue;
+									occD[(size_t)ny * gw + nx] = 1; } }
+						}
+					}
+					extOut.assign(nCells, 0);
+					std::vector<int> stk;
+					const auto pushIf = [&](int cx, int cy) {
+						const size_t k = (size_t)cy * gw + cx;
+						if (!occD[k] && !extOut[k]) { extOut[k] = 1; stk.push_back((int)k); }
+					};
+					for (int cx = 0; cx < gw; ++cx) { pushIf(cx, 0); pushIf(cx, gh - 1); }
+					for (int cy = 0; cy < gh; ++cy) { pushIf(0, cy); pushIf(gw - 1, cy); }
+					while (!stk.empty()) {
+						const int k = stk.back(); stk.pop_back();
+						const int cx = k % gw, cy = k / gw;
+						if (cx > 0) pushIf(cx - 1, cy);  if (cx < gw - 1) pushIf(cx + 1, cy);
+						if (cy > 0) pushIf(cx, cy - 1);  if (cy < gh - 1) pushIf(cx, cy + 1);
+					}
+					// Erode the footprint back == dilate the EXTERIOR inward by (seal - margin).
+					// Growing `ext` cannot reopen the sealed channel: interior/exterior was already
+					// decided by the flood above, so this only thickens the exterior region.
+					const int er = dr - margin;
+					if (er > 0) {
+						std::vector<uint8_t> extE(extOut);
+						for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
+							if (!extOut[(size_t)cy * gw + cx]) continue;
+							for (int dy = -er; dy <= er; ++dy) { int ny = cy + dy; if (ny < 0 || ny >= gh) continue;
+								for (int dx = -er; dx <= er; ++dx) { int nx = cx + dx; if (nx < 0 || nx >= gw) continue;
+									extE[(size_t)ny * gw + nx] = 1; } }
+						}
+						extOut.swap(extE);
+					}
+				};
+				buildExt(POISSON_TRIM_MARGIN_CELLS, ext);
+#if POISSON_TRIM_HARD_OUTSIDE
+				std::vector<uint8_t> vo(numV, 0);
+				const auto vOutFrom = [&](const std::vector<uint8_t>& e) {
+					for (Mesh::VIndex v = 0; v < numV; ++v) {
+						int cx, cy; cellOf(mesh.vertices[v].x, mesh.vertices[v].y, cx, cy);
+						vo[v] = e[(size_t)cy * gw + cx] ? 1 : 0;
+					}
+				};
+				// Component count of the surface that SURVIVES the cut, by union-find over the
+				// vertices of kept faces. Face adjacency does not exist yet at this point in the
+				// pipeline, and this is exactly the quantity the documented corridor failure
+				// showed up in: 4,844 components against ~880 on a scene where the cut was fine.
+				std::vector<uint32_t> uf(numV);
+				std::vector<uint8_t> ufUsed(numV);
+				const auto compCount = [&](bool applyCut, size_t& nCut) -> size_t {
+					for (Mesh::VIndex v = 0; v < numV; ++v) { uf[v] = v; ufUsed[v] = 0; }
+					nCut = 0;
+					const auto find = [&uf](uint32_t a) {
+						while (uf[a] != a) { uf[a] = uf[uf[a]]; a = uf[a]; }
+						return a;
+					};
+					FOREACH(f, mesh.faces) {
+						const Mesh::Face& fc = mesh.faces[f];
+						if (applyCut && vo[fc[0]] && vo[fc[1]] && vo[fc[2]]) { ++nCut; continue; }
+						const uint32_t r0 = find(fc[0]);
+						for (int k = 1; k < 3; ++k) { const uint32_t r = find(fc[k]); if (r != r0) uf[r] = r0; }
+						ufUsed[fc[0]] = ufUsed[fc[1]] = ufUsed[fc[2]] = 1;
+					}
+					size_t n = 0;
+					for (Mesh::VIndex v = 0; v < numV; ++v) if (ufUsed[v] && find(v) == v) ++n;
+					return n;
+				};
+				size_t dummy = 0;
+				const size_t compBase = compCount(false, dummy);
+				const size_t compBudget = (size_t)((double)compBase *
+					(double)POISSON_TRIM_GUARD_COMP_RATIO_X100 / 100.0)
+					+ (size_t)POISSON_TRIM_GUARD_COMP_SLACK;
+				// ESCALATE THE MARGIN, not the seal radius. A bigger margin means a bigger
+				// footprint, so the cut removes LESS -- the direction that makes a failing guard
+				// safer. Escalating the seal radius would no longer help, since boundary position
+				// is now decoupled from it. It also tops out correctly: once margin reaches the
+				// seal radius the erosion is zero and this becomes exactly the old dilate-only
+				// behaviour, which is the known-safe configuration.
+				int dr = POISSON_TRIM_MARGIN_CELLS;
+				for (int attempt = 0; attempt < POISSON_TRIM_GUARD_ATTEMPTS; ++attempt) {
+					if (attempt) { dr = (dr < 1 ? 1 : dr * 2); buildExt(dr, ext); }
+					vOutFrom(ext);
+					size_t nCut = 0;
+					const size_t compAfter = compCount(true, nCut);
+					VERBOSE("Poisson: footprint hard-cut attempt %d: margin %d cells (%.4g units, seal %d)"
+						" -> would cut %zu faces, components %zu -> %zu (budget %zu)",
+						attempt + 1, dr, (double)((float)dr * cellSz), (int)POISSON_TRIM_CLOSE_CELLS, nCut,
+						compBase, compAfter, compBudget);
+					if (nCut == 0 || compAfter <= compBudget) {
+						drUsed = dr; bHardCutOK = true; break;
+					}
+				}
+				if (!bHardCutOK) {
+					// FAIL SAFE -- incompleteness is worse than surplus geometry, the same policy
+					// as POISSON_CULL_MAX_FRACTION. Rebuild at the base dilation so the ramped
+					// DENSITY threshold still runs, and leave the hard cut off for this scene.
+					buildExt(POISSON_TRIM_CLOSE_CELLS, ext);
+					drUsed = POISSON_TRIM_CLOSE_CELLS;
+					VERBOSE("Poisson: footprint hard-cut ABANDONED after %d attempts -- every"
+						" dilation severed the surface past the %zu-component budget. Falling back"
+						" to the density ramp alone.", (int)POISSON_TRIM_GUARD_ATTEMPTS, compBudget);
+				}
+#endif
 			}
 			// 2-pass chamfer distance-to-perimeter over footprint (exterior = 0).
 			constexpr float BIG = 1e9f, d1 = 1.f, d2c = 1.41421356f;
@@ -5300,8 +5852,40 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			}
 
 			const float ramp = (float)POISSON_TRIM_RAMP_CELLS;
-			const float trimInterior = trimThreshold;
-			const float trimEdge = trimThreshold * (POISSON_TRIM_EDGE_MULT_X100 / 100.f);
+			// SELF-CALIBRATING INTERIOR THRESHOLD. Poisson density is on an arbitrary scale that
+			// shifts with octree DEPTH and with the dataset, so a raw --poisson-trim can never be
+			// portable: MEASURED, the same interior/edge pair removed 4.2% at depth 10, 0.02% at
+			// depth 11 and 0.8% at depth 12 on one cloud, and in the field one site was well tuned
+			// at 5.75 on depth 11 while another needed a visibly higher value purely because it
+			// solved at depth 12. That is a UNITS problem, not a per-dataset tuning problem -- the
+			// same class as the four resolution-relative thresholds elsewhere in this pipeline.
+			//
+			// So the threshold is taken as a PERCENTILE of THIS scene's own density distribution,
+			// which is depth- and dataset-invariant by construction. --poisson-trim then only has
+			// to be > 0 to enable the pass (the block is gated on it); its magnitude stops
+			// mattering. Set POISSON_TRIM_PERCENTILE_X100 to 0 to go back to the raw value.
+			float trimBase = trimThreshold;
+#if POISSON_TRIM_PERCENTILE_X100 > 0
+			{
+				std::vector<float> dsq;
+				const size_t qstride = std::max<size_t>(1, (size_t)numV / 200000);
+				dsq.reserve((size_t)numV / qstride + 1);
+				for (Mesh::VIndex v = 0; v < numV; v += (Mesh::VIndex)qstride)
+					dsq.push_back(pv[(size_t)v * 4 + 3]);
+				if (!dsq.empty()) {
+					std::sort(dsq.begin(), dsq.end());
+					const double q = (double)POISSON_TRIM_PERCENTILE_X100 / 10000.0;
+					const size_t kq = (size_t)(q * (double)(dsq.size() - 1) + 0.5);
+					const float qv = dsq[kq < dsq.size() ? kq : dsq.size() - 1];
+					VERBOSE("Poisson: trim from distribution: p%.2f = %.3g (raw --poisson-trim was"
+						" %.2f) -- percentile is depth- and dataset-invariant, the raw value is not",
+						q * 100.0, (double)qv, (double)trimThreshold);
+					trimBase = qv;
+				}
+			}
+#endif
+			const float trimInterior = trimBase;
+			const float trimEdge = trimBase * (POISSON_TRIM_EDGE_MULT_X100 / 100.f);
 
 			// per-vertex local threshold (e=0 deep interior -> e=1 at perimeter)
 			const Mesh::Vertex* __restrict pVtx = mesh.vertices.GetData();
@@ -5377,7 +5961,10 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				// and requiring all three vertices outside keeps every face that straddles the
 				// boundary -- so the cut lands just outside real surface rather than into it.
 				// Set POISSON_TRIM_HARD_OUTSIDE to 0 to disable.
-				if (POISSON_TRIM_HARD_OUTSIDE &&
+				// bHardCutOK: the escalating-dilation guard above accepted a dilation at which this
+				// cut does NOT sever the surface. If none passed, the cut is skipped entirely and
+				// only the density ramp runs -- see POISSON_TRIM_HARD_OUTSIDE.
+				if (POISSON_TRIM_HARD_OUTSIDE && bHardCutOK &&
 					vOut[face[0]] && vOut[face[1]] && vOut[face[2]]) {
 					++culledOutside; ++culled; continue;
 				}

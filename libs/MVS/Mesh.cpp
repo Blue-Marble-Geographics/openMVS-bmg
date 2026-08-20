@@ -213,7 +213,21 @@ using namespace MVS;
 // DIAG line before changing it -- if there is no clear gap, no floor is the right
 // tool.
 #ifndef MESH_KEEP_COMPONENT_PCT_X1000
-#define MESH_KEEP_COMPONENT_PCT_X1000 2000
+#define MESH_KEEP_COMPONENT_PCT_X1000 1000 // 1.0%. MEASURED on scene C: component sizes
+                                           // 1292973 9752 178 156 1 1 1 1 -- the 9,752-face
+                                           // blob survived 0.5% (threshold 6,465) by 1.5x.
+                                           // 1.0% puts the threshold at 12,930, which clears
+                                           // it with margin. The distribution has a wide safe
+                                           // window: the blob is 133x smaller than the body
+                                           // and 55x larger than the next component, so any
+                                           // threshold in ~0.76%-99% works there. 1.0% is
+                                           // still HALF the shipped default of 2000 (2%),
+                                           // which is a floor big enough to delete legitimately
+                                           // separate structures). 500 is sized to cull floating
+                                           // debris (a corner blob) without that risk. Read
+                                           // "post-tighten component filter: removed N faces in M
+                                           // blobs (threshold T faces)" and raise only if the blob
+                                           // survives.
 #endif
 
 // Hole-closing geometry gate (Mesh::Clean Phase 4 / Phase 8).
@@ -256,7 +270,15 @@ using namespace MVS;
 //
 // Set to 0 to disable and revert to the frac gate alone.
 #ifndef MESH_HOLE_MAX_SPAN_EDGES
-#define MESH_HOLE_MAX_SPAN_EDGES 12
+// RAISED 12 -> 64 (8.4 -> ~45 units at a 0.70 median edge). The gate above was set to 12 because
+// wide fills "texture black ... the one defect visible in a finished render" -- and that reason is
+// now OBSOLETE: TEXTURE_DATACOLOR_UNOBSERVED colours unobserved faces from their neighbours, so a
+// wide fill is data-coloured, not black. With POISSON_TRIM_HARD_OUTSIDE producing the boundary,
+// low-coverage regions are cut out cleanly and leave INTERIOR holes; filling them is what makes
+// the surface complete, and an interior hole is surrounded by real surface so the fill is bounded.
+// The frac gate (0.10 of mesh diagonal, ~110 units here) and MESH_HOLE_MAX_EDGES 2000 still cap it.
+// Lower this if large fabricated lids read badly; raise it if large holes persist.
+#define MESH_HOLE_MAX_SPAN_EDGES 64
 #endif
 
 // Density-aware edge cap for --close-holes. A boundary loop of a FIXED physical
@@ -299,10 +321,55 @@ using namespace MVS;
 //   Iterations are capped (can never cascade into the decimated interior).
 // A/B: set MESH_ALPHA_TIGHTEN_ENABLED to 0 to skip the whole Phase 9 block.
 #ifndef MESH_ALPHA_TIGHTEN_ENABLED
-#define MESH_ALPHA_TIGHTEN_ENABLED 1
+#define MESH_ALPHA_TIGHTEN_ENABLED 0   // OFF deliberately: POISSON_TRIM_HARD_OUTSIDE now owns the
+                                       // boundary and gives it a smooth footprint-following shape;
+                                       // this pass peeled into that. Re-enable only if slivers
+                                       // reappear. (was 1)
 #endif
+// DIRECTION OF THIS KNOB, since it is easy to get backwards: a face is peeled when its
+// circumradius EXCEEDS alpha (see the test at the call site). So
+//     LOWER K  = smaller alpha = MORE faces peeled (more aggressive)
+//     HIGHER K = larger alpha  = FEWER faces peeled (more permissive)
+// MEASURED both ways on the SchnellTests corridor, same mesh:
+//     K=500  -> alpha 3.51, peeled 797 rim faces
+//     K=1000 -> alpha 7.00, peeled 120 rim faces
+// A brief attempt to reduce rim fringe by RAISING this to 1000 therefore did the opposite and
+// was reverted. Note also that because alpha is K * median edge, a FINER mesh gets a SMALLER
+// alpha and so a MORE aggressive peel -- raising the Poisson depth strengthens this pass, it
+// does not weaken it.
+//
+// SCOPE, and why this is not the tool for a ragged silhouette: the criterion is
+// circumradius-based, so it removes STRETCHED / SLIVER faces only. A whisker or peninsula
+// built from reasonably-shaped triangles has a small circumradius and is invisible to this
+// pass no matter how thin the feature is in world terms. Uniform silhouette recession is
+// MESH_RIM_ERODE_RINGS; use that for a fringe and leave this at its calibrated value.
+//
+// (Still worth knowing that alpha is resolution-relative rather than world-referenced -- see
+// the world-units note in the four-knob group -- but the practical consequence here is the
+// opposite of what a "reach halves" reading would suggest.)
+// LOWERED 500 -> 250 as the "buzz saw" for slivers overhanging the rim. This IS the right pass
+// for that artifact -- the criterion is circumradius > alpha, and an overhanging sliver is by
+// definition a triangle too stretched for a radius-alpha disk to certify. (It is NOT the right
+// pass for a wide fringe of well-shaped triangles; that distinction is in the SCOPE note above.)
+//
+// Direction, restated because it is counter-intuitive and I got it wrong once: LOWER K = smaller
+// alpha = MORE peeled. Measured on the SchnellTests corridor:
+//     K=1000 -> alpha 7.00, peeled 120
+//     K= 500 -> alpha 3.48, peeled 496   (previous setting, visibly too weak)
+//     K= 250 -> alpha ~1.74, expect substantially more
+// 250 is half the previous alpha and below the 300 this knob shipped with before someone raised
+// it, so it is a return into the historically-used range rather than new territory.
+//
+// SAFETY is structural, not a matter of the value: only BORDER faces are candidates,
+// MESH_ALPHA_TIGHTEN_ITERS caps erosion at 6 rings, and the small-component filter re-runs
+// afterwards. So the worst case is losing genuine rim detail, not severing the body.
+//
+// TUNING: watch "peeled N rim faces" against the logged alpha. If N runs into the tens of
+// thousands, or the shoreline visibly recedes, come back up toward 350-400. If slivers persist
+// along the TEXTURE-stage cut rather than the Poisson rim, this pass cannot reach them -- it runs
+// in ReconstructMesh, before that cut exists; raise TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES instead.
 #ifndef MESH_ALPHA_TIGHTEN_K_X100
-#define MESH_ALPHA_TIGHTEN_K_X100 500   // was 300 3.00 * median edge
+#define MESH_ALPHA_TIGHTEN_K_X100 250   // was 500; shipped at 300 before that
 #endif
 #ifndef MESH_ALPHA_TIGHTEN_ITERS
 #define MESH_ALPHA_TIGHTEN_ITERS 6      // hard cap on erosion rings (safety)
@@ -332,8 +399,40 @@ using namespace MVS;
 //   HIGHER R = more aggressive straightening (loses more genuine edge detail).
 //   R = 0 disables the whole pass (pure A/B off switch).
 // Only touches BORDER faces, so it never reopens a sealed interior hole.
+//
+// ENABLED (0 -> 4). This is the pass that actually addresses the ragged silhouette reported on
+// large water sites -- the yellow-background fringe of thin fingers reaching out over water,
+// where Poisson only partially reconstructs a surface no camera can validate. The other two
+// rim passes cannot reach it:
+//   * the tooth-peel only takes faces with >=2 open edges (a dangling sliver);
+//   * alpha-tighten only takes over-large CIRCUMRADIUS faces, so a peninsula made of
+//     well-shaped triangles is invisible to it however thin the feature is.
+// This pass is the only one that recedes the silhouette UNIFORMLY, and per the note above any
+// fringe narrower than ~2R triangles is consumed outright.
+//
+// SET TO 2, after measuring that this pass CANNOT solve a wide-finger fringe and should not be
+// paid for as if it could. At 4 on the SchnellTests corridor:
+//     DIAG rim-erode: peeled 2262 border faces in 4 rings -> 1105035 fn
+//     DIAG rim-erode: dropped 88 newly-disconnected faces
+// i.e. ~565 faces per ring, so the silhouette is only ~600-900 faces around and 4 rings recede
+// it by 4 x median edge 0.7 ~= 2.8 units. The reported fringe fingers extend TENS of units, so
+// consuming one ~20 triangles wide would need R ~= 15-20 -- which pulls the ENTIRE coastline in
+// by 10-14 units, good terrain edge included. Uniform erosion cannot tell a finger from a
+// shoreline; it can only trade one for the other.
+//
+// So 2 is scoped to what this pass is genuinely good at: whisker tendrils and one-or-two-face
+// slivers, at ~1.4 units of recession. The wide fringe is a DENSITY / point-support problem
+// (Poisson extrapolating over water) and belongs to --poisson-trim, whose value cannot be set
+// blind -- see the "vertex density percentiles" line now logged unconditionally in
+// SceneReconstruct.cpp.
+//
+// TUNING: the component filter re-runs afterwards (erosion can sever necks holding floating
+// junk), so watch "dropped N newly-disconnected faces" -- a jump there means it is cutting
+// isthmuses, which is the signal R is getting large.
 #ifndef MESH_RIM_ERODE_RINGS
-#define MESH_RIM_ERODE_RINGS 0
+#define MESH_RIM_ERODE_RINGS 0   // OFF deliberately: uniform recession fought the footprint cut's
+                                 // outline. To pull the boundary IN, lower POISSON_TRIM_CLOSE_CELLS
+                                 // instead -- that moves the contour without roughening it. (was 2)
 #endif
 
 // Boundary-only TAUBIN smoothing (Mesh::Clean Phase 10, LAST geometric pass).
@@ -346,7 +445,9 @@ using namespace MVS;
 //   ITERS = number of lambda+mu Taubin pairs; LAMBDA/MU stored as *100.
 //   Set MESH_BOUNDARY_SMOOTH_ENABLED 0 to skip the whole pass (A/B off).
 #ifndef MESH_BOUNDARY_SMOOTH_ENABLED
-#define MESH_BOUNDARY_SMOOTH_ENABLED 1
+#define MESH_BOUNDARY_SMOOTH_ENABLED 0   // OFF: the outline is already smooth at grid resolution
+                                         // from the footprint cut, so there is nothing to polish.
+                                         // (was 1)
 #endif
 #ifndef MESH_BOUNDARY_SMOOTH_ITERS
 #define MESH_BOUNDARY_SMOOTH_ITERS 10 // Was 40     // lambda+mu pairs (scale up with band density)
@@ -372,7 +473,11 @@ using namespace MVS;
 //   RINGS = band thickness refined; LEVELS = number of 1->4 midpoint splits.
 //   Set MESH_BAND_REFINE_ENABLED 0 to skip the whole pass (A/B off).
 #ifndef MESH_BAND_REFINE_ENABLED
-#define MESH_BAND_REFINE_ENABLED 1
+#define MESH_BAND_REFINE_ENABLED 0   // OFF: it subdivided the edge band 2 levels (+85k faces),
+                                     // multiplying the face count of any residual edge clutter --
+                                     // the 4x triangle density visible in wireframe. REVISIT: its
+                                     // purpose is to leave RefineMesh headroom at the boundary,
+                                     // so check edge detail before keeping this off. (was 1)
 #endif
 #ifndef MESH_BAND_REFINE_RINGS
 #define MESH_BAND_REFINE_RINGS 4
