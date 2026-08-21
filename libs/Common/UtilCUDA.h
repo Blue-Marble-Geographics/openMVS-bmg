@@ -52,6 +52,34 @@ extern int desiredDeviceID;
 // Result is computed once and cached.
 bool HasLegacyDriverAPI();
 
+// Static capability probe for a single device: enough to compare that device
+// against this machine's CPU (see Scene::PreferCPUMeshRefinement) BEFORE
+// committing to one path or the other. Creates no context and allocates nothing --
+// cuInit plus attribute queries only -- so it is cheap enough to call on a run
+// that then decides not to touch the GPU at all.
+struct DeviceCapability {
+	int deviceID;            // resolved device index
+	int major, minor;        // compute capability
+	int multiProcessorCount;
+	int clockRateKHz;        // SM clock
+	int memClockRateKHz;     // 0 if the driver did not report it
+	int memBusWidthBits;     // 0 if the driver did not report it
+	size_t totalMem;         // VRAM [bytes]
+	char name[128];
+
+	// FP32 throughput proxy [GHz-cores]: SMs x cores/SM x SM clock. Comparable
+	// across NVIDIA generations only as a rough proxy -- cores/SM counts the
+	// second Ampere-consumer FP32 datapath that real kernels rarely saturate --
+	// which is why callers pair it with BandwidthGBs() rather than trusting it alone.
+	double ComputeScore() const;
+	// theoretical peak memory bandwidth [GB/s]; 0 when the inputs were not reported
+	double BandwidthGBs() const;
+};
+
+// probe the given device (-1 - the best available one); false if there is none,
+// or if the driver would not answer
+bool GetDeviceCapability(int deviceID, DeviceCapability& cap);
+
 // global list of initialized devices
 struct Device {
 	CUdevice ID;

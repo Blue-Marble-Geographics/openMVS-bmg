@@ -177,7 +177,7 @@ namespace PoissonReconLib
 		sParams.exactInterpolation     = false;    // --exact not set
 		sParams.showResidual           = false;
 		sParams.confidence             = false;    // --confidence not set
-		sParams.scale                  = (Real)1.1;
+		sParams.scale                  = (Real)params.scale;
 		sParams.lowDepthCutOff         = (Real)0.;
 		sParams.width                  = (Real)0.;
 		sParams.pointWeight            = (Real)params.pointWeight;

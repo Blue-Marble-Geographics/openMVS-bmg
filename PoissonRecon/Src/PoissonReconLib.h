@@ -44,6 +44,14 @@ namespace PoissonReconLib
 		float pointWeight    = 4.0f;   // --pointWeight
 		bool  density        = true;   // --density (emit per-vertex density)
 		bool  verbose        = false;  // --verbose
+		// --scale: the octree cube is scale * (max axis extent of the input points),
+		// so cell = scale * extent / 2^depth. Was hardcoded 1.1 (the CLI default).
+		// Exposed because the octree cube is a FREE parameter and the achievable cell
+		// is otherwise quantised in factors of 2: a scene whose cell at depth D lands
+		// just under the quality floor has to fall back to D-1 and a cell twice as
+		// coarse as it needed. Padding the cube instead lets depth D land the cell
+		// exactly on the floor. See POISSON_CUBE_PAD_MAX in SceneReconstruct.cpp.
+		float scale          = 1.1f;   // --scale
 	};
 
 	// Parameters for the surface trimmer (SurfaceTrimmer.exe equivalents).

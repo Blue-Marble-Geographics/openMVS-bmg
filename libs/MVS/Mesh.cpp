@@ -212,6 +212,18 @@ using namespace MVS;
 // lower it if the input is ever several distinct objects. Read the component-sizes
 // DIAG line before changing it -- if there is no clear gap, no floor is the right
 // tool.
+// MESH_COMPONENT_GAP_RESCUE / _OVERLAP: exempt a below-threshold component from the
+// size filter below when the ground under it is not already covered by a component that
+// DOES clear the threshold. Mirrors POISSON_COMP_GAP_RESCUE in SceneReconstruct.cpp --
+// keep the two in step; this filter runs immediately after that one, on its survivors,
+// with a bar 1.9x tighter, so a rescue there is worthless unless it is honoured here.
+// Set to 0 to restore the plain vcg size filter.
+#ifndef MESH_COMPONENT_GAP_RESCUE
+#define MESH_COMPONENT_GAP_RESCUE 1
+#endif
+#ifndef MESH_COMPONENT_GAP_OVERLAP
+#define MESH_COMPONENT_GAP_OVERLAP 0.5
+#endif
 #ifndef MESH_KEEP_COMPONENT_PCT_X1000
 #define MESH_KEEP_COMPONENT_PCT_X1000 1000 // 1.0%. MEASURED on scene C: component sizes
                                            // 1292973 9752 178 156 1 1 1 1 -- the 9,752-face
@@ -2504,11 +2516,122 @@ void Mesh::Clean(
 			if (largest > 0 && CCV.size() > 1) {
 				const double frac = double(MESH_KEEP_COMPONENT_PCT_X1000) / 100000.0; // (pct/1000)/100
 				const int sizeThreshold = std::max(1, (int)(frac * (double)largest));
-				vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
+				// GAP RESCUE -- mirrors the identical test in the Poisson small-component
+				// filter (SceneReconstruct.cpp); see POISSON_COMP_GAP_RESCUE there for the
+				// reasoning. Duplicated rather than shared because that one works on
+				// MVS::Mesh and this one on the vcg CLEAN::Mesh.
+				//
+				// WHY THIS FILTER NEEDS IT TOO. It runs immediately after the Poisson one,
+				// on the components that one deliberately KEPT, and it is far stricter:
+				// 1% of the largest component versus 0.5% of the whole mesh -- 125,764 vs
+				// 65,362 faces on RichmondHistoric, a 1.9x tighter bar applied to an
+				// already-filtered set. MEASURED there: the Poisson stage rescued 73
+				// components / 35,697 faces as gap-filling, and this filter then deleted
+				// 74 components / 35,685 faces -- undoing the rescue almost exactly, which
+				// is why the fix appeared to do nothing at all.
+				//
+				// So: a component below the size bar survives if the ground under it is
+				// not already covered by a component that IS above the bar.
+				std::vector<CLEAN::Mesh::FacePointer> smallFaces;
+				size_t nRescued = 0, nRescuedFaces = 0;
+#if MESH_COMPONENT_GAP_RESCUE
+				{
+					// Per-face component id by flood over the FF adjacency built above.
+					const size_t nF = mesh.face.size();
+					std::vector<int> cid(nF, -1);
+					std::vector<int> csz;
+					std::vector<CLEAN::Mesh::FacePointer> stack;
+					for (size_t i = 0; i < nF; ++i) {
+						if (mesh.face[i].IsD() || cid[i] >= 0) continue;
+						const int id = (int)csz.size();
+						int cnt = 0;
+						stack.push_back(&mesh.face[i]);
+						cid[i] = id;
+						while (!stack.empty()) {
+							CLEAN::Mesh::FacePointer fp = stack.back(); stack.pop_back();
+							++cnt;
+							for (int e = 0; e < 3; ++e) {
+								CLEAN::Mesh::FacePointer nb = fp->FFp(e);
+								if (nb == nullptr || nb == fp || nb->IsD()) continue;
+								const size_t ni = (size_t)vcg::tri::Index(mesh, nb);
+								if (cid[ni] >= 0) continue;
+								cid[ni] = id;
+								stack.push_back(nb);
+							}
+						}
+						csz.push_back(cnt);
+					}
+					// Ground covered by the components that clear the size bar.
+					float bx0 = FLT_MAX, by0 = FLT_MAX, bx1 = -FLT_MAX, by1 = -FLT_MAX;
+					for (size_t v = 0; v < mesh.vert.size(); ++v) {
+						if (mesh.vert[v].IsD()) continue;
+						const auto& P = mesh.vert[v].cP();
+						if (P[0] < bx0) bx0 = P[0];  if (P[0] > bx1) bx1 = P[0];
+						if (P[1] < by0) by0 = P[1];  if (P[1] > by1) by1 = P[1];
+					}
+					const float span = std::max(bx1 - bx0, by1 - by0);
+					if (span > 0.f && !csz.empty()) {
+						constexpr int GDIM = 1024;
+						const float ginv = (float)GDIM / span;
+						const int ggw = (int)((bx1 - bx0) * ginv) + 2;
+						const int ggh = (int)((by1 - by0) * ginv) + 2;
+						const size_t gN = (size_t)ggw * ggh;
+						std::vector<uint8_t> covered(gN, 0);
+						const auto cellOfFace = [&](const CLEAN::Mesh::FaceType& f, int& cx, int& cy) {
+							const float mx = (f.cV(0)->cP()[0] + f.cV(1)->cP()[0] + f.cV(2)->cP()[0]) / 3.f;
+							const float my = (f.cV(0)->cP()[1] + f.cV(1)->cP()[1] + f.cV(2)->cP()[1]) / 3.f;
+							cx = (int)((mx - bx0) * ginv); cy = (int)((my - by0) * ginv);
+							if (cx < 0) cx = 0; else if (cx >= ggw) cx = ggw - 1;
+							if (cy < 0) cy = 0; else if (cy >= ggh) cy = ggh - 1;
+						};
+						for (size_t i = 0; i < nF; ++i) {
+							if (mesh.face[i].IsD() || cid[i] < 0) continue;
+							if (csz[cid[i]] < sizeThreshold) continue;
+							int cx, cy; cellOfFace(mesh.face[i], cx, cy);
+							covered[(size_t)cy * ggw + cx] = 1;
+						}
+						std::vector<uint32_t> cTot(csz.size(), 0), cHit(csz.size(), 0);
+						std::vector<int> seen(gN, -1);
+						for (size_t i = 0; i < nF; ++i) {
+							if (mesh.face[i].IsD() || cid[i] < 0) continue;
+							const int c = cid[i];
+							if (csz[c] >= sizeThreshold) continue;
+							int cx, cy; cellOfFace(mesh.face[i], cx, cy);
+							const size_t k = (size_t)cy * ggw + cx;
+							if (seen[k] == c) continue;
+							seen[k] = c;
+							++cTot[c];
+							if (covered[k]) ++cHit[c];
+						}
+						std::vector<uint8_t> rescue(csz.size(), 0);
+						for (size_t c = 0; c < csz.size(); ++c) {
+							if (csz[c] >= sizeThreshold || cTot[c] == 0) continue;
+							if ((double)cHit[c] / (double)cTot[c] < MESH_COMPONENT_GAP_OVERLAP) {
+								rescue[c] = 1; ++nRescued; nRescuedFaces += (size_t)csz[c];
+							}
+						}
+						// Delete only the small components the rescue did not spare.
+						for (size_t i = 0; i < nF; ++i) {
+							if (mesh.face[i].IsD() || cid[i] < 0) continue;
+							const int c = cid[i];
+							if (csz[c] < sizeThreshold && !rescue[c])
+								smallFaces.push_back(&mesh.face[i]);
+						}
+						for (CLEAN::Mesh::FacePointer fp : smallFaces)
+							vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
+					}
+				}
+#endif
+				if (smallFaces.empty() && nRescued == 0)
+					vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
 				stats.removedComponents += (fnBefore - mesh.fn);
 				if (fnBefore != mesh.fn)
 					DEBUG("Removed %d faces in small components (kept >= %.3g%% of largest=%d faces -> threshold %d faces, of %zu components)",
 						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, sizeThreshold, CCV.size());
+				if (nRescued > 0)
+					DEBUG("DIAG gap rescue (Clean): kept %zu components / %zu faces whose ground"
+						" the kept mesh does not already cover (overlap < %.2f)",
+						nRescued, nRescuedFaces, (double)MESH_COMPONENT_GAP_OVERLAP);
 			}
 		}
 

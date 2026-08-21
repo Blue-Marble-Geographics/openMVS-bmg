@@ -7449,7 +7449,11 @@ static bool PackShelfReasonablySquare(
 #pragma comment(lib, "user32.lib")
 #endif
 
-static int GetOpenGLMaxTextureSize()
+// NOT static: SceneReconstruct.cpp declares this extern so ResolveAtlasMaxDim() can
+// size its atlas face budget from the same hardware limit this file will pack into.
+// Keeping it file-local let the two stages disagree by 4x in face capacity on a
+// 32768-capable host.
+int GetOpenGLMaxTextureSize()
 {
 	static int cached = 0;
 	if (cached != 0)

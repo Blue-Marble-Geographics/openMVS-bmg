@@ -163,6 +163,51 @@ CUresult _gpuGetMaxGflopsDeviceId(Device& bestDevice)
 	return CUDA_SUCCESS;
 }
 
+// see the declarations in UtilCUDA.h
+double DeviceCapability::ComputeScore() const
+{
+	return multiProcessorCount * (double)_convertSMVer2Cores(major, minor) * (clockRateKHz / 1.e6);
+}
+double DeviceCapability::BandwidthGBs() const
+{
+	if (memClockRateKHz <= 0 || memBusWidthBits <= 0)
+		return 0;
+	// double data rate, bits -> bytes, kHz -> GHz
+	return memClockRateKHz * 2.0 * (memBusWidthBits / 8.0) / 1.e6;
+}
+
+bool GetDeviceCapability(int deviceID, DeviceCapability& cap)
+{
+	if (deviceID < -1)
+		return false;
+	if (cuInit(0) != CUDA_SUCCESS)
+		return false;
+	Device device;
+	if (deviceID >= 0) {
+		if (_gpuCheckDeviceId(deviceID, device) != CUDA_SUCCESS)
+			return false;
+	} else if (_gpuGetMaxGflopsDeviceId(device) != CUDA_SUCCESS)
+		return false;
+	cap.deviceID = (int)device.ID;
+	cap.major = device.major;
+	cap.minor = device.minor;
+	if (cuDeviceGetAttribute(&cap.multiProcessorCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device.ID) != CUDA_SUCCESS ||
+		cuDeviceGetAttribute(&cap.clockRateKHz, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, device.ID) != CUDA_SUCCESS)
+		return false;
+	// the bandwidth inputs are optional: a device that does not report them still
+	// has a usable compute score, and BandwidthGBs() returns 0 to say so
+	if (cuDeviceGetAttribute(&cap.memClockRateKHz, CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, device.ID) != CUDA_SUCCESS)
+		cap.memClockRateKHz = 0;
+	if (cuDeviceGetAttribute(&cap.memBusWidthBits, CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, device.ID) != CUDA_SUCCESS)
+		cap.memBusWidthBits = 0;
+	cap.totalMem = 0;
+	cuDeviceTotalMem(&cap.totalMem, device.ID);
+	cap.name[0] = 0;
+	cuDeviceGetName(cap.name, (int)sizeof(cap.name), device.ID);
+	cap.name[sizeof(cap.name)-1] = 0;
+	return true;
+}
+
 // see the declaration in UtilCUDA.h for why this exists
 bool HasLegacyDriverAPI()
 {

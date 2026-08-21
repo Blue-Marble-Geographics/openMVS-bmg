@@ -559,7 +559,50 @@
 // them, i.e. on POISSON_TRIM_CLOSE_CELLS dilation sealing the channel. If holes persist over
 // water specifically, raise CLOSE_CELLS instead.
 #ifndef POISSON_TRIM_MIN_PTS_PER_CELL
-#define POISSON_TRIM_MIN_PTS_PER_CELL 8
+// TESTED AT 12 AND REVERTED TO 8 (2026-08-19): not better. That is informative -- raising it drops
+// the THINLY-SUPPORTED cells first, so if the fringe did not retreat, the fringe cells DO have
+// adequate point support at this grid scale. Which is unsurprising at 20x median spacing (~1.2 unit
+// cells): a cell containing a tongue almost certainly also contains the real terrain points the
+// tongue grew out of, so the footprint cannot resolve one from the other. To separate them the GRID
+// would have to be finer (POISSON_TRIM_CELL_FACTOR_X100), with MIN_PTS lowered in proportion --
+// halving the cell area quarters the expected count -- at the cost of a noisier footprint.
+//
+// Original rationale for 8, which still stands: this is the SELECTIVE way to shrink the footprint: a
+// cell joins only with >= N points, so raising it drops the THINLY-SUPPORTED cells first, which is
+// exactly what the fringe is -- unlike POISSON_TRIM_MARGIN_CELLS, which pulls the whole boundary in
+// uniformly and takes well-covered shoreline with it.
+//
+// Chosen as a middle step, not a return to the original: 20 was measured to punch holes in
+// thinly-covered real ground (rough/vegetated terrain under 20 points per cell), and 8 fixed them.
+// Headroom for this comes from the occupancy fraction, which was running 0.41-0.45 -- well clear of
+// the 1.0 that would mean the footprint has started swallowing the fringe.
+//
+// WATCH, in the trim log line: "X of Y cells occupied (fraction Z)" should FALL from ~0.42 (the
+// footprint really shrinking) and "outside-footprint cut M" should RISE from ~7-12k (the extra
+// fringe being cut). If Z falls but M barely moves, the fringe is not in the cells this removed and
+// neither this nor MARGIN_CELLS is the right instrument. The failure mode is holes reappearing in
+// thinly-covered INTERIOR areas -- if that happens, back off toward 10. If 12 is clean and the edge
+// still needs work, 16 is the next notch.
+// LOWERED 8 -> 4 (2026-08-20). The notes above are written for RAISING this to shrink the
+// footprint; this is the same lever run in reverse, to GROW it.
+//
+// DIAGNOSED on RichmondHistoric: a band along the bottom of the scene was missing from the
+// output at both depth 10 and depth 11, and from the raw solve too. --poisson-trim 0
+// restored it, and POISSON_TRIM_HARD_OUTSIDE 0 restored it with the density trim still on,
+// which isolates the FOOTPRINT HARD CUT as the cause. The band is real but very thinly
+// covered -- the cell is 20x median spacing, so a cell at median density holds ~400 points
+// and >=8 is already only ~2% of nominal, yet those cells still fail it.
+//
+// MARGIN_CELLS cannot fix this: the margin grows the footprint outward from its edge, but
+// these cells are not near the edge, they are not IN the footprint at all. Raising the
+// margin from 0.44% to 0.73% of extent changed nothing visible, which is what confirmed it.
+//
+// WATCH the trim line: occupancy should RISE from 0.413 and "outside-footprint cut" should
+// FALL from 24153. The guardrail is occupancy approaching 1.0, which means the footprint has
+// begun swallowing the extrapolated fringe this test exists to catch -- the notes above put
+// the healthy band at 0.41-0.45, so treat anything past ~0.6 as suspect and check the
+// under-cut scenes (Marco, Redy) before keeping it.
+#define POISSON_TRIM_MIN_PTS_PER_CELL 4
 #endif
 // Hard cut: remove a face when ALL THREE vertices sit in cells OUTSIDE the footprint,
 // regardless of density.
@@ -641,7 +684,124 @@
 // guard escalates it (not the seal radius) when a cut would sever the surface.
 // 2 cells ~= 2.5 units at a 1.232 cell.
 #ifndef POISSON_TRIM_MARGIN_CELLS
-#define POISSON_TRIM_MARGIN_CELLS 5   // ~6.2 units at a 1.232 cell; was 2 (~2.5)
+// LOWERED 5 -> 3 to cull more edge. This is the UNIFORM lever: it pulls the whole boundary in by
+// ~40% regardless of how well covered any part of it is, which is the opposite selectivity to
+// POISSON_TRIM_MIN_PTS_PER_CELL (tested at 12, no better -- see its note). Since the footprint
+// cannot resolve a tongue from the data it grew out of at this grid scale, moving the contour
+// bodily is what is left.
+//
+// Physical effect varies per scene because this is in GRID CELLS and the cell tracks point density:
+// at 3 cells it is ~3.7 units on SchnellTests (cell 1.232), ~3.4 on the depth-10 D scene (1.12),
+// ~1.25 on E (0.4177) and ~1.55 on F (0.516). That 3x spread is the open cells-vs-world-units
+// question; if the tight-cell scenes now cut too much while the coarse ones still leave fringe,
+// that is the evidence for converting this knob to world units.
+//
+// The guard escalates this upward if a tighter margin severs the surface, so the floor is enforced
+// automatically -- watch for "attempt 2" in the hard-cut line.
+#define POISSON_TRIM_MARGIN_CELLS 3
+#endif
+// POISSON_TRIM_MARGIN_FLOOR_FRAC: lower bound on the hard-cut margin, as a fraction of
+// the XY footprint extent. The margin above is in GRID CELLS and the grid cell tracks
+// POINT DENSITY, which has nothing to do with how far the Poisson balloon reaches -- so
+// on a dense scene the physical margin collapses and the cut eats real perimeter.
+//
+// MEASURED over nine scenes, labelled by eye. Sorted by margin/extent (extent = the
+// LONGER grid axis), the three the operator called over-cut are the three tightest in
+// the corpus and nothing else is below 0.59%:
+//   MechanicFalls 0.287% OVER | RichmondHistoric 0.438% OVER | RichmondWater 0.459% OVER
+//   SchnellTests 0.592% ok | Redy 0.673% under | Randy 0.750% ok | GEOTAG 0.833% ok
+//   Marco 1.250% under | Niwot 1.299% ok
+// Absolute margin does NOT separate them (Redy under-cuts at 1.403 units while
+// RichmondHistoric over-cuts at 1.252), and neither does grid cell alone. The ratio does.
+//
+// 0.006 sits above the over-cut cluster and below the first healthy scene. A BIGGER
+// margin means a BIGGER footprint, so the cut removes LESS -- the direction these three
+// need. Because the margin is an INTEGER cell count the floor overshoots slightly:
+//   MechanicFalls    3 -> 7 cells  1.944 -> 4.535 units  (0.287% -> 0.669%)
+//   RichmondHistoric 3 -> 5 cells  1.252 -> 2.087 units  (0.438% -> 0.731%)
+//   RichmondWater    3 -> 4 cells  1.510 -> 2.013 units  (0.459% -> 0.613%)
+//   SchnellTests     3 -> 4 cells  3.716 -> 4.956 units  (0.592% -> 0.789%)  <-- side effect
+//   Randy / GEOTAG / Niwot / Redy / Marco: unchanged (floor lands at or below 3 cells)
+// SchnellTests is the one healthy scene that moves, and only because its 3.042 rounds up.
+// It lands between Randy (0.750%) and GEOTAG (0.833%), both healthy, so it should be
+// safe -- but it is the scene to check first for a new under-cut.
+//
+// This is a FLOOR only. It cannot make the margin smaller, so it cannot make the
+// under-cut scenes (Marco, Redy) worse -- those are a different mechanism, still open;
+// see [MESH-OVERHANG].
+#ifndef POISSON_TRIM_MARGIN_FLOOR_FRAC
+#define POISSON_TRIM_MARGIN_FLOOR_FRAC 0.006f
+#endif
+// POISSON_TRIM_MARGIN_CAP_UNITS: the matching CEILING, in world units. The floor above stops
+// a DENSE scene (small cell) getting a margin too tight to clear the balloon; this stops a
+// SPARSE scene (large cell) getting one absurdly wide from the same cell count. Together they
+// are the "convert this knob to world units" the MARGIN_CELLS note asks for.
+//
+// Only Marco is affected at 7.0 (3 -> 2 cells, 10.46 -> 6.97 units); the other eight scenes
+// have cells small enough that the cap sits above their count. Set 0 to disable the cap.
+#ifndef POISSON_TRIM_MARGIN_CAP_UNITS
+#define POISSON_TRIM_MARGIN_CAP_UNITS 7.0f
+#endif
+// POISSON_COMP_GAP_RESCUE / _OVERLAP: exempt a below-threshold component from deletion
+// when the kept mesh does not already cover the ground it sits on. See the GAP RESCUE
+// block in the small-component filter for the reasoning and the observation behind it.
+//
+// _OVERLAP is the fraction of a component's XY cells that must ALREADY be covered by the
+// kept mesh for it to count as redundant. 0.5 = "more than half of this thing is
+// duplicating surface we already have" -> delete. Lower it to rescue less (stricter,
+// only components almost entirely in open ground); raise it to rescue more.
+//
+// UNTESTED as of writing. The failure mode to watch for is the opposite complaint --
+// floaters and shells surviving where they used to be cleaned -- which would show up as
+// the under-cut scenes (Marco, Redy) getting worse, or as spikes above roofs. The
+// "gap rescue kept N of M" line reports exactly what it saved on every run.
+// POISSON_REACH_CUT: remove surface sitting further than a WORLD-UNIT distance from the
+// nearest surveyed cell, independent of the footprint. See the REACH CUT block in the
+// adaptive trim for the corpus calibration.
+//
+// This exists because the footprint's margin is in GRID CELLS and the grid cell tracks
+// point density, so a sparsely-sampled scene gets a huge physical margin -- Marco's cell
+// is 3.486 units against 0.17-1.6 elsewhere, giving its 3-cell margin a 10.46-unit reach
+// where most scenes get 0.5-2.1. Extrapolation reach is a physical distance and has nothing
+// to do with sample spacing, so the ceiling on it must be physical too.
+//
+// max(MIN_UNITS, EXTENT_FRAC * extent): the floor leaves small scenes alone (their overhang
+// maxima are 7-42 units, all at or under the floor), the fraction keeps the tolerance
+// proportionate on large ones. At 30 / 0.05 this lands almost entirely on Marco and removes
+// nothing at all from Redy or Randy.
+//
+// Deliberately NOT gated on the footprint guard (bHardCutOK): a face 40+ units from any data
+// is not part of a surface worth preserving even when the footprint cut has been suppressed.
+// DEFAULTED OFF -- it fired ZERO faces on the scene it was written for.
+// MEASURED on Marco: armed at 41.46 units, 995 of 19291 mesh cells beyond it, 0 faces cut.
+// The footprint cut runs first in the same loop and had already taken all of them: anything
+// 41 units out is far outside a footprint that reaches only 10.46 units past the data, so
+// this criterion is redundant by construction at any threshold above the margin.
+//
+// The [MESH-OVERHANG] percentiles that motivated it are misleading for this purpose because
+// they conflate the outer balloon with ENCLOSED interior gaps -- Marco has 23% of mesh cells
+// outside surveyed data on a scene with 7.82% unobserved faces (courtyards, water, shadow),
+// and those are kept by design. Its p50 of 13.94 units is mostly interior, not reach.
+// Marco's real slop turned out to be INSIDE the footprint's own margin; see
+// POISSON_TRIM_MARGIN_CAP_UNITS.
+//
+// Kept because the machinery is sound and would become useful once [MESH-OVERHANG] is split
+// by the exterior flood (`ext`, already computed) so it measures outer reach alone. Until
+// then it is dead weight -- do not enable it without that split.
+#ifndef POISSON_REACH_CUT
+#define POISSON_REACH_CUT 0
+#endif
+#ifndef POISSON_REACH_CUT_MIN_UNITS
+#define POISSON_REACH_CUT_MIN_UNITS 30.0
+#endif
+#ifndef POISSON_REACH_CUT_EXTENT_FRAC
+#define POISSON_REACH_CUT_EXTENT_FRAC 0.05
+#endif
+#ifndef POISSON_COMP_GAP_RESCUE
+#define POISSON_COMP_GAP_RESCUE 1
+#endif
+#ifndef POISSON_COMP_GAP_OVERLAP
+#define POISSON_COMP_GAP_OVERLAP 0.5
 #endif
 // POISSON_TRIM_PERCENTILE_X100: take the INTERIOR trim threshold as this percentile of the scene's
 // own density distribution instead of from --poisson-trim. Units are hundredths of a percent, so
@@ -4210,6 +4370,14 @@ struct MeshPolicy {
 	// the scene missed the next level by 3% of a cell, not by a level's worth of quality.
 	// See POISSON_DEPTH_PIXELS_TOL.
 	float  depthPixelsRaw = 0.f;
+	// Octree cube scale handed to PoissonRecon (its --scale). 1.1 unless the cube was
+	// padded to unlock a deeper depth -- see POISSON_CUBE_PAD_MAX. cellSingle/cell are
+	// computed from THIS, not from the 1.1 default, so a padded run reports the cell it
+	// will actually get.
+	float  scale        = 1.1f;
+	// Pad factor actually applied (scale / 1.1). 1.0 = no padding. Logged so a run whose
+	// depth came from padding is distinguishable from one that cleared the ceiling itself.
+	float  cubePad      = 1.f;
 };
 
 // targetCell   : desired output cell size; <=0 means "best single mesh"
@@ -4439,9 +4607,42 @@ double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
 #ifndef POISSON_ATLAS_MAX_DIM
 #define POISSON_ATLAS_MAX_DIM 16384   // GL_MAX_TEXTURE_SIZE on current mainstream GPUs
 #endif
+// POISSON_CUBE_PAD_MAX: largest factor by which the octree cube may be grown past
+// scale*extent in order to unlock one more octree level. See the CUBE PADDING block
+// in ComputeMeshPolicy() for the argument; this is the cost dial.
+//
+// Padding does NOT make a depth increase cheaper -- a level is still ~4x the faces,
+// ~3.5x the solve nodes, one finer RefineMesh level (4x the view planes) and ~4x the
+// faces through texturing. It only removes the case where a scene pays for depth D-1
+// while its own quality floor permitted D.
+//
+// 1.07 is deliberately tight: it covers the near-boundary scenes, which are the ones
+// losing a whole factor of 2 for a few percent of cube, and declines the ones that
+// would need a 40-50% bigger cube for a 1.35x cell (measured: BellisPark 1.47,
+// MechanicFalls 1.48). Those are ordinary depth increases wearing a disguise -- if
+// they are wanted, raise the face budget, do not smuggle them in here.
+//
+// Per-scene pad needed to reach the next level, measured over six scenes:
+//   Marco 1.007 | OKState 1.04 | RichmondWater 1.064 | Niwot(127) 1.064
+//   MechanicFalls 1.48 | BellisPark 1.47
+// Set to 1.0 to disable padding entirely and restore the pre-change behaviour.
+#ifndef POISSON_CUBE_PAD_MAX
+#define POISSON_CUBE_PAD_MAX 1.07
+#endif
 // Usable fraction of the atlas: must match TEXTURE_ATLAS_FIT_MARGIN in SceneTexture.cpp,
 // which is the fraction AdaptiveFitPatches actually fills (measured: realized area lands
 // on 100% of that budget).
+//
+// KNOWN STALE -- do not "fix" without re-measuring the decimation cap it feeds.
+// 0.97 is the margin the fit ladder STARTS at, not the one it lands on. Measured over
+// six scenes, attempt 1 at 0.97 fails to pack and attempt 2 at 0.82 succeeds, on 5 of 6
+// at 16384 and also at 32768 (RichmondWater: 1041.5 Mpx budget -> overflow -> 885.3 Mpx
+// = 0.82). So the real usable fraction is 0.82 and this over-states atlas capacity by
+// 1.18x, i.e. the face cap here is ~18% too generous. Correcting it TIGHTENS the cap and
+// therefore decimates more, so it is an output change, not a pure bug fix -- and it is
+// moot on scenes where texCapMem binds first. Fix it together with the fit ladder itself
+// (see TEXTURE_ATLAS_FIT_MARGIN): if the packer is made to reach 0.97, this becomes
+// correct as written.
 #ifndef POISSON_ATLAS_USABLE_FRACTION
 #define POISSON_ATLAS_USABLE_FRACTION 0.97
 #endif
@@ -4450,14 +4651,44 @@ double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
 #ifndef POISSON_ATLAS_TEXELS_PER_FACE
 #define POISSON_ATLAS_TEXELS_PER_FACE 64.0
 #endif
+// Defined in SceneTexture.cpp. Spins up a throwaway hidden-window WGL context once,
+// queries GL_MAX_TEXTURE_SIZE, caches it, and falls back to 16384 when no driver is
+// reachable. Shared rather than duplicated so this stage sizes its face cap from the
+// SAME number the texturing stage will actually pack into: TextureMesh resolves
+// --max-texture-size < 0 through this identical probe. If the two disagree the face
+// capacity is wrong by (dim ratio)^2 -- 4x on a 32768-capable host, which silently
+// decimates the mesh for an atlas that is not the one being built.
+extern int GetOpenGLMaxTextureSize();
+
+// Atlas dimension the texturing stage will pack into, in precedence order:
+//   1. explicit argument     -- caller already knows the value
+//   2. OPENMVS_ATLAS_MAX_DIM -- operator override
+//   3. host GL_MAX_TEXTURE_SIZE
+//   4. POISSON_ATLAS_MAX_DIM -- only if the probe itself returns nothing usable
+//
+// The env override deliberately outranks the probe. GL_MAX_TEXTURE_SIZE is 16384 on
+// AMD/Intel and 32768 on NVIDIA, so on a mixed fleet an unpinned probe makes the same
+// job produce different texture resolution on different machines. Pinning one
+// dimension here and the matching --max-texture-size on TextureMesh is the only way
+// to make a quality tier mean the same thing everywhere.
+int ResolveAtlasMaxDim(int atlasMaxDim)
+{
+	if (atlasMaxDim > 0)
+		return atlasMaxDim;
+	static const int envDim = []() -> int {
+		const char* v = std::getenv("OPENMVS_ATLAS_MAX_DIM");
+		const int d = v ? std::atoi(v) : 0;
+		return d > 0 ? d : 0;
+	}();
+	if (envDim > 0)
+		return envDim;
+	const int glDim = GetOpenGLMaxTextureSize();
+	return (glDim > 0) ? glDim : (int)POISSON_ATLAS_MAX_DIM;
+}
+
 double ComputeAtlasFaceBudget(int atlasMaxDim)
 {
-	static const double envDim = []() -> double {
-		const char* v = std::getenv("OPENMVS_ATLAS_MAX_DIM");
-		return v ? std::atof(v) : 0.0;
-	}();
-	double dim = (atlasMaxDim > 0) ? (double)atlasMaxDim
-		: (envDim > 0.0 ? envDim : (double)POISSON_ATLAS_MAX_DIM);
+	const double dim = (double)ResolveAtlasMaxDim(atlasMaxDim);
 	if (!(dim > 0.0))
 		return 0.0; // unknown: caller falls back to no cap
 	const double texels = dim * dim * POISSON_ATLAS_USABLE_FRACTION;
@@ -4519,6 +4750,9 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 	const auto finish = [&](int depthData) {
 		int chosen = (depthData > 0) ? std::min(depthBudget, depthData) : depthBudget;
 		chosen = std::min(chosen, depthTexture);
+		// Baseline cube: whatever the caller asked for. Cube padding below may raise it.
+		pol.scale   = scaleFactor;
+		pol.cubePad = 1.f;
 		// Deepest depth whose cell is still >= minCellForTexture.
 		int depthPixels = maxDepth;
 		double depthPixelsRaw = 0.0; // unfloored, logged so a near-boundary scene is visible
@@ -4532,6 +4766,48 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 			chosen = std::min(chosen, depthPixels);
 		}
 		pol.depthPixelsRaw = (float)depthPixelsRaw;
+
+		// CUBE PADDING. The octree cube is scale*extent, and `scale` is a free
+		// parameter -- PoissonRecon only needs it big enough to contain the points.
+		// The achievable cell is therefore quantised in factors of 2 ONLY because the
+		// cube is held at 1.1x: cell = scale*ext / 2^depth.
+		//
+		// So when the PIXEL ceiling alone is what blocks a deeper depth, growing the
+		// cube is strictly better than accepting the coarser level. MEASURED on two
+		// runs of the same 109-image scene: extent 134.1 put depth 10 only 0.6% under
+		// the floor (tolerance absorbed it, cell 0.1441), while extent 127 put it 6.4%
+		// under (tolerance could not, so it fell back to depth 9 and cell 0.2728 --
+		// 1.88x coarser than that scene's OWN floor permitted). A 6.4% bigger cube
+		// would have given the second run depth 10 with the cell legally ON the floor.
+		//
+		// This is preferable to simply widening POISSON_DEPTH_PIXELS_TOL: the tolerance
+		// buys the deeper depth by accepting a cell BELOW the reliability floor, while
+		// padding buys the same depth with the cell at or above it. No violation.
+		//
+		// Bounded by POISSON_CUBE_PAD_MAX, and only ever up to the depth the OTHER
+		// three ceilings already allow -- padding cannot buy past a resource limit,
+		// only past the quantisation artefact. Scenes whose budget/data/texture ceiling
+		// is already at depthPixels (measured: MechanicFalls and OKState, both
+		// budget=10 pixels=10) are unaffected by design.
+		if (minCellForTexture > 0.0 && pol.extent > 0.f && POISSON_CUBE_PAD_MAX > 1.0) {
+			// Deepest depth the non-quantised ceilings permit.
+			int otherCeil = depthBudget;
+			if (depthData > 0) otherCeil = std::min(otherCeil, depthData);
+			otherCeil = std::min(otherCeil, depthTexture);
+			otherCeil = std::min(otherCeil, maxDepth);
+			for (int d = chosen + 1; d <= otherCeil; ++d) {
+				// Cube side needed for depth d to land the cell exactly on the floor.
+				const double needScale =
+					minCellForTexture * (double)(1u << d) / (double)pol.extent;
+				const double pad = needScale / (double)scaleFactor;
+				if (!(pad > 0.0) || pad > POISSON_CUBE_PAD_MAX)
+					break;              // next level costs more cube than we allow
+				pol.scale   = (float)needScale;
+				pol.cubePad = (float)pad;
+				chosen      = d;
+			}
+		}
+
 		pol.depth        = std::clamp(chosen, minDepth, maxDepth);
 		pol.depthBudget  = depthBudget;
 		// Normalized to maxDepth when unmeasurable (degenerate cloud, no GSD) so that
@@ -4539,8 +4815,10 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 		pol.depthData    = (depthData > 0) ? depthData : maxDepth;
 		pol.depthTexture = depthTexture;
 		pol.depthPixels  = depthPixels;
+		// From pol.scale, NOT scaleFactor: on a padded run these differ and the cell
+		// that matters downstream is the one the padded cube will actually produce.
 		pol.cellSingle = (pol.extent > 0.f)
-			? scaleFactor * pol.extent / (float)(1u << pol.depth) : 0.f;
+			? pol.scale * pol.extent / (float)(1u << pol.depth) : 0.f;
 		// Never target finer than the cloud actually resolves.
 		float desired = (targetCell > 0.f) ? targetCell : pol.cellSingle;
 		if (pol.spacing > 0.f && desired < pol.spacing)
@@ -4549,7 +4827,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 			? (int)std::ceil(pol.cellSingle / desired) : 1;
 		if (pol.tilesPerAxis < 1) pol.tilesPerAxis = 1;
 		pol.cell = (pol.extent > 0.f)
-			? scaleFactor * (pol.extent / (float)pol.tilesPerAxis) / (float)(1u << pol.depth)
+			? pol.scale * (pol.extent / (float)pol.tilesPerAxis) / (float)(1u << pol.depth)
 			: 0.f;
 		if (gsdFull > 0.f && pol.cell > 0.f)
 			pol.refineLevel = std::clamp((int)std::lround(
@@ -4565,6 +4843,27 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 			(pol.depth != chosen) ? " (CLAMPED)" : "",
 			pol.cellSingle, desired, pol.tilesPerAxis, pol.tilesPerAxis, pol.cell,
 			pol.refineLevel);
+		// Padding changes the meaning of the depth line above -- `pixels` reports the
+		// ceiling at the UNPADDED cube, so without this the chosen depth reads as if it
+		// had violated its own ceiling. This is also the first line to check if a padded
+		// run regresses: several cleanup thresholds are multiples of the median edge and
+		// weaken as the mesh gets finer.
+		if (pol.cubePad > 1.0001f) {
+			const double cellWas =
+				(double)scaleFactor * (double)pol.extent / (double)(1u << depthPixels);
+			VERBOSE("[MESH-POLICY] CUBE PAD x%.4g: cube %.4g -> %.4g to reach depth %d"
+				" instead of %d. Cell %.4g instead of %.4g (%.2fx finer), sitting ON the"
+				" %.4g floor rather than under it. Costs a full level: ~4x faces,"
+				" ~4x refine view-planes, ~4x textured faces."
+				" Set POISSON_CUBE_PAD_MAX 1.0 to disable.",
+				(double)pol.cubePad,
+				(double)scaleFactor * (double)pol.extent,
+				(double)pol.scale * (double)pol.extent,
+				pol.depth, depthPixels,
+				(double)pol.cellSingle, cellWas,
+				(pol.cellSingle > 0.f) ? cellWas / (double)pol.cellSingle : 0.0,
+				minCellForTexture);
+		}
 		// The pixel ceiling binds on most scenes and its FRACTIONAL part decides a 2x cell /
 		// 4x face outcome, so say so out loud when a scene is sitting near a boundary --
 		// that is the difference between "this scene wants depth N" and "this scene missed
@@ -5045,6 +5344,11 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	// both paths -- via the policy when auto-selecting, or from a cheap bounding-box
 	// pass (no kd-tree) when the caller pinned the depth.
 	float meshCell = 0.f;
+	// Octree cube scale handed to PoissonRecon. 1.1 (its CLI default) unless the policy
+	// padded the cube to unlock a level -- see POISSON_CUBE_PAD_MAX. Must reach every
+	// Reconstruct() call, the probe included, or the probe measures a different cube than
+	// the solve and its k comes out wrong.
+	float poissonScale = 1.1f;
 	// Probe's predicted k, kept so the post-solve check can score the PROBE rather than
 	// re-deriving a depth under a single ceiling that may not have been the binding one.
 	double probeK = 0.0;
@@ -5086,7 +5390,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			" (%d px, %.0f texels/face) -> %s-bound at decimation"
 			" | depth ceiling uses memory only (k too noisy to divide by)",
 			texCapMem * 1e-6, (unsigned)nViewsValid, texCapAtlas * 1e-6,
-			(int)POISSON_ATLAS_MAX_DIM, (double)POISSON_ATLAS_TEXELS_PER_FACE,
+			ResolveAtlasMaxDim(0), (double)POISSON_ATLAS_TEXELS_PER_FACE,
 			(texCapAtlas < texCapMem) ? "ATLAS" : "RAM");
 
 		// How much subdivision headroom to leave RefineMesh.
@@ -5178,6 +5482,9 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			PoissonReconLib::Mesh probe;
 			PoissonReconLib::ReconParams rp;
 			rp.depth          = probeDepth;
+			// Same cube as the real solve, or k is measured against a different octree
+			// than the one it will be used to predict.
+			rp.scale          = pol.scale;
 			rp.samplesPerNode = samplesPerNode;
 			rp.pointWeight    = pointWeight;
 			rp.density        = false;   // not needed; skips a pass
@@ -5186,7 +5493,9 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			if (PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp, probe)
 				&& probe.TriangleCount() > 0)
 			{
-				const double sc2   = 1.1 * 1.1;
+				// Must be the cube the probe actually ran with, not the 1.1 default: k is
+				// defined by faces ~= k*(scale*ext/cell)^2, so a padded cube shifts it.
+				const double sc2   = (double)pol.scale * (double)pol.scale;
 				const double kRaw  = (double)probe.TriangleCount() * sc2
 					/ std::pow(4.0, (double)probeDepth);
 				double kMeas = kRaw;
@@ -5378,10 +5687,11 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				VERBOSE("warning: could not write the mesh plan to %s", planPath.c_str());
 		}
 
-		depth    = pol.depth;
-		meshCell = pol.cell;
+		depth        = pol.depth;
+		meshCell     = pol.cell;
+		poissonScale = pol.scale;
 	} else {
-		meshCell = PoissonCellSizeAtDepth(poissonPts, poissonCount, 1.1f, depth);
+		meshCell = PoissonCellSizeAtDepth(poissonPts, poissonCount, poissonScale, depth);
 	}
 
 	// Compact to xyz+normals only, then release the full cloud before the solve
@@ -5448,6 +5758,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	{
 		PoissonReconLib::ReconParams rp;
 		rp.depth          = depth;
+		rp.scale          = poissonScale;
 		rp.samplesPerNode = samplesPerNode;
 		rp.pointWeight    = pointWeight;
 		rp.density        = true;
@@ -5471,7 +5782,8 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	// Report it, and the depth it would have selected, so the next run on this site
 	// is calibrated instead of guessed. Pass it back via OPENMVS_POISSON_FACE_K.
 	{
-		const double sc2  = 1.1 * 1.1;
+		// Cube actually solved, not the 1.1 default -- see the probe's sc2 above.
+		const double sc2  = (double)poissonScale * (double)poissonScale;
 		const double kMeas = (double)pmesh.TriangleCount() * sc2 / std::pow(4.0, (double)depth);
 		if (kMeas > 0.0) {
 			// Score the PROBE against the truth, not two depths derived under different
@@ -5666,6 +5978,55 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			}
 			const float cellSz = (POISSON_TRIM_CELL_FACTOR_X100 / 100.f) * medianSpacing;
 			const float invCell = 1.f / cellSz;
+			// Hard-cut margin, floored against the SCENE EXTENT so a dense scene (small
+			// grid cell) cannot end up with a margin too tight to clear the balloon.
+			// See POISSON_TRIM_MARGIN_FLOOR_FRAC for the nine-scene calibration.
+			const float footExtent = std::max(maxx - minx, maxy - miny);
+			const int marginCellsFloor =
+				(POISSON_TRIM_MARGIN_FLOOR_FRAC > 0.f && cellSz > 0.f && footExtent > 0.f)
+				? (int)std::ceil((double)POISSON_TRIM_MARGIN_FLOOR_FRAC
+					* (double)footExtent / (double)cellSz)
+				: 0;
+			// ... and a CEILING in world units, for the opposite failure. The cell is 20x
+			// median point spacing, so a sparsely-sampled scene gets a huge PHYSICAL margin
+			// from the same cell count -- and extrapolation reach is a physical distance,
+			// unrelated to how densely the cloud happens to be sampled.
+			//
+			// MEASURED margin over the corpus: Marco 10.46 units, then SchnellTests 4.96,
+			// GEOTAG 4.81, MechanicFalls 4.54, everything else 0.51-2.09. Marco is 2.1x the
+			// next scene and is the one reported as slop. A 7-unit cap takes it 3 -> 2 cells
+			// (10.46 -> 6.97) and leaves all eight other scenes untouched, since their cells
+			// are small enough that the cap lands above their count.
+			//
+			// 7 rather than 5 because Marco's own FLOOR is 0.006*829.2 = 4.98 units, which a
+			// 5-unit cap would collide with. If slop persists the next lever is
+			// POISSON_TRIM_CLOSE_CELLS (the seal: 8 cells = 27.9 units on Marco), not this.
+			// Safe by construction: the escalating guard doubles the margin back up if a
+			// tighter one would sever the surface.
+			const int marginBase = std::max((int)POISSON_TRIM_MARGIN_CELLS, marginCellsFloor);
+			const int marginCellsCap =
+				(POISSON_TRIM_MARGIN_CAP_UNITS > 0.f && cellSz > 0.f)
+				? std::max(1, (int)std::floor((double)POISSON_TRIM_MARGIN_CAP_UNITS / (double)cellSz))
+				: INT_MAX;
+			const int marginCells = std::min(marginBase, marginCellsCap);
+			if (marginCells < marginBase)
+				VERBOSE("Poisson: hard-cut margin capped %d -> %d cells (%.4g -> %.4g units)"
+					" -- a %.4g cell puts the margin past the %.4g-unit ceiling; cells track"
+					" point density, not extrapolation reach",
+					marginBase, marginCells,
+					(double)((float)marginBase * cellSz),
+					(double)((float)marginCells * cellSz),
+					(double)cellSz, (double)POISSON_TRIM_MARGIN_CAP_UNITS);
+			if (marginCells > (int)POISSON_TRIM_MARGIN_CELLS)
+				VERBOSE("Poisson: hard-cut margin floored %d -> %d cells (%.4g -> %.4g units)"
+					" -- %d cells is %.3f%% of the %.4g extent, below the %.3f%% floor;"
+					" the grid cell tracks point density, not balloon reach",
+					(int)POISSON_TRIM_MARGIN_CELLS, marginCells,
+					(double)((float)POISSON_TRIM_MARGIN_CELLS * cellSz),
+					(double)((float)marginCells * cellSz),
+					(int)POISSON_TRIM_MARGIN_CELLS,
+					100.0 * (double)((float)POISSON_TRIM_MARGIN_CELLS * cellSz) / (double)footExtent,
+					(double)footExtent, 100.0 * (double)POISSON_TRIM_MARGIN_FLOOR_FRAC);
 			int gw = (int)((maxx - minx) * invCell) + 3;
 			int gh = (int)((maxy - miny) * invCell) + 3;
 			gw = std::min(std::max(gw, 16), 4096);
@@ -5699,6 +6060,38 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			size_t nOcc = 0;
 			for (size_t k = 0; k < nCells; ++k)
 				if (cnt[k] >= (uint32_t)POISSON_TRIM_MIN_PTS_PER_CELL) { occ[k] = 1; ++nOcc; }
+			// [MESH-OCCUPANCY] What the threshold is actually choosing between.
+			//
+			// MEASURED on RichmondHistoric: halving the threshold 8 -> 4 moved occupancy only
+			// 0.413 -> 0.425 (4401 of 388512 cells) and the outside-footprint cut 24153 ->
+			// 18979. A 2x relaxation buying 2.7% more footprint means the per-cell counts are
+			// BIMODAL -- cells hold either plenty of points or almost none -- so no value of
+			// this threshold recovers a band whose cells are near-empty.
+			//
+			// The ladder says which regime a scene is in without another build-and-run cycle:
+			// if >=1 sits far above >=4, there is thin-but-real data the threshold is
+			// excluding and lowering it helps. If >=1 is close to >=4, the missing ground has
+			// no points at all, the surface over it is pure extrapolation, and the hard cut is
+			// working as designed -- at which point the question is whether that cut is wanted,
+			// not what its threshold should be.
+			{
+				size_t c1 = 0, c2 = 0, c4 = 0, c8 = 0, c16 = 0, c64 = 0;
+				for (size_t k = 0; k < nCells; ++k) {
+					const uint32_t n = cnt[k];
+					if (n >= 1)  ++c1;   if (n >= 2)  ++c2;
+					if (n >= 4)  ++c4;   if (n >= 8)  ++c8;
+					if (n >= 16) ++c16;  if (n >= 64) ++c64;
+				}
+				const double inv = nCells ? 1.0 / (double)nCells : 0.0;
+				VERBOSE("[MESH-OCCUPANCY] cells=%zu | >=1 %zu (%.4f) >=2 %zu (%.4f) >=4 %zu (%.4f)"
+					" >=8 %zu (%.4f) >=16 %zu (%.4f) >=64 %zu (%.4f) | threshold=%d cell=%.4g"
+					" (%.0fx median spacing %.4g, ~%.0f pts at median density)",
+					nCells, c1, c1 * inv, c2, c2 * inv, c4, c4 * inv, c8, c8 * inv,
+					c16, c16 * inv, c64, c64 * inv,
+					(int)POISSON_TRIM_MIN_PTS_PER_CELL, (double)cellSz,
+					(double)POISSON_TRIM_CELL_FACTOR_X100 / 100.0, (double)medianSpacing,
+					std::pow((double)POISSON_TRIM_CELL_FACTOR_X100 / 100.0, 2.0));
+			}
 			std::vector<uint32_t>().swap(cnt);
 			// ---------------------------------------------------------------
 			// FOOTPRINT: occupancy -> dilate -> flood the EXTERIOR so enclosed low-coverage
@@ -5760,7 +6153,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 						extOut.swap(extE);
 					}
 				};
-				buildExt(POISSON_TRIM_MARGIN_CELLS, ext);
+				buildExt(marginCells, ext);
 #if POISSON_TRIM_HARD_OUTSIDE
 				std::vector<uint8_t> vo(numV, 0);
 				const auto vOutFrom = [&](const std::vector<uint8_t>& e) {
@@ -5804,7 +6197,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				// is now decoupled from it. It also tops out correctly: once margin reaches the
 				// seal radius the erosion is zero and this becomes exactly the old dilate-only
 				// behaviour, which is the known-safe configuration.
-				int dr = POISSON_TRIM_MARGIN_CELLS;
+				int dr = marginCells;
 				for (int attempt = 0; attempt < POISSON_TRIM_GUARD_ATTEMPTS; ++attempt) {
 					if (attempt) { dr = (dr < 1 ? 1 : dr * 2); buildExt(dr, ext); }
 					vOutFrom(ext);
@@ -5849,6 +6242,133 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				if (cx < gw - 1 && cy < gh - 1)  m = std::min(m, dist[k + gw + 1] + d2c);
 				if (cx > 0 && cy < gh - 1)       m = std::min(m, dist[k + gw - 1] + d2c);
 				dist[k] = m;
+			}
+
+			// REACH CUT. Per-vertex "this sits further past the surveyed data than any real
+			// surface should", filled by the overhang block below and consumed by the
+			// outside-footprint cut. Empty/all-zero when disabled.
+			//
+			// WHY A SECOND CRITERION. The footprint cut asks a binary in/out question and its
+			// margin is in GRID CELLS, which track point density -- so on a sparse scene the
+			// cell is huge and the footprint legitimately reaches a long way past the data.
+			// MEASURED: Marco's cell is 3.486 units against a 0.17-1.6 median elsewhere, so
+			// its 3-cell margin is 10.46 units where most scenes get 0.5-2.1. That is the slop.
+			//
+			// Distance from the data is the one measurement that isolates Marco across the
+			// nine-scene corpus. Overhang of mesh-covered cells, in WORLD UNITS:
+			//   Marco p50 13.9  p90 76.0  p99 214    <-- 3.4x the next scene at p90
+			//   SchnellTests p90 22.4 | GEOTAG 21.6 | MechanicFalls 11.5 | RichmondWater 8.2
+			//   Niwot 7.3 | RichmondHistoric 6.3 | Redy 5.5 | Randy 2.2
+			// In CELLS the same scenes are 11.8-21.8 and do not separate at all -- so this
+			// threshold must be in world units. Extrapolation reach is a physical distance;
+			// it has nothing to do with how densely the cloud happens to be sampled.
+			std::vector<uint8_t> vFar;
+			size_t nFarCells = 0;
+			float reachCutUnits = 0.f;
+			// [MESH-OVERHANG] INSTRUMENTATION for the UNDER-cut failure (Marco, Redy: too
+			// much surface past the real edge). No behaviour attached.
+			//
+			// The margin floor above addresses over-cutting. Under-cutting is the opposite
+			// mechanism and nothing measured so far explains it -- margin/extent puts Redy
+			// (0.67%) between healthy scenes at 0.59% and 0.79%, so it is not a threshold in
+			// the other direction. What is missing is a measure of how far the SOLVE reaches
+			// past the DATA, independent of whatever the footprint then does about it.
+			//
+			// So: chamfer-DT from the well-surveyed cells (occ), then report the distribution
+			// of that distance over cells the mesh actually covers. A scene that extrapolates
+			// a long way shows a fat tail here regardless of its grid cell or its margin.
+			// Measured PRE-cut, so it describes the balloon the trim has to deal with, not
+			// what survived.
+			{
+				std::vector<float> dOcc(nCells, BIG);
+				for (size_t k = 0; k < nCells; ++k) if (occ[k]) dOcc[k] = 0.f;
+				for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
+					const size_t k = (size_t)cy * gw + cx; float m = dOcc[k];
+					if (cx > 0)                 m = std::min(m, dOcc[k - 1] + d1);
+					if (cy > 0)                 m = std::min(m, dOcc[k - gw] + d1);
+					if (cx > 0 && cy > 0)       m = std::min(m, dOcc[k - gw - 1] + d2c);
+					if (cx < gw - 1 && cy > 0)  m = std::min(m, dOcc[k - gw + 1] + d2c);
+					dOcc[k] = m;
+				}
+				for (int cy = gh - 1; cy >= 0; --cy) for (int cx = gw - 1; cx >= 0; --cx) {
+					const size_t k = (size_t)cy * gw + cx; float m = dOcc[k];
+					if (cx < gw - 1)                 m = std::min(m, dOcc[k + 1] + d1);
+					if (cy < gh - 1)                 m = std::min(m, dOcc[k + gw] + d1);
+					if (cx < gw - 1 && cy < gh - 1)  m = std::min(m, dOcc[k + gw + 1] + d2c);
+					if (cx > 0 && cy < gh - 1)       m = std::min(m, dOcc[k + gw - 1] + d2c);
+					dOcc[k] = m;
+				}
+				std::vector<uint8_t> mcov(nCells, 0);
+				for (Mesh::VIndex v = 0; v < numV; ++v) {
+					int cx, cy; cellOf(mesh.vertices[v].x, mesh.vertices[v].y, cx, cy);
+					mcov[(size_t)cy * gw + cx] = 1;
+				}
+				std::vector<float> oh;
+				size_t nMeshCells = 0;
+				for (size_t k = 0; k < nCells; ++k) {
+					if (!mcov[k]) continue;
+					++nMeshCells;
+					if (!occ[k]) oh.push_back(dOcc[k]);
+				}
+				std::sort(oh.begin(), oh.end());
+				const auto pctl = [&](double p) -> double {
+					if (oh.empty()) return 0.0;
+					size_t i = (size_t)(p * (double)(oh.size() - 1) + 0.5);
+					if (i >= oh.size()) i = oh.size() - 1;
+					return (double)oh[i];
+				};
+				VERBOSE("[MESH-OVERHANG] dataCells=%zu meshCells=%zu (x%.3f) outside=%zu (%.4f)"
+					" | overhang cells p50=%.2f p90=%.2f p99=%.2f max=%.2f"
+					" | units p50=%.4g p90=%.4g p99=%.4g max=%.4g | cell=%.4g extent=%.4g",
+					nOcc, nMeshCells,
+					nOcc ? (double)nMeshCells / (double)nOcc : 0.0,
+					oh.size(), nMeshCells ? (double)oh.size() / (double)nMeshCells : 0.0,
+					pctl(0.50), pctl(0.90), pctl(0.99), oh.empty() ? 0.0 : (double)oh.back(),
+					pctl(0.50) * (double)cellSz, pctl(0.90) * (double)cellSz,
+					pctl(0.99) * (double)cellSz,
+					(oh.empty() ? 0.0 : (double)oh.back()) * (double)cellSz,
+					(double)cellSz, (double)footExtent);
+
+#if POISSON_REACH_CUT
+				// Threshold in world units: an absolute floor so small scenes are untouched,
+				// raised on large ones so the tolerance stays proportionate.
+				//
+				// CALIBRATION against the corpus, T = max(30, 0.05*extent):
+				//   Marco     T=41.5  p90=76.0  -> cuts >10% of its outside cells  <-- target
+				//   SchnellT  T=31.2  p90=22.4  -> a few % of outside cells
+				//   GEOTAG    T=30.0  p90=21.6  -> a few %
+				//   MechFalls T=33.8  p90=11.5  -> ~3%
+				//   RichWater T=30.0  p99=32.9  -> ~1%
+				//   RichHist  T=30.0  p99=29.2  -> ~1%
+				//   Niwot     T=30.0  max=42.3  -> a handful of cells
+				//   Redy      T=30.0  max=28.8  -> NOTHING
+				//   Randy     T=30.0  max=7.3   -> nothing
+				// So it lands almost entirely on Marco, which is what was asked for. It does
+				// NOT help Redy -- Redy's overhang is lower than several healthy scenes, so its
+				// slop is not the mesh reaching past the cloud, it is the CLOUD reaching too
+				// far. That needs fixing upstream in densify, not here.
+				//
+				// Requiring all three vertices beyond T (at the cut site) keeps any face that
+				// straddles the threshold, so the boundary lands outside real surface.
+				reachCutUnits = std::max((float)POISSON_REACH_CUT_MIN_UNITS,
+					(float)POISSON_REACH_CUT_EXTENT_FRAC * footExtent);
+				if (reachCutUnits > 0.f && cellSz > 0.f) {
+					const float dLimit = reachCutUnits / cellSz;   // back into cell units
+					vFar.assign(numV, 0);
+					for (Mesh::VIndex v = 0; v < numV; ++v) {
+						int cx, cy; cellOf(mesh.vertices[v].x, mesh.vertices[v].y, cx, cy);
+						if (dOcc[(size_t)cy * gw + cx] > dLimit) vFar[v] = 1;
+					}
+					for (size_t k = 0; k < nCells; ++k)
+						if (mcov[k] && dOcc[k] > dLimit) ++nFarCells;
+					VERBOSE("Poisson: reach cut armed at %.4g units (%.1f cells) = max(%.4g,"
+						" %.3f x extent %.4g) -- %zu of %zu mesh cells are beyond it",
+						(double)reachCutUnits, (double)dLimit,
+						(double)POISSON_REACH_CUT_MIN_UNITS,
+						(double)POISSON_REACH_CUT_EXTENT_FRAC, (double)footExtent,
+						nFarCells, nMeshCells);
+				}
+#endif
 			}
 
 			const float ramp = (float)POISSON_TRIM_RAMP_CELLS;
@@ -5939,7 +6459,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			const Mesh::FIndex numF = mesh.faces.GetSize();
 			std::vector<uint8_t> keepV(numV, 0);
 			Mesh::FaceArr newFaces; newFaces.Reserve(numF);
-			size_t culled = 0, culledOutside = 0;
+			size_t culled = 0, culledOutside = 0, culledReach = 0;
 			FOREACH(f, mesh.faces) {
 				const Mesh::Face& face = mesh.faces[f];
 				const float dAvg = (pv[(size_t)face[0] * 4 + 3] + pv[(size_t)face[1] * 4 + 3] +
@@ -5968,6 +6488,15 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					vOut[face[0]] && vOut[face[1]] && vOut[face[2]]) {
 					++culledOutside; ++culled; continue;
 				}
+				// Reach cut: independent of the footprint, and NOT gated on bHardCutOK.
+				// The footprint cut is suppressed when its guard finds it would sever the
+				// surface, but a face sitting 40+ units from any surveyed cell is not part
+				// of a surface worth preserving -- that is the case the footprint's
+				// cells-based margin structurally cannot see. See the REACH CUT note above.
+				if (!vFar.empty() &&
+					vFar[face[0]] && vFar[face[1]] && vFar[face[2]]) {
+					++culledReach; ++culled; continue;
+				}
 				if (dAvg < tAvg) { ++culled; continue; }
 				keepV[face[0]] = keepV[face[1]] = keepV[face[2]] = 1;
 				newFaces.Insert(face);
@@ -5994,14 +6523,16 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			VERBOSE("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f)"
 				" | interior=%.2f edge=%.2f ramp=%d cells (%.4g units)"
 				" | grid %dx%d cell=%.4g, %zu of %zu cells occupied (fraction %.3f)"
-				" at >=%d pts/cell | outside-footprint cut %zu faces [%s]",
+				" at >=%d pts/cell | outside-footprint cut %zu faces"
+				" | reach cut %zu faces (>%.4g units from data) [%s]",
 				(unsigned)culled, (unsigned)numF,
 				numF ? (double)culled / (double)numF : 0.0,
 				trimInterior, trimEdge, POISSON_TRIM_RAMP_CELLS,
 				(double)(POISSON_TRIM_RAMP_CELLS * cellSz),
 				gw, gh, cellSz, nOcc, nCells,
 				nCells ? (double)nOcc / (double)nCells : 0.0,
-				(int)POISSON_TRIM_MIN_PTS_PER_CELL, culledOutside, TD_TIMER_GET_FMT().c_str());
+				(int)POISSON_TRIM_MIN_PTS_PER_CELL, culledOutside,
+				culledReach, (double)reachCutUnits, TD_TIMER_GET_FMT().c_str());
 		}
 	}
 #endif // POISSON_ADAPTIVE_TRIM
@@ -6517,16 +7048,177 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			}
 
 			// Find the largest component; remove anything < 0.5% of total
+			//
+			// KNOWN UNITS PROBLEM -- this threshold is not scene-invariant. It is a fraction
+			// of the FACE COUNT, and face count depends on both scene size and octree cell,
+			// so the physical area it deletes swings ~58x across the corpus:
+			//   Randy 51 m2 | Niwot 148 | Redy 224 | RichmondHistoric 762 | RichmondWater 1019
+			//   MechanicFalls 1210 | SchnellTests 1839 | Marco 1850 | GEOTAG 2973
+			// (area = (numF/200) * cell^2 / 2). A scene solved at a finer depth deletes
+			// BIGGER physical pieces, which is backwards -- the finer solve is exactly the
+			// one that fragments real surface into detachable pieces.
+			//
+			// NOT yet converted to an area threshold, because area alone does not separate
+			// the labelled scenes either: SchnellTests (1839 m2) and GEOTAG (2973 m2) delete
+			// more than RichmondHistoric (762 m2) and are both fine. Whether a deleted piece
+			// matters depends on whether it is real terrain, not on how big it is -- hence
+			// the -v 3 export below, which answers that by inspection instead of by proxy.
 			const Mesh::FIndex minCompSize = std::max<Mesh::FIndex>(numF / 200, 10);
+			// [MESH-FRAG] INSTRUMENTATION, no behaviour attached yet.
+			//
+			// Whether a deeper octree is worth taking is NOT decided by cell size alone:
+			// MEASURED, Niwot at depth 10 solved into 115 components on 3.0M faces and
+			// looked right, while RichmondHistoric at depth 11 solved into 1510 on 13.1M
+			// and lost its whole fringe -- 4x the faces but 13x the components, and the
+			// filter below then deleted 494k faces of real perimeter terrain. Cell/GSD
+			// cannot see that: RichmondHistoric had the LARGER cell relative to its median
+			// spacing (8.0x vs 5.1x) and fragmented anyway, because the failure is in the
+			// sparse fringe and the median is blind to it.
+			//
+			// So the quantity to gate on is connectivity, normalised by mesh size:
+			// components per million faces. Niwot 38/M, RichmondHistoric 115/M. Logged on
+			// every run so a threshold can be set from a real corpus rather than fitted to
+			// two scenes -- grep [MESH-FRAG] across runs and pair it with whether the
+			// output looked right.
+			//
+			// Also reported: the largest component's share, which separates "one sheet
+			// plus confetti" (healthy: share ~1.0) from "the surface came apart"
+			// (share well below 1). A scene can have many components and still be fine if
+			// they are all tiny.
+			Mesh::FIndex largestComp = 0;
+			for (size_t c = 0; c < compSize.size(); ++c)
+				if (compSize[c] > largestComp) largestComp = compSize[c];
+			// GAP RESCUE. Size is the wrong question for this filter.
+			//
+			// OBSERVED on RichmondHistoric at depth 11: the 495k faces this removes are
+			// scattered right across the scene, not concentrated where the output looks
+			// wrong -- yet the regions that ARE missing (centre-bottom, upper-right) have
+			// their surface in there too. Both at once means the removed set is a MIXTURE:
+			// mostly redundant shells sitting directly over surface the kept mesh already
+			// has (Poisson emits these near the main sheet at fine depths, and deleting
+			// them is correct), plus a minority that are the ONLY surface in their spot,
+			// where deleting them opens a hole.
+			//
+			// No size threshold can tell those apart -- they are the same size. What
+			// separates them is whether the kept mesh already covers that ground. So:
+			// rasterise the KEPT components into an XY grid, then rescue any small
+			// component whose footprint is mostly NOT already covered.
+			//
+			// Z is deliberately ignored: a shell floating above a roof projects onto the
+			// same cells as the roof and is correctly judged redundant, which is the whole
+			// point. Set POISSON_COMP_GAP_RESCUE 0 to restore the size-only behaviour.
+			std::vector<uint8_t> compRescue(compSize.size(), 0);
+			size_t nRescued = 0, nRescuedFaces = 0;
+#if POISSON_COMP_GAP_RESCUE
+			if (numF > 0) {
+				float bx0 = FLT_MAX, by0 = FLT_MAX, bx1 = -FLT_MAX, by1 = -FLT_MAX;
+				for (Mesh::VIndex v = 0; v < numV; ++v) {
+					const Mesh::Vertex& p = mesh.vertices[v];
+					if (p.x < bx0) bx0 = p.x;  if (p.x > bx1) bx1 = p.x;
+					if (p.y < by0) by0 = p.y;  if (p.y > by1) by1 = p.y;
+				}
+				const float span = std::max(bx1 - bx0, by1 - by0);
+				if (span > 0.f) {
+					constexpr int GDIM = 1024;
+					const float gcell = span / (float)GDIM;
+					const float ginv = 1.f / gcell;
+					const int ggw = std::min(GDIM + 2, (int)((bx1 - bx0) * ginv) + 2);
+					const int ggh = std::min(GDIM + 2, (int)((by1 - by0) * ginv) + 2);
+					const size_t gN = (size_t)ggw * ggh;
+					const auto gcellOf = [&](const Mesh::Face& fc, int& cx, int& cy) {
+						const Mesh::Vertex& a = mesh.vertices[fc[0]];
+						const Mesh::Vertex& b = mesh.vertices[fc[1]];
+						const Mesh::Vertex& c = mesh.vertices[fc[2]];
+						cx = (int)(((a.x + b.x + c.x) / 3.f - bx0) * ginv);
+						cy = (int)(((a.y + b.y + c.y) / 3.f - by0) * ginv);
+						if (cx < 0) cx = 0; else if (cx >= ggw) cx = ggw - 1;
+						if (cy < 0) cy = 0; else if (cy >= ggh) cy = ggh - 1;
+					};
+					// Ground the KEPT components cover.
+					std::vector<uint8_t> covered(gN, 0);
+					for (Mesh::FIndex f = 0; f < numF; ++f) {
+						if (compSize[compId[f]] < minCompSize) continue;
+						int cx, cy; gcellOf(pF[f], cx, cy);
+						covered[(size_t)cy * ggw + cx] = 1;
+					}
+					// Per small component: cells touched, and how many were already covered.
+					std::vector<uint32_t> cTot(compSize.size(), 0), cHit(compSize.size(), 0);
+					std::vector<uint32_t> seen(gN, 0xFFFFFFFFu);
+					for (Mesh::FIndex f = 0; f < numF; ++f) {
+						const uint32_t cid = compId[f];
+						if (compSize[cid] >= minCompSize) continue;
+						int cx, cy; gcellOf(pF[f], cx, cy);
+						const size_t k = (size_t)cy * ggw + cx;
+						if (seen[k] == cid) continue;   // count each cell once per component
+						seen[k] = cid;
+						++cTot[cid];
+						if (covered[k]) ++cHit[cid];
+					}
+					for (size_t c = 0; c < compSize.size(); ++c) {
+						if (compSize[c] >= minCompSize || cTot[c] == 0) continue;
+						const double overlap = (double)cHit[c] / (double)cTot[c];
+						if (overlap < POISSON_COMP_GAP_OVERLAP) {
+							compRescue[c] = 1;
+							++nRescued;
+							nRescuedFaces += compSize[c];
+						}
+					}
+				}
+			}
+#endif
 			size_t blobsRemoved = 0;
 			Mesh::FaceArr newFaces;
 			newFaces.Reserve(numF);
+			// What the filter deletes, kept so it can be written out and LOOKED AT rather
+			// than inferred from counts. See the export below.
+			Mesh::FaceArr cutFaces;
+			// -v 3 OR OPENMVS_DUMP_REMOVED=1. The env trigger exists because the command
+			// line is generated by the orchestrator, so raising verbosity for a one-off
+			// diagnostic would mean changing the caller; an env var can be set in the shell
+			// for a single run and unset again.
+			static const bool bDumpRemoved = []() -> bool {
+				const char* v = std::getenv("OPENMVS_DUMP_REMOVED");
+				return v && *v && *v != '0';
+			}();
+			const bool bWantCut = (g_nVerbosityLevel > 2) || bDumpRemoved;
 			for (Mesh::FIndex f = 0; f < numF; ++f) {
-				if (compSize[compId[f]] < minCompSize) {
+				const uint32_t cid = compId[f];
+				if (compSize[cid] < minCompSize && !compRescue[cid]) {
 					++blobsRemoved;
+					if (bWantCut)
+						cutFaces.Insert(pF[f]);
 					continue;
 				}
 				newFaces.Insert(pF[f]);
+			}
+			if (nRescued > 0)
+				VERBOSE("Poisson: gap rescue kept %zu of %zu small components (%zu faces,"
+					" %.4f of mesh) whose ground the kept mesh does not already cover"
+					" (overlap < %.2f)", nRescued, compSize.size(), nRescuedFaces,
+					numF ? (double)nRescuedFaces / (double)numF : 0.0,
+					(double)POISSON_COMP_GAP_OVERLAP);
+			// EXPORT THE DELETED MATERIAL (-v 3). Four rounds of metrics have not settled
+			// whether this filter removes real terrain or floating noise, and every scalar
+			// tried so far (components/M faces, overhang percentiles, absolute area
+			// threshold) fails to separate the labelled scenes. Looking at the geometry
+			// answers it directly: load this next to the final mesh and the deleted parts
+			// are either the missing perimeter or they are not.
+			//
+			// Written BEFORE the vertex compaction below, so face indices still address the
+			// pre-filter vertex array.
+			// Swap rather than copy: the vertex array stays exactly where it is and only
+			// the face list is exchanged, so there is no aliasing between two Mesh objects
+			// and no second copy of a multi-million-vertex array. The written PLY carries
+			// the full vertex set with only the removed faces indexing into it -- the
+			// unreferenced vertices are harmless in any viewer.
+			if (bWantCut && cutFaces.GetSize() > 0) {
+				const String cutPath(MAKE_PATH("poisson_removed_components.ply"));
+				mesh.faces.Swap(cutFaces);          // mesh.faces := removed
+				const bool bSaved = mesh.Save(cutPath);
+				mesh.faces.Swap(cutFaces);          // restore; cutFaces := removed again
+				if (bSaved)
+					VERBOSE("Poisson: wrote the %u removed faces to %s (-v 3 diagnostic)",
+						(unsigned)cutFaces.GetSize(), cutPath.c_str());
 			}
 			if (blobsRemoved > 0) {
 				mesh.faces.Swap(newFaces);
@@ -6555,8 +7247,36 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					}
 					mesh.vertices.Swap(nv);
 				}
-				VERBOSE("Poisson: removed %u faces in %u small components (threshold %u faces)",
+				// NOTE the second %u is the TOTAL component count, not the number removed
+				// -- the old wording ("in %u small components") read as the latter and was
+				// misleading when the two differ by orders of magnitude.
+				VERBOSE("Poisson: removed %u faces, %u components total (threshold %u faces)",
 					(unsigned)blobsRemoved, (unsigned)compSize.size(), (unsigned)minCompSize);
+			}
+			// Emitted unconditionally, including when nothing was removed -- a run that
+			// fragmented but stayed above the threshold is exactly as interesting for
+			// calibration as one that did not.
+			char fragLine[512];
+			snprintf(fragLine, sizeof(fragLine),
+				"[MESH-FRAG] depth=%d faces=%u components=%u perM=%.1f"
+				" largest=%u largestFrac=%.4f removed=%u removedFrac=%.4f threshold=%u",
+				depth, (unsigned)numF, (unsigned)compSize.size(),
+				numF ? (1.0e6 * (double)compSize.size() / (double)numF) : 0.0,
+				(unsigned)largestComp,
+				numF ? (double)largestComp / (double)numF : 0.0,
+				(unsigned)blobsRemoved,
+				numF ? (double)blobsRemoved / (double)numF : 0.0,
+				(unsigned)minCompSize);
+			VERBOSE("%s", fragLine);
+			// Durable copy at a STABLE path. The app logs carry a fresh timestamp suffix
+			// every run and live in a temp folder, so collecting this across a corpus by
+			// hand means globbing for the newest file each time. Its own file rather than
+			// a second line in mesh_plan.txt, which the orchestrator parses.
+			{
+				const String fragPath(MAKE_PATH("mesh_frag.txt"));
+				std::ofstream fragOut(fragPath.c_str(), std::ios::out | std::ios::trunc);
+				if (fragOut)
+					fragOut << fragLine << "\n";
 			}
 		}
 	}
@@ -7502,7 +8222,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// we are compiling and using the work with TBB.
 #if 1
 		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.22");
+		DEBUG("ReconstructMesh optimization version 1.1.23");
 		const auto [isParallel, CGALversion] = CGAL::info();
 		DEBUG("Parallel: %s", isParallel ? "true" : "false");
 		DEBUG("CGAL version: = %d", CGALversion);

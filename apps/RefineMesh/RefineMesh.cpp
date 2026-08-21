@@ -32,6 +32,7 @@
 #include "../../libs/MVS/Common.h"
 #include "../../libs/MVS/Scene.h"
 #include <boost/program_options.hpp>
+#include <cstdlib>
 
 using namespace MVS;
 
@@ -67,6 +68,7 @@ float fRatioRigidityElasticity;
 unsigned nMaxFaceArea;
 float fPlanarVertexRatio;
 float fGradientStep;
+unsigned nCudaPolicy;
 unsigned nArchiveType;
 int nProcessPriority;
 unsigned nMaxThreads;
@@ -110,6 +112,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		#else
 		("cuda-device", boost::program_options::value(&unused)->default_value(-2), "CUDA device number to be used for mesh refinement (-2 - CPU processing, -1 - best GPU, >=0 - device index)")
 		#endif
+		("cuda-policy", boost::program_options::value(&OPT::nCudaPolicy)->default_value(0), "which mesh refinement path to run (0 - auto: weigh this host against the requested device and use the GPU only when it wins, since a fast desktop CPU beats a mid-range card here, 1 - always use the GPU, 2 - always use the CPU); overridable at run time with OPENMVS_REFINE_DEVICE=auto|gpu|cpu")
 		;
 
 	// group of options allowed both on command line and in config file
@@ -275,7 +278,49 @@ int main(int argc, LPCTSTR* argv)
 	// that the CPU path rebuilds itself.
 	Mesh::VertexArr meshVerticesBackup;
 	Mesh::FaceArr meshFacesBackup;
-	const bool bTryCUDA(SEACAVE::CUDA::desiredDeviceID >= -1);
+
+	// Which path to run (--cuda-policy: 0 auto, 1 GPU, 2 CPU). The environment
+	// override exists so the two paths can be A/B'd, or one of them pinned in a
+	// deployment, without editing the command line the pipeline builds.
+	unsigned nPolicy(OPT::nCudaPolicy);
+	if (const char* szDevice = std::getenv("OPENMVS_REFINE_DEVICE")) {
+		const String device(String(szDevice).ToLower());
+		if (device == _T("auto"))
+			nPolicy = 0;
+		else if (device == _T("gpu") || device == _T("cuda"))
+			nPolicy = 1;
+		else if (device == _T("cpu"))
+			nPolicy = 2;
+		else
+			VERBOSE("warning: ignoring unrecognized OPENMVS_REFINE_DEVICE='%s' (expected auto, gpu or cpu)", szDevice);
+		if (nPolicy != OPT::nCudaPolicy)
+			VERBOSE("Mesh refinement device policy overridden by OPENMVS_REFINE_DEVICE=%s", device.c_str());
+	}
+	if (nPolicy == 1 && SEACAVE::CUDA::desiredDeviceID < -1)
+		SEACAVE::CUDA::desiredDeviceID = -1; // GPU demanded but no device asked for: best available
+
+	// A CUDA device was asked for, but a fast host CPU is measurably faster than a
+	// mid-range one -- 44.3 s vs 82.6 s on Richmond Historic against an RTX 3060 --
+	// so in auto mode the GPU has to earn the run: enough VRAM for the finest scale
+	// AND a host slow enough to lose to it. Note the settings passed here are the
+	// ones ResolveRefineMeshSafeSettings just resolved, not the requested ones.
+	//
+	// Whichever way this goes, the log says which path ran and why: the three
+	// suppressed cases below each name themselves, and in auto mode
+	// PreferCPUMeshRefinement logs the actual reason (it can be driver, VRAM or
+	// speed, so this level must not paraphrase it).
+	bool bTryCUDA(nPolicy != 2 && SEACAVE::CUDA::desiredDeviceID >= -1);
+	if (nPolicy == 2) {
+		VERBOSE("Mesh refinement: CPU path pinned by --cuda-policy 2; any requested CUDA device is ignored");
+	} else if (SEACAVE::CUDA::desiredDeviceID < -1) {
+		VERBOSE("Mesh refinement: no CUDA device requested (--cuda-device %d); refining on the CPU", SEACAVE::CUDA::desiredDeviceID);
+	} else if (nPolicy == 1) {
+		VERBOSE("Mesh refinement: GPU path pinned by --cuda-policy 1; the host-vs-device checks are skipped");
+	} else if (scene.PreferCPUMeshRefinement(OPT::nResolutionLevel, OPT::nMinResolution)) {
+		VERBOSE("Mesh refinement: taking the CPU path for the reason logged above "
+				"(--cuda-policy 1, or OPENMVS_REFINE_DEVICE=gpu, to use the requested device anyway)");
+		bTryCUDA = false;
+	}
 	if (bTryCUDA) {
 		meshVerticesBackup.CopyOf(scene.mesh.vertices);
 		meshFacesBackup.CopyOf(scene.mesh.faces);
@@ -301,6 +346,11 @@ int main(int argc, LPCTSTR* argv)
 		scene.mesh.faces.CopyOfRemove(meshFacesBackup);
 	}
 	if (!bRefinedCUDA)
+	#else
+	// Same guarantee as the CUDA build above: the log always states which path ran
+	// and why, so "why did this refine on the CPU?" is answerable from the log in
+	// every build configuration rather than only where a GPU path exists.
+	VERBOSE("Mesh refinement: CPU path (this build has no CUDA support)");
 	#endif
 	if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 						  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,

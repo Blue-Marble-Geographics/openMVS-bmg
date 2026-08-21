@@ -148,6 +148,21 @@ public:
 		unsigned nMaxFaceArea, unsigned nScales, float fScaleStep, unsigned nReduceMemory, unsigned nAlternatePair, float fRegularityWeight, float fRatioRigidityElasticity,
 		float fThPlanarVertex, float fGradientStep);
 	#ifdef _USE_CUDA
+	// Deterministic capability check: true when this machine's CPU refinement path
+	// is expected to beat its GPU one, so a CUDA device that was requested should
+	// NOT be used. Measured (Richmond Historic): RefineMesh took 44.3 s on a fast
+	// desktop CPU (13900K / 7950X class, 64 GB) against 82.6 s on an RTX 3060 12 GB.
+	// The bar scales with the device actually installed, so a stronger card still
+	// wins; a host with roughly half that CPU throughput, or too little RAM to hold
+	// the working set, loses to the 3060 itself. Call this before RefineMeshCUDA; it
+	// looks only at static machine and device attributes, never at live load, so the
+	// same machine always resolves the same way.
+	bool PreferCPUMeshRefinement(unsigned nResolutionLevel, unsigned nMinResolution) const;
+	// Pre-flight VRAM estimate for the finest scale of the CUDA path, from scene
+	// metadata alone (no decode, no context). False when it cannot be estimated.
+	// Used by PreferCPUMeshRefinement so a device too small for the scene is passed
+	// over before the run, instead of refusing itself at the last scale.
+	bool EstimateRefineMeshCUDAVRAM(unsigned nResolutionLevel, unsigned nMinResolution, uint64_t& needBytes, uint64_t& budgetBytes) const;
 	bool RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, unsigned nMaxViews, float fDecimateMesh, unsigned nCloseHoles, unsigned nEnsureEdgeSize,
 		unsigned nMaxFaceArea, unsigned nScales, float fScaleStep, unsigned nAlternatePair, float fRegularityWeight, float fRatioRigidityElasticity, float fGradientStep);
 	#endif

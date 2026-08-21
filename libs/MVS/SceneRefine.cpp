@@ -7696,6 +7696,194 @@ static void SavePairSupportPLY(const String& fileName, const Mesh& mesh, const F
 #endif // MESHOPT_ITER_DIAGNOSTICS
 
 
+#ifdef _USE_CUDA
+// Everything from here to the matching #endif exists only to decide between the CPU
+// and the CUDA refinement path, so it is compiled only where both paths exist.
+
+// Host CPU base clock in MHz, or 0 when this platform cannot report it (macOS,
+// and any Windows box whose registry does not carry ~MHz). Deliberately the BASE
+// clock, not the current one: the current clock depends on load and on whatever
+// the governor is doing right now, and the caller needs an answer that is the
+// same on every run of the same machine.
+static unsigned GetHostBaseClockMHz()
+{
+#ifdef _MSC_VER
+	HKEY key;
+	if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, _T("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"), 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+		return 0;
+	DWORD mhz(0), type(0), size((DWORD)sizeof(mhz));
+	const bool bValid(RegQueryValueEx(key, _T("~MHz"), NULL, &type, (LPBYTE)&mhz, &size) == ERROR_SUCCESS && type == REG_DWORD);
+	RegCloseKey(key);
+	return bValid ? (unsigned)mhz : 0u;
+#elif defined(__linux__)
+	// cpufreq reports the maximum clock in kHz, which is stable; /proc/cpuinfo's
+	// "cpu MHz" is only whatever the core happened to be running at, so it is the
+	// fallback rather than the first choice
+	if (FILE* f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r")) {
+		unsigned long kHz(0);
+		const int n(fscanf(f, "%lu", &kHz));
+		fclose(f);
+		if (n == 1 && kHz > 0)
+			return (unsigned)(kHz/1000);
+	}
+	if (FILE* f = fopen("/proc/cpuinfo", "r")) {
+		char line[256];
+		double best(0);
+		while (fgets(line, sizeof(line), f) != NULL) {
+			double mhz;
+			if (sscanf(line, "cpu MHz : %lf", &mhz) == 1 && mhz > best)
+				best = mhz;
+		}
+		fclose(f);
+		if (best > 0)
+			return (unsigned)best;
+	}
+	return 0;
+#else
+	return 0;
+#endif
+}
+
+// CPU-vs-GPU path selection for mesh refinement; see Scene::PreferCPUMeshRefinement.
+//
+// Minimum total physical RAM [GB] for the CPU path to be preferred. Below this the
+// CPU path spends its time batching and evicting images instead of computing (see
+// ResolveRefineMeshSafeSettings below for the floor it cannot batch its way out of),
+// which is one of the two regimes where the GPU path wins outright. Not scaled by
+// the GPU: a memory-starved host loses to any GPU that can hold the scene.
+#ifndef MESHOPT_CPU_PATH_MIN_RAM_GB
+#define MESHOPT_CPU_PATH_MIN_RAM_GB 48.0
+#endif
+// Absolute floor on usable threads (after --max-threads), NOT a comparison against
+// the GPU: below a handful of cores the CPU path is dominated by its own per-batch
+// overhead whatever the clock says.
+#ifndef MESHOPT_CPU_PATH_MIN_THREADS
+#define MESHOPT_CPU_PATH_MIN_THREADS 8
+#endif
+// CPU throughput proxy needed to beat a REFERENCE-CLASS GPU, in GHz-threads (usable
+// threads x base clock). Derived from the measurement this whole check exists to
+// encode: on Richmond Historic, RefineMesh took 44.3 s on a fast desktop CPU
+// (13900K class, ~32 threads x 3.0 GHz base = 96 GHz-threads) against 82.6 s on an
+// RTX 3060 12 GB -- the CPU was 1.86x faster, so the crossover against that GPU
+// sits at 96 / 1.86 = ~52 GHz-threads. Scaled by the actual device's strength below.
+#ifndef MESHOPT_CPU_PATH_MIN_GHZ_THREADS
+#define MESHOPT_CPU_PATH_MIN_GHZ_THREADS 52.0
+#endif
+// The reference GPU those 82.6 s were measured on: an RTX 3060 12 GB, i.e.
+// 28 SMs x 128 cores x 1.777 GHz = ~6370 GHz-cores, 192-bit at 15 Gbps = 360 GB/s.
+// A device stronger than this raises the bar the CPU has to clear, and vice versa.
+#ifndef MESHOPT_GPU_REF_GHZ_CORES
+#define MESHOPT_GPU_REF_GHZ_CORES 6370.0
+#endif
+#ifndef MESHOPT_GPU_REF_BANDWIDTH_GBS
+#define MESHOPT_GPU_REF_BANDWIDTH_GBS 360.0
+#endif
+
+// Answers "should mesh refinement stay on the CPU even though a CUDA device is
+// available?" -- see the declaration in Scene.h for the measurement this encodes.
+//
+// The comparison is GPU-RELATIVE. The 44.3 s / 82.6 s data point above fixes one
+// point on the curve (a fast desktop CPU against a 3060); anything else is placed
+// by scoring the device actually installed and moving the CPU bar by the same
+// factor. That device score is the geometric mean of two ratios against the
+// reference, FP32 throughput and memory bandwidth, because neither alone tracks
+// this kernel: pure FLOPS would credit an Ada card with a ~6x speedup its memory
+// system cannot feed, and pure bandwidth would ignore the arithmetic entirely.
+//
+// Keyed on STATIC attributes only: total physical RAM, usable thread count, base
+// clock, AVX2, and the device's own advertised capability. Never on live free RAM,
+// current clock or a timing micro-benchmark. Which path runs is output-affecting
+// (the CPU and CUDA paths do not produce bit-identical meshes), and an
+// output-affecting decision that moved with whatever else happens to be running
+// would make the identical scene on the identical machine irreproducible -- the
+// same rule ResolveRefineMeshSafeSettings below follows.
+//
+// The metric is coarse: GHz-threads scores a 13900K at 96 and a 7950X at 144
+// although the two refine at similar speed, so the derived bar is only good to
+// within ~1.5x. That is tolerable precisely BECAUSE it is a crossover: a host
+// landing near the bar performs about the same either way, by definition, so a
+// wrong call there costs little. It is the far-from-the-bar cases -- a fast desktop
+// against a mid-range card, a laptop against the same card -- that this has to get
+// right, and those it gets right by a wide margin. Every number is logged, and all
+// five thresholds above are overridable, so a machine that contradicts the model
+// can be pinned with --cuda-policy instead of argued with.
+//
+// Any input this platform cannot report (clock, RAM, device capability) simply stops
+// gating: an unreadable value is not evidence that the host is slow.
+bool Scene::PreferCPUMeshRefinement(unsigned nResolutionLevel, unsigned nMinResolution) const
+{
+	// Every branch below logs the reason it decided, because the caller cannot know
+	// it and must not paraphrase it: "the GPU lost on speed", "the GPU cannot hold
+	// the scene" and "there is no GPU path on this driver" are three different
+	// answers that all return true here.
+	//
+	// No usable GPU path at all on a CUDA-12+ driver (the refine kernels are on the
+	// legacy driver API -- see CUDA::HasLegacyDriverAPI), so there is nothing to
+	// weigh. Answering early keeps the caller from snapshotting the mesh and
+	// entering RefineMeshCUDA only to be refused there.
+	if (!SEACAVE::CUDA::HasLegacyDriverAPI()) {
+		LOG(_T("Mesh refinement device check: this driver does not export the legacy CUDA entry points the GPU ")
+			_T("refinement kernels are built on (removed in CUDA 12.0); there is no GPU path here -- refining on the CPU"));
+		return true;
+	}
+
+	// Hard gate, ahead of any speed comparison: a device that cannot hold the finest
+	// scale is not a candidate however fast it is. Without this the run would reach
+	// the last scale, refuse itself in ResolveResidency(), and hand a discarded GPU
+	// run's worth of time back to the CPU path (see EstimateRefineMeshCUDAVRAM).
+	uint64_t needBytes(0), budgetBytes(0);
+	if (EstimateRefineMeshCUDAVRAM(nResolutionLevel, nMinResolution, needBytes, budgetBytes) && needBytes > budgetBytes) {
+		LOG(_T("Mesh refinement device check: the finest scale needs about %s of device memory but this GPU ")
+			_T("offers only %s; refining on the CPU"),
+			Util::formatBytes(needBytes).c_str(), Util::formatBytes(budgetBytes).c_str());
+		return true;
+	}
+	constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
+	const uint64_t totalPhys = (uint64_t)Util::GetMemoryInfo().totalPhysical;
+	const unsigned threads = nMaxThreads > 0 ? nMaxThreads : Thread::hardwareConcurrency();
+	const unsigned mhz = GetHostBaseClockMHz();
+	// the CPU path's inner loops (the ZNCC score and the image warp) have AVX2
+	// kernels; without them it falls back to SSE2 and loses the comparison
+	const bool bAVX2 = SupportsAVX2();
+	const double ghzThreads = mhz > 0 ? threads * (mhz / 1000.0) : 0.0;
+
+	// how much stronger (or weaker) the installed device is than the RTX 3060 the
+	// crossover was measured against
+	double gpuFactor = 1.0;
+	String gpuDesc(_T("unknown device, assuming reference class"));
+	SEACAVE::CUDA::DeviceCapability cap;
+	if (SEACAVE::CUDA::GetDeviceCapability(SEACAVE::CUDA::desiredDeviceID, cap) && cap.ComputeScore() > 0) {
+		const double compute = cap.ComputeScore();
+		const double bandwidth = cap.BandwidthGBs();
+		const double computeRatio = compute / MESHOPT_GPU_REF_GHZ_CORES;
+		if (bandwidth > 0)
+			gpuFactor = SQRT(computeRatio * (bandwidth / MESHOPT_GPU_REF_BANDWIDTH_GBS));
+		else
+			gpuFactor = computeRatio; // no bandwidth to blend in; compute alone it is
+		gpuDesc = String::FormatString(_T("%s: %.0f GHz-cores, %.0f GB/s, %s VRAM -> %.2fx the reference RTX 3060"),
+			cap.name, compute, bandwidth, Util::formatBytes(cap.totalMem).c_str(), gpuFactor);
+	}
+	const double reqGhzThreads = MESHOPT_CPU_PATH_MIN_GHZ_THREADS * gpuFactor;
+
+	const bool bEnoughRAM = totalPhys == 0 || (double)totalPhys / GB >= MESHOPT_CPU_PATH_MIN_RAM_GB;
+	const bool bEnoughThreads = threads >= (unsigned)MESHOPT_CPU_PATH_MIN_THREADS;
+	const bool bFastEnough = mhz == 0 || ghzThreads >= reqGhzThreads;
+	const bool bPreferCPU = bEnoughRAM && bEnoughThreads && bAVX2 && bFastEnough;
+
+	LOG(_T("Mesh refinement device check: GPU %s"), gpuDesc.c_str());
+	LOG(_T("Mesh refinement host check: %.1f GB RAM, %u usable threads, %s base clock, %s, score %s -> %s path ")
+		_T("(CPU path needs >= %.0f GB, >= %u threads, AVX2, and >= %.0f GHz-threads against this device)"),
+		totalPhys / (double)GB, threads,
+		mhz > 0 ? String::FormatString(_T("%.2f GHz"), mhz / 1000.0).c_str() : _T("unknown"),
+		bAVX2 ? _T("AVX2") : _T("no AVX2"),
+		mhz > 0 ? String::FormatString(_T("%.0f GHz-threads"), ghzThreads).c_str() : _T("unknown (clock unavailable, not gated on it)"),
+		bPreferCPU ? _T("CPU") : _T("GPU"),
+		(double)MESHOPT_CPU_PATH_MIN_RAM_GB, (unsigned)MESHOPT_CPU_PATH_MIN_THREADS, reqGhzThreads);
+	return bPreferCPU;
+}
+#endif // _USE_CUDA
+
+
 // Pre-flight, deterministic memory-safety check for RefineMesh, called once before
 // any image is decoded or MeshRefine is constructed.
 //

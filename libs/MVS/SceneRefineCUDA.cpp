@@ -2887,6 +2887,69 @@ bool MeshRefineCUDA::ResolveResidency(uint64_t totalPixels, uint64_t maxPixels)
 	return true;
 }
 
+// Pre-flight VRAM sizing for the CUDA refinement path, from scene metadata alone:
+// no image is decoded, no context is created, nothing is allocated.
+//
+// ResolveResidency() above answers the same question per scale, but only once that
+// scale's images have been decoded -- and the finest scale is the LAST one, so a
+// device that cannot hold it is discovered after every coarser scale has already
+// run on the GPU, at which point the caller throws that work away and the CPU path
+// starts over from the input mesh. This answers it before any of that is spent,
+// which is what makes "the GPU is used only when it has sufficient memory" a
+// decision rather than a discovery.
+//
+// Estimates the finest scale (scale factor 1.0, i.e. the images at nResolutionLevel)
+// in the CHEAPEST layout ResolveResidency() could pick, and compares it against the
+// device's TOTAL memory less the same reserve -- total rather than free, because a
+// free-memory reading needs a context and the whole point here is to decide without
+// creating one. The per-scale check still runs later against real free memory; this
+// one only has to catch the card that was never going to fit.
+//
+// The mesh term is estimated from the INPUT mesh (the finest scale's mesh is larger,
+// having been subdivided on the way there) with the same growth allowance. That is
+// the known slack in this estimate, and it is small: the image term is ~98% of the
+// footprint, which is also why kMeshGrowthAllowance can afford to be a flat factor.
+bool Scene::EstimateRefineMeshCUDAVRAM(unsigned nResolutionLevel, unsigned nMinResolution, uint64_t& needBytes, uint64_t& budgetBytes) const
+{
+	constexpr uint64_t MB = 1024ull*1024ull;
+	if (images.IsEmpty() || mesh.IsEmpty())
+		return false;
+	SEACAVE::CUDA::DeviceCapability cap;
+	if (!SEACAVE::CUDA::GetDeviceCapability(SEACAVE::CUDA::desiredDeviceID, cap) || cap.totalMem == 0)
+		return false;
+
+	// the finest scale keeps every valid image resident at nResolutionLevel, aspect
+	// preserved -- the same set InitImages() below builds
+	uint64_t totalPixels(0), maxPixels(0);
+	FOREACH(idxImage, images) {
+		const Image& imageData = images[idxImage];
+		if (!imageData.IsValid() || imageData.width == 0 || imageData.height == 0)
+			continue;
+		unsigned level(nResolutionLevel);
+		const double imageSize((double)imageData.RecomputeMaxResolution(level, nMinResolution));
+		const double maxDim((double)MAXF(imageData.width, imageData.height));
+		const double s(imageSize / maxDim);
+		const uint64_t px((uint64_t)(((double)imageData.width * s) * ((double)imageData.height * s)));
+		totalPixels += px;
+		maxPixels = MAXF(maxPixels, px);
+	}
+	if (totalPixels == 0)
+		return false;
+
+	const uint64_t fixedBytes =
+		  kScratchBytesPerPixel * maxPixels
+		+ MeshDeviceBytes(mesh.vertices.GetSize(), mesh.faces.GetSize()) * kMeshGrowthAllowance;
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	needBytes = fixedBytes + (kViewBytesT1+kViewBytesT2) * totalPixels + kViewBytesT3 * maxPixels;
+#else
+	needBytes = fixedBytes + kViewBytesFlat * totalPixels;
+#endif
+	const uint64_t reserve = MAXF((uint64_t)(MESHOPT_CUDA_VRAM_RESERVE_MB*MB),
+								  (uint64_t)((double)cap.totalMem*MESHOPT_CUDA_VRAM_RESERVE_FRACTION));
+	budgetBytes = (cap.totalMem > reserve ? (uint64_t)cap.totalMem - reserve : 0);
+	return true;
+}
+
 // load and initialize all images at the given scale
 // and compute the gradient for each input image
 // optional: blur them using the given sigma
