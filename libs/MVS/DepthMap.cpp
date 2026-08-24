@@ -99,15 +99,68 @@ MDEFVAR_OPTDENSE_float(fMinAngle, "Min Angle", "Min angle for accepting the dept
 MDEFVAR_OPTDENSE_float(fOptimAngle, "Optim Angle", "Optimal angle for computing the depth triangulation", "12.0")
 MDEFVAR_OPTDENSE_float(fMaxAngle, "Max Angle", "Max angle for accepting the depth triangulation", "65.0")
 MDEFVAR_OPTDENSE_float(fDescriptorMinMagnitudeThreshold, "Descriptor Min Magnitude Threshold", "minimum patch texture variance accepted when matching two patches (0 - disabled)", "0.04") // 0.02: pixels with patch texture variance below 0.0004 (0.02^2) will be removed from depthmap; 0.12: patch texture variance below 0.02 (0.12^2) is considered texture-less
-MDEFVAR_OPTDENSE_float(fDepthDiffThreshold, "Depth Diff Threshold", "maximum variance allowed for the depths during refinement", "0.015") // JPB WIP BUG Testin "0.008") // JPB WIP BUG"0.01")
-MDEFVAR_OPTDENSE_float(fNormalDiffThreshold, "Normal Diff Threshold", "maximum variance allowed for the normal during fusion (degrees)", "25")
+// RAISED 0.015 -> 0.03 (2026-08-23) to recover RichmondHistoric's bottom strip.
+//
+// WHY. That strip's depths EXIST -- at --number-views-fuse 1 they appear (as a noisy lump) and
+// ReconstructMesh makes a good surface from them -- but no two views agree closely enough for
+// fusion to accept them at nMinViewsFuse 2, so they are discarded. Every post-fusion filter was
+// ruled out first: planarity 0, linear-smear 53k, density global 90k, visibility tested at both
+// 10 and 30. The loss is the fusion agreement test, not a filter.
+//
+// The view COUNT is a cliff (2 or nothing); this is the dial. At grazing incidence two views can
+// both be roughly right and still differ by more than 1.5% in relative depth. 0.03 keeps the
+// 2-view requirement and just stops demanding they agree so tightly -- far safer than dropping
+// consensus, which would faithfully reconstruct systematic error (repeated texture, moving
+// objects, single-view depths over water) rather than merely passing noise Poisson can average.
+//
+// NOT A PURE FUSION KNOB -- read this before tuning further. It is also used by the depth-map
+// filter with multipliers 0.7 / 0.8 / 1.2 / 2.5 (SceneDensify.cpp 1438, 1532, 1810, 1902, 2115,
+// 2195), so raising it loosens depth-map filtering as well as fusion. That is the same direction
+// here, but it means the effect is broader than the fusion line suggests and noise rises in both
+// stages. If it overshoots, back off toward 0.02 before touching fNormalDiffThreshold.
+MDEFVAR_OPTDENSE_float(fDepthDiffThreshold, "Depth Diff Threshold", "maximum variance allowed for the depths during refinement", "0.03") // JPB WIP BUG Testin "0.008") // JPB WIP BUG"0.01")
+// RAISED 25 -> 35 (2026-08-23), companion to fDepthDiffThreshold above. On a steeply-viewed or
+// low-texture strip the estimated normals swing well past 25 degrees between views even when
+// both are broadly correct, so the normal test rejects the pair on its own. Purely a fusion
+// gate (COS(FD2R(...)) at SceneDensify.cpp 2761, 3655, 4378, 4693), unlike the depth threshold.
+//
+// Try the depth threshold FIRST and this only if that is not enough: normals are the noisier of
+// the two measurements, so this admits more marginal geometry per degree than the depth dial
+// does per percent.
+MDEFVAR_OPTDENSE_float(fNormalDiffThreshold, "Normal Diff Threshold", "maximum variance allowed for the normal during fusion (degrees)", "35")
 MDEFVAR_OPTDENSE_float(fPairwiseMul, "Pairwise Mul", "pairwise cost scale to match the unary cost", "0.3")
 MDEFVAR_OPTDENSE_float(fOptimizerEps, "Optimizer Eps", "MRF optimizer stop epsilon", "0.001")
 MDEFVAR_OPTDENSE_int32(nOptimizerMaxIters, "Optimizer Max Iters", "MRF optimizer max number of iterations", "80")
 MDEFVAR_OPTDENSE_uint32(nSpeckleSize, "Speckle Size", "maximal size of a speckle (small speckles get removed)", "40") // JPB WIP BUG Testing "100")
 MDEFVAR_OPTDENSE_uint32(nIpolGapSize, "Interpolate Gap Size", "interpolate small gaps (left<->right, top<->bottom)", "7")
 MDEFVAR_OPTDENSE_int32(nIgnoreMaskLabel, "Ignore Mask Label", "label id used during ignore mask filter (<0 - disabled)", "-1")
-MDEFVAR_OPTDENSE_float(fOutlierFilterStdDev, "Outlier Filter StdDev", "remove fused-cloud points whose kNN mean distance exceeds mean + N*stddev (0 - disabled); cleans the sparse spray on low-overlap edges, dataset-adaptive", "0")
+MDEFVAR_OPTDENSE_float(fOutlierFilterStdDev, "Outlier Filter StdDev", "remove fused-cloud points whose kNN mean distance exceeds mean + N*stddev (0 - disabled); cleans the sparse spray on low-overlap edges, dataset-adaptive", "6")
+// SPLIT OUT OF fOutlierFilterStdDev (2026-08-22). FilterPointCloudDensity runs TWO tests and
+// OR's them, and they catch opposite things:
+//   GLOBAL: meanDist > cloud mean + N*sigma -- bulk spray that is sparse relative to the whole
+//           scene. This is what removes the sub-surface points "way out there, bigger than the
+//           boundary of the surface" that were deforming meshes.
+//   LOCAL:  meanDist > its own neighbourhood's mean + N*sigma -- a point sparser than what
+//           surrounds it. Intended for fringe haze that has detached from a dense edge.
+// The local test is what removes WATER. With KNN=16 and returns that sparse, a water point's
+// nearest neighbours are mostly on the surrounding shore, so it is measured against dense land
+// and cut -- the test working as designed, with no way to know sparse-here is legitimate.
+// MEASURED (SchnellTests, this filter 0 -> 6): 6239 grid cells went from having returns to
+// having none and the sparse tail fell 19.5% -> 11.8%, taking the middle of a water body.
+//
+// Defaults to 6 so behaviour is unchanged. Set 0 to disable the local test and keep the global
+// one, which is the configuration that removes far-out spray while sparing enclosed water.
+// Raise it instead (10-12) to keep the test but make it tolerant of locally-sparse surfaces.
+// SET TO 0 (2026-08-22) to test whether the local half is what removes water. MEASURED on
+// SchnellTests at 6/6: global 76633 points, local 31120, of 26.8M. If the water body is in
+// that 31120 it comes back at 0 while the global test keeps removing the far-out sub-surface
+// spray. If it does NOT come back, the water is failing the GLOBAL test too -- it is sparse
+// enough to be an outlier against the whole cloud, not just against its shore -- and no
+// setting of this knob reaches it; that case needs a different criterion on the global test
+// (offset from the local surface plane along its own normal, which is skew-invariant).
+// Restore to 6 if disabling it makes low-overlap edges fuzzy again; 10-12 keeps the test but
+// tolerant of locally-sparse real surfaces.
+MDEFVAR_OPTDENSE_float(fOutlierFilterLocalStdDev, "Outlier Filter Local StdDev", "local (surface-following) half of the density outlier filter: remove a point whose kNN mean distance exceeds ITS OWN neighborhood's mean + N*stddev (0 - disabled, global test still runs); this is the half that removes sparse water returns", "0")
 MDEFVAR_OPTDENSE_uint32(nOutlierFilterKNN, "Outlier Filter KNN", "number of nearest neighbors used by the density/low-view outlier filters", "16")
 // ENABLED (Aug 2026), default 0 -> 1. FIELD-OBSERVED on the 115-view OKState corridor:
 // "point spray beneath the surface extending down" in the dense cloud, present both with
@@ -138,8 +191,42 @@ MDEFVAR_OPTDENSE_uint32(nOutlierFilterKNN, "Outlier Filter KNN", "number of near
 // off-surface fuzz: a wall is planar and survives, a ray smear is linear and does not.
 MDEFVAR_OPTDENSE_uint32(nLowViewSupportCut, "Low View Support Cut", "delete a fused point that has only the minimum views (nMinViewsFuse) when at least N better-supported (more-view) points lie within fLowViewSupportRadius (0 - disabled); emulates nMinViewsFuse+1 ONLY where a higher-view surface already exists, leaving sole-evidence min-view regions intact (1 = remove every min-view point that touches a real surface = closest to a global nMinViewsFuse+1; raise to be more conservative)", "0")
 MDEFVAR_OPTDENSE_float(fLowViewSupportRadius, "Low View Support Radius", "search radius for nLowViewSupportCut, as a multiple of the LOCAL surface (higher-view) point spacing near each candidate; larger reaches across a thicker low-overlap scatter slab to find the real higher-view surface", "4.0")
-MDEFVAR_OPTDENSE_float(fLowViewPlanarityMax, "Low View Planarity Max", "for min-view points that have NO higher-view surface nearby (floating, unsupported): delete the point when its local neighborhood is volumetric/scattered rather than thin/planar, i.e. surface-variation (smallest/sum of PCA eigenvalues, 0=flat plane ~0.33=isotropic blob) EXCEEDS this; removes floating fuzz while keeping genuine sparse 2-view surfaces. 0 - disable (keep all unsupported min-view points)", "0.2"/* JPB WIP BUG "0.1"*/)
-MDEFVAR_OPTDENSE_float(fLowViewLinearityMin, "Low View Linearity Min", "companion to fLowViewPlanarityMax for min-view points with NO higher-view surface nearby: delete the point when its local neighborhood is a 1D SMEAR ALONG THE VIEWING RAY, i.e. linearity (l1-l2)/l1 EXCEEDS this. Needed because surface-variation (l3/sum) is ~0 for a LINE just as for a PLANE, so the planarity test alone cannot see ray-aligned depth-error spray -- only isotropic blobs. A genuine thin sparse surface is low on both. 0 - disable", "0.6")
+// RESTORED to 0.2 (2026-08-23) after a bisect run at 0 CLEARED it as the cause of
+// RichmondHistoric's missing bottom edge. At 0 the strip did not come back, and the whole
+// post-fusion filter chain was eliminated with it:
+//   planarity 0 | linear-smear 53,581 | density global 89,556 | density local 0
+//   | visibility 883,652 (also tested at 30, no change)
+// ~2% of the cloud between them, and the edge stayed absent. The loss was the FUSION agreement
+// test -- see fDepthDiffThreshold above, raised 0.015 -> 0.03, which recovered most of it.
+//
+// NOTE the bisect only worked after fixing a real bug: `0` did not disable this test, it made it
+// maximally aggressive (surface variation is >= 0, and the `> 0.f` guard was missing), removing
+// 15,501,359 points -- 30% of the cloud -- with `kept 0`. Fixed at SceneDensify.cpp ~5745.
+//
+// WATCH after restoring: this test's candidate set is min-view points with no higher-view
+// surface nearby, which is exactly what the recovered bottom strip is made of. If the strip
+// regresses now that this is back on, tune it UP (0.25, 0.3) rather than back to 0 -- and note
+// 0.2 is already two thirds of the way to the 0.33 isotropic-blob limit, so the useful range is
+// narrow and most of what it removes is genuinely scattered.
+MDEFVAR_OPTDENSE_float(fLowViewPlanarityMax, "Low View Planarity Max", "for min-view points that have NO higher-view surface nearby (floating, unsupported): delete the point when its local neighborhood is volumetric/scattered rather than thin/planar, i.e. surface-variation (smallest/sum of PCA eigenvalues, 0=flat plane ~0.33=isotropic blob) EXCEEDS this; removes floating fuzz while keeping genuine sparse 2-view surfaces. 0 - disable (keep all unsupported min-view points)", "0.2")
+// RAISED 0.6 -> 0.9 (2026-08-23). CONFIRMED BY BISECT: at 0.6 this removed 831,001 points on
+// SchnellTests -- 3.1% of the cloud, and 11x the density outlier filter's 72,624 -- and took a
+// whole water body with them. Setting it to 0 restored the water, which isolates this test as
+// the cause; 0.9 is where it should rest, not 0.
+//
+// WHY 0.6 WAS TOO LOW. Linearity is (l1-l2)/l1, so 0.6 fires whenever l2 < 0.4*l1 -- a mildly
+// elongated neighbourhood, not a smear. Sparse returns off a low-texture surface are routinely
+// that anisotropic: sampled along scan lines, or thinned unevenly by the density filter running
+// before this one. A genuine depth-error smear along a viewing ray is far more extreme, 0.9+.
+// So the bar was catching ordinary sparse surface, and water -- the sparsest real surface in
+// any aerial scene -- fails it first and hardest.
+//
+// This test cannot in principle separate "noise smeared along a ray" from "real surface we can
+// only localise along the ray"; both are linear. All 0.9 buys is that only the extreme case is
+// cut. WATCH the "linear-smear removed" count in the low-view diag: it should fall well below
+// 831,001. If ray-smear artifacts return on other datasets, prefer tightening the PLANARITY
+// test or the support radius over lowering this back toward 0.6.
+MDEFVAR_OPTDENSE_float(fLowViewLinearityMin, "Low View Linearity Min", "companion to fLowViewPlanarityMax for min-view points with NO higher-view surface nearby: delete the point when its local neighborhood is a 1D SMEAR ALONG THE VIEWING RAY, i.e. linearity (l1-l2)/l1 EXCEEDS this. Needed because surface-variation (l3/sum) is ~0 for a LINE just as for a PLANE, so the planarity test alone cannot see ray-aligned depth-error spray -- only isotropic blobs. A genuine thin sparse surface is low on both. 0 - disable", "0.9")
 MDEFVAR_OPTDENSE_bool(bFlattenWater, "Flatten Water", "snap a rough water/pond surface onto a robustly fitted near-horizontal plane; the crust is selected by a LOW elevation band AND local roughness, so genuine flat ground and out-of-band features are left untouched; heavily guarded (declines unless a large, near-horizontal, well-fit rough sheet exists and the change stays under Flatten Water Max Frac) so it is a near no-op on datasets without prominent water (0 - disabled)", "0")
 MDEFVAR_OPTDENSE_float(fFlattenWaterBandPct, "Flatten Water Band Pct", "elevation band for water-surface detection: candidates must lie within the lowest N percent of the cloud height (gravity-up Z assumed); larger reaches higher up the banks (more aggressive)", "15.0")
 MDEFVAR_OPTDENSE_float(fFlattenWaterRoughness, "Flatten Water Roughness", "minimum local PCA surface-variation (0=flat plane ~0.33=isotropic blob) for a band point to be treated as noisy water crust; raise to be more selective (only very rough), lower to catch gently rippled water", "0.04")

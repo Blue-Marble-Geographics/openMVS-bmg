@@ -163,6 +163,7 @@ extern unsigned nIpolGapSize;
 extern int nIgnoreMaskLabel;
 extern unsigned nOptimize;
 extern float fOutlierFilterStdDev;
+extern float fOutlierFilterLocalStdDev;
 extern unsigned nOutlierFilterKNN;
 extern unsigned nLowViewSupportCut;
 extern float fLowViewSupportRadius;

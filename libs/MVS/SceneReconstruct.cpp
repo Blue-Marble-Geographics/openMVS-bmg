@@ -480,6 +480,64 @@
 // only boundary mechanism and the ramp is the least-bad way to bias it outward.
 #define POISSON_TRIM_EDGE_MULT_X100 100
 #endif
+// POISSON_TRIM_INTERIOR_MULT_X100: the same dial for the OTHER end of the ramp. The threshold
+// runs trimInterior (deep interior) -> trimEdge (perimeter); EDGE_MULT scales the perimeter
+// end and this scales the interior end. Until now the interior was pinned to trimBase with no
+// dial at all, so the only way to relax it was to move the percentile, which moves both.
+//
+// WHY IT IS WANTED. Enclosed low-return regions -- water above all -- are held up by nothing
+// but Poisson's interpolation across the gap, so their density sits at the very bottom of the
+// distribution. The exterior flood already recognises them as interior (that is what
+// POISSON_TRIM_CLOSE_CELLS seals the shore channel for), so they take the INTERIOR threshold,
+// and lowering it is the one lever that spares them without touching the boundary.
+//
+// FIELD CASE: SchnellTests lost the middle of a water body after the operator's dense-cloud
+// outlier filter was improved. The filter took 6239 cells from having-any-returns to none and
+// cut the sparse tail 19.5% -> 11.8%; those spurious returns were the only thing holding that
+// water above the trim. Its ladder: min=3 p0.1=5 p0.2=5.76 (= trimBase) p1=7.31 p50=12.4, so
+// the water bridge sits somewhere in 3-5.76 and a 0.60 multiplier puts the interior threshold
+// at 3.46 -- under p0.1, above min.
+//
+// SAFE DIRECTION. This can only ever KEEP more, never cut more, so it cannot re-open
+// RichmondHistoric's bottom or worsen any over-cut scene. Nor does it touch Marco's or Redy's
+// edge slop, which is a boundary problem the footprint cut owns.
+//
+// The cost is that genuine low-density interior surface also survives -- noise shells and
+// spikes over well-surveyed ground. Disconnected ones still go to the small-component filter;
+// connected ones will not. If spikes appear over roofs, raise this back toward 100.
+//
+// TUNE IT FROM THE LOGGED LADDER, not by guessing: the "vertex density percentiles" line gives
+// min and the low tail for that run. Put the interior threshold below the density of whatever
+// you want to keep and above the noise floor.
+// POISSON_TRIM_INTERIOR_CELLS: how far inside the footprint the interior relaxation reaches
+// FULL strength, in grid cells. It must be well clear of POISSON_TRIM_RAMP_CELLS (6) or the
+// relaxation bleeds into the perimeter band and loosens the edge -- see the two-ramp note in
+// the per-vertex threshold loop for the measurement that forced this to exist.
+//
+// This is the "how far in before water is protected" dial. At 24 cells on SchnellTests
+// (cell 1.213) full relaxation starts 29 units inside the boundary, and the threshold slides
+// from trimBase at 7.3 units to trimInterior at 29. A lake in the middle of a scene is far
+// past that; a lake sitting ON the survey edge is not, and will still be trimmed -- that case
+// is called out in the POISSON_TRIM_EDGE_MULT_X100 notes and this does not solve it.
+// Raise it to protect the edge more and water less; lower it for the reverse.
+#ifndef POISSON_TRIM_INTERIOR_CELLS
+#define POISSON_TRIM_INTERIOR_CELLS 24
+#endif
+// REVERTED TO 100 (flat) 2026-08-22. At 60 it restored SchnellTests' water but the whole
+// mechanism was moving 0.03% of the mesh -- density trim 3408 -> 658 faces at 60 with one
+// ramp, 1111 with two, against 3,051,493 total, and final face counts across all three runs
+// spanning 0.31%. Meanwhile the operator's dense-cloud filter change had moved 6239 grid
+// cells from having returns to having none (sparse tail 19.5% -> 11.8%). The leverage is
+// three orders of magnitude apart: this is not the place to compensate for a cloud change,
+// and doing it globally makes nine scenes pay for one scene's input.
+//
+// The machinery is kept and is inert at 100 (trimInterior == trimBase, identical to the
+// original flat behaviour). It is the correct lever if enclosed low-return regions ever need
+// protecting for their own sake rather than as compensation -- set 60 with
+// POISSON_TRIM_INTERIOR_CELLS controlling how far in it reaches.
+#ifndef POISSON_TRIM_INTERIOR_MULT_X100
+#define POISSON_TRIM_INTERIOR_MULT_X100 100
+#endif
 // Ramp width (in grid cells) over which the threshold blends interior->edge.
 // RAISED 6 -> 16 (7.4 -> 19.7 world units at a 1.232 cell). This is the knob that decides how far
 // INWARD from the data perimeter the elevated edge threshold reaches, and it was the real
@@ -4626,8 +4684,45 @@ double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
 //   Marco 1.007 | OKState 1.04 | RichmondWater 1.064 | Niwot(127) 1.064
 //   MechanicFalls 1.48 | BellisPark 1.47
 // Set to 1.0 to disable padding entirely and restore the pre-change behaviour.
+// RAISED 1.07 -> 1.10 (2026-08-22). FIELD CASE that proves the mechanism and set the value:
+// Niwot at HIGHEST, after the dense cloud was cleaned of spurious points beneath the surface.
+// Cleaning it shrank the bbox 134.1 -> 122.8 (-8.4%), which dropped the raw pixel ceiling
+// 9.957 -> 9.881 and crossed an integer boundary: depth 10 -> 9, cell 0.1409 -> 0.2638,
+// refine level 1 -> 2, final mesh 2,163,593 -> 475,873 faces. IMPROVING THE INPUT MADE THE
+// OUTPUT 4.5x COARSER, and left HIGHEST producing a worse mesh than HIGH on the same scene.
+//
+// The pad it needed was 1.086 and the cap was 1.07 -- short by 1.5%. 1.10 admits it.
+//
+// Checked against the whole corpus: at 1.10 the ONLY additional scene that pads is this one.
+// Every other scene either already padded at 1.07 (RichmondWater 1.045), was already carried
+// by the tolerance (Marco 12.011, RichmondHistoric 10.980, Niwot-at-HIGH 9.957), is capped by
+// its face budget (MechanicFalls, OKState), or needs far more than 1.10 (Redy 1.289,
+// GEOTAG 1.399, BellisPark 1.46, Randy 1.813, SchnellTests 1.214).
+//
+// Do not read 1.10 as "padding is cheap". A level is still ~4x the faces, ~4x the refine
+// view-planes and ~4x the textured faces; the cap is a cost dial and raising it widens the
+// band of scenes that pay. It is justified here because the alternative is a tier inversion.
+// RAISED 1.10 -> 1.15 (2026-08-24). 1.10 was set from Niwot-at-HIGHEST needing 1.086, and that
+// margin was called out as uncomfortably tight at the time. It then failed on the very next
+// bbox change: Niwot at HIGH needed 1.1018 and was declined by 0.16%, dropping depth 10 -> 9 and
+// the final mesh from 2,163,593 faces to 359,807.
+//
+// 1.15 is NOT fitted to that number -- it is the middle of an empty band. Pad required to reach
+// the next level, across the corpus:
+//   Niwot HIGHEST 1.086 | Niwot HIGH 1.1018 | <-- gap --> | SchnellTests 1.214 | Redy 1.289
+//   GEOTAG 1.399 | BellisPark 1.46 | Randy 1.813 ... (MechanicFalls, OKState budget-capped;
+//   Marco, RichmondHistoric already carried by POISSON_DEPTH_PIXELS_TOL)
+// Nothing sits between 1.102 and 1.214, so 1.15 buys ~4.5% of bbox drift tolerance without
+// admitting a single additional scene. Anything above ~1.21 starts paying a full octree level
+// on SchnellTests.
+//
+// ROOT CAUSE, not fixed here: the depth decision keys off the RAW bbox, which is outlier-driven
+// and therefore moves whenever the densify filters change -- 134.1 -> 122.3 on this scene while
+// the robust 0.2-99.8 extent held at 103.7 -> 104.2. Padding absorbs the drift; it does not
+// remove it. The structural fix is to choose the depth from the robust extent and size the cube
+// from the raw one, so cloud-filter work stops moving mesh resolution.
 #ifndef POISSON_CUBE_PAD_MAX
-#define POISSON_CUBE_PAD_MAX 1.07
+#define POISSON_CUBE_PAD_MAX 1.15
 #endif
 // Usable fraction of the atlas: must match TEXTURE_ATLAS_FIT_MARGIN in SceneTexture.cpp,
 // which is the fraction AdaptiveFitPatches actually fills (measured: realized area lands
@@ -6404,7 +6499,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				}
 			}
 #endif
-			const float trimInterior = trimBase;
+			const float trimInterior = trimBase * (POISSON_TRIM_INTERIOR_MULT_X100 / 100.f);
 			const float trimEdge = trimBase * (POISSON_TRIM_EDGE_MULT_X100 / 100.f);
 
 			// per-vertex local threshold (e=0 deep interior -> e=1 at perimeter)
@@ -6417,8 +6512,34 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			for (ptrdiff_t v = 0; v < (ptrdiff_t)numV; ++v) {
 				int cx, cy; cellOf(pVtx[v].x, pVtx[v].y, cx, cy);
 				const float dcell = dist[(size_t)cy * gw + cx];
+				// TWO independent ramps, because they answer different questions and the
+				// distances are an order of magnitude apart.
+				//
+				// 1. EDGE ramp, over POISSON_TRIM_RAMP_CELLS (6): trimBase -> trimEdge as you
+				//    approach the perimeter. Unchanged.
+				// 2. INTERIOR ramp, over POISSON_TRIM_INTERIOR_CELLS (24): trimBase ->
+				//    trimInterior as you move away from it. Starts only where the edge ramp
+				//    has finished.
+				//
+				// Sharing one ramp for both was wrong and measurably so. With a 6-cell ramp,
+				// trimEdge applies only at dist == 0 and everything within 7.3 units of the
+				// boundary interpolates toward the interior value -- so lowering the interior
+				// end to protect mid-scene water dragged the whole perimeter band down with it.
+				// MEASURED on SchnellTests: the density trim fell 3408 -> 658 faces and the
+				// edge went visibly sloppy, when the intent was to change the interior alone.
+				//
+				// Anchoring both ramps at trimBase keeps the perimeter exactly as it was before
+				// the interior dial existed: at dist 0 the threshold is trimEdge, at dist ramp
+				// it is trimBase, and only past that does it start relaxing.
 				float e = 1.f - dcell / ramp; if (e < 0.f) e = 0.f; else if (e > 1.f) e = 1.f;
-				vTrim[v] = trimInterior + e * (trimEdge - trimInterior);
+				float vt = trimBase + e * (trimEdge - trimBase);
+				const float interiorSpan = (float)POISSON_TRIM_INTERIOR_CELLS - ramp;
+				if (interiorSpan > 0.f) {
+					float ei = (dcell - ramp) / interiorSpan;
+					if (ei < 0.f) ei = 0.f; else if (ei > 1.f) ei = 1.f;
+					vt += ei * (trimInterior - trimBase);
+				}
+				vTrim[v] = vt;
 				vOut[v] = (dcell <= 0.f) ? 1 : 0; // exterior cells were seeded to 0
 			}
 
@@ -6521,13 +6642,15 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				mesh.faces.Swap(newFaces);
 			}
 			VERBOSE("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f)"
-				" | interior=%.2f edge=%.2f ramp=%d cells (%.4g units)"
+				" | interior=%.2f (x%.2f of base %.2f, full at %d cells) edge=%.2f"
+				" ramp=%d cells (%.4g units)"
 				" | grid %dx%d cell=%.4g, %zu of %zu cells occupied (fraction %.3f)"
 				" at >=%d pts/cell | outside-footprint cut %zu faces"
 				" | reach cut %zu faces (>%.4g units from data) [%s]",
 				(unsigned)culled, (unsigned)numF,
 				numF ? (double)culled / (double)numF : 0.0,
-				trimInterior, trimEdge, POISSON_TRIM_RAMP_CELLS,
+				trimInterior, (double)POISSON_TRIM_INTERIOR_MULT_X100 / 100.0, trimBase,
+				(int)POISSON_TRIM_INTERIOR_CELLS, trimEdge, POISSON_TRIM_RAMP_CELLS,
 				(double)(POISSON_TRIM_RAMP_CELLS * cellSz),
 				gw, gh, cellSz, nOcc, nCells,
 				nCells ? (double)nOcc / (double)nCells : 0.0,

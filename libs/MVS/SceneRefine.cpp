@@ -1263,6 +1263,10 @@ public:
 	// use, which is the difference between fitting a 16 GB box and not.
 	uint64_t retainedFreeBytes = 0;
 	bool streamSingleBatch = false; // true when the whole view set fit in one batch
+	// BuildViewBatches bails out when there is no pair graph to partition, and it
+	// leaves viewBatches empty when it does -- which is exactly the condition its
+	// caller retries on, so ScoreMesh re-enters it every iteration. Say it once.
+	bool streamNoPairGraphWarned = false;
 	// true when PrepareViewGeometryChunked determined the whole streamed set fits
 	// under the ceiling, so it keeps the planes rather than making the pair loop
 	// reload them
@@ -2115,6 +2119,35 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 	constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
 	uint64_t budget;
 	String src;
+	// ONE memory sample for the whole resolution, with the simulated-box adjustment
+	// applied once, because the SPEED FLOOR at the bottom and the AUTO branch below
+	// MUST see the same numbers. The floor used to take its own sample and read the
+	// RAW mi.freePhysical from it, so under MESHOPT_MEM_SIMULATE_PHYSICAL_GB it
+	// measured the REAL machine: on a big box the whole streamed set always "fits",
+	// the floor raised the budget back to totalStreamBytes, and the simulated run
+	// silently took ONE batch no matter how small a box was being simulated -- the
+	// testing aid could never produce the batching it exists to test.
+	// Reachable only with MESHOPT_MEM_TARGET_GB < 0 (see ceilingMode below), so this
+	// is latent at the shipped defaults, not something the current runs hit.
+	// Nothing between here and the floor allocates, so collapsing the two samples
+	// into one is also strictly more consistent than re-querying.
+	const Util::MemoryInfo mi(Util::GetMemoryInfo());
+	uint64_t totalPhys = (uint64_t)mi.totalPhysical;
+	uint64_t freePhys = (uint64_t)mi.freePhysical;
+	String simNote;
+	if (MESHOPT_MEM_SIMULATE_PHYSICAL_GB > 0 && totalPhys > 0) {
+		// Model a smaller box: everything the system holds right now would
+		// still have to be held there, so the simulated free memory is
+		// whatever is left of the smaller box after that same usage. Clamps
+		// at 0 rather than going negative -- and 0 free is meaningful here,
+		// because `reclaimable` below is still real headroom we can free.
+		const uint64_t simTotal = (uint64_t)(MESHOPT_MEM_SIMULATE_PHYSICAL_GB * (double)GB);
+		const uint64_t used = totalPhys - freePhys;
+		freePhys = (simTotal > used) ? (simTotal - used) : 0;
+		totalPhys = simTotal;
+		simNote = String::FormatString(_T(" [SIMULATED %.2f GB box; real free was %.1f GB]"),
+			simTotal / (double)GB, mi.freePhysical / (double)GB);
+	}
 	if (MESHOPT_VIEW_STREAM_BUDGET_GB < 0) {
 		// parity control: never batch
 		budget = std::numeric_limits<uint64_t>::max();
@@ -2129,18 +2162,22 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 		if (MESHOPT_MEM_TARGET_GB > 0) {
 			target = (uint64_t)(MESHOPT_MEM_TARGET_GB * (double)GB);
 		} else {
-			// derive from this machine (see MESHOPT_MEM_TARGET_GB == 0)
-			const Util::MemoryInfo miT(Util::GetMemoryInfo());
-			uint64_t totalPhys = (uint64_t)miT.totalPhysical;
+			// derive from this machine (see MESHOPT_MEM_TARGET_GB == 0).
+			// Uses the hoisted sample: total physical RAM does not change between two
+			// queries, so this is the same number the removed second query returned.
+			// Deliberately NOT the hoisted `totalPhys`: that one is guarded by
+			// `totalPhys > 0`, and this path must keep its existing behaviour of
+			// simulating a box even when the OS query failed.
+			uint64_t totalPhysT = (uint64_t)mi.totalPhysical;
 			if (MESHOPT_MEM_SIMULATE_PHYSICAL_GB > 0)
-				totalPhys = (uint64_t)(MESHOPT_MEM_SIMULATE_PHYSICAL_GB * (double)GB);
-			if (totalPhys == 0) {
+				totalPhysT = (uint64_t)(MESHOPT_MEM_SIMULATE_PHYSICAL_GB * (double)GB);
+			if (totalPhysT == 0) {
 				// cannot size a ceiling without knowing the machine: hold everything
 				// rather than invent a number and batch for no reason
 				DEBUG_EXTRA("view-stream budget: unlimited (physical memory query failed)");
 				return std::numeric_limits<uint64_t>::max();
 			}
-			target = ResolveTargetBytesFromTotal(totalPhys);
+			target = ResolveTargetBytesFromTotal(totalPhysT);
 		}
 		const uint64_t commit = ProcessCommitBytes();
 		const uint64_t reclaimable = StreamBytesResident() + DecodeCacheBytesResident();
@@ -2178,23 +2215,6 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 			}
 		}
 	} else {
-		const Util::MemoryInfo mi(Util::GetMemoryInfo());
-		uint64_t totalPhys = (uint64_t)mi.totalPhysical;
-		uint64_t freePhys = (uint64_t)mi.freePhysical;
-		String simNote;
-		if (MESHOPT_MEM_SIMULATE_PHYSICAL_GB > 0 && totalPhys > 0) {
-			// Model a smaller box: everything the system holds right now would
-			// still have to be held there, so the simulated free memory is
-			// whatever is left of the smaller box after that same usage. Clamps
-			// at 0 rather than going negative -- and 0 free is meaningful here,
-			// because `reclaimable` below is still real headroom we can free.
-			const uint64_t simTotal = (uint64_t)(MESHOPT_MEM_SIMULATE_PHYSICAL_GB * (double)GB);
-			const uint64_t used = totalPhys - freePhys;
-			freePhys = (simTotal > used) ? (simTotal - used) : 0;
-			totalPhys = simTotal;
-			simNote = String::FormatString(_T(" [SIMULATED %.2f GB box; real free was %.1f GB]"),
-				simTotal / (double)GB, mi.freePhysical / (double)GB);
-		}
 		if (totalPhys == 0) {
 			// OS query failed: fall back to holding everything rather than
 			// guessing a small number and batching hard for no reason
@@ -2227,13 +2247,18 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 	// instead of 70% is a RISK the in-flight governor can walk back; splitting is a
 	// CERTAIN cost. Asymmetric consequences deserve an asymmetric threshold.
 	// Deliberately NOT applied when an explicit ceiling is set and cannot fit --
-	// a hard target must still be honoured.
+	// a hard target must still be honoured. That guard is load-bearing, not
+	// redundant: MESHOPT_MEM_TARGET_GB >= 0 (the shipped default is 0) reaches this
+	// block from the CEILING branch above, and without the guard the floor would
+	// override the very ceiling that branch just computed. It also means this whole
+	// block is inert at the shipped defaults.
+	// freePhys/totalPhys here are the SIMULATED values when simulation is on -- see
+	// the sample at the top of the function.
 	if (budget < totalStreamBytes) {
-		const Util::MemoryInfo mi(Util::GetMemoryInfo());
 		const uint64_t reclaimable = StreamBytesResident() + DecodeCacheBytesResident();
-		const uint64_t headroom = (uint64_t)mi.freePhysical + reclaimable;
+		const uint64_t headroom = freePhys + reclaimable;
 		const bool ceilingMode = (MESHOPT_MEM_TARGET_GB >= 0);
-		if (!ceilingMode && mi.totalPhysical > 0 && totalStreamBytes <= (uint64_t)(headroom * 0.85)) {
+		if (!ceilingMode && totalPhys > 0 && totalStreamBytes <= (uint64_t)(headroom * 0.85)) {
 			budget = totalStreamBytes;
 			src += String::FormatString(
 				_T(" -> raised to %.2f GB: whole set fits in %.2f GB headroom, taking ONE batch (1->2 costs ~37%%)"),
@@ -2274,29 +2299,88 @@ void MeshRefine::BuildViewBatches()
 	if (viewNeeded.size() != numViews)
 		viewNeeded.assign(numViews, 0);
 
+	// The pair graph is the ONLY input to the partition, and it is built lazily and
+	// conditionally: the caller fills refViewNeighbors only when `pairs` is non-empty,
+	// so with no image pairs it is still EMPTY here while numViews is not -- and every
+	// loop below indexes refViewNeighbors[v] over [0, numViews). Read out of bounds.
+	// Deliberately checked with != rather than empty(): the caller sizes it to exactly
+	// images.GetSize(), so any other size is a mismatch this function cannot partition
+	// against either.
+	// Bailing out is not a behaviour change in disguise -- with no pairs there is
+	// nothing for the pair loop to score, so an empty partition is what the run would
+	// have produced anyway had it not read past the end. Said out loud rather than
+	// silently, because "zero batches" and "one batch" both mean "no batching" to the
+	// consumers below and the difference would otherwise be invisible.
+	// Note the residency bookkeeping above is sized FIRST and unconditionally: the
+	// eviction/residency helpers index those arrays regardless of this bail-out.
+	if (refViewNeighbors.size() != numViews) {
+		streamBudgetBytes = std::numeric_limits<uint64_t>::max();
+		streamSingleBatch = true; // no batching: nothing is ever evicted or reloaded
+		// Once, not per iteration: this leaves viewBatches empty, which is the very
+		// condition ScoreMesh retries on, so it lands here again every iteration.
+		if (!streamNoPairGraphWarned) {
+			streamNoPairGraphWarned = true;
+			DEBUG_EXTRA("view-stream: no pair graph (%zu neighbour lists for %zu views) -- "
+				"no view batches built; the pair loop has nothing to process",
+				refViewNeighbors.size(), numViews);
+		}
+		return;
+	}
+
+	// Per-view admission cost, computed ONCE. BatchBytesPerView is a pure function of
+	// (view dimensions, decode-cache size, retained candidate count), none of which
+	// move inside this partition, yet the BFS below asks for it O(views x degree)
+	// times -- every neighbour of every queue entry, and the queue holds duplicates.
+	// Hoisting it also removes the double call this loop used to make for `v`.
+	std::vector<uint64_t> viewBytes(numViews, 0);
+	for (size_t v = 0; v < numViews; ++v)
+		viewBytes[v] = BatchBytesPerView((uint32_t)v);
+
 	// largest single reference-view neighbourhood (floors the budget), and the whole
 	// streamed set (lets the budget snap to a single batch when it genuinely fits)
 	uint64_t maxNeighbourhoodBytes = 0, totalStreamBytes = 0;
 	for (size_t v = 0; v < numViews; ++v) {
 		if (refViewNeighbors[v].empty())
 			continue;
-		totalStreamBytes += BatchBytesPerView((uint32_t)v);
-		uint64_t bytes = BatchBytesPerView((uint32_t)v);
+		totalStreamBytes += viewBytes[v];
+		uint64_t bytes = viewBytes[v];
 		for (uint32_t nb : refViewNeighbors[v])
-			bytes += BatchBytesPerView(nb);
+			bytes += viewBytes[nb];
 		if (bytes > maxNeighbourhoodBytes)
 			maxNeighbourhoodBytes = bytes;
 	}
 	streamBudgetBytes = ResolveStreamBudget(maxNeighbourhoodBytes, totalStreamBytes);
 
+	// Scratch shared by every batch instead of rebuilt per batch. `resident` used to
+	// be an unordered_set constructed inside the batch loop: one heap node per
+	// insert, rehashes as it grew, and an unordered iteration order that then had to
+	// be sorted. A flag array indexed by view is O(1) per test with no allocation at
+	// all, and `residentList` comes out already deduplicated so allViews needs only a
+	// sort of its own (kept, since the list is in BFS discovery order).
+	// clear() keeps capacity, so the whole partition allocates once.
 	std::vector<uint8_t> assigned(numViews, 0);
+	std::vector<uint8_t> resident(numViews, 0);
+	std::vector<uint32_t> residentList;
+	std::vector<uint32_t> queue;
+	residentList.reserve(numViews);
+	queue.reserve(numViews);
+	// Monotone re-seed cursor. `assigned` only ever goes 0->1, so once a view is
+	// taken it can never be a seed candidate again -- the drain handler below used to
+	// rescan that whole prefix (and re-walk its neighbour lists) on every drain, of
+	// which there is roughly one per admitted view. Selection is unchanged: still the
+	// lowest-indexed unassigned reference view that fits.
+	size_t scanFrom = 0;
 	for (size_t start = 0; start < numViews; ++start) {
 		if (assigned[start] || refViewNeighbors[start].empty())
 			continue;
 		ViewBatch batch;
-		std::unordered_set<uint32_t> resident;
+		// reset only what the previous batch touched
+		for (uint32_t v : residentList)
+			resident[v] = 0;
+		residentList.clear();
 		uint64_t residentBytes = 0;
-		std::vector<uint32_t> queue{ (uint32_t)start };
+		queue.clear();
+		queue.push_back((uint32_t)start);
 		size_t qi = 0;
 		while (true) {
 			if (qi >= queue.size()) {
@@ -2311,13 +2395,15 @@ void MeshRefine::BuildViewBatches()
 				// view that still fits and keep filling. Lowest-indexed, not nearest,
 				// so the partition stays deterministic.
 				bool seeded = false;
-				for (size_t v2 = 0; v2 < numViews; ++v2) {
+				while (scanFrom < numViews && (assigned[scanFrom] || refViewNeighbors[scanFrom].empty()))
+					++scanFrom;
+				for (size_t v2 = scanFrom; v2 < numViews; ++v2) {
 					if (assigned[v2] || refViewNeighbors[v2].empty())
 						continue;
-					uint64_t seedBytes = resident.count((uint32_t)v2) ? 0 : BatchBytesPerView((uint32_t)v2);
+					uint64_t seedBytes = resident[v2] ? 0 : viewBytes[v2];
 					for (uint32_t nb : refViewNeighbors[v2])
-						if (nb != (uint32_t)v2 && !resident.count(nb))
-							seedBytes += BatchBytesPerView(nb);
+						if (nb != (uint32_t)v2 && !resident[nb])
+							seedBytes += viewBytes[nb];
 					if (!batch.refViews.empty() && residentBytes + seedBytes > streamBudgetBytes)
 						continue;
 					queue.push_back((uint32_t)v2);
@@ -2331,10 +2417,10 @@ void MeshRefine::BuildViewBatches()
 			if (assigned[v])
 				continue;
 			// cost of admitting v = v itself plus any neighbour not already resident
-			uint64_t addBytes = resident.count(v) ? 0 : BatchBytesPerView(v);
+			uint64_t addBytes = resident[v] ? 0 : viewBytes[v];
 			for (uint32_t nb : refViewNeighbors[v])
-				if (nb != v && !resident.count(nb))
-					addBytes += BatchBytesPerView(nb);
+				if (nb != v && !resident[nb])
+					addBytes += viewBytes[nb];
 			// Skip a view that would blow the budget, but KEEP SCANNING rather than
 			// closing the batch. Breaking here abandoned the rest of the queue, and
 			// those views then formed their own tiny batches -- a 22-batch partition
@@ -2348,18 +2434,26 @@ void MeshRefine::BuildViewBatches()
 				continue;
 			assigned[v] = 1;
 			batch.refViews.push_back(v);
-			resident.insert(v);
+			if (!resident[v]) {
+				resident[v] = 1;
+				residentList.push_back(v);
+			}
 			for (uint32_t nb : refViewNeighbors[v]) {
-				resident.insert(nb);
+				if (!resident[nb]) {
+					resident[nb] = 1;
+					residentList.push_back(nb);
+				}
 				if (!assigned[nb])
 					queue.push_back(nb);
 			}
 			residentBytes += addBytes;
 		}
 		if (!batch.refViews.empty()) {
-			batch.allViews.assign(resident.begin(), resident.end());
-			// Deterministic order. allViews: the BFS/hash-set order is not stable
-			// across runs. refViews: sorting makes the SINGLE-BATCH case walk the
+			batch.allViews.assign(residentList.begin(), residentList.end());
+			// Deterministic order. allViews: the BFS discovery order is not the
+			// ascending order downstream residency expects (and before this was a
+			// vector it was hash-set order, which was not even stable across runs).
+			// refViews: sorting makes the SINGLE-BATCH case walk the
 			// reference views in exactly the ascending order the non-streamed loop
 			// uses, so the parity control differs from it in nothing but where
 			// ProjectMesh is dispatched from. Ordering within a batch does not
@@ -2385,10 +2479,9 @@ void MeshRefine::BuildViewBatches()
 	// called exactly once per ScoreMesh over every view, which is precisely what
 	// the non-streamed path does in ListCameraFaces. Log it so a "streaming is
 	// slower" measurement can always be attributed to batching or ruled out.
-	uint64_t totalBytes = 0;
-	for (size_t v = 0; v < numViews; ++v)
-		if (!refViewNeighbors[v].empty())
-			totalBytes += BatchBytesPerView((uint32_t)v);
+	// totalStreamBytes is already exactly this sum (see the sizing loop above), so
+	// there is no need to re-walk every view and re-derive its bytes for the log.
+	const uint64_t totalBytes = totalStreamBytes;
 	constexpr double GBd = 1024.0 * 1024.0 * 1024.0;
 	DEBUG_EXTRA("view-stream: %zu batch(es) over %zu views, %.2f GB streamed planes total%s",
 		viewBatches.size(), numViews, totalBytes / GBd,
@@ -6412,10 +6505,14 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		float* __restrict rowMean = ringMean.data() + s;
 		float* __restrict rowVarB = ringVarB.data() + s;
 		float* __restrict rowValid = ringValid.data() + s;
+		// InvS/Zovb/Mean/Valid are box-summed over the window in emitRow, so
+		// out-of-mask and out-of-border entries must read as zero. VarB is not:
+		// emitRow reads varBRow[i] only under the same `mask[rOut*cols+i]` test
+		// that guards the write below, for the same row, so every entry it reads
+		// was written this pass. Zeroing it was a whole cols-wide fill per row.
 		memset(rowInvS, 0, plane * sizeof(float));
 		memset(rowZovb, 0, plane * sizeof(float));
 		memset(rowMean, 0, plane * sizeof(float));
-		memset(rowVarB, 0, plane * sizeof(float));
 		memset(rowValid, 0, plane * sizeof(float));
 
 		const uint8_t* __restrict maskRow = &mask[(size_t)r * cols];

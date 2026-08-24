@@ -5369,10 +5369,23 @@ static inline float SurfaceVariation3x3(double a, double b, double c, double d, 
 // "spray"/fuzz on low-overlap edges (which has a much larger neighbor distance)
 // is cut. Only the HIGH (sparse) side is removed so dense regions are kept.
 // Returns the number of points removed. No-op when stddevMul <= 0.
-static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stddevMul)
+// stddevMul     : GLOBAL test -- sparse relative to the whole cloud. Catches bulk spray that
+//                 sits well outside the surface (the sub-surface points that deform meshes).
+// localStddevMul: LOCAL test -- sparse relative to its own neighbourhood. Catches fringe haze
+//                 detached from a dense edge, and ALSO removes genuinely sparse legitimate
+//                 surfaces such as water, whose nearest neighbours are the dense shore around
+//                 them. <=0 disables it and leaves the global test running.
+// outRemovedGlobal/outRemovedLocal: which test claimed each point, so the caller can log the
+//                 split. Without it the two are indistinguishable in the output and there is
+//                 no way to tell whether a loss is bulk spray or a locally-sparse real surface.
+static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stddevMul,
+	float localStddevMul, size_t* outRemovedGlobal = nullptr, size_t* outRemovedLocal = nullptr)
 {
 	const size_t n = pc.NumPoints();
-	if (stddevMul <= 0.f || n == 0 || (size_t)(k + 1) >= n)
+	if (outRemovedGlobal) *outRemovedGlobal = 0;
+	if (outRemovedLocal)  *outRemovedLocal  = 0;
+	// Both tests off -> nothing to do. Either one alone is a valid configuration.
+	if ((stddevMul <= 0.f && localStddevMul <= 0.f) || n == 0 || (size_t)(k + 1) >= n)
 		return 0;
 
 	using namespace nanoflann;
@@ -5421,7 +5434,9 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 	double var = 0.0;
 	for (size_t i = 0; i < n; ++i) { const double d = (double)meanDist[i] - mean; var += d * d; }
 	var /= (double)n;
-	const float globalThr = (float)(mean + (double)stddevMul * std::sqrt(var));
+	// FLT_MAX when the global test is off, so the gate below never fires.
+	const float globalThr = (stddevMul > 0.f)
+		? (float)(mean + (double)stddevMul * std::sqrt(var)) : FLT_MAX;
 
 	// Local (surface-following) outlier test: compare each point's neighbor
 	// distance against the mean+stddev of ITS OWN neighborhood rather than the
@@ -5435,12 +5450,14 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 	// extreme) and the bulk spray (globally extreme) both go. The test NEVER
 	// consults view count, so nMinViewsFuse=2 is fully respected.
 	std::vector<uint8_t> outlier(n, 0);
+	size_t nGlobal = 0, nLocal = 0;
 #ifdef DENSE_USE_OPENMP
-#pragma omp parallel for schedule(static, 1024)
+#pragma omp parallel for schedule(static, 1024) reduction(+:nGlobal,nLocal)
 #endif
 	for (int64_t i = 0; i < (int64_t)n; ++i) {
 		// global gate first (cheap, no neighborhood stats needed)
-		if (meanDist[i] > globalThr) { outlier[i] = 1; continue; }
+		if (meanDist[i] > globalThr) { outlier[i] = 1; ++nGlobal; continue; }
+		if (localStddevMul <= 0.f) continue;   // local test disabled
 		// reuse the neighbor list gathered in pass 1 (identical to re-querying the tree)
 		const uint32_t* __restrict pn = nbrIdx.data() + (size_t)i * (size_t)kq;
 		// local mean+std of the neighbors' own neighbor-distance
@@ -5460,11 +5477,14 @@ static size_t FilterPointCloudDensity(PointCloudStreaming& pc, int k, float stdd
 			lvar += d * d;
 		}
 		lvar /= (double)cnt;
-		const double lthr = lmean + (double)stddevMul * std::sqrt(lvar);
+		const double lthr = lmean + (double)localStddevMul * std::sqrt(lvar);
 		// high (sparse) side only: a point sparser than its neighborhood is fuzz
-		if ((double)meanDist[i] > lthr)
-			outlier[i] = 1;
+		if ((double)meanDist[i] > lthr) {
+			outlier[i] = 1; ++nLocal;
+		}
 	}
+	if (outRemovedGlobal) *outRemovedGlobal = nGlobal;
+	if (outRemovedLocal)  *outRemovedLocal  = nLocal;
 
 	// compact every parallel stream in lockstep, keeping only inliers.
 	// A serial prefix pass assigns each survivor its destination point index and
@@ -5722,7 +5742,14 @@ static size_t FilterRedundantLowViewPoints(PointCloudStreaming& pc, unsigned min
 				//   1D ray smear    -> variation ~0 but linearity ~1  (depth error along the
 				//                      viewing ray -- the "spray beneath the surface")
 				// A genuine thin/planar sparse surface is low on BOTH and is kept.
-				if (variation > planarityMax) {
+				// BUG FIX (2026-08-23): the `planarityMax > 0.f` guard was missing, so the
+				// documented "0 - disable (keep all unsupported min-view points)" did the
+				// exact opposite. Surface variation is >= 0 by construction, so at 0 the test
+				// `variation > 0` is true for essentially every candidate. MEASURED on
+				// RichmondHistoric: setting it to 0 to disable it removed ALL 15,501,359
+				// candidates -- 30.17% of the cloud -- with `kept 0` in the diag.
+				// The linearity branch below always had this guard; planarity did not.
+				if (planarityMax > 0.f && variation > planarityMax) {
 					outlier[i] = 1; // volumetric floating fuzz -> remove
 					++dPlanarRemoved;
 				} else if (linearityMin > 0.f && linearity > linearityMin) {
@@ -5979,13 +6006,25 @@ bool Scene::DenseReconstruction(int nFusionMode, bool bCrop2ROI, float fBorderRO
 	// density-based statistical outlier removal: cull the sparse "spray"/fuzz on
 	// low-overlap edges using local 3D neighbor density (dataset-adaptive; dense
 	// surfaces are essentially untouched). Disabled when fOutlierFilterStdDev<=0.
-	if (!pointcloud.IsEmpty() && OPTDENSE::fOutlierFilterStdDev > 0.f) {
+	if (!pointcloud.IsEmpty() &&
+		(OPTDENSE::fOutlierFilterStdDev > 0.f || OPTDENSE::fOutlierFilterLocalStdDev > 0.f)) {
 		TD_TIMER_START();
 		const size_t numBefore = pointcloud.NumPoints();
-		const size_t removed = FilterPointCloudDensity(pointcloud, (int)OPTDENSE::nOutlierFilterKNN, OPTDENSE::fOutlierFilterStdDev);
-		VERBOSE("Density outlier filter: %u/%u points removed (%.2f%%%%) (%s)",
+		size_t remGlobal = 0, remLocal = 0;
+		const size_t removed = FilterPointCloudDensity(pointcloud,
+			(int)OPTDENSE::nOutlierFilterKNN,
+			OPTDENSE::fOutlierFilterStdDev, OPTDENSE::fOutlierFilterLocalStdDev,
+			&remGlobal, &remLocal);
+		// The split is the whole point of reporting: GLOBAL removals are bulk spray sitting
+		// away from the surface, LOCAL removals are points sparser than their surroundings --
+		// which includes water and any other genuinely thin surface. A run that loses water
+		// shows it as a large local count with a small global one.
+		VERBOSE("Density outlier filter: %u/%u points removed (%.2f%%%%)"
+			" -- global(>%.3g sd) %u, local(>%.3g sd) %u (%s)",
 			(unsigned)removed, (unsigned)numBefore,
 			numBefore ? 100.0 * (double)removed / (double)numBefore : 0.0,
+			(double)OPTDENSE::fOutlierFilterStdDev, (unsigned)remGlobal,
+			(double)OPTDENSE::fOutlierFilterLocalStdDev, (unsigned)remLocal,
 			TD_TIMER_GET_FMT().c_str());
 	}
 
@@ -6864,6 +6903,10 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 {
 	TD_TIMER_STARTD();
 
+	// nothing to filter -- and every sized allocation below asserts on a zero size
+	if (pointcloud.IsEmpty())
+		return;
+
 	// Build the octree over a uint32-indexed point array. PointCloud::PointArr's index is
 	// 64-bit (size_t), which doubles the octree's per-point index storage (m_indices, read
 	// on every leaf visit); the cloud never exceeds 2^32 points, so 32-bit indices halve it
@@ -6871,22 +6914,45 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	// the shared PointCloud class is untouched.
 	typedef CLISTDEF0IDX(PointCloud::Point, uint32_t) PointArr32;
 	typedef TOctree<PointArr32,PointCloud::Point::Type,3,uint32_t> Octree;
-	// Lock-free visibility collector: carries only per-query state (no shared
-	// mutable members, no critical section) and accumulates into the shared
-	// visibility array with a single atomic add. Because nothing is shared
-	// between concurrent (point,view) queries, they all run in parallel without
-	// serializing on a per-view lock; the atomic also removes the latent
-	// lost-update race the previous code had across different views.
-	struct Collector {
+	// Per-view constants: the part of a (point,view) query that depends only on the view.
+	// SHARED read-only by every worker (24B/view, so tens of KB even for the largest scenes),
+	// which is what replaces the old per-thread array of one full collector per view. That
+	// array was indexed by a random view id once per (point,view) pair -- ~nPoints*nViews
+	// times -- so every iteration wrote ~120 bytes at a random offset inside a working set of
+	// numViews*~230B (well past L1 for any real scene), and every thread first paid a
+	// numViews-long construction pass costing a tan, a cos, a sin and a divide apiece.
+	struct ViewConst {
+		float ox, oy, oz;  // camera center == cone apex
+		float angle;       // cone half-angle (reference path only, see Intersects)
+		float tanAngle;    // tan(half-angle); the capsule radius is derived from it
+		float cosAngleSq;  // == TConeIntersect::cosAngleSq, the Classify half-angle constant
+	};
+
+	// Lock-free visibility query: ONE instance per worker thread, on the stack, reused for
+	// every (point,view) pair that thread handles. It carries only per-query state (no shared
+	// mutable members, no critical section) and accumulates into the shared visibility array
+	// with a single atomic add. Because nothing is shared between concurrent queries they all
+	// run in parallel without per-view locking; the atomic also removes the latent lost-update
+	// race the pre-atomic code had across different views.
+	//
+	// Being a single hot object rather than one slot of a large pool is what makes the packed
+	// __m128 form below possible at all: the separating-axis state is preloaded into vectors
+	// once per query (and is naturally 16-byte aligned as a stack local), then Intersects
+	// consumes it with two branchless SIMD chains. That is the right place to spend the
+	// effort -- the cone is one pixel wide (its half-angle is FOV/width) but reaches from the
+	// camera to just past the point, so each query needles through the tree and calls
+	// Intersects on many more cells than the whole sweep makes queries per point.
+	struct Query {
 		typedef Octree::IDX_TYPE IDX;
 		typedef PointCloud::Point::Type Real;
 		typedef TCone<Real,3> Cone;
 		typedef TSphere<Real,3> Sphere;
 		typedef TConeIntersect<Real,3> ConeIntersect;
+		typedef Cone::POINT EVec;
 
-		Cone cone;
-		const ConeIntersect coneIntersect;
-		const PointCloudStreaming& pointcloud;
+		// --- fixed for the whole sweep ---
+		const ViewConst* const __restrict viewConsts;
+		const uint32_t* const __restrict pViewSizes; // pointViewsSizes.data(); see emit
 		int* const __restrict visibility;
 		// leaf-ordered SoA positions (aligned with the octree index array) so the classify
 		// loop reads positions sequentially instead of gathering scattered points
@@ -6894,101 +6960,167 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 		const float* const __restrict pLeafY;
 		const float* const __restrict pLeafZ;
 		const IDX* const __restrict pIdxBase; // octree index array base; a leaf's idices offset into this
-		PointCloud::Index idxPoint;
-		Real distance;
+		// --- per point (hoisted out of the view loop) ---
 		int weight;
-		const Real tanAngle; // cone half-angle tangent (per view); capsule radius = maxHeight*tanAngle
-		// separating-axis data (rebuilt per point/view) for the cone-axis capsule vs octree cell box
-		Real capRadius;
-		Real m_axN[6][3];
-		Real m_axInv[6];
-		Real m_axL1[6];
-		Real m_segLo[6];
-		Real m_segHi[6];
+		// --- per (point,view) ---
+		Real apexX, apexY, apexZ; // cone apex (copied from the view constants)
+		Real dirX, dirY, dirZ;    // cone axis, unit length
+		Real distance;    // |X - apex|
+		Real maxH;        // cone max height == distance*thMaxDepth (min height is always 0)
+		Real angle, cosSq;
+		// Separating-axis state, preloaded as vectors. Lanes 0..2 are the three axes of a
+		// group, lane 3 is inert (threshold +inf, everything else 0, so it can never reject).
+		__m128 vDir;                            // (dx,dy,dz,0), also the cross-product operand
+		__m128 vExtCross;                       // |N|_1 per cross axis (scaled by the cell radius at test time)
+		__m128 vLoCross, vHiCross, vThrCross;
+		__m128 vLoBox,   vHiBox,   vThrBox;
 
-		Collector(const Cone::RAY& ray, Real angle, const PointCloudStreaming& _pointcloud, int* __restrict _visibility,
-			const float* __restrict _pLeafX, const float* __restrict _pLeafY, const float* __restrict _pLeafZ, const IDX* __restrict _pIdxBase)
-			: cone(ray, angle), coneIntersect(cone), pointcloud(_pointcloud), visibility(_visibility),
-			  pLeafX(_pLeafX), pLeafY(_pLeafY), pLeafZ(_pLeafZ), pIdxBase(_pIdxBase), tanAngle(std::tan(angle)) {}
-		inline void Init(PointCloud::Index _idxPoint, const PointCloud::Point& X, int _weight) {
+		Query(const ViewConst* __restrict _viewConsts, const uint32_t* __restrict _pViewSizes,
+			int* __restrict _visibility, const float* __restrict _pLeafX, const float* __restrict _pLeafY,
+			const float* __restrict _pLeafZ, const IDX* __restrict _pIdxBase)
+			: viewConsts(_viewConsts), pViewSizes(_pViewSizes), visibility(_visibility),
+			  pLeafX(_pLeafX), pLeafY(_pLeafY), pLeafZ(_pLeafZ), pIdxBase(_pIdxBase), weight(0) {}
+
+		// per-point setup: the weight is the point's view count, identical for all of its
+		// views, so it is set once instead of once per (point,view) pair
+		inline void InitPoint(int _weight) { weight = _weight; }
+
+		inline void InitView(uint32_t idxView, const PointCloud::Point& X) {
 			const Real thMaxDepth(1.02f);
-			idxPoint = _idxPoint;
-			const PointCloud::Point::EVec D((PointCloud::Point::EVec&)X-cone.ray.m_pOrig);
+			const ViewConst& vc = viewConsts[idxView];
+			apexX = vc.ox; apexY = vc.oy; apexZ = vc.oz;
+			angle = vc.angle; cosSq = vc.cosAngleSq;
+			const EVec D((const EVec&)X - EVec(apexX, apexY, apexZ));
 			distance = D.norm();
-			cone.ray.m_vDir = D/distance;
-			cone.maxHeight = MaxDepthDifference(distance, thMaxDepth);
-			weight = _weight;
-			BuildSepAxes();
+			const EVec d(D/distance);
+			dirX = d.x(); dirY = d.y(); dirZ = d.z();
+			maxH = MaxDepthDifference(distance, thMaxDepth);
+			BuildSepAxes(vc.tanAngle);
 		}
+
+		// (x,y,z,w) -> (y,z,x,w) and (x,y,z,w) -> (z,x,y,w): the two shuffles a cross product needs
+		static inline __m128 YZXW(__m128 v) { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(3,0,2,1)); }
+		static inline __m128 ZXYW(__m128 v) { return _mm_shuffle_ps(v, v, _MM_SHUFFLE(3,1,0,2)); }
+		// a x b in lanes 0..2; lane 3 is 0 whenever both inputs have lane 3 == 0
+		static inline __m128 Cross(__m128 a, __m128 b) {
+			return _mm_sub_ps(_mm_mul_ps(YZXW(a), ZXYW(b)), _mm_mul_ps(ZXYW(a), YZXW(b)));
+		}
+
 		// Build the capsule (cone-axis segment + capRadius) that conservatively encloses the finite
 		// cone; Intersects then rejects a cell only when a projection proves it lies farther than
 		// capRadius from the segment (a lower bound on true distance, so no in-cone point is ever
 		// pruned -> removed set stays bit-identical to the exact cone-sphere filter).
-		inline void BuildSepAxes() {
-			const Real ox(cone.ray.m_pOrig.x()), oy(cone.ray.m_pOrig.y()), oz(cone.ray.m_pOrig.z());
-			const Real dx(cone.ray.m_vDir.x()), dy(cone.ray.m_vDir.y()), dz(cone.ray.m_vDir.z());
-			const Real h0(cone.minHeight), h1(cone.maxHeight);
-			const Real Ax(ox+dx*h0), Ay(oy+dy*h0), Az(oz+dz*h0);
-			const Real Bx(ox+dx*h1), By(oy+dy*h1), Bz(oz+dz*h1);
-			// 3 (axis x box-face) cross products first (reject thin cones laterally), then 3 box faces
-			const Real N[6][3] = {
-				{ Real(0), dz, -dy }, { -dz, Real(0), dx }, { dy, -dx, Real(0) },
-				{ Real(1), Real(0), Real(0) }, { Real(0), Real(1), Real(0) }, { Real(0), Real(0), Real(1) }
-			};
-			for (int k=0; k<6; ++k) {
-				const Real nx(N[k][0]), ny(N[k][1]), nz(N[k][2]);
-				m_axN[k][0]=nx; m_axN[k][1]=ny; m_axN[k][2]=nz;
-				m_axL1[k] = std::abs(nx)+std::abs(ny)+std::abs(nz);
-				const Real nn(std::sqrt(nx*nx+ny*ny+nz*nz));
-				m_axInv[k] = (nn > Real(1e-12)) ? (Real(1)/nn) : Real(0);
-				const Real pA(Ax*nx+Ay*ny+Az*nz), pB(Bx*nx+By*ny+Bz*nz);
-				m_segLo[k] = pA<pB?pA:pB;
-				m_segHi[k] = pA<pB?pB:pA;
-			}
+		//
+		// This runs once per (point,view) -- once per octree query -- and carries none of the setup
+		// the generic 6-axis form did:
+		//  - the segment starts exactly at the apex. cone.minHeight was 0 for every query ever made
+		//    here (TCone defaults it and nothing ever assigned it), so A = apex with no multiply-add;
+		//  - the 3 box-face axes are constant-folded: unit normals mean |N| = |N|_1 = 1, the
+		//    projection of a point onto e_x is just its x, and the threshold is capRadius^2 flat;
+		//  - the per-axis threshold is stored SQUARED and pre-scaled by |N|^2, removing all 6 sqrt
+		//    and all 6 divides. Intersects compares gap^2 against it rather than gap/|N| against
+		//    capRadius: both sides of `gap/|N| > capRadius` are non-negative, so squaring is an
+		//    equivalence, and the test stays exactly scale-invariant in |N|;
+		//  - the 3 cross-product axes N = d x e_k are never materialized. Their projection of a
+		//    point c is exactly the cross product c x d, and of the segment ends exactly A x d and
+		//    B x d, so all of it is done with SIMD cross products.
+		inline void BuildSepAxes(Real tanAngle) {
+			const Real ax(apexX), ay(apexY), az(apexZ);
+			const Real dx(dirX), dy(dirY), dz(dirZ);
+			const Real h1(maxH);
+			const Real Bx(ax+dx*h1), By(ay+dy*h1), Bz(az+dz*h1);
 			// capsule radius = max cone radius over the segment, plus small FP slack (keeps the prune conservative)
-			capRadius = h1*tanAngle*Real(1.01) + h1*Real(1e-4);
+			const Real capRadius(h1*tanAngle*Real(1.01) + h1*Real(1e-4));
+			const Real capSq(capRadius*capRadius);
+			const Real kNever(std::numeric_limits<Real>::infinity());
+			const __m128 vA = _mm_setr_ps(ax, ay, az, Real(0));
+			const __m128 vB = _mm_setr_ps(Bx, By, Bz, Real(0));
+			vDir = _mm_setr_ps(dx, dy, dz, Real(0));
+			// cross-product axes N0 = d x e_x = (0,dz,-dy), N1 = (-dz,0,dx), N2 = (dy,-dx,0).
+			// Both endpoints are projected separately and min/max'd, exactly as before: they are
+			// equal in exact arithmetic (N is perpendicular to the segment) but not in float, and
+			// keeping both preserves that rounding interval rather than tightening the prune.
+			const __m128 pA(Cross(vA, vDir)), pB(Cross(vB, vDir));
+			vLoCross = _mm_min_ps(pA, pB);
+			vHiCross = _mm_max_ps(pA, pB);
+			vExtCross = _mm_setr_ps(std::abs(dz)+std::abs(dy), std::abs(dz)+std::abs(dx), std::abs(dy)+std::abs(dx), Real(0));
+			// A cross-product axis degenerates to the zero vector when the view ray is box-axis
+			// aligned; +inf then disables it, exactly as the old 1/|N| == 0 did (never reject, let
+			// the exact per-point cone test decide). Keeping the guard on |N|^2 also keeps
+			// capSq*|N|^2 clear of the denormal range where it could flush to zero and over-prune.
+			// Lane 3's |N|^2 is 0, so the same blend makes it inert for free.
+			const __m128 vnSq = _mm_setr_ps(dz*dz+dy*dy, dz*dz+dx*dx, dy*dy+dx*dx, Real(0));
+			const __m128 ok = _mm_cmpgt_ps(vnSq, _mm_set1_ps(Real(1e-12)));
+			vThrCross = _mm_or_ps(_mm_and_ps(ok, _mm_mul_ps(_mm_set1_ps(capSq), vnSq)),
+								  _mm_andnot_ps(ok, _mm_set1_ps(kNever)));
+			// box-face axes e_x/e_y/e_z: the segment projections are just the endpoint coordinates
+			vLoBox = _mm_min_ps(vA, vB);
+			vHiBox = _mm_max_ps(vA, vB);
+			vThrBox = _mm_setr_ps(capSq, capSq, capSq, kNever);
 		}
+		// One separating-axis pass over both groups. Per axis, the gap between the cell box's
+		// projection [cP-ext, cP+ext] and the segment's [lo,hi] is max(0, max(lo-boxHi, boxLo-hi))
+		// -- the two one-sided cases of the old branchy form are mutually exclusive, so the max
+		// reproduces it value for value -- and the cell is rejected when gap^2 exceeds the
+		// pre-scaled threshold. Both groups are three lanes of the same shape, so this is two
+		// independent SIMD chains and ONE branch, in place of six scalar tests each with its own
+		// unpredictable branch, and it needs no stored axis normals.
 		inline bool Intersects(const Octree::POINT_TYPE& center, Octree::Type radius) const {
 		#if PCF_CONE_AABB
-			const Real cx(center.x()), cy(center.y()), cz(center.z());
-			for (int k=0; k<6; ++k) {
-				const Real cP(cx*m_axN[k][0]+cy*m_axN[k][1]+cz*m_axN[k][2]);
-				const Real boxExt(radius*m_axL1[k]);
-				const Real boxLo(cP-boxExt), boxHi(cP+boxExt);
-				const Real g((m_segLo[k] > boxHi) ? (m_segLo[k]-boxHi) : ((boxLo > m_segHi[k]) ? (boxLo-m_segHi[k]) : Real(0)));
-				if (g*m_axInv[k] > capRadius)
-					return false;
-			}
-			return true;
+			// built from the scalar accessors rather than a wide load: POINT_TYPE is a 12-byte
+			// Vector3f, and for a leaf it is a temporary, so a 16-byte load could read past it
+			const __m128 c = _mm_setr_ps(center.x(), center.y(), center.z(), Real(0));
+			const __m128 vRad = _mm_set1_ps(radius);
+			const __m128 zero = _mm_setzero_ps();
+			// cross-product axes: the three projections of c are exactly c x d
+			const __m128 cP = Cross(c, vDir);
+			const __m128 ext = _mm_mul_ps(vRad, vExtCross);
+			const __m128 gC = _mm_max_ps(zero, _mm_max_ps(_mm_sub_ps(vLoCross, _mm_add_ps(cP, ext)),
+															_mm_sub_ps(_mm_sub_ps(cP, ext), vHiCross)));
+			// box-face axes: unit normals reduce this to a plain per-coordinate AABB overlap test
+			const __m128 gB = _mm_max_ps(zero, _mm_max_ps(_mm_sub_ps(vLoBox, _mm_add_ps(c, vRad)),
+															_mm_sub_ps(_mm_sub_ps(c, vRad), vHiBox)));
+			const __m128 rej = _mm_or_ps(_mm_cmpgt_ps(_mm_mul_ps(gC, gC), vThrCross),
+										 _mm_cmpgt_ps(_mm_mul_ps(gB, gB), vThrBox));
+			return _mm_movemask_ps(rej) == 0;
 		#else
-			return coneIntersect(Sphere(center, radius*Real(SQRT_3)));
+			// reference path: the exact cone-vs-boundingsphere test. The cone and its angle
+			// derivatives are rebuilt per call now that they are no longer kept per view -- this
+			// path exists to validate the prune above, not to be fast.
+			const Cone cone(Cone::RAY(EVec(apexX, apexY, apexZ), EVec(dirX, dirY, dirZ)), angle, Real(0), maxH);
+			return ConeIntersect(cone)(Sphere(center, radius*Real(SQRT_3)));
 		#endif
 		}
 		inline void operator () (const IDX* __restrict idices, IDX size) const {
 			// Hoist every per-cone constant into a local so the inner loop reads no
-			// memory reachable through the cone / coneIntersect references (the
-			// atomic update below is a compiler memory barrier that would otherwise
-			// reload them every iteration), then run the inlined cone Classify
-			// (axis projection + half-angle test) four points at a time with SSE2.
+			// memory reachable through this object (the atomic update below is a
+			// compiler memory barrier that would otherwise reload them every
+			// iteration), then run the inlined cone Classify (axis projection +
+			// half-angle test) four points at a time with SSE2.
 			// Most leaf points fall outside the cone, so the single movemask branch
 			// keeps the common path branchless; only the rare VISIBLE lanes take the
 			// scalar tail (depth-similarity test + atomic accumulation).
-			const Real ax(cone.ray.m_pOrig.x()), ay(cone.ray.m_pOrig.y()), az(cone.ray.m_pOrig.z());
-			const Real dx(cone.ray.m_vDir.x()), dy(cone.ray.m_vDir.y()), dz(cone.ray.m_vDir.z());
-			const Real minH(cone.minHeight);
-			const Real maxH(cone.maxHeight);
-			const Real cosSq(coneIntersect.cosAngleSq);
+			const Real ax(apexX), ay(apexY), az(apexZ);
+			const Real dx(dirX), dy(dirY), dz(dirZ);
+			const Real maxHeight(maxH);
+			const Real cosAngleSq(cosSq);
 			const Real refDist(distance);
 			const Real thSimilar(0.01f);
 			const int w(weight);
 			int* const __restrict vis = visibility;
+			// raw pointViewsSizes base instead of pointcloud.ViewsStreamSize(): that accessor
+			// re-tests the vector's emptiness on every visible point, and the atomic below stops
+			// the compiler hoisting the test out. Reached only when the point has views at all,
+			// so the array is non-empty whenever this runs.
+			const uint32_t* const __restrict vsz = pViewSizes;
+			ASSERT(vsz != NULL);
 
 			// commit one VISIBLE point (rare path): depth-similarity reject, then a
 			// lock-free signed accumulation into the shared visibility array.
 			const auto emit = [&](const uint32_t idx, const float t) {
 				if (IsDepthSimilar(refDist, t, thSimilar))
 					return;
-				const int delta = (t > refDist) ? (int)pointcloud.ViewsStreamSize(idx) : -w;
+				const int delta = (t > refDist) ? (int)vsz[idx] : -w;
 			#ifdef DENSE_USE_OPENMP
 				_InterlockedExchangeAdd(reinterpret_cast<volatile long*>(vis + idx), (long)delta);
 			#else
@@ -6998,7 +7130,8 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 
 			const __m128 vAx = _mm_set1_ps(ax), vAy = _mm_set1_ps(ay), vAz = _mm_set1_ps(az);
 			const __m128 vDx = _mm_set1_ps(dx), vDy = _mm_set1_ps(dy), vDz = _mm_set1_ps(dz);
-			const __m128 vMinH = _mm_set1_ps(minH), vMaxH = _mm_set1_ps(maxH), vCosSq = _mm_set1_ps(cosSq);
+			// min height is 0 for every query, so the lower bound is a compare against zero
+			const __m128 vMinH = _mm_setzero_ps(), vMaxH = _mm_set1_ps(maxHeight), vCosSq = _mm_set1_ps(cosAngleSq);
 
 			// leaf-ordered positions: this leaf's points are contiguous at [base, base+size),
 			// so positions load sequentially (1-2 cache lines) instead of 12 scattered loads.
@@ -7033,14 +7166,20 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 			for (; k < size; ++k) {
 				const float Dx(lx[k] - ax), Dy(ly[k] - ay), Dz(lz[k] - az);
 				const float t(dx*Dx + dy*Dy + dz*Dz);
-				if (t <= minH || t > maxH)
+				if (t <= Real(0) || t > maxHeight)
 					continue;
-				if (t*t <= cosSq * (Dx*Dx + Dy*Dy + Dz*Dz))
+				if (t*t <= cosAngleSq * (Dx*Dx + Dy*Dy + Dz*Dz))
 					continue;
 				emit(idices[k], t);
 			}
 		}
 	};
+
+	// Declared BEFORE the octree scaffolding because it is the only thing here that has
+	// to survive it: the compaction at the end reads these scores, everything else built
+	// below is scratch and is released as soon as the sweep finishes.
+	IntArr visibility(pointcloud.GetSize()); visibility.Memset(0);
+	int* const __restrict pVisibility = visibility.Begin();
 
 	// gather points into a contiguous array for the octree (streaming cloud
 	// stores XYZ as a flat float stream, so build the typed array once)
@@ -7057,15 +7196,18 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	Octree octree(ptsForOctree, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
 		return size > 128;
 	});
-	IntArr visibility(pointcloud.GetSize()); visibility.Memset(0);
-	int* const __restrict pVisibility = visibility.Begin();
 
 	// Build leaf-ordered SoA positions aligned with the octree's index array so the classify
 	// inner loop reads positions sequentially -- the profiled bottleneck was the scattered
 	// per-point position gather. Result-identical: same positions, same lane order, same math.
+	// FloatArr, not std::vector<float>: the sized vector ctor value-initializes, which is a
+	// serial 12 bytes/point zero-fill (~324MB on a 27M-point cloud) of memory the parallel
+	// loop below overwrites in full one statement later -- twice the write bandwidth, all of
+	// it on one thread, and it first-touches every page off the thread that will own it.
+	// FloatArr is cList<...,useConstruct=0>, so its sized ctor only allocates.
 	const Octree::IDXARR_TYPE& octIdx = octree.GetIndexArr();
 	const size_t nOctItems = octIdx.size();
-	std::vector<float> leafX(nOctItems), leafY(nOctItems), leafZ(nOctItems);
+	FloatArr leafX(nOctItems), leafY(nOctItems), leafZ(nOctItems);
 	{
 		const float* const __restrict pXYZsrc = pointcloud.pointsXYZ.data();
 		const Octree::IDX_TYPE* const __restrict pMI = octIdx.data();
@@ -7083,52 +7225,53 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	const float* const pLeafZ = leafZ.data();
 	const Octree::IDX_TYPE* const pIdxBase = octIdx.data();
 
-	// pre-compute each view's cone origin (camera center) and half-angle once;
-	// each (point,view) query then builds a private Collector from these, so the
-	// hot loop owns all its mutable state and needs no per-view locking.
+	// pre-compute every view-dependent constant exactly once, into one small read-only table
+	// shared by all workers. The camera direction the old code stored per view was dead: the
+	// cone axis is overwritten with the apex->point direction on every query, so the view's
+	// own optical axis was never read.
 	const size_t numViews(images.size());
-	std::vector<Ray3f> viewRays; viewRays.reserve(numViews);
-	std::vector<float> viewAngles; viewAngles.reserve(numViews);
+	std::vector<ViewConst> viewConsts; viewConsts.reserve(numViews);
 	FOREACH(idxView, images) {
 		const Image& image = images[idxView];
-		viewRays.emplace_back(Cast<float>(image.camera.C), Cast<float>(image.camera.Direction()));
-		viewAngles.push_back(float(image.ComputeFOV(0)/image.width));
+		const Point3f C(Cast<float>(image.camera.C));
+		const float angle(float(image.ComputeFOV(0)/image.width));
+		// cosAngleSq is computed exactly as TConeIntersect does, so the Classify test that
+		// consumes it is unchanged
+		const float cosAngle(COS(angle));
+		viewConsts.push_back(ViewConst{ C.x, C.y, C.z, angle, TAN(angle), cosAngle*cosAngle });
 	}
+	const ViewConst* const pViewConsts = viewConsts.data();
+	// raw base of the per-point view counts, read on the rare visible-point path in emit()
+	const uint32_t* const pViewSizes = pointcloud.pointViewsSizes.empty() ? NULL : pointcloud.pointViewsSizes.data();
 
-	// run all camera-point visibility intersections. Keep the parallel sweep over
-	// points (best load-balance), but give each worker thread its own array of
-	// per-view Collectors and reuse them: a Collector's cone half-angle and the
-	// angle-derived ConeIntersect constants depend ONLY on the view, so they are
-	// built once per (thread,view) and reused for every point that thread tests
-	// against that view, instead of being reconstructed for each (point,view) pair.
-	// Only the cheap per-point ray direction/distance is refreshed in Init().
+	// Run all camera-point visibility intersections. The sweep stays over points (best
+	// load-balance), but each worker now keeps a SINGLE Query object on its stack and reuses it
+	// for every (point,view) pair, reading that pair's view-dependent constants from the shared
+	// table above. Previously each worker built and held one full collector per view and indexed
+	// that pool by a random view id per pair, which meant ~120 bytes written at a random offset
+	// in a >L1 working set on every one of the ~nPoints*nViews iterations, ~119KB of stack per
+	// thread for the inline pool, and a numViews-long per-thread construction pass. The point's
+	// view count is now also set once per point instead of once per pair.
 	// Accumulation into the shared visibility array stays lock-free via the atomic.
 	Util::Progress progress(_T("Point visibility checks"), pointcloud.GetSize());
 	const int64_t numPoints = (int64_t)pointcloud.GetSize();
 	#ifdef DENSE_USE_OPENMP
 	#pragma omp parallel
 	{
-		// one Collector per view, indexed directly by view id. reserve() up front so
-		// the buffer never reallocates after construction: a Collector holds a
-		// ConeIntersect that references its own cone, so it must keep a stable address
-		// (never moved/copied once built). The inline capacity covers the usual
-		// few-hundred views with no heap allocation; larger counts spill to a single
-		// reserved heap buffer (still no relocation, since reserve == final size).
-		boost::container::small_vector<Collector, 512> pool;
-		pool.reserve(numViews);
-		for (size_t v = 0; v < numViews; ++v)
-			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
+		Query q(pViewConsts, pViewSizes, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
 		size_t progressBatch = 0; // batch the display-only counter: one contended atomic per 65536 pts, not per pt
 		#pragma omp for schedule(dynamic, 2048)
 		for (int64_t i = 0; i < numPoints; ++i) {
 			const PointCloud::Index idxPoint((PointCloud::Index)i);
-			const PointCloud::Point& X = pointcloud.Point(idxPoint);
 			const uint32_t* __restrict views = pointcloud.ViewsStream(idxPoint);
 			const size_t nViews = pointcloud.ViewsStreamSize(idxPoint);
-			for (size_t v = 0; v < nViews; ++v) {
-				Collector& c = pool[views[v]];
-				c.Init(idxPoint, X, (int)nViews);
-				octree.Collect(c, c);
+			if (nViews) {
+				const PointCloud::Point& X = pointcloud.Point(idxPoint);
+				q.InitPoint((int)nViews);
+				for (size_t v = 0; v < nViews; ++v) {
+					q.InitView(views[v], X);
+					octree.Collect(q, q);
+				}
 			}
 			if (++progressBatch == 65536) { progress += (int)progressBatch; progressBatch = 0; }
 		}
@@ -7137,18 +7280,17 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	}
 	#else
 	{
-		boost::container::small_vector<Collector, 512> pool;
-		pool.reserve(numViews);
-		for (size_t v = 0; v < numViews; ++v)
-			pool.emplace_back(viewRays[v], viewAngles[v], pointcloud, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
+		Query q(pViewConsts, pViewSizes, pVisibility, pLeafX, pLeafY, pLeafZ, pIdxBase);
 		for (PointCloud::Index idxPoint=0; idxPoint<(PointCloud::Index)numPoints; ++idxPoint) {
-			const PointCloud::Point& X = pointcloud.Point(idxPoint);
 			const uint32_t* __restrict views = pointcloud.ViewsStream(idxPoint);
 			const size_t nViews = pointcloud.ViewsStreamSize(idxPoint);
-			for (size_t v=0; v<nViews; ++v) {
-				Collector& c = pool[views[v]];
-				c.Init(idxPoint, X, (int)nViews);
-				octree.Collect(c, c);
+			if (nViews) {
+				const PointCloud::Point& X = pointcloud.Point(idxPoint);
+				q.InitPoint((int)nViews);
+				for (size_t v=0; v<nViews; ++v) {
+					q.InitView(views[v], X);
+					octree.Collect(q, q);
+				}
 			}
 			++progress;
 		}
@@ -7156,9 +7298,23 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	#endif
 	progress.close();
 
+	// Release the octree scaffolding NOW, before the compaction below reclaims the
+	// cloud's own buffers. This scratch is ~24 bytes/point (typed point array 12, the
+	// leaf-ordered SoA another 12) plus the octree's index array -- ~700MB on a 27M-point
+	// cloud -- and every shrink below needs a transient copy of what it KEEPS, so doing
+	// it while all of this is still resident would raise the peak by more than the
+	// compaction gives back. Nothing past this point reads them; pLeafX/pLeafY/pLeafZ,
+	// pIdxBase and octIdx are dead pointers from here on and must not be used again.
+	octree.Release();
+	ptsForOctree.Release();
+	leafX.Release();
+	leafY.Release();
+	leafZ.Release();
+
 	// filter points: single O(n) compaction pass (mid-array RemovePoint per cull
 	// is O(n) -> O(n^2) over the whole cloud). Keep visibility>thRemove, copying
-	// survivors down; view/weight offsets keep pointing into their original blobs.
+	// survivors down; the variable-length view/weight blobs are packed in the same
+	// pass and every buffer is then shrunk, so the removal actually returns memory.
 	const size_t numInitPoints(pointcloud.GetSize());
 	// Safety guard: if the threshold would remove more than maxRemoveFrac of the
 	// cloud it is almost certainly mis-set (too aggressive). Bail without touching
@@ -7186,7 +7342,46 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 		const bool hasVS(!pointcloud.pointViewsSizes.empty());
 		const bool hasWO(!pointcloud.pointWeightsOffsets.empty());
 		const bool hasWS(!pointcloud.pointWeightsSizes.empty());
-		size_t w = 0;
+
+		// PACK THE VIEW/WEIGHT BLOBS TOO (previously left whole, with survivors' offsets
+		// still indexing the original arrays). That was not merely wasted RAM: Save()
+		// serializes pointViewsMemory.size() verbatim (see PointCloud.h), so every culled
+		// point's view list was still WRITTEN INTO THE .mvs and carried on to the mesh
+		// stage -- up to the 50% removal cap of pure garbage.
+		//
+		// Packing in place is safe, and provably rather than by inspection: the blobs are
+		// always PACKED (offsets[i] == sum of sizes[0..i-1]) because every producer only
+		// ever appends -- AddViews/AddWeights, and both upstream filters rebuild them that
+		// way. Given packing, a survivor's destination offset (the sum of SURVIVING sizes
+		// before it) is <= its source offset (the sum of ALL sizes before it), so a forward
+		// copy can never overwrite bytes it has yet to read. The check below CONFIRMS the
+		// invariant instead of assuming it, and on failure falls back to the old
+		// leave-the-blob-alone behaviour rather than corrupting the streams.
+		const auto isPacked = [](const std::vector<uint32_t>& offs, const std::vector<uint32_t>& sizes, size_t np) {
+			if (offs.size() < np || sizes.size() < np)
+				return false;
+			uint64_t run = 0;
+			for (size_t i = 0; i < np; ++i) {
+				if ((uint64_t)offs[i] != run)
+					return false;
+				run += sizes[i];
+			}
+			return true;
+		};
+		const bool packV(hasVO && hasVS && !pointcloud.pointViewsMemory.empty() &&
+			isPacked(pointcloud.pointViewsOffsets, pointcloud.pointViewsSizes, numInitPoints));
+		const bool packW(hasWO && hasWS && !pointcloud.pointWeightsMemory.empty() &&
+			isPacked(pointcloud.pointWeightsOffsets, pointcloud.pointWeightsSizes, numInitPoints));
+		if ((hasVO && !pointcloud.pointViewsMemory.empty() && !packV) ||
+			(hasWO && !pointcloud.pointWeightsMemory.empty() && !packW))
+			VERBOSE("WARNING: point view/weight streams are not packed (views %s, weights %s);"
+				" leaving those blobs uncompacted", packV?"ok":"unpacked", packW?"ok":"unpacked");
+
+		uint32_t* const __restrict pVM = pointcloud.pointViewsMemory.empty() ? NULL : pointcloud.pointViewsMemory.data();
+		float* const __restrict pWM = pointcloud.pointWeightsMemory.empty() ? NULL : pointcloud.pointWeightsMemory.data();
+		const size_t vMemInit = pointcloud.pointViewsMemory.size();
+		const size_t wMemInit = pointcloud.pointWeightsMemory.size();
+		size_t w = 0, vMem = 0, wMem = 0;
 		for (size_t r = 0; r < numInitPoints; ++r) {
 			if (visibility[r] <= thRemove)
 				continue;
@@ -7196,8 +7391,32 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 				pointcloud.pointsXYZ[w*3+2] = pointcloud.pointsXYZ[r*3+2];
 				if (hasN) { pointcloud.normalsXYZ[w*3+0]=pointcloud.normalsXYZ[r*3+0]; pointcloud.normalsXYZ[w*3+1]=pointcloud.normalsXYZ[r*3+1]; pointcloud.normalsXYZ[w*3+2]=pointcloud.normalsXYZ[r*3+2]; }
 				if (hasC) { pointcloud.colorsRGB[w*3+0]=pointcloud.colorsRGB[r*3+0]; pointcloud.colorsRGB[w*3+1]=pointcloud.colorsRGB[r*3+1]; pointcloud.colorsRGB[w*3+2]=pointcloud.colorsRGB[r*3+2]; }
+			}
+			// view stream: slide the run down to the packed write cursor and repoint the
+			// offset at it. Done even when w==r, because the OFFSET still changes once any
+			// earlier point has been dropped (at w==r nothing was, so vMem==off and both
+			// the move and the store are no-ops).
+			if (packV) {
+				const uint32_t off = pointcloud.pointViewsOffsets[r], sz = pointcloud.pointViewsSizes[r];
+				ASSERT(vMem <= (size_t)off && (size_t)off + sz <= vMemInit);
+				if (vMem != (size_t)off && sz)
+					memmove(pVM + vMem, pVM + off, sz * sizeof(uint32_t));
+				pointcloud.pointViewsOffsets[w] = (uint32_t)vMem;
+				pointcloud.pointViewsSizes[w] = sz;
+				vMem += sz;
+			} else if (w != r) {
 				if (hasVO) pointcloud.pointViewsOffsets[w]=pointcloud.pointViewsOffsets[r];
 				if (hasVS) pointcloud.pointViewsSizes[w]=pointcloud.pointViewsSizes[r];
+			}
+			if (packW) {
+				const uint32_t off = pointcloud.pointWeightsOffsets[r], sz = pointcloud.pointWeightsSizes[r];
+				ASSERT(wMem <= (size_t)off && (size_t)off + sz <= wMemInit);
+				if (wMem != (size_t)off && sz)
+					memmove(pWM + wMem, pWM + off, sz * sizeof(float));
+				pointcloud.pointWeightsOffsets[w] = (uint32_t)wMem;
+				pointcloud.pointWeightsSizes[w] = sz;
+				wMem += sz;
+			} else if (w != r) {
 				if (hasWO) pointcloud.pointWeightsOffsets[w]=pointcloud.pointWeightsOffsets[r];
 				if (hasWS) pointcloud.pointWeightsSizes[w]=pointcloud.pointWeightsSizes[r];
 			}
@@ -7210,6 +7429,23 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 		if (hasVS) pointcloud.pointViewsSizes.resize(w);
 		if (hasWO) pointcloud.pointWeightsOffsets.resize(w);
 		if (hasWS) pointcloud.pointWeightsSizes.resize(w);
+		if (packV) pointcloud.pointViewsMemory.resize(vMem);
+		if (packW) pointcloud.pointWeightsMemory.resize(wMem);
+		// resize() moves the size, never the capacity -- without this the culled tail of
+		// EVERY buffer stays committed for the life of the cloud, and the caller goes
+		// straight on to the Morton reorder and two Save()s still holding it. The octree
+		// scratch was released above so the transient copy each shrink needs has room.
+		pointcloud.pointsXYZ.shrink_to_fit();
+		pointcloud.normalsXYZ.shrink_to_fit();
+		pointcloud.colorsRGB.shrink_to_fit();
+		pointcloud.pointViewsOffsets.shrink_to_fit();
+		pointcloud.pointViewsSizes.shrink_to_fit();
+		pointcloud.pointWeightsOffsets.shrink_to_fit();
+		pointcloud.pointWeightsSizes.shrink_to_fit();
+		pointcloud.pointViewsMemory.shrink_to_fit();
+		pointcloud.pointWeightsMemory.shrink_to_fit();
+		VERBOSE("Point-cloud streams reclaimed: views %zu -> %zu, weights %zu -> %zu entries",
+			vMemInit, pointcloud.pointViewsMemory.size(), wMemInit, pointcloud.pointWeightsMemory.size());
 	}
 
 	DEBUG_EXTRA("Point-cloud filtered: %u/%u points (%d%%%%) (%s)", pointcloud.NumPoints(), numInitPoints, ROUND2INT((100.f*pointcloud.NumPoints()) / numInitPoints), TD_TIMER_GET_FMT().c_str());
