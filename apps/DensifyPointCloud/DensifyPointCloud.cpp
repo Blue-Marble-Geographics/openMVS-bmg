@@ -112,8 +112,12 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 	// Previously, the _USE_CUDA pathway set numIters to 4 by default.
 	// This has the effect of forcing the CPU to 4 patch-match iterations when
 	// CUDA use is compiled in AND CPU processing is enabled.
-	// Now we default both to DPC_NUM_ITERS (3) and the CUDA path
-	// will manually set this to 4 in CUDA-specific code.
+	// Now both default to DPC_NUM_ITERS (3) here, and when --iters was NOT given
+	// explicitly AND a CUDA device is actually present, nEstimationIters is
+	// raised back to 4 after option parsing (see the block before Util::Init()):
+	// the GPU's parallel checkerboard propagation converges slower per iteration
+	// than the CPU's sequential raster sweeps, so it needs the extra iteration
+	// (this matches upstream, which always defaulted the CUDA build to 4).
 #ifdef FORCIBLY_DISABLE_CUDA
 	const unsigned nNumViewsDefault(5); // 0, 1, 8, 12 Doesn't make much of a difference?
 	const unsigned numIters(DPC_NUM_ITERS);
@@ -280,6 +284,29 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 		CUDA::desiredDeviceID = -2;
 #endif
 #endif
+
+	#ifdef _USE_CUDA
+	// GPU checkerboard propagation needs one more photometric iteration than the
+	// CPU's sequential sweeps to converge equally (see the numIters note above).
+	// Apply it only when the user did not set --iters explicitly (command line or
+	// config file) and a usable CUDA device is actually present, so an explicit
+	// choice always wins and the CPU fallback keeps DPC_NUM_ITERS.
+	if (OPT::vm["iters"].defaulted() && SEACAVE::CUDA::desiredDeviceID >= -1) {
+		#ifdef _MSC_VER
+		// probe the driver DLL before any cu* call: nvcuda.dll is delay-loaded,
+		// so calling into it on a machine without an NVIDIA driver would raise a
+		// delay-load exception instead of failing gracefully
+		const bool bCudaDriverPresent(GetModuleHandleA("nvcuda.dll") != NULL || LoadLibraryA("nvcuda.dll") != NULL);
+		#else
+		const bool bCudaDriverPresent(true);
+		#endif
+		SEACAVE::CUDA::DeviceCapability cap;
+		if (bCudaDriverPresent && SEACAVE::CUDA::GetDeviceCapability(SEACAVE::CUDA::desiredDeviceID, cap)) {
+			OPTDENSE::nEstimationIters = 4;
+			DEBUG("Patch-match iterations raised to 4 for the CUDA estimator (device %d: %s)", cap.deviceID, cap.name);
+		}
+	}
+	#endif // _USE_CUDA
 
 	Util::Init();
 	return true;
@@ -581,7 +608,9 @@ void ReorderPointCloudMorton(PointCloudStreaming& pc) {
 		pc.pointWeightsSizes.swap(newSizes);
 		pc.pointWeightsMemory.swap(newMemory);
 	}
-	VERBOSE("Point-cloud reordered in Morton order: %u points (%s)", (unsigned)numPoints, TD_TIMER_GET_FMT().c_str());
+	// instrumentation for an internal cache-locality reorder: the count and the
+	// timing say nothing about the reconstruction, so it rides the diag gate
+	DENSIFY_DIAG("Point-cloud reordered in Morton order: %u points (%s)", (unsigned)numPoints, TD_TIMER_GET_FMT().c_str());
 }
 } // namespace
 #endif

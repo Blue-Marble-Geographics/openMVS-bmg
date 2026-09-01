@@ -34,6 +34,8 @@
 #include <algorithm>
 #include <vector>
 #include <cstdlib>
+#include <chrono> // the per-scale summary times itself unconditionally, unlike the
+                  // MESHOPT_CUDA_PROFILE clocks that used to be the only users here
 
 using namespace MVS;
 
@@ -130,8 +132,13 @@ using namespace MVS;
 // happens to contain the next blocking call (photoGrad.GetData() at the end of
 // ScoreMesh) -- i.e. "pairs" silently absorbs the whole ProjectMesh round. Costs
 // one extra sync per iteration, so it is tied to the profile switch, not free.
+// Since the buckets it exists to make meaningful are only ever PRINTED under
+// REFINE_DIAG, it is tied to that as well: with the gate closed the syncs would be
+// paid for numbers nobody reads. Dropping them cannot change the result -- the
+// default stream already orders every call, and this only ever forced the deferred
+// work to land before a clock reading rather than before its next consumer.
 #if MESHOPT_CUDA_PROFILE
-#define MESHOPT_CUDA_PROFILE_SYNC() reportCudaError(cuCtxSynchronize())
+#define MESHOPT_CUDA_PROFILE_SYNC()	{ if (REFINE_DIAG_ENABLED()) reportCudaError(cuCtxSynchronize()); }
 #else
 #define MESHOPT_CUDA_PROFILE_SYNC() ((void)0)
 #endif
@@ -2470,7 +2477,9 @@ public:
 	void ListCameraFaces();
 
 	void ListFaceAreas(Mesh::AreaArr& maxAreas);
-	void SubdivideMesh(uint32_t maxArea, float fDecimate=1.f, unsigned nCloseHoles=15, unsigned nEnsureEdgeSize=1);
+	// atlasDim: resolved ONCE by the caller before any per-scale rescaling -- see the
+	// matching note on MeshRefine::SubdivideMesh in SceneRefine.cpp.
+	void SubdivideMesh(uint32_t maxArea, int atlasDim, float fDecimate=1.f, unsigned nCloseHoles=15, unsigned nEnsureEdgeSize=1);
 
 	void ComputeNormalFaces();
 
@@ -2835,7 +2844,7 @@ bool MeshRefineCUDA::ResolveResidency(uint64_t totalPixels, uint64_t maxPixels)
 	size_t freeMem = 0, totalMem = 0;
 	if (cuMemGetInfo(&freeMem, &totalMem) != CUDA_SUCCESS || freeMem == 0) {
 		// no reading available: keep the previous behaviour rather than guess
-		DEBUG_EXTRA("[CUDA] cuMemGetInfo unavailable; skipping the VRAM budget check");
+		REFINE_DIAG("[CUDA] cuMemGetInfo unavailable; skipping the VRAM budget check");
 #if MESHOPT_CUDA_REFLOCAL_FACEBARY
 		bRefLocalFaceBary = (forcedResidency == 2);
 		idxRefProjected = NO_ID;
@@ -2853,18 +2862,23 @@ bool MeshRefineCUDA::ResolveResidency(uint64_t totalPixels, uint64_t maxPixels)
 			bRefLocalFaceBary ? "reflocal" : "flat");
 	idxRefProjected = NO_ID;
 	const uint64_t needBytes = (bRefLocalFaceBary ? refLocalBytes : flatBytes);
-	DEBUG_EXTRA("[CUDA] VRAM budget: need %s (%s layout) | free %s, reserve %s, budget %s",
+	REFINE_DIAG("[CUDA] VRAM budget: need %s (%s layout) | free %s, reserve %s, budget %s",
 		Util::formatBytes(needBytes).c_str(),
 		bRefLocalFaceBary ? "reference-local face/bary" : "flat",
 		Util::formatBytes(freeMem).c_str(), Util::formatBytes(reserve).c_str(), Util::formatBytes(budget).c_str());
-	if (bRefLocalFaceBary)
-		VERBOSE("GPU memory: the flat layout would need %s but only %s is available; keeping face/bary for "
+	if (bRefLocalFaceBary) {
+		// The result is identical either way, so at the default verbosity this is
+		// nothing but a description of the GPU residency ladder. All the user could
+		// act on is that it will be slower, and only when it is drastic -- which is
+		// the "deep batching" warning's job on the CPU side, not this rung's.
+		REFINE_DIAG("GPU memory: the flat layout would need %s but only %s is available; keeping face/bary for "
 				"the current reference view only -- %s instead (identical result, ~2x ProjectMesh work)",
 			Util::formatBytes(flatBytes).c_str(), Util::formatBytes(budget).c_str(),
 			Util::formatBytes(refLocalBytes).c_str());
+	}
 #else
 	const uint64_t needBytes = flatBytes;
-	DEBUG_EXTRA("[CUDA] VRAM budget: need %s (flat layout) | free %s, reserve %s, budget %s",
+	REFINE_DIAG("[CUDA] VRAM budget: need %s (flat layout) | free %s, reserve %s, budget %s",
 		Util::formatBytes(needBytes).c_str(),
 		Util::formatBytes(freeMem).c_str(), Util::formatBytes(reserve).c_str(), Util::formatBytes(budget).c_str());
 #endif
@@ -2879,8 +2893,9 @@ bool MeshRefineCUDA::ResolveResidency(uint64_t totalPixels, uint64_t maxPixels)
 			return true;
 		}
 #endif
-		VERBOSE("warning: this scale needs %s of device memory but only %s is available on this GPU; "
-				"falling back to the CPU refinement path",
+		VERBOSE("warning: this GPU does not have enough memory to refine this scene; "
+				"falling back to the CPU");
+		REFINE_DIAG("this scale needs %s of device memory but only %s is available",
 			Util::formatBytes(needBytes).c_str(), Util::formatBytes(budget).c_str());
 		return false;
 	}
@@ -3073,7 +3088,8 @@ bool MeshRefineCUDA::InitImages(float scale, float sigma)
 		// or another process took memory since); drop a rung and retry once before
 		// handing the scale to the CPU path. imageHost is still populated at this
 		// point, so the retry can re-upload the images.
-		VERBOSE("warning: device allocation failed on the flat layout despite fitting the budget; "
+		// A recovered-from hiccup with no user-visible consequence: gated.
+		REFINE_DIAG("warning: device allocation failed on the flat layout despite fitting the budget; "
 				"retrying with reference-local face/bary");
 		bRefLocalFaceBary = true;
 		idxRefProjected = NO_ID;
@@ -3085,7 +3101,8 @@ bool MeshRefineCUDA::InitImages(float scale, float sigma)
 	}
 #endif
 	if (!bAllocated) {
-		VERBOSE("error: out of device memory initializing the refinement scale");
+		VERBOSE("error: out of GPU memory during mesh refinement");
+		REFINE_DIAG("the failing allocation was this scale's device-side working set");
 		return false;
 	}
 	// the host copies are only needed to feed view.image above
@@ -3316,7 +3333,7 @@ void MeshRefineCUDA::ListFaceAreas(Mesh::AreaArr& maxAreas)
 
 // decimate or subdivide mesh such that for each face there is no image pair in which
 // its projection area is bigger than the given number of pixels in both images
-void MeshRefineCUDA::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nCloseHoles, unsigned nEnsureEdgeSize)
+void MeshRefineCUDA::SubdivideMesh(uint32_t maxArea, int atlasDim, float fDecimate, unsigned nCloseHoles, unsigned nEnsureEdgeSize)
 {
 	Mesh::AreaArr maxAreas;
 
@@ -3383,6 +3400,21 @@ void MeshRefineCUDA::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned n
 	// subdivide mesh faces if its projection area is bigger than the given number of pixels
 	const size_t numVertsOld(scene.mesh.vertices.GetSize());
 	const size_t numFacesOld(scene.mesh.faces.GetSize());
+
+	// Hold subdivision inside the texture atlas face budget, exactly as the CPU refiner
+	// does. Defined in SceneRefine.cpp at global scope (which is also where the
+	// MESHOPT_ATLAS_BUDGET_* knobs live, so the policy has one definition point);
+	// declared locally rather than via a header, the same pattern ComputeAtlasFaceBudget
+	// uses across this library.
+	//
+	// This path MUST clamp too. RefineMesh chooses its own device -- see
+	// PreferCPUMeshRefinement -- so if only the CPU refiner honoured the ceiling, the
+	// face count handed to TextureMesh would depend on which device won the run, and the
+	// atlas cap would hold or not hold for reasons invisible in the mesh.
+	extern uint32_t ClampSubdivideAreaToAtlasBudget(const Mesh::AreaArr& maxAreas, size_t nFaces, uint32_t maxArea,
+		int atlasDim);
+	maxArea = ClampSubdivideAreaToAtlasBudget(maxAreas, scene.mesh.faces.GetSize(), maxArea, atlasDim);
+
 	scene.mesh.Subdivide(maxAreas, maxArea);
 
 	#ifdef MESHOPT_ENSUREEDGESIZE
@@ -3399,7 +3431,9 @@ void MeshRefineCUDA::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned n
 	// re-map vertex and camera faces
 	ListVertexFacesPre();
 
-	DEBUG_EXTRA("Mesh subdivided: %u/%u -> %u/%u vertices/faces", numVertsOld, numFacesOld, scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize());
+	// Gated: RefineMesh's completion line already reports the final vertex/face count,
+	// so at the default verbosity this only says which internal stage moved it.
+	REFINE_DIAG("Mesh subdivided: %u/%u -> %u/%u vertices/faces", numVertsOld, numFacesOld, scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize());
 
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 3)
@@ -3884,6 +3918,13 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 	if (pointcloud.IsEmpty() && !ImagesHaveNeighbors())
 		SampleMeshWithVisibility();
 
+	// Resolved ONCE, while the cameras are still at the stored resolution -- the same
+	// resolution TextureMesh works from. InitImages rescales per scale, so deriving this
+	// inside the loop would shrink the dimension at every coarser scale.
+	extern int ComputeSceneAtlasDim(const ImageArr& images, const Mesh& mesh,
+		int* pCeiling, double* pWantDim, double* pSurfaceArea, double* pGsd);
+	const int atlasDim = ComputeSceneAtlasDim(images, mesh, NULL, NULL, NULL, NULL);
+
 	MeshRefineCUDA refine(*this, nAlternatePair, fRegularityWeight, fRatioRigidityElasticity, nResolutionLevel, nMinResolution, nMaxViews);
 	if (!refine.IsValid())
 		return false;
@@ -3893,7 +3934,7 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 		// init images
 		const float scale(POWI(fScaleStep, nScales-nScale-1));
 		const float step(POWI(2.f, nScales-nScale));
-		DEBUG_ULTIMATE("Refine mesh at: %.2f image scale", scale);
+		REFINE_DIAG("Refine mesh at: %.2f image scale", scale);
 		if (!refine.InitImages(scale, 0.12f*step+0.2f))
 			return false;
 
@@ -3901,7 +3942,7 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 		refine.ListVertexFacesPre();
 
 		// automatic mesh subdivision
-		refine.SubdivideMesh(nMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
+		refine.SubdivideMesh(nMaxFaceArea, atlasDim, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
 
 		// extract array of triangle normals
 		refine.ListVertexFacesPost();
@@ -3923,6 +3964,11 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 		Eigen::Matrix<float,Eigen::Dynamic,3,Eigen::RowMajor> gradients(mesh.vertices.GetSize(),3);
 		Util::Progress progress(_T("Processed iterations"), iters);
 		GET_LOGCONSOLE().Pause();
+		// carried out of the loop for the one-line per-scale summary that replaced the
+		// per-iteration table below; the gradient norm is only ever computed inside the
+		// gate (see there), so the summary reports it as unavailable when it is closed
+		const auto scaleT0(std::chrono::steady_clock::now());
+		float lastGradNorm(-1.f), lastAvgGrad(0.f);
 		for (int iter=0; iter<iters; ++iter) {
 			refine.iteration = (unsigned)iter;
 			refine.nAlternatePair = (iter+1 < iters ? nAlternatePair : 0);
@@ -3953,17 +3999,39 @@ bool Scene::RefineMeshCUDA(unsigned nResolutionLevel, unsigned nMinResolution, u
 			// comes free from the norms already accumulated above; it is what
 			// sizes/spends the padded-frustum budget (MESHOPT_CUDA_VISIBILITY_REUSE)
 			refine.OnVerticesDisplaced(maxGradNorm*gstep);
-			DEBUG_EXTRA("\t%2d. g: %.5f (%.3e - %.3e)\ts: %.3f", iter+1, gradients.norm(), gradients.norm()/mesh.vertices.GetSize(), gv/mesh.vertices.GetSize(), gstep);
-			#if MESHOPT_CUDA_PROFILE
-			DEBUG_EXTRA("\t    [CUDA] ScoreMesh %.0f ms = cull %.0f ms + project %.0f ms + refproj %.0f ms (%u) + pairs %.0f ms (reculls %u at this scale)",
-				tScoreMs, refine.tCullMs, refine.tProjectMs, refine.tRefProjMs, refine.numRefProj,
-				tScoreMs-refine.tCullMs-refine.tProjectMs-refine.tRefProjMs, refine.numReculls);
-			#endif
+			// Convergence trace, one line per iteration per scale (two with the CUDA
+			// phase breakdown under it), and the log console is paused for the whole
+			// loop, so at the default verbosity these arrived in a single burst at the
+			// end of every scale -- the per-scale summary after the loop is what remains
+			// there. gradients.norm() is an O(vertices) reduction with no other consumer,
+			// so it is computed once, inside the gate, rather than the twice this line
+			// used to ask for unconditionally.
+			lastAvgGrad = gv/mesh.vertices.GetSize();
+			if (REFINE_DIAG_ENABLED()) {
+				lastGradNorm = gradients.norm();
+				REFINE_DIAG("\t%2d. g: %.5f (%.3e - %.3e)\ts: %.3f", iter+1, lastGradNorm, lastGradNorm/mesh.vertices.GetSize(), lastAvgGrad, gstep);
+				#if MESHOPT_CUDA_PROFILE
+				REFINE_DIAG("\t    [CUDA] ScoreMesh %.0f ms = cull %.0f ms + project %.0f ms + refproj %.0f ms (%u) + pairs %.0f ms (reculls %u at this scale)",
+					tScoreMs, refine.tCullMs, refine.tProjectMs, refine.tRefProjMs, refine.numRefProj,
+					tScoreMs-refine.tCullMs-refine.tProjectMs-refine.tRefProjMs, refine.numReculls);
+				#endif
+			}
 			gstep *= 0.98f;
 			progress.display(iter);
 		}
 		GET_LOGCONSOLE().Play();
 		progress.close();
+
+		// What the per-iteration table above used to say, once per scale instead of
+		// once (or twice) per iteration. Gated with the rest: the coarse-to-fine
+		// schedule, the iteration budget and the convergence values are all internal,
+		// and RefineMesh's caller already prints the finished mesh's size and runtime.
+		REFINE_DIAG("Refined scale %u/%u at %.2f image scale: %u vertices, %u faces, "
+			"%d iterations, final avg gradient %.3e%s (%.1fs)",
+			nScale+1, nScales, (double)scale, mesh.vertices.GetSize(), mesh.faces.GetSize(),
+			iters, lastAvgGrad,
+			lastGradNorm >= 0.f ? String::FormatString(_T(", g: %.5f"), lastGradNorm).c_str() : _T(""),
+			std::chrono::duration<double>(std::chrono::steady_clock::now()-scaleT0).count());
 
 		#if TD_VERBOSE != TD_VERBOSE_OFF
 		if (VERBOSITY_LEVEL > 2)

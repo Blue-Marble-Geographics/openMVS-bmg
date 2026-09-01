@@ -237,7 +237,15 @@ MDEFVAR_OPTDENSE_uint32(nEstimateNormals, "Estimate Normals", "should we estimat
 MDEFVAR_OPTDENSE_float(fNCCThresholdKeep, "NCC Threshold Keep", "Maximum 1-NCC score accepted for a match", "0.7", "0.5")
 DEFVAR_OPTDENSE_uint32(nEstimationIters, "Estimation Iters", "Number of patch-match iterations", "3")
 DEFVAR_OPTDENSE_uint32(nEstimationGeometricIters, "Estimation Geometric Iters", "Number of geometric consistent patch-match iterations (0 - disabled)", "4")
-MDEFVAR_OPTDENSE_float(fGeomConsistencyMaxChange, "Geom Consistency Max Change", "stop the geometric-consistent iterations early once the mean relative depth change between successive iterations drops below this fraction, then jump straight to the final (optimize) iteration; keeps essentially the same result while skipping already-converged passes (0 - disabled, run all iterations)", "0.005")
+// EXPERIMENT 26-Aug-2026: raised 0.005 -> 0.01. Profiling MechanicFalls (168 img,
+// 168 depth-maps, CPU path) showed this exit already skipping 2 of the 4 geometric
+// passes -- it declined after geometric0 and fired after geometric1 -- worth ~46s of
+// a 2m2.6s densify. Each remaining pass costs ~23s (~19% of densify), so if the mean
+// change after geometric0 sits between 0.005 and 0.01 this also skips geometric1 for
+// the same again. The ESTIMATE_PROFILE convergence line prints the measured value
+// against the threshold each pass, so one run shows both the margin and the result.
+// REVERT TO "0.005" if fused point count or geometry degrades.
+MDEFVAR_OPTDENSE_float(fGeomConsistencyMaxChange, "Geom Consistency Max Change", "stop the geometric-consistent iterations early once the mean relative depth change between successive iterations drops below this fraction, then jump straight to the final (optimize) iteration; keeps essentially the same result while skipping already-converged passes (0 - disabled, run all iterations)", "0.01")
 MDEFVAR_OPTDENSE_float(fEstimationGeometricWeight, "Estimation Geometric Weight", "pairwise geometric consistency cost weight", "0.1")
 MDEFVAR_OPTDENSE_uint32(nRandomIters, "Random Iters", "Number of iterations for random assignment per pixel", "6")
 MDEFVAR_OPTDENSE_uint32(nRandomMaxScale, "Random Max Scale", "Maximum number of iterations to skip during random assignment", "2")
@@ -1118,6 +1126,22 @@ void sincos_ps(v4sf x, v4sf* s, v4sf* c) {
 
 constexpr _DataI vOneThree{ -1,-1,-1,-1, 0x00,0x00,0x00,0x00, -1,-1,-1,-1, 0x00,0x00,0x00,0x00 };
 
+#ifdef DPC_FAST_RCP_DIV
+// Reciprocal for the projective x/z, y/z divides: _mm_rcp_ps refined by one
+// Newton-Raphson step, r1 = r0*(2 - z*r0). The raw rcpps approximation (~12
+// bits) is what previously produced the rare out-of-bounds sample coordinate
+// (see the "introduce problems" strategy notes in GatherSampleInfo); one NR
+// step lands within ~1-2 ulp of divps, well inside the border slack enforced
+// by IsScorable3's corner test. Each x/y pair divides by the same z, so one
+// reciprocal feeds two multiplies.
+static inline _Data ProjectiveRcp(const _Data z) noexcept
+{
+	const _Data r0 = _mm_rcp_ps(z);
+	constexpr _Data vTwo{ 2.f, 2.f, 2.f, 2.f };
+	return _Mul(r0, _Sub(vTwo, _Mul(z, r0)));
+}
+#endif
+
 bool __declspec(safebuffers) DepthEstimator::IsScorable3(
 	const ImageInfo_t& imageInfo
 ) noexcept
@@ -1211,7 +1235,11 @@ bool __declspec(safebuffers) DepthEstimator::IsScorable3(
 		const _Data vVYs = _Splat(sh.mVX, 1);
 		const _Data vVZs = _Splat(sh.mVX, 2);
 
+#ifdef DPC_FAST_RCP_DIV
+		const _Data vProj = _Mul(sh.mVX, ProjectiveRcp(vVZs));
+#else
 		const _Data vProj = _Div(sh.mVX, vVZs);
+#endif
 		const _Data vVBasisHX = _Splat(vBasisH, 0);
 		const _Data vVBasisHY = _Splat(vBasisH, 1);
 		const _Data vVBasisHZ = _Splat(vBasisH, 2);
@@ -1344,8 +1372,14 @@ void __declspec(safebuffers) DepthEstimator::GatherSampleInfo(
 
 	// Handle the 4 left-column samples "1", "2", "3" and "4".
 
+#ifdef DPC_FAST_RCP_DIV
+	const _Data vRcpLeftColZ4 = ProjectiveRcp(sh.mVLeftColZ4);
+	_Data vPtx = _Mul(sh.mVLeftColX4, vRcpLeftColZ4);
+	_Data vPty = _Mul(sh.mVLeftColY4, vRcpLeftColZ4);
+#else
 	_Data vPtx = _Div(sh.mVLeftColX4, sh.mVLeftColZ4);
 	_Data vPty = _Div(sh.mVLeftColY4, sh.mVLeftColZ4);
+#endif
 
 	_DataI vPtxAsInt = _TruncateIF(vPtx);
 	_DataI vPtyAsInt = _TruncateIF(vPty);
@@ -1405,8 +1439,14 @@ void __declspec(safebuffers) DepthEstimator::GatherSampleInfo(
 	_Data vY1Y2Y3Y4 = sh.mVTopRowY4;
 	_Data vZ1Z2Z3Z4 = sh.mVTopRowZ4;
 
+#ifdef DPC_FAST_RCP_DIV
+	_Data vRcpZ4 = ProjectiveRcp(vZ1Z2Z3Z4);
+	vPtx = _Mul(vX1X2X3X4, vRcpZ4);
+	vPty = _Mul(vY1Y2Y3Y4, vRcpZ4);
+#else
 	vPtx = _Div(vX1X2X3X4, vZ1Z2Z3Z4);
 	vPty = _Div(vY1Y2Y3Y4, vZ1Z2Z3Z4);
+#endif
 
 	const _Data vBasisVX = sh.mvBasisVX;
 	const _Data vBasisVY = sh.mvBasisVY;
@@ -1517,8 +1557,15 @@ void __declspec(safebuffers) DepthEstimator::GatherSampleInfo(
 			vY1Y2Y3Y4 = _Add(vY1Y2Y3Y4, vBasisVY);
 			vZ1Z2Z3Z4 = _Add(vZ1Z2Z3Z4, vBasisVZ);
 
+		// (kept at the end of the loop on purpose -- see "what worked" note 9)
+#ifdef DPC_FAST_RCP_DIV
+		vRcpZ4 = ProjectiveRcp(vZ1Z2Z3Z4);
+		vPtx = _Mul(vX1X2X3X4, vRcpZ4);
+		vPty = _Mul(vY1Y2Y3Y4, vRcpZ4);
+#else
 		vPtx = _Div(vX1X2X3X4, vZ1Z2Z3Z4);
 		vPty = _Div(vY1Y2Y3Y4, vZ1Z2Z3Z4);
+#endif
 	}
 
 	// sum4, num4 and sumSq4 are spread across their SIMD registers.
@@ -1822,6 +1869,16 @@ float DepthEstimator::ScorePixel(Depth depth, const Normal4& normal)
 	// Note: scoreResults is always sized maximally.
 	// scoreResults.numScoreResults is used to track scores as we identify them.
 
+#ifdef DPC_FLAT_PATCH_PRIOR_SHORTCUT
+	// A reference patch this flat carries no usable NCC signal: the prior blend
+	// below collapses every view's score to f*deltaDepth to within
+	// (1-f)*thRobust < 0.003 (see the toggle note in Common.h), so skip the
+	// per-view scoring entirely. mDeltaDepth was just set by sh.Detail() above;
+	// vFactorDeltaDepth/vOneMinusFactorDeltaDepth are per-pixel (FillPixelPatch).
+	if (mLowResDepth > 0.f && _vFirst(vOneMinusFactorDeltaDepth) <= 0.001f)
+		return _vFirst(vFactorDeltaDepth) * sh.mDeltaDepth;
+#endif
+
 #ifndef DPC_FASTER_SAMPLING
 	restart :
 	std::vector<float> origScores;
@@ -1837,11 +1894,34 @@ float DepthEstimator::ScorePixel(Depth depth, const Normal4& normal)
 	scoreResults.numScoreResults = 0;
 	// Only called for estimating depth-maps (after first pass).
 	// Scorable roughly 90% of the time.
+#ifdef DPC_VIEW_SHORTLIST
+	// after the pixel's first hypothesis this iteration, only the short-listed
+	// views are scored (see the toggle note in Common.h); entryViews maps each
+	// committed score entry back to its view for the selection below.
+	// More than 32 views cannot be bit-masked, so the shortlist disables itself
+	// (never expected: nMaxViews caps neighbors at 18)
+	uint8_t entryViews[32];
+	const size_t numInfos(sh.imageInfo.size());
+	const bool bShortlistUsable(numInfos <= 32);
+	for (size_t idxView = 0; idxView < numInfos; ++idxView) {
+		if (bShortlistUsable && !(viewShortlistMask & (1u << idxView)))
+			continue;
+		const auto& image = sh.imageInfo[idxView];
+		if (IsScorable3(image)) {
+			if (bShortlistUsable) {
+				// provisional: kept only if ScorePixelImage commits the entry
+				entryViews[scoreResults.numScoreResults] = (uint8_t)idxView;
+			}
+			scoreResults.numScoreResults += ScorePixelImage(image);
+		}
+	}
+#else
 	for (const auto& image : sh.imageInfo) {
 		if (IsScorable3(image)) {
 			scoreResults.numScoreResults += ScorePixelImage(image);
 		}
 	}
+#endif
 
 	if (0 == scoreResults.numScoreResults) {
 		return thRobust; // JPB WIP May not work for all DENSE_AGGNCC
@@ -2018,6 +2098,31 @@ float DepthEstimator::ScorePixel(Depth depth, const Normal4& normal)
 		const _Data vCurrentScore = _LoadA(&scoreResults.pScores[i]);
 		const _Data vClampedScore = _Min(vCurrentScore, vTwo);
 		_StoreA(&scoreResults.pScores[i], vClampedScore);
+	}
+#endif
+
+#ifdef DPC_VIEW_SHORTLIST
+	if (bShortlistPending && bShortlistUsable) {
+		// first hypothesis of this pixel's iteration: shortlist the best-scoring
+		// views using the same final blended scores the aggregation below sees;
+		// with too few scorable views every view stays enabled
+		bShortlistPending = false;
+		if (scoreResults.numScoreResults > (size_t)DPC_VIEW_SHORTLIST_SIZE) {
+			uint32_t mask = 0, used = 0;
+			for (int k = 0; k < DPC_VIEW_SHORTLIST_SIZE; ++k) {
+				float best = FLT_MAX;
+				size_t bestI = 0;
+				for (size_t i = 0; i < scoreResults.numScoreResults; ++i) {
+					if (!(used & (1u << i)) && scoreResults.pScores[i] < best) {
+						best = scoreResults.pScores[i];
+						bestI = i;
+					}
+				}
+				used |= 1u << (uint32_t)bestI;
+				mask |= 1u << entryViews[bestI];
+			}
+			viewShortlistMask = mask;
+		}
 	}
 #endif
 #endif // DPC_FASTER_SAMPLING
@@ -2411,6 +2516,13 @@ void DepthEstimator::ProcessPixel(IDX idx)
 		#endif
 		// A scorefactor is 1.f if it has no neighbors.
 		sh.mVScoreFactor = _Set(1.f);
+
+#ifdef DPC_VIEW_SHORTLIST
+		// completely random hypotheses explore depths where a DIFFERENT view set
+		// may match (occlusions), so recovery keeps every view as a candidate
+		viewShortlistMask = ~0u;
+		bShortlistPending = false;
+#endif
 
 #ifdef DPC_FASTER_RANDOM_ITER_CALC
 		Point2f p(
@@ -4365,12 +4477,16 @@ bool MVS::ImportDepthDataRaw(const String& fileName, String& imageFileName,
 // output is never wrong, only conditionally faster.
 // NOTE: this writes in place (no temp+rename), trading crash-atomicity of this one file
 // for fewer bytes; the completed content is identical to Save().
-bool MVS::PatchDepthConfRaw(
+// shared implementation of the two public PatchDepthConfRaw overloads; with
+// bCheckLayout false the file's header alone decides which optional sections it
+// carries and hasNormal/hasViews are ignored (see the header for why)
+static bool PatchDepthConfRawImpl(
 	const String& fileName,
 	const DepthMap& depthMap,
 	const ConfidenceMap& confMap,
 	bool hasNormal,
-	bool hasViews)
+	bool hasViews,
+	bool bCheckLayout)
 {
 	if (depthMap.empty() || confMap.empty())
 		return false;
@@ -4396,7 +4512,12 @@ bool MVS::PatchDepthConfRaw(
 		const bool fileHasNormal = (header.type & HeaderDepthDataRaw::HAS_NORMAL) != 0;
 		const bool fileHasConf   = (header.type & HeaderDepthDataRaw::HAS_CONF) != 0;
 		const bool fileHasViews  = (header.type & HeaderDepthDataRaw::HAS_VIEWS) != 0;
-		if (!fileHasConf || fileHasNormal != hasNormal || fileHasViews != hasViews)
+		// HAS_CONF is non-negotiable -- there is no confidence section to patch
+		// without it. The normal/views cross-check only applies when the caller has
+		// an in-memory map to compare against.
+		if (!fileHasConf)
+			break;
+		if (bCheckLayout && (fileHasNormal != hasNormal || fileHasViews != hasViews))
 			break;
 		// dimensions must match the maps we are about to write
 		if ((size_t)header.depthWidth != (size_t)depthMap.cols ||
@@ -4447,6 +4568,24 @@ bool MVS::PatchDepthConfRaw(
 
 	fclose(f);
 	return ok;
+} // PatchDepthConfRawImpl
+
+bool MVS::PatchDepthConfRaw(
+	const String& fileName,
+	const DepthMap& depthMap,
+	const ConfidenceMap& confMap,
+	bool hasNormal,
+	bool hasViews)
+{
+	return PatchDepthConfRawImpl(fileName, depthMap, confMap, hasNormal, hasViews, true);
+} // PatchDepthConfRaw
+
+bool MVS::PatchDepthConfRaw(
+	const String& fileName,
+	const DepthMap& depthMap,
+	const ConfidenceMap& confMap)
+{
+	return PatchDepthConfRawImpl(fileName, depthMap, confMap, false, false, false);
 } // PatchDepthConfRaw
 
 bool MVS::PatchDepthNormalConfRaw(

@@ -711,6 +711,25 @@ Util::ProcessMemoryInfo Util::GetSelfMemoryInfo()
 /*----------------------------------------------------------------*/
 
 
+// see the declaration in Util.h
+int64_t Util::GetSelfCpuTimeNs()
+{
+	#if defined(_MSC_VER)                   // windows
+	FILETIME ftCreation, ftExit, ftKernel, ftUser;
+	if (!::GetProcessTimes(::GetCurrentProcess(), &ftCreation, &ftExit, &ftKernel, &ftUser))
+		return 0;
+	// FILETIME counts 100ns ticks
+	const auto ToNs = [](const FILETIME& ft) -> int64_t {
+		return (int64_t)((((uint64_t)ft.dwHighDateTime) << 32) | ft.dwLowDateTime) * 100;
+	};
+	return ToNs(ftKernel) + ToNs(ftUser);
+	#else
+	return 0; // callers report "n/a" rather than a wrong number
+	#endif
+}
+/*----------------------------------------------------------------*/
+
+
 // Parses a ASCII command line string and returns an array of pointers to the command line arguments,
 // along with a count of such arguments, in a way that is similar to the standard C run-time
 // argv and argc values.

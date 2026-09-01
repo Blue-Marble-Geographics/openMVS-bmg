@@ -41,17 +41,20 @@
 
 using namespace MVS; 
 
-// [MEM] TEMPORARY per-stage peak-memory probe (Windows). PeakWorkingSetSize is
-// monotonic, so the FIRST stage boundary where it jumps owns the peak. Used to
-// target the 32 GB fit; remove once the dominant allocation is identified.
+// [MEM] per-stage peak-memory probe (Windows). PeakWorkingSetSize is monotonic, so
+// the FIRST stage boundary where it jumps owns the peak. Used to target the 32 GB
+// fit. Rides TEXTURE_DIAG: the OS query itself is skipped when the gate is closed,
+// so a normal run pays nothing for the probe points left in place.
 #ifdef _WIN32
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 static void LogPeakMem(const char* stage) {
+	if (!TEXTURE_DIAG_ENABLED())
+		return;
 	PROCESS_MEMORY_COUNTERS pmc = {};
 	pmc.cb = sizeof(pmc);
 	if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
-		DEBUG_EXTRA("[MEM] %-26s peakWS=%.2f GB  curWS=%.2f GB", stage,
+		TEXTURE_DIAG("[MEM] %-26s peakWS=%.2f GB  curWS=%.2f GB", stage,
 			pmc.PeakWorkingSetSize / (1024.0*1024.0*1024.0),
 			pmc.WorkingSetSize / (1024.0*1024.0*1024.0));
 }
@@ -82,8 +85,9 @@ static inline void TrimHeap() {
 // Everything is gated behind TEXTURE_PROFILE. Set it to 0 (or delete this block
 // plus the TEX_PROFILE_* call sites) to strip every timer at compile time with
 // ZERO residual overhead -- when disabled the macros expand to ((void)0).
-// Output goes through DEBUG_EXTRA with a [PROFILE] tag so it sits next to the
-// existing [MEM] probes.
+// Output goes through TEXTURE_DIAG with a [PROFILE] tag so it sits next to the
+// [MEM] probes and stays silent unless that gate is open (the clock reads are
+// per-stage/per-view, i.e. free, so they are left compiled in).
 //   - TEX_PROFILE_SCOPE("name")   : times the enclosing { } scope via RAII.
 //   - TEX_PROFILE_BEGIN(tok)      : start a manual timer named by token `tok`.
 //   - TEX_PROFILE_END(tok,"name") : stop that timer and log elapsed ms.
@@ -100,8 +104,10 @@ static inline void TrimHeap() {
 namespace { namespace texprof {
 	using Clock = std::chrono::steady_clock;
 	static inline void Log(const char* name, Clock::time_point t0) {
+		if (!TEXTURE_DIAG_ENABLED())
+			return;
 		const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-		DEBUG_EXTRA("[PROFILE] %-44s %10.2f ms", name, ms);
+		TEXTURE_DIAG("[PROFILE] %-44s %10.2f ms", name, ms);
 	}
 	struct ScopeTimer {
 		const char* name; Clock::time_point t0;
@@ -1054,8 +1060,18 @@ namespace { namespace texprof {
 // Guessing between those five is what the last three rounds did. Set back to 0 once the
 // residual is understood; it costs one extra double-precision reprojection of every
 // candidate face per view, plus the PLY write.
+//
+// BACK TO 0 (the "set back to 0" above, now that the trace has served its purpose). This
+// is the one piece of texturing instrumentation that is NOT merely a log line, so it does
+// not ride TEXTURE_DIAG: it adds a reprojection of every candidate face in every view,
+// three per-face byte arrays, per-texel luminance stats inside the feather bake, and it
+// writes TexViewClass.ply -- a debug-only artifact -- on EVERY run. All of that is in hot
+// loops where a runtime branch is the wrong tool, so it stays a compile-time switch: set
+// it to 1 (here or via -DTEXTURE_DATACOLOR_DIAG=1) to get the [TEX-VIEWCLASS] /
+// [DATACOLOR-DIAG] lines and the PLY back. No output texel changes either way (that is
+// DIAG_TINT, still 0).
 #ifndef TEXTURE_DATACOLOR_DIAG
-#define TEXTURE_DATACOLOR_DIAG 1
+#define TEXTURE_DATACOLOR_DIAG 0
 #endif
 #ifndef TEXTURE_DATACOLOR_DIAG_TINT
 #define TEXTURE_DATACOLOR_DIAG_TINT 0
@@ -2747,7 +2763,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		// a failed query (zeros) leaves the budget at 0 -> fall back to release-and-reload
 		const uint64_t keepBudget = (uint64_t)((double)memInfo.freePhysical * TEXTURE_KEEP_IMAGES_FRACTION);
 		bKeepImagesResident = (imagesBytes > 0 && imagesBytes <= keepBudget);
-		DEBUG_EXTRA("ListCameraFaces: source images %.2f GB decoded, budget %.2f GB (%.1f GB free x %.2f) -> %s",
+		TEXTURE_DIAG("ListCameraFaces: source images %.2f GB decoded, budget %.2f GB (%.1f GB free x %.2f) -> %s",
 			imagesBytes / (double)GB, keepBudget / (double)GB, memInfo.freePhysical / (double)GB,
 			(double)TEXTURE_KEEP_IMAGES_FRACTION,
 			bKeepImagesResident ? "KEEP resident (single decode pass)" : "release + reload (two decode passes)");
@@ -3102,7 +3118,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 #endif
 	TEX_PROFILE_END(_tLcfPerView, "ListCameraFaces: per-view rasterize+quality");
 #if TEXTURE_PROFILE
-	{
+	if (TEXTURE_DIAG_ENABLED()) {
 		// Summed over threads, so read these as SHARES of the loop, not wall time.
 		// "raster" is what TEXTURE_FAST_RASTER touches; if it is a small slice of the
 		// total, a faster rasterizer cannot move this stage no matter how fast it is.
@@ -3112,15 +3128,15 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			acc = _pfAccum.load() * ms, out = _pfOut.load() * ms;
 		const double tot = dec + gra + blu + cul + pre + ras + acc + out;
 		const double inv = tot > 0 ? 100.0 / tot : 0.0;
-		DEBUG_EXTRA("[PROFILE] LCF per-view CPU-ms summed over threads (total %.0f):", tot);
-		DEBUG_EXTRA("[PROFILE]   decode/reload %9.0f (%4.1f%%) | toGray+Sobel %9.0f (%4.1f%%) | blur15x15 %9.0f (%4.1f%%)",
+		TEXTURE_DIAG("[PROFILE] LCF per-view CPU-ms summed over threads (total %.0f):", tot);
+		TEXTURE_DIAG("[PROFILE]   decode/reload %9.0f (%4.1f%%) | toGray+Sobel %9.0f (%4.1f%%) | blur15x15 %9.0f (%4.1f%%)",
 			dec, dec * inv, gra, gra * inv, blu, blu * inv);
-		DEBUG_EXTRA("[PROFILE]   frustum cull  %9.0f (%4.1f%%) | raster prep  %9.0f (%4.1f%%) | RASTER     %9.0f (%4.1f%%)",
+		TEXTURE_DIAG("[PROFILE]   frustum cull  %9.0f (%4.1f%%) | raster prep  %9.0f (%4.1f%%) | RASTER     %9.0f (%4.1f%%)",
 			cul, cul * inv, pre, pre * inv, ras, ras * inv);
-		DEBUG_EXTRA("[PROFILE]   accum scan    %9.0f (%4.1f%%) | face-out     %9.0f (%4.1f%%)",
+		TEXTURE_DIAG("[PROFILE]   accum scan    %9.0f (%4.1f%%) | face-out     %9.0f (%4.1f%%)",
 			acc, acc * inv, out, out * inv);
 		const uint64_t nf = _pfRasterFaces.load(), np = _pfRasterPix.load();
-		DEBUG_EXTRA("[PROFILE]   raster: %llu candidate faces, %llu frame px over %u views -> %.1f ns/face, %.2f ns/frame-px",
+		TEXTURE_DIAG("[PROFILE]   raster: %llu candidate faces, %llu frame px over %u views -> %.1f ns/face, %.2f ns/frame-px",
 			(unsigned long long)nf, (unsigned long long)np, (unsigned)views.size(),
 			nf ? _pfRaster.load() / (double)nf : 0.0, np ? _pfRaster.load() / (double)np : 0.0);
 	}
@@ -3128,17 +3144,18 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 #undef LCF_TICK
 #undef LCF_TOCK
 
-	// [MEM-DECOMP] TEMPORARY: decompose the ListCameraFaces resident footprint so we
-	// can target the ~20 GB base that stage-level probes leave unexplained. Measures
-	// the ACTUAL bytes of the two big suspects at their peak (perViewOut is fully
-	// built here, just before the merge frees it). Remove once the hog is identified.
-	{
+	// [MEM-DECOMP] decompose the ListCameraFaces resident footprint so we can target
+	// the ~20 GB base that stage-level probes leave unexplained. Measures the ACTUAL
+	// bytes of the two big suspects at their peak (perViewOut is fully built here,
+	// just before the merge frees it). Both scans exist only for the log line, so the
+	// whole block rides TEXTURE_DIAG.
+	if (TEXTURE_DIAG_ENABLED()) {
 		size_t pvBytes = 0, pvObs = 0;
 		for (const auto& v : perViewOut) { pvBytes += v.capacity() * sizeof(FaceOut); pvObs += v.size(); }
 		size_t imgBytes = 0; unsigned imgResident = 0;
 		for (const Image& im : images) if (!im.image.empty()) { imgBytes += (size_t)im.image.total() * im.image.elemSize(); ++imgResident; }
 		const double G = 1.0 / (1024.0*1024.0*1024.0);
-		DEBUG_EXTRA("[MEM-DECOMP] perViewOut=%.2f GB (%zu obs, %zuB/obs) | images=%.2f GB (%u resident, %zuB/px*3) | mesh.faces=%u verts=%u",
+		TEXTURE_DIAG("[MEM-DECOMP] perViewOut=%.2f GB (%zu obs, %zuB/obs) | images=%.2f GB (%u resident, %zuB/px*3) | mesh.faces=%u verts=%u",
 			pvBytes*G, pvObs, sizeof(FaceOut), imgBytes*G, imgResident, (size_t)3, faces.GetSize(), vertices.GetSize());
 		LogPeakMem("LCF: after per-view (perViewOut full)");
 	}
@@ -3199,10 +3216,10 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 	std::vector<std::vector<FaceOut>>().swap(perViewOut); // drop the outer array too
 	TEX_PROFILE_END(_tLcfMerge, "ListCameraFaces: merge into facesDatas");
 
-	// [MEM-DECOMP] TEMPORARY: size facesDatas now that perViewOut is freed. Includes
-	// both the live observations and the cList capacity slack (grow-by-doubling can
-	// hold ~2x the live bytes). Remove once the hog is identified.
-	{
+	// [MEM-DECOMP] size facesDatas now that perViewOut is freed. Includes both the live
+	// observations and the cList capacity slack (grow-by-doubling can hold ~2x the live
+	// bytes). The per-face scan is log-only, so it rides TEXTURE_DIAG.
+	if (TEXTURE_DIAG_ENABLED()) {
 		size_t fdData = 0, fdCap = 0, fdObs = 0;
 		for (FIndex f = 0; f < facesDatas.GetSize(); ++f) {
 			const FaceDataArr& a = facesDatas[f];
@@ -3211,7 +3228,7 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 			fdCap += (size_t)a.GetCapacity() * sizeof(FaceData);
 		}
 		const double G = 1.0 / (1024.0*1024.0*1024.0);
-		DEBUG_EXTRA("[MEM-DECOMP] facesDatas live=%.2f GB cap=%.2f GB (%zu obs, %zuB/obs, %u faces headers=%.2f GB)",
+		TEXTURE_DIAG("[MEM-DECOMP] facesDatas live=%.2f GB cap=%.2f GB (%zu obs, %zuB/obs, %u faces headers=%.2f GB)",
 			fdData*G, fdCap*G, fdObs, sizeof(FaceData), facesDatas.GetSize(),
 			((size_t)facesDatas.GetSize()*sizeof(FaceDataArr))*G);
 		LogPeakMem("LCF: after merge (facesDatas full)");
@@ -3244,8 +3261,17 @@ bool MeshTexture::ListCameraFaces(FaceDataViewArr& facesDatas, float fOutlierThr
 		TEX_PROFILE_BEGIN(_tLcfOutlier);
 		// try to detect outlier views for each face
 		// (views for which the face is occluded by a dynamic object in the scene, ex. pedestrians)
-		for (FaceDataArr& faceDatas : facesDatas)
-			FaceOutlierDetection(faceDatas, fOutlierThreshold);
+		// Each face owns its own view list and the detector is const and reads no member
+		// state, so this is embarrassingly parallel and stays bit-exact whatever the thread
+		// count: there is no reduction and no shared accumulator, only per-face writes.
+		// dynamic, not static: per-face cost tracks the view count, which is spatially
+		// correlated (faces mid-capture are seen by far more cameras than those at the
+		// edges), so a static split would leave threads idle. 1024 keeps the scheduling
+		// overhead negligible against a per-face body this small.
+		const int_t nOutlierFaces = (int_t)facesDatas.GetSize();
+		#pragma omp parallel for schedule(dynamic, 1024)
+		for (int_t f = 0; f < nOutlierFaces; ++f)
+			FaceOutlierDetection(facesDatas[(FIndex)f], fOutlierThreshold);
 		TEX_PROFILE_END(_tLcfOutlier, "ListCameraFaces: outlier detection");
 	}
 #endif
@@ -3489,19 +3515,45 @@ bool MeshTexture::FaceOutlierDetection(FaceDataArr& faceDatas, float thOutlier) 
 	}
 	const double thMahalanobisSq = -2.0 * std::log((double)thOutlier);
 
-	// Preconvert colors once (SoA for cache + no Eigen temporaries).
-	std::vector<double> c0(nAll), c1(nAll), c2(nAll);
+	// Scratch buffers. nAll is the number of views seeing this one face, so it is small
+	// (typically well under 32). The caller runs this over every mesh face from an omp
+	// parallel-for, so sizing these on the heap would put every worker on the process
+	// heap five times per face, millions of times over - allocator contention, not the
+	// arithmetic, would then set the ceiling. Keep the working set on the stack for the
+	// common case and touch the heap only for the rare heavily-observed face. The stack
+	// path also leaves nothing in this body that can throw, which matters because an
+	// exception escaping an omp region is undefined behavior.
+	constexpr uint32_t maxStackViews = 64;
+	double stackC0[maxStackViews], stackC1[maxStackViews], stackC2[maxStackViews];
+	uint8_t stackMask[maxStackViews];
+	uint32_t stackIdx[maxStackViews];
+	std::vector<double> heapC0, heapC1, heapC2;
+	std::vector<uint8_t> heapMask;
+	std::vector<uint32_t> heapIdx;
+	double *c0, *c1, *c2;
+	uint8_t* inlierMask;
+	uint32_t* inlierIdx;
+	if (nAll <= maxStackViews) {
+		c0 = stackC0; c1 = stackC1; c2 = stackC2;
+		inlierMask = stackMask;
+		inlierIdx = stackIdx;
+	} else {
+		heapC0.resize(nAll); heapC1.resize(nAll); heapC2.resize(nAll);
+		heapMask.resize(nAll);
+		heapIdx.resize(nAll);
+		c0 = heapC0.data(); c1 = heapC1.data(); c2 = heapC2.data();
+		inlierMask = heapMask.data();
+		inlierIdx = heapIdx.data();
+	}
+
+	// Preconvert colors once (SoA for cache + no Eigen temporaries), seeding the inlier
+	// mask and the active index list with every view in the same pass.
 	for (uint32_t i = 0; i < nAll; ++i) {
 		const Color::EVec v = (const Color::EVec)faceDatas[i].color;
 		c0[i] = (double)v[0];
 		c1[i] = (double)v[1];
 		c2[i] = (double)v[2];
-	}
-
-	// Inlier mask and active index list.
-	std::vector<uint8_t> inlierMask(nAll, 1);
-	std::vector<uint32_t> inlierIdx(nAll);
-	for (uint32_t i = 0; i < nAll; ++i) {
+		inlierMask[i] = 1;
 		inlierIdx[i] = i;
 	}
 	uint32_t nIn = nAll;
@@ -4077,6 +4129,17 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				{
 					inference.SetNumNodes(virtualFaces.size());
 					inference.SetSmoothCost(SmoothnessPotts);
+
+					// Label counts up front for the CSR data-cost store (see
+					// LBPInference::ReserveDataCosts): label 0 plus one per candidate
+					// view, matching exactly what the two loops below then write.
+					{
+						std::vector<uint32_t> labelCounts(virtualFaces.size(), 1u);
+						FOREACH(f, virtualFacesDatas)
+							labelCounts[f] += (uint32_t)virtualFacesDatas[f].size();
+						inference.ReserveDataCosts(labelCounts.data());
+					}
+
 					EdgeOutIter ei, eie;
 					FOREACH(f, virtualFaces) {
 						for (boost::tie(ei, eie) = boost::out_edges(f, graph); ei != eie; ++ei) {
@@ -4259,19 +4322,37 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				// shared "order" scratch above is safe.
 				size_t numUnobservedFaces = 0;
 
+				// ---- label-count pre-pass, for the CSR data-cost store ----
+				// LBP.h keeps labels/dataCosts in flat arrays rather than two
+				// small_vectors inlined into every Node, which needs the exact per-node
+				// count up front. It is already known here: one label for an unobserved
+				// face, otherwise one per candidate view (plus the undefined label when
+				// TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED is off).
+				{
+					std::vector<uint32_t> labelCounts(numFaces);
+					#pragma omp parallel for schedule(static)
+					for (int64_t f = 0; f < (int64_t)numFaces; ++f) {
+						const uint32_t nFD = (uint32_t)facesDatas[f].size();
+#if TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED
+						labelCounts[f] = nFD ? nFD : 1u;
+#else
+						labelCounts[f] = nFD + 1u;
+#endif
+					}
+					inference.ReserveDataCosts(labelCounts.data());
+				}
+
 #pragma omp for schedule(dynamic, 128)
 				for (int64_t f = 0; f < (int64_t)numFaces; ++f) {
 					const FaceDataArr& faceDatas = facesDatas[f];
 
 					const int nFD = (int)faceDatas.size();
 
-					LBPInference::Node& node = inference.nodes[f];
-
-					node.labels.clear();
-					node.dataCosts.clear();
-
-					//node.labels.reserve(nFD + 1);
-					//node.dataCosts.reserve(nFD + 1);
+					// Node itself is now just (label, dataCost); the candidate labels and
+					// their costs are written straight into the reserved CSR slots.
+					LBPInference::LabelID* __restrict lblOut = inference.Labels((LBPInference::NodeID)f);
+					LBPInference::EnergyType* __restrict costOut = inference.DataCosts((LBPInference::NodeID)f);
+					uint32_t nWritten = 0;
 
 #if TEXTURE_LBP_NO_UNDEFINED_WHEN_VIEWED
 					// ---- undefined label: ONLY for a face with no candidate view ----
@@ -4281,15 +4362,16 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 					// fixed in SmoothnessPottsStrong. nFD >= 1 below, so the node still has at
 					// least one label, as LBP requires.
 					if (nFD == 0) {
-						node.labels.push_back(0);
-						node.dataCosts.push_back(undefinedCost);
+						lblOut[nWritten] = 0;
+						costOut[nWritten] = undefinedCost;
 						++numUnobservedFaces;
 						continue;
 					}
 #else
 					// ---- undefined label first ----
-					node.labels.push_back(0);
-					node.dataCosts.push_back(undefinedCost);
+					lblOut[nWritten] = 0;
+					costOut[nWritten] = undefinedCost;
+					++nWritten;
 
 					if (nFD == 0) {
 						++numUnobservedFaces;
@@ -4333,14 +4415,16 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 						float dataCost =
 							rank * scale;
 
-						node.labels.push_back(lbl);
-						node.dataCosts.push_back(dataCost);
+						lblOut[nWritten] = lbl;
+						costOut[nWritten] = dataCost;
+						++nWritten;
 					}
+					ASSERT(nWritten == inference.NumLabels((LBPInference::NodeID)f));
 				}
 				TEX_PROFILE_END(_tFvsLbpBuild, "FaceViewSelection: LBP build graph+datacost");
 
 				// Floor for the per-sweep "undefined=" count printed by the LBP below.
-				DEBUG_EXTRA("[LBP-DIAG] faces=%u unobserved=%zu (%.2f%%) -- faces with no candidate view; 'undefined' cannot go below this",
+				TEXTURE_DIAG("[LBP-DIAG] faces=%u unobserved=%zu (%.2f%%) -- faces with no candidate view; 'undefined' cannot go below this",
 					(unsigned)numFaces, numUnobservedFaces,
 					numFaces ? 100.0 * (double)numUnobservedFaces / (double)numFaces : 0.0);
 
@@ -4579,7 +4663,7 @@ bool MeshTexture::FaceViewSelection(LabelArr& labels, unsigned minCommonCameras,
 				}
 
 				if (propagationPasses > 1) {
-					DEBUG("Label propagation to invisible faces: %d passes", propagationPasses);
+					TEXTURE_DIAG("Label propagation to invisible faces: %d passes", propagationPasses);
 				}
 			}
 		}
@@ -6605,7 +6689,7 @@ void MeshTexture::LocalSeamLeveling()
 	{
 		const int nScalingCap = (TEXTURE_SEAM_MAX_WORKERS > 0 ? (int)TEXTURE_SEAM_MAX_WORKERS : GetPhysicalCoreCount());
 		if (nScalingCap > 0 && nScalingCap < T) {
-			DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (bandwidth-bound pass capped at %s)",
+			TEXTURE_DIAG("LocalSeamLeveling: threads %d -> %d (bandwidth-bound pass capped at %s)",
 				T, nScalingCap, (TEXTURE_SEAM_MAX_WORKERS > 0 ? "TEXTURE_SEAM_MAX_WORKERS" : "physical cores"));
 			T = nScalingCap;
 		}
@@ -6723,13 +6807,13 @@ void MeshTexture::LocalSeamLeveling()
 					finalArea += areas[i];
 				// Always log the decision (even when NOT capping) so the memory budget is
 				// observable in the profile trace.
-				DEBUG_EXTRA("LocalSeamLeveling: threads %d -> %d (%u patches, largest %llu px, ~%.2f GB est for %d workers, budget %s)",
+				TEXTURE_DIAG("LocalSeamLeveling: threads %d -> %d (%u patches, largest %llu px, ~%.2f GB est for %d workers, budget %s)",
 					T, finalT, (unsigned)areas.size(), (unsigned long long)areas[0],
 					finalArea * bytesPerPixel / (double)GB, finalT, strBudgetSrc.c_str());
 				T = finalT;
 			}
 		} else {
-			DEBUG_EXTRA("LocalSeamLeveling: threads %d (memory budget cap disabled)", T);
+			TEXTURE_DIAG("LocalSeamLeveling: threads %d (memory budget cap disabled)", T);
 		}
 	}
 
@@ -7453,6 +7537,14 @@ static bool PackShelfReasonablySquare(
 // size its atlas face budget from the same hardware limit this file will pack into.
 // Keeping it file-local let the two stages disagree by 4x in face capacity on a
 // 32768-capable host.
+//
+// This is now the HOST LIMIT ONLY, not the pack decision. GenerateTexture resolves the
+// atlas dimension through ResolveAtlasMaxDimEx (pin > this probe > fallback), because
+// calling this directly there ignored OPENMVS_ATLAS_MAX_DIM and let an env pin move the
+// geometry stages' face cap without moving the atlas. Remaining direct callers should
+// want the host maximum specifically -- e.g. [ATLAS-FINAL], which reports whether the
+// finished atlas is sampleable on THIS machine, a genuine host question and one whose
+// answer is legitimately "no" when the deliverable targets a better GPU.
 int GetOpenGLMaxTextureSize()
 {
 	static int cached = 0;
@@ -7525,8 +7617,31 @@ int GetOpenGLMaxTextureSize()
 // tries is byte-identical to going straight there -- a failed high attempt costs only
 // repack time, never quality. The old ladder (0.85 x 0.85 per retry -> 0.72, 0.61)
 // could only ever undershoot, and never tested whether the packer had room to spare.
+//
+// LOWERED 0.97 -> 0.93 after MEASURING the packer instead of guessing at it. On a
+// 16384 px host the ladder settled at 0.8245 and produced:
+//     patches placed  0.8245 x 268.4 Mpx = 221.3 Mpx
+//     atlas built     14877 x 15609      = 232.2 Mpx   -> 95.3% fill
+// So shelf packing achieves ~95% here, not the 60-85% the step comment below
+// assumed -- and that makes 0.97 STRUCTURALLY UNREACHABLE, since 0.97 / 0.953 > 1:
+// the first rung can never pass, on any scene that packs this well. It was not a
+// high starting guess, it was a wasted attempt, and the coarse step then jumped
+// clean over the feasible band to 0.8245.
+//
+// 0.93 sits just under the measured ceiling, so a well-packing scene lands on the
+// FIRST attempt and keeps 0.93/0.8245 = 1.128x the texel area, i.e. ~6% finer
+// linear detail. A scene that packs worse simply steps down (see below).
+//
+// Caveat, stated plainly: 95.3% is one scene. If other scenes pack materially
+// worse, 0.93 costs an extra repack pass or two and lands wherever they can. It
+// cannot cost quality -- attempts shrink monotonically, so reaching 0.82 through
+// three tries is byte-identical to going straight there.
+//
+// VERIFY on the next run with the ungated "[ATLAS] built WxH px, ceiling N px"
+// line: W*H should rise toward 268 Mpx, and the "keeps 0.24x the pixels it asked
+// for" figure should improve by roughly the same 1.13x.
 #ifndef TEXTURE_ATLAS_FIT_MARGIN
-#define TEXTURE_ATLAS_FIT_MARGIN 0.97
+#define TEXTURE_ATLAS_FIT_MARGIN 0.93
 #endif
 // Multiplicative step between adaptive-fit attempts.
 //
@@ -7538,13 +7653,36 @@ int GetOpenGLMaxTextureSize()
 // failed. 0.85 over 8 attempts walks 0.97 down to ~0.31, which covers any real packer.
 // Quality is unaffected on scenes that pack at the first try; a failed high attempt costs
 // only repack time.
+//
+// RESTORED 0.85 -> 0.95. The "60-85% occupancy" premise above was an estimate that has
+// now been measured, and it was wrong: this packer achieved 95.3% (see the arithmetic on
+// TEXTURE_ATLAS_FIT_MARGIN). The reasoning that motivated 0.85 -- reach the real
+// occupancy range so SOMETHING trims -- still holds, but the real range is near 0.95, and
+// a 0.85 step overshoots straight through it: from a 0.93 start the second rung is 0.883
+// and the third 0.839, so a scene whose true limit is 0.91 gives up 8% of its texel area
+// to step granularity alone.
+//
+// 0.95 over 8 attempts walks 0.93 down to 0.65, which still clears any plausible packer
+// while landing within ~5% of the true limit instead of ~15%. The extra rungs cost repack
+// time only on scenes that actually need them, and only until one passes.
 #ifndef TEXTURE_ATLAS_FIT_MARGIN_STEP
-#define TEXTURE_ATLAS_FIT_MARGIN_STEP 0.85
+#define TEXTURE_ATLAS_FIT_MARGIN_STEP 0.95
 #endif
 // Number of shrink-and-repack attempts. Each costs one pack pass, which is cheap next to
 // failing the whole stage after 28 s of texturing.
+//
+// RAISED 8 -> 12 to hold the ladder's FLOOR while the step got finer. What matters here
+// is not the attempt count but where the last rung lands, because exhausting the ladder
+// is what failed the stage outright:
+//     0.97 x 0.85^7  = 0.31   (old start, old step, 8 attempts)
+//     0.93 x 0.95^7  = 0.65   (new start, new step, 8 attempts)  <-- would have regressed
+//     0.93 x 0.95^11 = 0.53   (new start, new step, 12 attempts)
+// 0.53 stays below the 60% worst case the step comment cites, so the finer search buys
+// precision near the top of the range without giving up reach at the bottom. The added
+// rungs only ever execute on a scene that needs them, and only until one passes -- a
+// scene that packs on the first attempt sees no change at all.
 #ifndef TEXTURE_ATLAS_FIT_ATTEMPTS
-#define TEXTURE_ATLAS_FIT_ATTEMPTS 8
+#define TEXTURE_ATLAS_FIT_ATTEMPTS 12
 #endif
 // When --max-texture-size is 0 (deliberately unbounded, no GPU ceiling to respect),
 // the atlas still has to be built in memory, so derive a RAM-safe packing dimension
@@ -7556,6 +7694,59 @@ int GetOpenGLMaxTextureSize()
 // Used only if the OS memory query fails (returns zeros).
 #ifndef TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB
 #define TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB 8
+#endif
+// Predictive memory pre-flight on the atlas, for the case the fraction above does NOT
+// cover: an EXPLICIT --max-texture-size (or OPENMVS_ATLAS_MAX_DIM pin).
+//
+// The RAM-safe derivation above runs only when the size is <= 0. Pin 32768 and nothing
+// checks anything: the atlas is 32768^2 * 3 = 3.2 GB in one Image8U3, on top of a
+// 368-view working set already resident, and the first sign of trouble is an allocation
+// failure part-way through a multi-hour pipeline.
+//
+// WHY IT DEGRADES RATHER THAN FAILS. GlobalMapper retries TextureMesh at a lower
+// resolution level when it sees low memory, but it detects that by OBSERVING
+// mMinAvailMem < 1 GB during the run (ImageToCloudConverter.cpp:8164) -- it does not read
+// the log. A clean early failure would leave memory untouched, so no retry would fire and
+// the pipeline would simply die. Reducing the dimension and continuing also matches what
+// the <= 0 path already does, so the two cases now behave alike.
+//
+// The reduction is reported at normal verbosity and names the RAM that WOULD have been
+// needed, because on a machine building deliverables for better GPUs a silent downgrade
+// to 16k is the exact failure this whole atlas-dimension effort exists to prevent -- the
+// operator has to know to build on a bigger box.
+//
+// 0 disables the check (restores the previous unguarded behaviour for explicit sizes).
+#ifndef TEXTURE_ATLAS_MEM_PREFLIGHT
+#define TEXTURE_ATLAS_MEM_PREFLIGHT 1
+#endif
+// Bytes of peak TRANSIENT residency per atlas texel, used to size the pre-flight.
+//
+// Derived, not guessed, from where the atlas path actually peaks:
+//
+//   3.0  textureDiffuse itself (Image8U3), allocated at textureDiffuse.create() right
+//        after the pack -- note this is BEFORE any source image is released, so the
+//        freePhysical the pre-flight reads already accounts for the images correctly.
+//   3.1  newTex during the data-color bake, which builds a SECOND full atlas
+//        (oldRows + extraRows, measured 1.02x) and only then does
+//        `textureDiffuse = newTex`. Both are resident across that copy -- this is the
+//        real peak of the whole atlas path, and it is invisible in the [MEM] lines
+//        because they sample after the assignment. Conditional on unobserved faces
+//        existing, which is the norm (100,917 of 3.73M on a 32768 run).
+//   ~0.4 headroom for the gutter clear-and-regrow, which peaks LOWER than the bake
+//        (one atlas + a per-texel mask + a frontier queue ~ 4.2 B/texel) and so is
+//        already covered by the figure above.
+//
+// MEASURED on a 32768 run (1071.3 Mpx): atlas-phase curWS settled at 3.87 GB = 3.6
+// B/texel, but that is sampled AFTER the bake released the old buffer -- it is the
+// steady state, not the peak. Sizing to 3.6 or 4.0 would approve an atlas that then OOMs
+// mid-bake on a machine without slack. That run never showed it because its process peak
+// (11.25 GB) had already been set by the source images during seam levelling, so the
+// double-atlas moment fitted underneath.
+//
+// Erring high costs atlas dimension; erring low costs an OOM in the last minute of a
+// multi-hour pipeline. Kept deliberately loose for that reason.
+#ifndef TEXTURE_ATLAS_MEM_BYTES_PER_TEXEL
+#define TEXTURE_ATLAS_MEM_BYTES_PER_TEXEL 6.5
 #endif
 
 unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatchDim)
@@ -7703,7 +7894,9 @@ unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatch
 	// D is a texel density in world units, so 1/sqrt(D) is the world size of one texel:
 	// the achievable texture GSD for this mesh at this atlas size. Compare it against
 	// the imagery GSD to see how much resolution the atlas ceiling is costing.
-	{
+	// Log-only (the fit itself is already applied above), so it rides TEXTURE_DIAG --
+	// the fact that a downscale HAPPENED is reported ungated by the caller.
+	if (TEXTURE_DIAG_ENABLED()) {
 		double realizedPx = 0.0, totalWorld = 0.0;
 		for (unsigned p = 0; p < numPatches; ++p) {
 			realizedPx += (double)texturePatches[p].rect.width * (double)texturePatches[p].rect.height;
@@ -7714,7 +7907,7 @@ unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatch
 		// merged with the following " of" into an octal conversion that ate the next
 		// argument), while %%%% rendered as a literal "%%". A ratio says the same thing
 		// and cannot be misparsed.
-		DEBUG("[ATLAS-FIT] budget=%.1f Mpx | patch area %.1f -> %.1f Mpx (x%.3f of budget)"
+		TEXTURE_DIAG("[ATLAS-FIT] budget=%.1f Mpx | patch area %.1f -> %.1f Mpx (x%.3f of budget)"
 			" | density ceiling D=%.1f px/unit^2 -> texel %.4g world units | surface %.4g unit^2",
 			(double)budgetAreaPixels * 1e-6, totalAreaPx * 1e-6, realizedPx * 1e-6,
 			budgetAreaPixels ? realizedPx / (double)budgetAreaPixels : 0.0,
@@ -7724,16 +7917,67 @@ unsigned MeshTexture::AdaptiveFitPatches(uint64_t budgetAreaPixels, int maxPatch
 #endif // TEXTURE_CROP_IMAGES
 }
 
+// The atlas-dimension policy (env pin > host GL probe > built-in fallback) lives in
+// SceneReconstruct.cpp, which sizes the DECIMATION face cap from it. Declared locally
+// rather than in a header, matching what ReconstructMesh.cpp and RefineMesh.cpp do for
+// this same pair -- and note both that definition and this declaration are at GLOBAL
+// scope (SceneReconstruct.cpp does `using namespace MVS`, it is not inside the
+// namespace), which is what makes them link.
+extern int ResolveAtlasMaxDimEx(int atlasMaxDim, int* pHostLimit, int* pEnvPin);
+
 bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLeveling, unsigned nTextureSizeMultiple, unsigned nRectPackingHeuristic, Pixel8U colEmpty, float fSharpnessWeight, int nMaxTextureSize)
 {
-	// --max-texture-size < 0 => cap the final atlas to the GPU's native
-	// GL_MAX_TEXTURE_SIZE (the viewer is OpenGL). == 0 keeps its original meaning:
-	// UNBOUNDED (no cap). Resolved once here so BOTH the packer's starting
-	// dimension and the final "enforce max size" step use it.
+	// --max-texture-size < 0 => cap the final atlas to the atlas dimension the GEOMETRY
+	// stages already sized their face budget against. == 0 keeps its original meaning:
+	// UNBOUNDED (no cap). Resolved once here so BOTH the packer's starting dimension
+	// and the final "enforce max size" step use it.
+	//
+	// Routed through ResolveAtlasMaxDimEx rather than calling GetOpenGLMaxTextureSize
+	// directly, which is what this did before. That bypassed OPENMVS_ATLAS_MAX_DIM:
+	// ReconstructMesh's decimation cap and RefineMesh's audit BOTH honour the env pin,
+	// so pinning 32768 on a 16384-limited host sized the mesh for a 16.3M-face atlas
+	// while this function packed into 16384 -- the mesh arrived 4x over-dense for the
+	// atlas actually built, with nothing saying so. One resolver for all three stages is
+	// the only way the pin can mean one thing. (The reverse hazard -- the two stages
+	// disagreeing by 4x in face capacity -- is the one already called out at the
+	// GetOpenGLMaxTextureSize definition above and at ResolveAtlasMaxDimEx.)
+	int atlasHostLimit = 0, atlasEnvPin = 0;
 	if (nMaxTextureSize < 0) {
-		nMaxTextureSize = GetOpenGLMaxTextureSize();
-		DEBUG_EXTRA("Texture max size < 0 -> GL_MAX_TEXTURE_SIZE = %d", nMaxTextureSize);
+		nMaxTextureSize = ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
+		TEXTURE_DIAG("Texture max size < 0 -> atlas %d px (%s; host GL_MAX_TEXTURE_SIZE %d)",
+			nMaxTextureSize,
+			(atlasEnvPin > 0)    ? "pinned by OPENMVS_ATLAS_MAX_DIM" :
+			(atlasHostLimit > 0) ? "host GPU limit" :
+			                       "fallback, no GPU reachable",
+			atlasHostLimit);
+	} else {
+		// An explicit (or explicitly-unbounded) --max-texture-size is an operator
+		// decision and still wins -- same precedence ResolveAtlasMaxDimEx documents.
+		// Probe anyway, purely to CHECK it against the pin below. The probe caches, so
+		// asking here costs nothing.
+		ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
 	}
+	// Any disagreement means the mesh was sized for a DIFFERENT atlas than the one about
+	// to be packed, by (ratio)^2 in face capacity. Reported at normal verbosity, not on
+	// TEXTURE_DIAG: this is a silently wrong deliverable, not a mechanism.
+	if (atlasEnvPin > 0 && nMaxTextureSize > 0 && nMaxTextureSize != atlasEnvPin)
+		VERBOSE("[ATLAS] warning: packing into %d px but OPENMVS_ATLAS_MAX_DIM pins %d px"
+			" -- the mesh face cap was sized for the PINNED atlas, so this mesh carries"
+			" %.2fx the faces this atlas can texture; pass --max-texture-size %d to agree",
+			nMaxTextureSize, atlasEnvPin,
+			((double)atlasEnvPin * atlasEnvPin) / ((double)nMaxTextureSize * nMaxTextureSize),
+			atlasEnvPin);
+	else if (atlasEnvPin > 0 && nMaxTextureSize == 0)
+		VERBOSE("[ATLAS] warning: --max-texture-size 0 (unbounded) but"
+			" OPENMVS_ATLAS_MAX_DIM pins %d px -- the mesh face cap was sized for the"
+			" pinned atlas while this atlas is bounded only by RAM; the two will not agree",
+			atlasEnvPin);
+	// The pin exceeding the host is the more dangerous direction and must not pass
+	// silently: the atlas is built, then cannot be sampled by an OpenGL viewer.
+	if (atlasHostLimit > 0 && nMaxTextureSize > atlasHostLimit)
+		VERBOSE("[ATLAS] warning: atlas %d px is LARGER THAN THIS HOST CAN SAMPLE"
+			" (GL_MAX_TEXTURE_SIZE %d px) -- the result will not upload to an OpenGL"
+			" viewer without a rescale", nMaxTextureSize, atlasHostLimit);
 	// project patches in the corresponding view and compute texture-coordinates and bounding-box
 	TEX_PROFILE_BEGIN(_tGtProject);
 	const int border(2);
@@ -7884,7 +8128,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			const double capacity = dim * dim * TEXTURE_ATLAS_FIT_MARGIN;
 			if (totalWorld > 1e-9)
 				cropMaxDensity = (float)(TEXTURE_CROP_OVERSAMPLE * std::sqrt(capacity / totalWorld));
-			DEBUG_EXTRA("[CROP-CAP] atlas capacity %.1f Mpx over %.4g unit^2 -> atlas density"
+			TEXTURE_DIAG("[CROP-CAP] atlas capacity %.1f Mpx over %.4g unit^2 -> atlas density"
 				" %.2f px/unit; extracting at up to %.1fx that = %.2f px/unit",
 				capacity * 1e-6, totalWorld, std::sqrt(capacity / std::max(1e-9, totalWorld)),
 				(double)TEXTURE_CROP_OVERSAMPLE, cropMaxDensity);
@@ -8014,13 +8258,13 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				nReloadFailed, (unsigned)usedLabels.size(), strFirstFailed.c_str());
 			return false;
 		}
-		// [CROP-DECOMP] TEMP decisive measurement: is the +20 GB after this stage the
-		// CROPS themselves, or retained/committed image-decode memory that our buffer
+		// [CROP-DECOMP] decisive measurement: is the +20 GB after this stage the CROPS
+		// themselves, or retained/committed image-decode memory that our buffer
 		// management can't reach? Sum the actual bytes held in every patch crop. If this
 		// prints ~0.6 GB while curWS jumped ~20 GB, the crops are NOT the hog (it is
 		// OpenCV/jpeg decode retention). If it prints ~20 GB, the patch rects really are
-		// huge and the packing-area estimate was wrong. Remove once answered.
-		{
+		// huge and the packing-area estimate was wrong. Log-only scan -> TEXTURE_DIAG.
+		if (TEXTURE_DIAG_ENABLED()) {
 			size_t cropBytes = 0, cropPx = 0; unsigned nCrop = 0, nBig = 0; size_t maxPx = 0;
 			for (uint32_t p = 0; p < texturePatches.GetSize(); ++p) {
 				const Image8U3& im = texturePatches[p].image;
@@ -8030,7 +8274,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				if (px > maxPx) maxPx = px;
 				if (px > 4000000) ++nBig; // patches bigger than ~2000x2000
 			}
-			DEBUG_EXTRA("[CROP-DECOMP] crops=%.2f GB (%u patches, %.1f Mpx total, largest %.1f Mpx, %u patches >4Mpx)",
+			TEXTURE_DIAG("[CROP-DECOMP] crops=%.2f GB (%u patches, %.1f Mpx total, largest %.1f Mpx, %u patches >4Mpx)",
 				cropBytes / (1024.0*1024.0*1024.0), nCrop, cropPx / 1e6, maxPx / 1e6, nBig);
 		}
 		LogPeakMem("GenTex: after per-patch extract");
@@ -8134,14 +8378,96 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			if (memInfo.totalPhysical > 0)
 				targetBytes = (uint64_t)((double)memInfo.totalPhysical * TEXTURE_ATLAS_MEM_TARGET_FRACTION);
 			hardMaxDim = (int)std::sqrt((double)targetBytes / 3.0/*Image8U3*/);
-			DEBUG_EXTRA("GenerateTexture: --max-texture-size 0 (unbounded) -> memory-safe cap %d px (%.1f GB target)",
-				hardMaxDim, targetBytes / (double)GB);
+			VERBOSE("[ATLAS] no texture-size limit requested -> capped at %d px so the atlas"
+				" fits in memory (%.1f GB target)", hardMaxDim, targetBytes / (double)GB);
 		}
 		hardMaxDim = std::max(64, hardMaxDim);
+		// Everything the patches wanted, before any packing decision. Kept so the
+		// downscale below can be stated as a LOSS against this rather than as a bare
+		// count of shrunk patches -- how much resolution was given up is the question,
+		// and the patch count does not answer it.
+		uint64_t wantedAreaPixels = 0;
+		for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i) {
+			const auto& r = texturePatches[(uint32_t)i].rect;
+			wantedAreaPixels += (uint64_t)std::max(0, r.width) * (uint64_t)std::max(0, r.height);
+		}
+
+#if TEXTURE_ATLAS_MEM_PREFLIGHT
+		// Will the atlas this is about to pack actually fit in RAM? See
+		// TEXTURE_ATLAS_MEM_PREFLIGHT for why this degrades instead of failing.
+		//
+		// Predicted from wantedAreaPixels, not from hardMaxDim^2: the patches are already
+		// measured at this point, so the honest estimate is what the pack will REACH,
+		// capped by the ceiling. Sizing on hardMaxDim^2 alone would refuse a 32768 pin on
+		// every small scene that would never have grown near it.
+		{
+			constexpr uint64_t GB = 1024ull * 1024ull * 1024ull;
+			const Util::MemoryInfo memInfo(Util::GetMemoryInfo());
+			const uint64_t ceilTexels = (uint64_t)hardMaxDim * (uint64_t)hardMaxDim;
+			// The pack lands near wanted/margin (measured 249.7 of 268.4 Mpx = 0.93 on a
+			// 16384 run, which is TEXTURE_ATLAS_FIT_MARGIN); never above the ceiling.
+			const uint64_t predTexels = std::min(ceilTexels,
+				(uint64_t)((double)wantedAreaPixels / TEXTURE_ATLAS_FIT_MARGIN));
+			const double bytesPerTexel = (double)TEXTURE_ATLAS_MEM_BYTES_PER_TEXEL;
+			const uint64_t predBytes = (uint64_t)((double)predTexels * bytesPerTexel);
+
+			// Same safety convention the densify stage uses throughout: hold back
+			// max(8% of total, 1 GB). freePhysical rather than totalPhysical because the
+			// view working set is ALREADY resident at this point -- that is the whole
+			// reason to check here rather than at entry -- so counting it again would
+			// double-charge it.
+			uint64_t budgetBytes;
+			if (memInfo.totalPhysical > 0) {
+				const uint64_t safety = std::max(
+					(uint64_t)((double)memInfo.totalPhysical * 0.08), 1ull * GB);
+				budgetBytes = (memInfo.freePhysical > safety) ? memInfo.freePhysical - safety : 0;
+			} else {
+				// OS query failed: fall back to the same figure the unbounded path uses.
+				budgetBytes = (uint64_t)TEXTURE_ATLAS_MEM_TARGET_FALLBACK_GB * GB;
+			}
+
+			TEXTURE_DIAG("[ATLAS-MEM] atlas prediction %.1f Mpx x %.1f B/texel = %.2f GB"
+				" | free %.2f GB, budget %.2f GB | ceiling %d px",
+				predTexels * 1e-6, bytesPerTexel, predBytes / (double)GB,
+				memInfo.freePhysical / (double)GB, budgetBytes / (double)GB, hardMaxDim);
+
+			if (predBytes > budgetBytes && budgetBytes > 0) {
+				// Largest dimension that fits, snapped DOWN to nTextureSizeMultiple so the
+				// packer's own alignment is preserved, and floored at 64 (the same floor
+				// applied to hardMaxDim above) so a hopeless budget still produces
+				// something rather than a zero-sized atlas.
+				int fitDim = (int)std::sqrt((double)budgetBytes / bytesPerTexel);
+				const int mult = (int)std::max(1u, nTextureSizeMultiple);
+				fitDim = (fitDim / mult) * mult;
+				fitDim = std::max(64, std::min(fitDim, hardMaxDim));
+				// Needed RAM for the atlas the operator ASKED for, so the message says what
+				// to change about the machine rather than only what was taken away.
+				const uint64_t neededBytes = (uint64_t)((double)predTexels * bytesPerTexel)
+					+ ((memInfo.totalPhysical > 0)
+						? std::max((uint64_t)((double)memInfo.totalPhysical * 0.08), 1ull * GB)
+						: 1ull * GB);
+				VERBOSE("[ATLAS-MEM] NOT ENOUGH MEMORY for the requested atlas:"
+					" %d px needs about %.2f GB (%.1f Mpx x %.1f B/texel) but only %.2f GB"
+					" is safely available -- capping the atlas at %d px, which keeps %.2fx"
+					" the texture pixels (%.2fx linear detail)."
+					" About %.1f GB of free RAM would be needed to build %d px here.",
+					hardMaxDim, predBytes / (double)GB, predTexels * 1e-6, bytesPerTexel,
+					budgetBytes / (double)GB, fitDim,
+					((double)fitDim * fitDim) / (double)predTexels,
+					std::sqrt(((double)fitDim * fitDim) / (double)predTexels),
+					neededBytes / (double)GB, hardMaxDim);
+				hardMaxDim = fitDim;
+			}
+		}
+#endif
 
 		TEX_PROFILE_BEGIN(_tGtPack);
 		bool ok = PackShelfReasonablySquare(rects, (int)nTextureSizeMultiple, hardMaxDim, placed, atlasW, atlasH);
 
+		// Set only if patch resolution was actually surrendered, so the report below
+		// distinguishes "the atlas came out small because the scene is small" from
+		// "the atlas came out small because it was not allowed to be bigger".
+		bool bAtlasReduced = false;
 		if (!ok && TEXTURE_ATLAS_ADAPTIVE_FIT) {
 			// Patches don't fit within hardMaxDim at native resolution. Rather than
 			// growing the atlas past a real GPU/memory ceiling, shrink only the patches
@@ -8152,7 +8478,14 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 				++attempt, margin *= TEXTURE_ATLAS_FIT_MARGIN_STEP) {
 				const uint64_t budgetAreaPixels = (uint64_t)((double)hardMaxDim * (double)hardMaxDim * margin);
 				const unsigned numFit = AdaptiveFitPatches(budgetAreaPixels, hardMaxDim);
-				DEBUG_EXTRA("GenerateTexture: atlas overflow at %d px -- adaptively downscaled %u/%u patches to fit (attempt %d, margin %.2f)",
+				if (numFit > 0)
+					bAtlasReduced = true;
+				// Per-attempt detail only. Resolution IS being surrendered here and that
+				// must reach the default log, but the loop can run several times and
+				// numFit can legitimately be 0 (area fits, pack still failed), so the
+				// single authoritative statement is the [ATLAS] summary after the pack
+				// succeeds -- it reports the total loss rather than one step of it.
+				TEXTURE_DIAG("GenerateTexture: atlas overflow at %d px -- adaptively downscaled %u/%u patches to fit (attempt %d, margin %.2f)",
 					hardMaxDim, numFit, texturePatches.GetSize(), attempt + 1, margin);
 				for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i)
 					rects[i] = texturePatches[(uint32_t)i].rect;
@@ -8177,9 +8510,105 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			// Cannot fit even after adaptive downscaling: fail loudly rather than repeat
 			// the old behaviour of silently doubling the atlas dimension past a "hard"
 			// cap toward a multi-hundred-GB allocation.
-			DEBUG_EXTRA("GenerateTexture: FATAL -- cannot fit texture patches within %d px even after "
-				"adaptive downscaling; increase --max-texture-size or reduce mesh/image resolution", hardMaxDim);
+			VERBOSE("error: cannot fit the texture within %d px even after reducing patch"
+				" resolution; raise --max-texture-size or reduce mesh/image resolution", hardMaxDim);
 			return false;
+		}
+
+		// THE ATLAS THAT WILL ACTUALLY BE BUILT. Nothing reported this before -- the
+		// dimension was decided, used and never named, so a run that quietly produced a
+		// quarter of the texture resolution it asked for was indistinguishable from one
+		// that did not.
+		//
+		// The loss is measured on the PATCHES, not on the atlas: atlasW*atlasH includes
+		// shelf-packing waste, so comparing the atlas area against the requested area
+		// can read above 1.0 on a run that genuinely downscaled. Summing the patch rects
+		// after the fit is the honest measure -- AdaptiveFitPatches shrinks those rects
+		// in place, so the difference against wantedAreaPixels is exactly the resolution
+		// given up. The equivalent square dimension is reported alongside because that
+		// is the number that maps onto --max-texture-size; a pixel-area figure does not.
+		{
+			uint64_t finalAreaPixels = 0;
+			for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i) {
+				const auto& r = texturePatches[(uint32_t)i].rect;
+				finalAreaPixels += (uint64_t)std::max(0, r.width) * (uint64_t)std::max(0, r.height);
+			}
+			if (bAtlasReduced && wantedAreaPixels > 0) {
+				const double keptFrac = (double)finalAreaPixels / (double)wantedAreaPixels;
+				const int wantedDim = (int)std::ceil(std::sqrt((double)wantedAreaPixels));
+				VERBOSE("[ATLAS] built %dx%d px, ceiling %d px -- SMALLER THAN WANTED:"
+					" full resolution needed about %d px, so the texture keeps %.2fx the"
+					" pixels it asked for (about %.2fx linear detail)",
+					atlasW, atlasH, hardMaxDim, wantedDim, keptFrac, std::sqrt(keptFrac));
+			} else {
+				VERBOSE("[ATLAS] built %dx%d px, ceiling %d px -- full requested resolution",
+					atlasW, atlasH, hardMaxDim);
+			}
+		}
+
+		// [ATLAS-PATCHES] Where the allocated patch area actually goes, bucketed by patch
+		// size. Added to answer ONE question that [ATLAS-GUTTER] raises but cannot settle.
+		//
+		// ATLAS-GUTTER measures the end state: 51.6% of a 16384^2 atlas carried no triangle
+		// on a 7.2M-face run -- 138.3M texels cleared and regrown by the flood. Packing is
+		// not the cause (patch rects 249.6 Mpx into a 262.0 Mpx atlas is only 4.7% waste),
+		// so the loss is INSIDE the rects. Two very different causes produce that same
+		// number and they have opposite fixes:
+		//
+		//   * MANY TINY PATCHES -- every patch pays a fixed border, so overhead scales with
+		//     PERIMETER while payload scales with AREA. A patch near the floor is mostly
+		//     border. Fix: fewer, larger charts (the view-labelling smoothness term).
+		//   * FEW LARGE PATCHES WITH SLACK BOUNDING BOXES -- an irregular chart inside an
+		//     axis-aligned rect leaves the corners empty regardless of size. Fix: chart
+		//     shape or rotation, an entirely different change.
+		//
+		// The discriminator is whether the small buckets hold a share of AREA out of all
+		// proportion to their share of FACES. They carry the same information either way,
+		// so area-per-face is the payload; a bucket holding 30% of the atlas for 5% of the
+		// faces is pure overhead, and that is the signature of fragmentation.
+		//
+		// Deliberately NOT reporting a computed gutter overhead here: the border width on
+		// this path is not a single named constant (the 2 px `gutter` near the tile bake is
+		// a different code path), so any per-patch overhead figure would rest on an assumed
+		// value. Counts, areas and faces are all measured directly.
+		if (TEXTURE_DIAG_ENABLED()) {
+			// Bucket by the LONGER side: a 6x400 strip is a fragmentation artifact, not a
+			// large patch, and bucketing on area alone would file it with the healthy ones.
+			const int kEdges[] = { 8, 16, 32, 64, 128, 256, 512, INT_MAX };
+			const size_t nB = sizeof(kEdges) / sizeof(kEdges[0]);
+			std::vector<uint64_t> bCount(nB, 0), bArea(nB, 0), bFaces(nB, 0);
+			uint64_t totArea = 0, totFaces = 0;
+			int minSide = INT_MAX, maxSide = 0;
+			for (size_t i = 0; i < (size_t)texturePatches.GetSize(); ++i) {
+				const auto& p = texturePatches[(uint32_t)i];
+				const int w = std::max(0, p.rect.width), h = std::max(0, p.rect.height);
+				const int side = std::max(w, h);
+				const uint64_t a = (uint64_t)w * (uint64_t)h;
+				const uint64_t nf = (uint64_t)p.faces.size();
+				size_t b = 0;
+				while (b + 1 < nB && side >= kEdges[b]) ++b;
+				++bCount[b]; bArea[b] += a; bFaces[b] += nf;
+				totArea += a; totFaces += nf;
+				if (side < minSide) minSide = side;
+				if (side > maxSide) maxSide = side;
+			}
+			TEXTURE_DIAG("[ATLAS-PATCHES] %u patches | %llu faces | %.1f Mpx allocated |"
+				" side min=%d max=%d -- bucket columns are: patches, %% of allocated area,"
+				" %% of faces, texels/face",
+				texturePatches.GetSize(), (unsigned long long)totFaces,
+				(double)totArea * 1e-6, minSide == INT_MAX ? 0 : minSide, maxSide);
+			const char* kNames[] = { "<8", "8-15", "16-31", "32-63", "64-127",
+				"128-255", "256-511", ">=512" };
+			for (size_t b = 0; b < nB; ++b) {
+				if (!bCount[b])
+					continue;
+				TEXTURE_DIAG("[ATLAS-PATCHES]   side %-8s %8llu patches | area %5.1f%% |"
+					" faces %5.1f%% | %7.1f texels/face",
+					kNames[b], (unsigned long long)bCount[b],
+					totArea  ? 100.0 * (double)bArea[b]  / (double)totArea  : 0.0,
+					totFaces ? 100.0 * (double)bFaces[b] / (double)totFaces : 0.0,
+					bFaces[b] ? (double)bArea[b] / (double)bFaces[b] : 0.0);
+			}
 		}
 
 		rects.swap(placed);
@@ -8681,11 +9110,14 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						const float meshDiag = len3(Point3f(mxx-mnx, mxy-mny, mxz-mnz));
 						const float minLoopDiag =
 							(float)TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC * meshDiag;
+						// Loop census: reported only, the cut below tests each loop directly.
 						size_t nLoops = 0, nOuterLoops = 0;
-						for (size_t v = 0; v < nV; ++v) {
-							if (!isLoopRoot[v]) continue;
-							++nLoops;
-							if (loopDiag((uint32_t)v) >= minLoopDiag) ++nOuterLoops;
+						if (TEXTURE_DIAG_ENABLED()) {
+							for (size_t v = 0; v < nV; ++v) {
+								if (!isLoopRoot[v]) continue;
+								++nLoops;
+								if (loopDiag((uint32_t)v) >= minLoopDiag) ++nOuterLoops;
+							}
 						}
 						cur.clear();
 						for (const FIndex f : noViewFaces) {
@@ -8699,7 +9131,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								}
 							}
 						}
-						DEBUG("[TEX-SHEET] border loops: %zu total, %zu qualify as outer"
+						TEXTURE_DIAG("[TEX-SHEET] border loops: %zu total, %zu qualify as outer"
 							" (bbox diag >= %.3g = %.3g of mesh diag %.4g)",
 							nLoops, nOuterLoops, minLoopDiag,
 							(double)TEXTURE_OUTER_LOOP_MIN_DIAG_FRAC, meshDiag);
@@ -8742,16 +9174,19 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								}
 							}
 						}
-						std::vector<uint32_t> srt(compSizeNV);
-						std::sort(srt.begin(), srt.end(), [](uint32_t a, uint32_t b) { return a > b; });
-						std::string szStr;
-						for (size_t i = 0; i < srt.size() && i < 12; ++i) { szStr += std::to_string(srt[i]); szStr += ' '; }
-						DEBUG("[TEX-SHEET] unobserved components: %zu total, sizes (top of %zu): %s"
-							"| ENCLOSED kept only at >= %d faces -- read this distribution and pick a"
-							" value in a real GAP between the big regions (lakes, textureless roofs) and"
-							" the speck/tongue tier",
-							compSizeNV.size(), srt.size(), szStr.c_str(),
-							(int)TEXTURE_FILL_MIN_COMPONENT_FACES);
+						// Distribution report only -- the keep rule below reads compSizeNV directly.
+						if (TEXTURE_DIAG_ENABLED()) {
+							std::vector<uint32_t> srt(compSizeNV);
+							std::sort(srt.begin(), srt.end(), [](uint32_t a, uint32_t b) { return a > b; });
+							std::string szStr;
+							for (size_t i = 0; i < srt.size() && i < 12; ++i) { szStr += std::to_string(srt[i]); szStr += ' '; }
+							TEXTURE_DIAG("[TEX-SHEET] unobserved components: %zu total, sizes (top of %zu): %s"
+								"| ENCLOSED kept only at >= %d faces -- read this distribution and pick a"
+								" value in a real GAP between the big regions (lakes, textureless roofs) and"
+								" the speck/tongue tier",
+								compSizeNV.size(), srt.size(), szStr.c_str(),
+								(int)TEXTURE_FILL_MIN_COMPONENT_FACES);
+						}
 					}
 					// Per-face keep/drop, before smoothing.
 					std::vector<uint8_t> keepF(nF, 0);
@@ -8800,10 +9235,10 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						if (bEnclosed || (dist[f] != kUnreached && dist[f] <= marginDist))
 							keepF[f] = 1;
 					}
-					DEBUG("[TEX-SHEET] hidden-geometry filter: %zu of %zu unobserved faces never"
+					TEXTURE_DIAG("[TEX-SHEET] hidden-geometry filter: %zu of %zu unobserved faces never"
 						" projected front-wound in any view -> dropped instead of filled",
 						nHiddenDropped, noViewFaces.size());
-					DEBUG("[TEX-SHEET] small-component filter: %zu unobserved faces dropped as"
+					TEXTURE_DIAG("[TEX-SHEET] small-component filter: %zu unobserved faces dropped as"
 						" enclosed components under %d faces", nSmallDropped,
 						(int)TEXTURE_FILL_MIN_COMPONENT_FACES);
 
@@ -8841,6 +9276,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					// strictly reduces local disagreement, so the filter descends to a fixed point.
 					// Order is the fixed noViewFaces order, so the result stays deterministic.
 					std::string smoothFlips;
+					const bool bFlipTrace = TEXTURE_DIAG_ENABLED(); // the trace, not the filter
 					for (int pass = 0; pass < TEXTURE_UNOBSERVED_EDGE_SMOOTH_PASSES; ++pass) {
 						size_t nFlips = 0;
 						for (const FIndex f : noViewFaces) {
@@ -8862,12 +9298,14 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								++nFlips;
 							}
 						}
-						smoothFlips += (pass ? " " : "");
-						smoothFlips += std::to_string(nFlips);
+						if (bFlipTrace) {
+							smoothFlips += (pass ? " " : "");
+							smoothFlips += std::to_string(nFlips);
+						}
 						if (nFlips == 0)
 							break; // fixed point reached; further passes cannot change anything
 					}
-					DEBUG("[TEX-SHEET] contour majority filter: %d passes, flips per pass: %s"
+					TEXTURE_DIAG("[TEX-SHEET] contour majority filter: %d passes, flips per pass: %s"
 						" -- falling to ~0 means the contour has converged and more passes are"
 						" pointless; still large on the last pass means it is eating into the"
 						" boundary rather than removing spikes",
@@ -9012,7 +9450,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 							// removes them safely; if they are all tiny, the cut is only shedding
 							// specks and the floor is doing its job. Same idiom as
 							// "DIAG component sizes" in Mesh.cpp.
-							{
+							if (TEXTURE_DIAG_ENABLED()) {
 								std::vector<uint32_t> sorted(compSize);
 								std::sort(sorted.begin(), sorted.end(),
 									[](uint32_t a, uint32_t b) { return a > b; });
@@ -9021,7 +9459,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 									dist += std::to_string(sorted[i]);
 									dist += ' ';
 								}
-								DEBUG("[TEX-SHEET] component sizes (top of %zu): %s",
+								TEXTURE_DIAG("[TEX-SHEET] component sizes (top of %zu): %s",
 									compSize.size(), dist.c_str());
 							}
 							if (compSize.size() > 1 && largest > 0) {
@@ -9045,13 +9483,13 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 									}
 								}
 								if (bKeepLargestOnly) {
-									DEBUG("[TEX-SHEET] orphan filter: input was 1 component,"
+									TEXTURE_DIAG("[TEX-SHEET] orphan filter: input was 1 component,"
 										" this stage's cuts made %zu -> keeping only the largest"
 										" (%u faces), dropped %zu components (%zu faces)",
 										compSize.size(), largest, nOrphanComps, nOrphanFaces);
 								} 
 								else {
-									DEBUG("[TEX-SHEET] orphan filter: input had %zu components,"
+									TEXTURE_DIAG("[TEX-SHEET] orphan filter: input had %zu components,"
 										" %zu survive the cut, largest %u faces -> dropped %zu"
 										" components (%zu faces) under %u faces (%.3g%% of largest)",
 										nInputComps, compSize.size(), largest, nOrphanComps,
@@ -9059,7 +9497,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 										(double)TEXTURE_ORPHAN_COMPONENT_PCT_X1000 / 1000.0);
 								}
 							} else {
-								DEBUG("[TEX-SHEET] orphan filter: surface is a single component"
+								TEXTURE_DIAG("[TEX-SHEET] orphan filter: surface is a single component"
 									" (%u faces) -- nothing to drop", largest);
 							}
 						}
@@ -9105,7 +9543,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						keep.push_back(f);
 						if (touchesBorder[f]) ++nMargin; else ++nEnclosed;
 					}
-					DEBUG("[TEX-SHEET] unobserved %zu faces -> keep %zu enclosed (interior fill)"
+					TEXTURE_DIAG("[TEX-SHEET] unobserved %zu faces -> keep %zu enclosed (interior fill)"
 						" + %zu within %.3g-unit edge margin (%.1f x median edge %.3g,"
 						" %d smoothing passes) | rim peel removed %zu 2-border-edge slivers"
 						" | orphan filter removed %zu faces in %zu islands"
@@ -9603,7 +10041,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 							}
 							extraRows = shelfY + shelfH;
 						}
-						DEBUG("[DATACOLOR-CLAMP] fill wanted %d rows on top of %d packed"
+						TEXTURE_DIAG("[DATACOLOR-CLAMP] fill wanted %d rows on top of %d packed"
 							" (cap %d) -> shrunk to %d rows. Global atlas downscale avoided;"
 							" the loss is taken by the flat fill, not by real texture.",
 							wanted, oldRows, nMaxTextureSize, extraRows);
@@ -9942,7 +10380,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 							}
 							if (boundary) { fRing[f] = 0; cur.push_back(f); bandFaces.push_back(f); }
 						}
-						DEBUG("[SEAM-SKIP] feather ring 0 = %zu faces (%zu seeded by an open mesh"
+						TEXTURE_DIAG("[SEAM-SKIP] feather ring 0 = %zu faces (%zu seeded by an open mesh"
 							" edge, %zu by a visible no-view neighbour); %zu neighbour links"
 							" skipped as hidden geometry (never front-wound in any view)",
 							cur.size(), nSeedRim, nSeedFill, nHiddenLinksSkipped);
@@ -10174,14 +10612,14 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 								dgSumResid += d.sumResid; if (d.maxResid > dgMaxResid) dgMaxResid = d.maxResid;
 							}
 #endif
-							DEBUG("[SEAM-OUTSET] feather band %zu faces -> %lld texels written,"
+							TEXTURE_DIAG("[SEAM-OUTSET] feather band %zu faces -> %lld texels written,"
 								" %lld of them (%.1f%%) in the %.2f px outset rim that the old"
 								" centre-inside test left stale",
 								bandFaces.size(), nBandWritten, nOutsetWritten,
 								nBandWritten ? 100.0 * (double)nOutsetWritten / (double)nBandWritten : 0.0,
 								(double)bakeOutset);
 #if TEXTURE_DATACOLOR_DIAG
-							DEBUG("[DATACOLOR-DIAG] noView=%d nComp=%d band=%d | written=%lld skipEmpty=%lld skipAlpha=%lld | boundary=%lld meanStep=%.2f maxStep=%.2f meanResid=%.2f maxResid=%.2f",
+							TEXTURE_DIAG("[DATACOLOR-DIAG] noView=%d nComp=%d band=%d | written=%lld skipEmpty=%lld skipAlpha=%lld | boundary=%lld meanStep=%.2f maxStep=%.2f meanResid=%.2f maxResid=%.2f",
 								N, nComp, (int)bandFaces.size(),
 								dgWritten, dgSkipEmpty, dgSkipAlpha, dgBoundN,
 								dgBoundN ? dgSumStep / (double)dgBoundN : 0.0, dgMaxStep,
@@ -10521,7 +10959,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					std::vector<cv::Point>().swap(v); // release as we go: nf can be millions
 				}
 			}
-			DEBUG("[ATLAS-GUTTER] %u faces (%zu dropped) -> cleared %lld of %lld texels"
+			TEXTURE_DIAG("[ATLAS-GUTTER] %u faces (%zu dropped) -> cleared %lld of %lld texels"
 				" (%.1f%%) and regrew them from the final per-face colours (seed frontier %zu)",
 				nFaces, unobservedToDelete.size(), nCleared, (long long)H * (long long)W,
 				100.0 * (double)nCleared / (double)std::max<long long>(1, (long long)H * (long long)W),
@@ -10721,6 +11159,53 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 		if (!texture.GenerateTexture(bGlobalSeamLeveling, bLocalSeamLeveling, nTextureSizeMultiple, nRectPackingHeuristic, colEmpty, fSharpnessWeight, nMaxTextureSize))
 			return false;
 		DEBUG_EXTRA("Generating texture atlas and image completed: %u patches, %u image size (%s)", texture.texturePatches.GetSize(), mesh.textureDiffuse.width(), TD_TIMER_GET_FMT().c_str());
+		if (TEXTURE_DIAG_ENABLED()) {
+			// [ATLAS-FINAL] What the atlas actually came out as. On the TEXTURE_DIAG build
+			// switch, paired with RefineMesh's [REFINE-FACES] on REFINE_DIAG: the two are
+			// the texel-budget audit trail and are only meaningful read together, so a
+			// -DOPENMVS_DIAG=1 build carries both. (ReconstructMesh's [ATLAS] cap line and
+			// the "SMALLER THAN WANTED" notice stay ungated on purpose -- those report a
+			// change to the deliverable, not a mechanism.)
+			//
+			// The line above reports textureDiffuse.width() ONLY. The atlas is not square --
+			// measured 14876 x 16054 on one run -- so reading that single number as the atlas
+			// size understates the area by ~8% and makes the fill look far worse than it is.
+			// That misreading produced a wrong "18% of the atlas is wasted" conclusion that
+			// had to be walked back; the real figure came from dividing the ATLAS-GUTTER texel
+			// count by the width. Report both dimensions and the fill directly.
+			//
+			// texels/face is the quantity ReconstructMesh's atlas cap is trying to hold at 64
+			// (D^2*0.97/64). It is computed here on the POST-refine mesh, which is the one that
+			// actually gets textured -- see [REFINE-FACES].
+			const double atlasW = (double)mesh.textureDiffuse.width();
+			const double atlasH = (double)mesh.textureDiffuse.height();
+			const double atlasPx = atlasW * atlasH;
+			const int hostDim = GetOpenGLMaxTextureSize();
+			const double hostPx = (double)hostDim * (double)hostDim;
+			const unsigned nF = mesh.faces.GetSize();
+			// The host comparison is stated in words rather than as a bare ratio. It used to
+			// print "%.3f of the %d px host maximum", which on a deliberately-pinned atlas
+			// LARGER than the build machine's GL limit reads as "3.991 of the 16384 px host
+			// maximum" -- indistinguishable from a scaling bug, and this is a normal, wanted
+			// state when the deliverable targets better hardware than the box building it.
+			// Say which side of the limit the atlas landed on and leave the ratio out.
+			const bool bOverHost = (hostDim > 0 && (atlasW > hostDim || atlasH > hostDim));
+			String hostNote;
+			if (hostDim <= 0)
+				hostNote = _T("no GL limit probed");
+			else if (bOverHost)
+				hostNote = String::FormatString(
+					"EXCEEDS this build host's %d px GL limit -- fine if the consumer's GPU"
+					" is larger, not sampleable here", hostDim);
+			else
+				hostNote = String::FormatString("within this host's %d px GL limit (%.1f Mpx)",
+					hostDim, hostPx * 1e-6);
+			TEXTURE_DIAG("[ATLAS-FINAL] %.0f x %.0f = %.1f Mpx | %s"
+				" | %u faces -> %.0f texels/face | %u patches",
+				atlasW, atlasH, atlasPx * 1e-6, hostNote.c_str(),
+				nF, nF ? atlasPx / (double)nF : 0.0,
+				texture.texturePatches.GetSize());
+		}
 
 		// Apply the boundary-sheet removal decided during the data-colour pass. Done
 		// HERE, after texturing, because texturePatches / components / faceTexcoords are
@@ -10850,7 +11335,8 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 						(int)TEXTURE_BOUNDARY_SMOOTH_ITERS, lambda, mu,
 						TD_TIMER_GET_FMT().c_str());
 				} else {
-					DEBUG("[TEX-SMOOTH] silhouette Taubin: no clean border-curve vertices"
+					// nothing changed on the mesh -> trace, not a result
+					TEXTURE_DIAG("[TEX-SMOOTH] silhouette Taubin: no clean border-curve vertices"
 						" (%zu junctions) -- nothing to smooth", nJunction);
 				}
 			}

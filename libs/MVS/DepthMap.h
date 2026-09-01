@@ -601,6 +601,12 @@ struct MVS_API DepthEstimator {
 	//WeightMapInfo_t& weightMap0Info;
 	#endif
 	DepthMap lowResDepthMap;
+#ifdef DPC_VIEW_SHORTLIST
+	// see the toggle note in Common.h: reset for every pixel in
+	// PreparePixelPatch, narrowed by the pixel's first ScorePixel call
+	uint32_t viewShortlistMask = ~0u;
+	bool bShortlistPending = false;
+#endif
 
 	//const unsigned nIteration; // current PatchMatch iteration
 	const DepthData::ViewDataArr images; // neighbor images used
@@ -816,6 +822,11 @@ struct MVS_API DepthEstimator {
 
 	bool PreparePixelPatch(const ImageRef& x)
 	{
+#ifdef DPC_VIEW_SHORTLIST
+		// new pixel: every view is a candidate until its first hypothesis scores
+		viewShortlistMask = ~0u;
+		bShortlistPending = true;
+#endif
 		const _DataI vUlxy = _CastIF(_mm_loadl_pi(vX0, (__m64*) &x.x)); // x0.x, x0.y, xx, xx
 		const _Data vUlxyAsF = _ConvertFI(vUlxy);
 		constexpr _Data vHalfWindowSize { nSizeHalfWindow, nSizeHalfWindow, 0.f, 0.f };
@@ -1276,6 +1287,14 @@ MVS_API bool ImportDepthDataRaw(const String&, String& imageFileName,
 MVS_API bool PatchDepthConfRaw(const String& fileName,
 	const DepthMap& depthMap, const ConfidenceMap& confMap,
 	bool hasNormal, bool hasViews);
+// Same, but taking the file's own header as the authority on which optional sections
+// it carries instead of cross-checking against an in-memory DepthData. For the adjust
+// sub-phase, which replaces only depth+confidence and therefore has no reason to read
+// the ~30MB of normals/views back off disk purely to answer two yes/no questions. The
+// checks that make the in-place patch safe -- magic, HAS_DEPTH, HAS_CONF, dimensions,
+// total size -- are all still performed against the header.
+MVS_API bool PatchDepthConfRaw(const String& fileName,
+	const DepthMap& depthMap, const ConfidenceMap& confMap);
 // fast, allocation-free measurement of the mean relative depth change between two raw
 // depth-data files: reads ONLY the depth section and subsamples rows/columns with the
 // given stride (>=1), avoiding the full-image allocation + copy ImportDepthDataRaw does.

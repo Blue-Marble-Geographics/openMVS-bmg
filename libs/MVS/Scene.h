@@ -45,7 +45,7 @@
 // It is logged by the ReconstructMesh app and the Poisson reconstruction path
 // so any log we produce identifies exactly which build was run.
 #ifndef OPENMVS_BMG_BUILD
-#define OPENMVS_BMG_BUILD 13
+#define OPENMVS_BMG_BUILD 14
 #endif
 
 

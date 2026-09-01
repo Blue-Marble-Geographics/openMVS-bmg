@@ -1072,6 +1072,11 @@ void Mesh::SmoothNormalFaces(float fMaxGradient,
 
 	NormalArr newFaceNormals(faceNormals.size());
 
+	// Degenerate faces reaching here as the (0,0,0) that SafeNormalizeFaceNormal
+	// deliberately substitutes for a NaN. Counted so the damage is measurable
+	// instead of inferred -- see the guard at the final normalize below.
+	size_t numDegenerate = 0;
+
 	for (unsigned rep = 0; rep < nIterations; ++rep) {
 
 		FOREACH(idxFace, faces) {
@@ -1102,16 +1107,27 @@ void Mesh::SmoothNormalFaces(float fMaxGradient,
 
 			if (count > 0) {
 				// normalize neighbor sum once
-				const float invLen =
-					1.0f / sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+				// Guarded like SafeNormalizeFaceNormal: the accepted neighbours all
+				// satisfy dot >= cos(fMaxGradient) with orig, so a cancelling sum is
+				// not reachable for well-formed input and this branch is never taken
+				// -- but 1/sqrt(0) is +inf, and inf*0 is the NaN this function must
+				// not manufacture.
+				const float lenSum =
+					sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
 
-				const Normal avg(sum.x * invLen,
-					sum.y * invLen,
-					sum.z * invLen);
+				if (lenSum > 0.f) {
+					const float invLen = 1.0f / lenSum;
 
-				blended.x = orig.x * w0 + avg.x * w1;
-				blended.y = orig.y * w0 + avg.y * w1;
-				blended.z = orig.z * w0 + avg.z * w1;
+					const Normal avg(sum.x * invLen,
+						sum.y * invLen,
+						sum.z * invLen);
+
+					blended.x = orig.x * w0 + avg.x * w1;
+					blended.y = orig.y * w0 + avg.y * w1;
+					blended.z = orig.z * w0 + avg.z * w1;
+				} else {
+					blended = orig;
+				}
 			}
 			else {
 				// no valid neighbors
@@ -1119,18 +1135,61 @@ void Mesh::SmoothNormalFaces(float fMaxGradient,
 			}
 
 			// final normalize (still required)
-			const float invLen =
-				1.0f / sqrt(blended.x * blended.x +
+			//
+			// THE NaN SOURCE. ComputeNormalFaces/SafeNormalizeFaceNormal deliberately
+			// substitutes (0,0,0) for a degenerate (zero-area) face, because a zero
+			// "sums benignly and every existing length guard already handles it". For
+			// such a face, orig is (0,0,0), so `dot` is 0 against every neighbour,
+			// 0 >= cos(25deg) is false, count stays 0, and blended = orig = (0,0,0).
+			// The unguarded reciprocal then made invLen = 1/sqrt(0) = +inf and the
+			// three products 0*inf = NaN -- re-manufacturing, one function later,
+			// exactly the NaN that SafeNormalizeFaceNormal exists to prevent.
+			//
+			// What that NaN then does (it does NOT stay local):
+			//  - SmoothnessPottsStrong (SceneTexture.cpp, INCREASE_PATCHES variant)
+			//    computes cosAngle = N1.dot(N2) and clamps with `if (cosAngle < 0.f)`,
+			//    which is FALSE for NaN, so the NaN survives into
+			//    w = gSmoothnessWeight * (1 + cosAngle). (The non-INCREASE_PATCHES
+			//    variant uses std::max(0.f, cosAngle), which happens to return 0.f for
+			//    a NaN second argument -- so only the ACTIVE variant propagates it.)
+			//  - LBP.h PrepareTopology caches that as edgeWeight[e] once per directed
+			//    edge, and the Potts fast path computes minPlusW = minAll + W = NaN.
+			//    Every `<` test against NaN is false, so the whole outgoing message is
+			//    NaN, the receiving node's incoming sum is NaN, and its own outgoing
+			//    messages are NaN: the poison advances one ring per sweep, ~50 rings.
+			//  - In the final labeling, `e = data[j] + m0[j]+m1[j]+m2[j]` is NaN and
+			//    `if (e < bestE)` never fires, so the node silently keeps labels[0]
+			//    (the rank-0 view) forever. It stops flipping, which SUPPRESSES the
+			//    `changed=` count -- the solve looks converged while the MRF is inert
+			//    over the poisoned region, and only the [LBP-DIAG] smooth= term (NaN
+			//    while data= stays finite) reveals it.
+			const float lenBlended =
+				sqrt(blended.x * blended.x +
 					blended.y * blended.y +
 					blended.z * blended.z);
 
-			newFaceNormals[idxFace].x = blended.x * invLen;
-			newFaceNormals[idxFace].y = blended.y * invLen;
-			newFaceNormals[idxFace].z = blended.z * invLen;
+			// `> 0` rather than a negated epsilon so a NaN arriving from an earlier
+			// stage also takes the fallback: this function is now a NaN sink, not a
+			// NaN source.
+			if (lenBlended > 0.f) {
+				const float invLen = 1.0f / lenBlended;
+
+				newFaceNormals[idxFace].x = blended.x * invLen;
+				newFaceNormals[idxFace].y = blended.y * invLen;
+				newFaceNormals[idxFace].z = blended.z * invLen;
+			} else {
+				newFaceNormals[idxFace] = Normal(0, 0, 0);
+				if (rep == 0)
+					++numDegenerate;
+			}
 		}
 
 		newFaceNormals.Swap(faceNormals);
 	}
+
+	if (numDegenerate)
+		DEBUG("warning: %zu/%u face normals are degenerate (zero-area faces); they are held at (0,0,0) instead of NaN",
+			numDegenerate, faces.GetSize());
 }
 #else
 void Mesh::SmoothNormalFaces(float fMaxGradient, float fOriginalWeight, unsigned nIterations) {
@@ -2182,6 +2241,10 @@ void Mesh::Clean(
 		return;
 
 	CleanStats stats;
+	// Captured before the vcg copy below releases them, for the one summary line this
+	// pass emits at normal verbosity -- the per-phase counters ride MESH_DIAG.
+	const VIndex numVertsIn = vertices.GetSize();
+	const FIndex numFacesIn = faces.GetSize();
 
 	TD_TIMER_STARTD();
 
@@ -2332,7 +2395,7 @@ void Mesh::Clean(
 			// only need to compact here -- the FF/VF rebuild would be wasted.
 			Compact();
 
-			DEBUG("DIAG after long-edge removal: %d vn, %d fn (removed %d)",
+			MESH_DIAG("DIAG after long-edge removal: %d vn, %d fn (removed %d)",
 				mesh.vn, mesh.fn, removed);
 		}
 
@@ -2359,7 +2422,7 @@ void Mesh::Clean(
 				// TIER 1: Pass 3 below immediately rebuilds FaceFace, so we only
 				// need to compact here -- the FF/VF rebuild would be wasted.
 				Compact();
-				DEBUG("DIAG after orientation fix: %d vn, %d fn (was%s oriented, %sorientable)",
+				MESH_DIAG("DIAG after orientation fix: %d vn, %d fn (was%s oriented, %sorientable)",
 					mesh.vn, mesh.fn,
 					isOriented ? "" : " not",
 					isOrientable ? "" : "not ");
@@ -2377,7 +2440,7 @@ void Mesh::Clean(
 			// fixing. This is both safer (no holes) and more effective (removes
 			// entire spurious patches rather than individual faces).
 			if (!isOrientable) {
-				DEBUG("DIAG mesh is non-orientable; deferring cleanup to component removal");
+				MESH_DIAG("DIAG mesh is non-orientable; deferring cleanup to component removal");
 			}
 		}
 
@@ -2426,7 +2489,7 @@ void Mesh::Clean(
 
 			if (!toDelete.empty()) {
 				stats.removedLongEdgeFaces += (int)toDelete.size();
-				DEBUG("DIAG removed %d remaining flipped-normal faces", (int)toDelete.size());
+				MESH_DIAG("DIAG removed %d remaining flipped-normal faces", (int)toDelete.size());
 			}
 		}
 #else
@@ -2480,7 +2543,7 @@ void Mesh::Clean(
 
 			if (removedFlipped > 0) {
 				stats.removedLongEdgeFaces += removedFlipped;
-				DEBUG("DIAG removed %d remaining flipped-normal faces", removedFlipped);
+				MESH_DIAG("DIAG removed %d remaining flipped-normal faces", removedFlipped);
 			}
 		}
 #endif
@@ -2502,14 +2565,16 @@ void Mesh::Clean(
 			// the %. If everything after the body is tiny, the remaining junk is
 			// CONNECTED to the body (a thin thread) and no size filter can drop
 			// it -- that needs a different fix.
-			{
+			//
+			// The sort exists only to order the line, so it goes behind the gate too.
+			if (MESH_DIAG_ENABLED()) {
 				std::vector<int> sz; sz.reserve(CCV.size());
 				for (auto& cc : CCV) sz.push_back(cc.first);
 				std::sort(sz.begin(), sz.end(), std::greater<int>());
 				char buf[256]; int off = 0;
 				for (size_t i = 0; i < sz.size() && i < 12 && off < 230; ++i)
 					off += snprintf(buf + off, sizeof(buf) - off, "%d ", sz[i]);
-				DEBUG("DIAG component sizes (top of %zu): %s", CCV.size(), buf);
+				MESH_DIAG("DIAG component sizes (top of %zu): %s", CCV.size(), buf);
 			}
 
 			const int fnBefore = mesh.fn;
@@ -2626,10 +2691,10 @@ void Mesh::Clean(
 					vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
 				stats.removedComponents += (fnBefore - mesh.fn);
 				if (fnBefore != mesh.fn)
-					DEBUG("Removed %d faces in small components (kept >= %.3g%% of largest=%d faces -> threshold %d faces, of %zu components)",
+					MESH_DIAG("Removed %d faces in small components (kept >= %.3g%% of largest=%d faces -> threshold %d faces, of %zu components)",
 						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, sizeThreshold, CCV.size());
 				if (nRescued > 0)
-					DEBUG("DIAG gap rescue (Clean): kept %zu components / %zu faces whose ground"
+					MESH_DIAG("DIAG gap rescue (Clean): kept %zu components / %zu faces whose ground"
 						" the kept mesh does not already cover (overlap < %.2f)",
 						nRescued, nRescuedFaces, (double)MESH_COMPONENT_GAP_OVERLAP);
 			}
@@ -2637,7 +2702,7 @@ void Mesh::Clean(
 
 		CompactAndRefresh();
 
-		DEBUG("DIAG after topology repair: %d vn, %d fn (long-edge pass %s)",
+		MESH_DIAG("DIAG after topology repair: %d vn, %d fn (long-edge pass %s)",
 			mesh.vn, mesh.fn,
 			fSpurious > 0 ? "ran" : "skipped, fSpurious=0");
 		ValidateMesh(mesh, "after topology repair", false);
@@ -2650,7 +2715,7 @@ void Mesh::Clean(
 		LightRefresh();
 		RemoveSpikes(mesh, stats);
 
-		DEBUG("DIAG after spikes: %d vn, %d fn", mesh.vn, mesh.fn);
+		MESH_DIAG("DIAG after spikes: %d vn, %d fn", mesh.vn, mesh.fn);
 		ValidateMesh(mesh, "after spike removal", true);
 	}
 
@@ -2697,7 +2762,7 @@ void Mesh::Clean(
 			if (toothRemoved > 0) {
 				stats.removedLongEdgeFaces += toothRemoved;
 				CompactAndRefresh();
-				DEBUG("DIAG boundary-tooth peel: removed %d sawtooth/whisker faces in %d rings",
+				MESH_DIAG("DIAG boundary-tooth peel: removed %d sawtooth/whisker faces in %d rings",
 					toothRemoved, toothIters);
 			}
 		}
@@ -2766,7 +2831,7 @@ void Mesh::Clean(
 		if (sailRemoved > 0) {
 			stats.removedLongEdgeFaces += sailRemoved;
 			CompactAndRefresh();
-			DEBUG("DIAG boundary-sail peel: removed %d non-upward drape/underside faces in %d rings (keep nz>=%.2f, len-gate %.2fx median %.3g)",
+			MESH_DIAG("DIAG boundary-sail peel: removed %d non-upward drape/underside faces in %d rings (keep nz>=%.2f, len-gate %.2fx median %.3g)",
 				sailRemoved, sailRings, minUpZ, float(MESH_SAIL_PEEL_LEN_MULT_X100) / 100.f, medianEdge);
 		}
 		ValidateMesh(mesh, "after sail peel", true);
@@ -2797,7 +2862,7 @@ void Mesh::Clean(
 				vcg::tri::Allocator<CLEAN::Mesh>::DeleteFace(mesh, *fp);
 			stats.removedLongEdgeFaces += (int)toDelete.size();
 			CompactAndRefresh();
-			DEBUG("DIAG down-cull: removed %d down-facing faces (nz < %.2f) -> %d fn",
+			MESH_DIAG("DIAG down-cull: removed %d down-facing faces (nz < %.2f) -> %d fn",
 				(int)toDelete.size(), maxNZ, mesh.fn);
 		}
 		ValidateMesh(mesh, "after down-cull", true);
@@ -2891,7 +2956,7 @@ void Mesh::Clean(
 			}
 			if (nLifted > 0) {
 				CompactAndRefresh();
-				DEBUG("DIAG underside-deflate: lifted %d hanging verts to local top (grid %dx%d cell %.3g, margin %.3g) -> %d fn",
+				MESH_DIAG("DIAG underside-deflate: lifted %d hanging verts to local top (grid %dx%d cell %.3g, margin %.3g) -> %d fn",
 					nLifted, gw, gh, cell, margin, mesh.fn);
 			}
 			ValidateMesh(mesh, "after underside deflate", true);
@@ -2951,10 +3016,10 @@ void Mesh::Clean(
 			// regions collapse maximally and detail is preserved.
 			medianEdgeLen = ComputeMedianEdgeLength(mesh);
 			errorDev = (double)medianEdgeLen * kEff;
-			DEBUG("Adaptive decimation ON: medianEdge=%.4g, k=%.2f, allowed-deviation~%.4g world units, keep-floor=%d faces",
+			MESH_DIAG("Adaptive decimation ON: medianEdge=%.4g, k=%.2f, allowed-deviation~%.4g world units, keep-floor=%d faces",
 				medianEdgeLen, kEff, errorDev, targetFaces);
 		}
-		DEBUG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
+		MESH_DIAG("Original faces: %d, target faces: %d", OriginalFaceNum, targetFaces);
 
 		const auto oldNested = omp_get_nested();
 		const auto oldDynamic = omp_get_dynamic();
@@ -3002,13 +3067,15 @@ void Mesh::Clean(
 					++liveVerts;
 					if (vb[i]) ++borderVerts;
 				}
-				DEBUG("DIAG decimate input: %u live verts, %u border verts (%.1f%%), %u border edges, fn=%d, target=%d, OptimalPlacement=1",
+				MESH_DIAG("DIAG decimate input: %u live verts, %u border verts (%.1f%%), %u border edges, fn=%d, target=%d, OptimalPlacement=1",
 					(unsigned)liveVerts, (unsigned)borderVerts,
 					liveVerts ? 100.0 * (double)borderVerts / (double)liveVerts : 0.0,
 					(unsigned)borderEdges, mesh.fn, targetFaces);
 			}
 
 			vcg::math::Quadric<double> QZero; QZero.SetZero();
+			double diagForLog = 0.0; // bbox diagonal, kept so the stop diagnostic can invert
+			                         // vcg's ScaleIndependent metric back into world units
 			CLEAN::QuadricTemp TD(mesh.vert, QZero);
 			CLEAN::QHelper::TDp() = &TD;
 
@@ -3021,6 +3088,7 @@ void Mesh::Clean(
 				// tau = g_ScaleFactor * deviation^2. SetTargetSimplices above stays active as
 				// the keep floor -- decimation stops at whichever goal triggers first.
 				const double diag = mesh.bbox.Diag();
+				diagForLog = diag;
 				if (diag > 0 && errorDev > 0) {
 					const double scale = 1e8 * std::pow(1.0 / diag, 6.0);
 					deci.SetTargetMetric((CLEAN::Mesh::ScalarType)(scale * errorDev * errorDev));
@@ -3037,18 +3105,47 @@ void Mesh::Clean(
 			if (logDiag && kEff > 0) {
 				const bool hitFloor = (mesh.fn <= targetFaces);
 				const bool hitMetric = (deci.currMetric > deci.targetMetric);
-				DEBUG("DIAG decimate stop: %s | final-error=%.4g tau=%.4g (ratio=%.2f)",
+				// Report the deviation in WORLD UNITS, not in vcg's scaled metric.
+				//
+				// The raw numbers are unreadable: with ScaleIndependent the metric is
+				// g_ScaleFactor * distance^2 and g_ScaleFactor = 1e8/diag^6, so on a 404-unit
+				// scene a 0.42 mm deviation prints as 4.086e-15 and a 166 mm tolerance as
+				// 6.369e-10. Those look like a scaling bug and are not one -- they cost a
+				// round of investigation before anyone converted them back. Invert the scale
+				// here so the line says what it means: d = sqrt(metric / g_ScaleFactor).
+				const double invScale = (diagForLog > 0.0)
+					? std::pow(diagForLog, 6.0) / 1e8 : 0.0;
+				const double devCurr = (invScale > 0.0 && deci.currMetric > 0)
+					? std::sqrt((double)deci.currMetric * invScale) : 0.0;
+				const double devTau = (invScale > 0.0 && deci.targetMetric > 0)
+					? std::sqrt((double)deci.targetMetric * invScale) : 0.0;
+				MESH_DIAG("DIAG decimate stop: %s | deviation reached %.4g vs tolerance %.4g"
+					" world units (%.4g of it) | k=%.4g x median-edge %.4g"
+					" | raw metric %.4g vs tau %.4g",
 					hitFloor ? "FLOOR" : hitMetric ? "METRIC" : "HEAP-EMPTY",
-					(double)deci.currMetric, (double)deci.targetMetric,
-					deci.targetMetric > 0 ? (double)deci.currMetric / (double)deci.targetMetric : 0.0);
+					devCurr, devTau, devTau > 0.0 ? devCurr / devTau : 0.0,
+					kEff, (double)medianEdgeLen,
+					(double)deci.currMetric, (double)deci.targetMetric);
+				if (hitFloor && devTau > 0.0 && devCurr < devTau * 0.5)
+					MESH_DIAG("DIAG decimate: the error criterion never engaged -- --decimate"
+						" (%.4g) hit its floor while the surface had moved only %.4g of the"
+						" %.4g allowed. --decimate-error only ever KEEPS faces above that"
+						" floor, so at this k it cannot act. To make it bite on this scene"
+						" k must be near %.4g.",
+						(double)fDecimate, devCurr, devTau,
+						medianEdgeLen > 0.f ? devCurr / (double)medianEdgeLen : 0.0);
 			}
 			return faceBefore - mesh.fn;
 		};
 
+		// runDecimate's logDiag argument drives a full border scan over every face and
+		// vertex purely to report the border fraction, so it tracks the gate rather
+		// than being passed unconditionally.
+		const bool bDecimateDiag = MESH_DIAG_ENABLED();
 		int totalCollapsed = 0;
 		if (mesh.fn > targetFaces)
-			totalCollapsed += runDecimate(true);
-		DEBUG("Decimation pass 1 (PreserveBoundary=true): %d collapsed, fn=%d", totalCollapsed, mesh.fn);
+			totalCollapsed += runDecimate(bDecimateDiag);
+		MESH_DIAG("Decimation pass 1 (PreserveBoundary=true): %d collapsed, fn=%d", totalCollapsed, mesh.fn);
 
 		// Fallback: if pass 1 collapsed nothing, the mesh is genuinely
 		// non-2-manifold even after compaction (every edge a true border).
@@ -3061,13 +3158,13 @@ void Mesh::Clean(
 			const int nmv = Tri::SplitNonManifoldVertex(mesh, 0);
 			const int unref = Tri::RemoveUnreferencedVertex(mesh);
 			Compact();
-			DEBUG("Decimation manifold-repair: removed %d non-manifold faces, split %d non-manifold verts, removed %d unref verts -> fn=%d",
+			MESH_DIAG("Decimation manifold-repair: removed %d non-manifold faces, split %d non-manifold verts, removed %d unref verts -> fn=%d",
 				nmf, nmv, unref, mesh.fn);
 
 			if (mesh.fn > targetFaces) {
-				const int again = runDecimate(true);
+				const int again = runDecimate(bDecimateDiag);
 				totalCollapsed += again;
-				DEBUG("Decimation pass 2 (after manifold repair): %d collapsed, fn=%d", again, mesh.fn);
+				MESH_DIAG("Decimation pass 2 (after manifold repair): %d collapsed, fn=%d", again, mesh.fn);
 			}
 		}
 
@@ -3078,7 +3175,7 @@ void Mesh::Clean(
 		// action, so the topology rebuild here would be wasted.
 		Compact();
 
-		DEBUG("DIAG after decimation: %d vn, %d fn (%d total collapsed)", mesh.vn, mesh.fn, totalCollapsed);
+		MESH_DIAG("DIAG after decimation: %d vn, %d fn (%d total collapsed)", mesh.vn, mesh.fn, totalCollapsed);
 		// Safety net: decimation must never empty a non-empty mesh. If it does
 		// (degenerate quadrics on pathological input), warn loudly — the
 		// guards above should prevent it, but this catches any residual case
@@ -3123,7 +3220,7 @@ void Mesh::Clean(
 					const float edgesAcrossDiag = meshDiag / medianEdge;
 					const float densityScale = edgesAcrossDiag / float(MESH_HOLE_REF_EDGES_ACROSS_DIAG);
 					scaledCloseHoles = std::max(1, ROUND2INT(nCloseHoles * densityScale));
-					DEBUG("DIAG holes density-scale: median-edge=%.4g, edges-across-diag=%.0f, scale=%.2f, --close-holes %u -> %d",
+					MESH_DIAG("DIAG holes density-scale: median-edge=%.4g, edges-across-diag=%.0f, scale=%.2f, --close-holes %u -> %d",
 						medianEdge, edgesAcrossDiag, densityScale, nCloseHoles, scaledCloseHoles);
 				}
 			}
@@ -3168,9 +3265,9 @@ void Mesh::Clean(
 				if (many) ++nMany;
 				if (!wide && !many) ++nPass;
 			}
-			DEBUG("DIAG holes pre-fill: %zu loops | %zu pass gate | %zu skip-wide | %zu skip-edges(>=%d) | largest diag=%.3g (%.0f%% mesh) edges=%d",
+			MESH_DIAG("DIAG holes pre-fill: %zu loops | %zu pass gate | %zu skip-wide | %zu skip-edges(>=%d) | largest diag=%.3g (%.0f%% mesh) edges=%d",
 				loops.size(), nPass, nWide, nMany, holeEdgeCap, maxDiag, meshDiag > 0 ? 100.f * maxDiag / meshDiag : 0.f, maxEdges);
-			DEBUG("DIAG wide-hole diag buckets (%% of mesh diag): (gate-20]=%d (20-30]=%d (30-50]=%d (50-100]=%d (>100]=%d",
+			MESH_DIAG("DIAG wide-hole diag buckets (%% of mesh diag): (gate-20]=%d (20-30]=%d (30-50]=%d (50-100]=%d (>100]=%d",
 				wideBucket[0], wideBucket[1], wideBucket[2], wideBucket[3], wideBucket[4]);
 		}
 #endif
@@ -3179,7 +3276,7 @@ void Mesh::Clean(
 			vcg::tri::SelfIntersectionEar<CLEAN::Mesh>>(mesh, holeEdgeCap, false, nullptr, maxHoleDiag);
 
 		if (closed > 0) {
-			DEBUG("Closed %d interior holes (<= %.3g world units [%s: frac %.3g vs span %.3g = %d x median edge %.4g], up to %d edges)",
+			MESH_DIAG("Closed %d interior holes (<= %.3g world units [%s: frac %.3g vs span %.3g = %d x median edge %.4g], up to %d edges)",
 				closed, maxHoleDiag,
 				(spanHoleDiag < fracHoleDiag) ? "span-gated" : "frac-gated",
 				fracHoleDiag, spanHoleDiag, MESH_HOLE_MAX_SPAN_EDGES, medianEdge, holeEdgeCap);
@@ -3253,7 +3350,7 @@ void Mesh::Clean(
 			const int nmfRemoved = vcg::tri::Clean<CLEAN::Mesh>::RemoveNonManifoldFace(mesh);
 			const int nmvSplit = vcg::tri::Clean<CLEAN::Mesh>::SplitNonManifoldVertex(mesh, 0);
 			if (nmfRemoved > 0 || nmvSplit > 0) {
-				DEBUG("DIAG pre-seal fix: removed %d NM faces, split %d NM vertices",
+				MESH_DIAG("DIAG pre-seal fix: removed %d NM faces, split %d NM vertices",
 					nmfRemoved, nmvSplit);
 				vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 				KillEdges(mesh);
@@ -3351,16 +3448,16 @@ void Mesh::Clean(
 				++closedTiny;
 			}
 			if (skippedStale > 0)
-				DEBUG("DIAG fallback seal: skipped %d loops whose Pos was invalidated by an"
+				MESH_DIAG("DIAG fallback seal: skipped %d loops whose Pos was invalidated by an"
 					" earlier fill (of %zu loops)", skippedStale, loops.size());
 			closed += closedTiny;
 			if (closedTiny > 0)
-				DEBUG("DIAG fallback seal: trivially closed %d small holes (<=%d edges, <= %.3g-unit diag)",
+				MESH_DIAG("DIAG fallback seal: trivially closed %d small holes (<=%d edges, <= %.3g-unit diag)",
 					closedTiny, MESH_HOLE_FALLBACK_MAX_EDGES, fallbackMaxDiag);
 		}
 
 		if (closed > 0) {
-			DEBUG("Final seal: closed %d interior holes (<= %.3g world units [%s], up to %d edges)",
+			MESH_DIAG("Final seal: closed %d interior holes (<= %.3g world units [%s], up to %d edges)",
 				closed, sealMaxHoleDiag,
 				(sealSpanHoleDiag < sealFracHoleDiag) ? "span-gated" : "frac-gated",
 				sealHoleEdgeCap);
@@ -3393,7 +3490,7 @@ void Mesh::Clean(
 				if (L.size > maxE) maxE = L.size;
 				if (d > sealMaxHoleDiag) ++widerThanGate;
 			}
-			DEBUG("DIAG holes post-seal: %zu open loops remain (%zu wider than %.3g-unit gate), largest diag=%.3g (%.0f%% mesh) edges=%d",
+			MESH_DIAG("DIAG holes post-seal: %zu open loops remain (%zu wider than %.3g-unit gate), largest diag=%.3g (%.0f%% mesh) edges=%d",
 				openLoops, widerThanGate, sealMaxHoleDiag, maxD,
 				sealMeshDiag > 0 ? 100.f * maxD / sealMeshDiag : 0.f, maxE);
 			// Enumerate every remaining open loop so we can correlate it with the
@@ -3405,10 +3502,10 @@ void Mesh::Clean(
 				int shown = 0;
 				for (auto& L : rem) {
 					if (L.size < 3) continue;
-					if (++shown > 40) { DEBUG("   ... (%zu more)", rem.size() - 40); break; }
+					if (++shown > 40) { MESH_DIAG("   ... (%zu more)", rem.size() - 40); break; }
 					const float d = L.bb.Diag();
 					const auto c = L.bb.Center();
-					DEBUG("   open loop: diag=%.3g (%.0f%% mesh) edges=%d %s center=(%.1f,%.1f,%.1f)",
+					MESH_DIAG("   open loop: diag=%.3g (%.0f%% mesh) edges=%d %s center=(%.1f,%.1f,%.1f)",
 						d, sealMeshDiag > 0 ? 100.f * d / sealMeshDiag : 0.f, L.size,
 						d > sealMaxHoleDiag ? "SKIPPED-wide" : "ear-rejected", c[0], c[1], c[2]);
 				}
@@ -3456,7 +3553,7 @@ void Mesh::Clean(
 		if (rimRemoved > 0) {
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 			Compact();
-			DEBUG("DIAG rim-erode: peeled %d border faces in %d rings -> %d fn",
+			MESH_DIAG("DIAG rim-erode: peeled %d border faces in %d rings -> %d fn",
 				rimRemoved, rimRings, mesh.fn);
 
 			// Re-run small-component filter: erosion may have severed thin necks
@@ -3474,7 +3571,7 @@ void Mesh::Clean(
 				stats.removedComponents += (fnBefore - mesh.fn);
 				if (fnBefore != mesh.fn) {
 					Compact();
-					DEBUG("DIAG rim-erode: dropped %d newly-disconnected faces (kept >= %.3g%% of largest=%d, %zu components)",
+					MESH_DIAG("DIAG rim-erode: dropped %d newly-disconnected faces (kept >= %.3g%% of largest=%d, %zu components)",
 						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, CCV.size());
 				}
 			}
@@ -3546,11 +3643,11 @@ void Mesh::Clean(
 		if (totalPeeled > 0) {
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 			Compact();
-			DEBUG("Alpha-tighten: peeled %d rim faces (alpha=%.3g = %.2f x median edge %.3g, <=%d iters) -> %d fn",
+			MESH_DIAG("Alpha-tighten: peeled %d rim faces (alpha=%.3g = %.2f x median edge %.3g, <=%d iters) -> %d fn",
 				totalPeeled, alpha, float(MESH_ALPHA_TIGHTEN_K_X100) / 100.f, medianEdge,
 				MESH_ALPHA_TIGHTEN_ITERS, mesh.fn);
 		} else {
-			DEBUG("Alpha-tighten: nothing to peel (alpha=%.3g, median edge %.3g)", alpha, medianEdge);
+			MESH_DIAG("Alpha-tighten: nothing to peel (alpha=%.3g, median edge %.3g)", alpha, medianEdge);
 		}
 		ValidateMesh(mesh, "after alpha tighten", true);
 	}
@@ -3576,7 +3673,7 @@ void Mesh::Clean(
 			vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
 			if (fnBefore != mesh.fn) {
 				CompactAndRefresh();
-				DEBUG("DIAG post-tighten component filter: removed %d faces in %zu orphaned blobs (threshold %d faces)",
+				MESH_DIAG("DIAG post-tighten component filter: removed %d faces in %zu orphaned blobs (threshold %d faces)",
 					fnBefore - mesh.fn, CCV.size() - 1, sizeThreshold);
 			}
 		}
@@ -3652,7 +3749,7 @@ void Mesh::Clean(
 		}
 		if (totalAddedF > 0) {
 			CompactAndRefresh();
-			DEBUG("Band refine: subdivided edge band (%d rings, %d levels) -> +%d verts, +%d faces (now %d fn)",
+			MESH_DIAG("Band refine: subdivided edge band (%d rings, %d levels) -> +%d verts, +%d faces (now %d fn)",
 				RINGS, MESH_BAND_REFINE_LEVELS, totalAddedV, totalAddedF, mesh.fn);
 		}
 		ValidateMesh(mesh, "after band refine", true);
@@ -3780,7 +3877,7 @@ void Mesh::Clean(
 		}
 		if (totalAddedF > 0) {
 			CompactAndRefresh();
-			DEBUG("Edge dilate: extended boundary outward (%d rings, step %.3g) -> +%d verts, +%d faces (now %d fn)",
+			MESH_DIAG("Edge dilate: extended boundary outward (%d rings, step %.3g) -> +%d verts, +%d faces (now %d fn)",
 				MESH_EDGE_DILATE_RINGS, step, totalAddedV, totalAddedF, mesh.fn);
 		}
 		ValidateMesh(mesh, "after edge dilate", true);
@@ -3907,7 +4004,7 @@ void Mesh::Clean(
 				}
 			}
 			if (nCurve + nBand > 0)
-				DEBUG("Boundary smooth: Taubin-smoothed %d edge + %d band vertices (%d rings, %d iters, lambda=%.2f mu=%.2f)",
+				MESH_DIAG("Boundary smooth: Taubin-smoothed %d edge + %d band vertices (%d rings, %d iters, lambda=%.2f mu=%.2f)",
 					nCurve, nBand, RINGS, MESH_BOUNDARY_SMOOTH_ITERS, lambda, mu);
 		}
 		ValidateMesh(mesh, "after boundary smooth", true);
@@ -3941,8 +4038,20 @@ void Mesh::Clean(
 		f[2] = indices[fi->cV(2)];
 	}
 
-	DEBUG("Final cleaned mesh: %u vertices, %u faces (%s)",
-		vertices.GetSize(), faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+	// The one line Clean prints at normal verbosity. Every phase above reports itself
+	// through MESH_DIAG, which is silent by default, so the totals it accumulated into
+	// `stats` are rolled up here instead -- otherwise a default run would say that faces
+	// disappeared without saying which pass took them.
+	// The counts describe the RESULT and stay; the breakdown names the individual
+	// passes (long-edge, spike, component, hole-fill), which is a description of the
+	// method, so it rides the gate with everything else those passes emit.
+	DEBUG("Final cleaned mesh: %u vertices, %u faces (was %u/%u) (%s)",
+		vertices.GetSize(), faces.GetSize(), numVertsIn, numFacesIn,
+		TD_TIMER_GET_FMT().c_str());
+	MESH_DIAG("Clean breakdown: removed %d spurious/flipped, %d spikes, %d in components,"
+		" %d verts | closed %d holes",
+		stats.removedLongEdgeFaces, stats.removedSpikes, stats.removedComponents,
+		stats.removedVerts, stats.closedHoles);
 }
 /*----------------------------------------------------------------*/
 
@@ -6041,7 +6150,7 @@ static void EnsureEdgeSize(Polyhedron& p, double epsilonMin, double epsilonMax, 
 	#if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 2) {
 		ComputeStatsEdge(p, edge);
-		VERBOSE("Edge size in [%g, %g] (requested in [%g, %g]): %d ops, %d iters", edge.min, edge.max, epsilonMin, epsilonMax, total_no_ops, iters);
+		MESH_DIAG("Edge size in [%g, %g] (requested in [%g, %g]): %d ops, %d iters", edge.min, edge.max, epsilonMin, epsilonMax, total_no_ops, iters);
 	}
 	#endif	
 }

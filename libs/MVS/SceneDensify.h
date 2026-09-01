@@ -37,10 +37,35 @@
 
 #include "SemiGlobalMatcher.h"
 
+#include <atomic>
+
 
 // S T R U C T S ///////////////////////////////////////////////////
 
 namespace MVS {
+
+#ifdef _USE_CUDA
+// Breakdown of the CUDA estimator's sem-serialized section.
+//
+// ESTIMATE PROFILE's estimate= lumps together everything inside data.sem: host
+// resizing and packing, texture uploads, the kernels, and the final stream sync.
+// Those have very different implications -- only the device part is a hard floor,
+// the host parts could overlap with another image's kernels if the semaphore were
+// narrowed to the device-exclusive region. Splitting them says whether that
+// restructure is worth doing before anyone writes it.
+//
+// Populated by CUDA::PatchMatch::EstimateDepthMap; the legacy estimator variant
+// and the CPU path leave them at zero. Atomics because the whole point is to be
+// still correct once more than one image is in flight.
+struct CUDAEstimateBreakdown {
+	std::atomic<int64_t> nsPrep{0};     // ScaleDepthData, camera/pair math, pinned pack -- host only
+	std::atomic<int64_t> nsTexture{0};  // image/depth texture acquisition (a VRAM cache hit is nearly free)
+	std::atomic<int64_t> nsDevice{0};   // prior upload -> kernels -> download, ending at cudaStreamSynchronize
+	std::atomic<int64_t> nsReadback{0}; // pinned staging -> cv::Mat, plus the sub-resolution carry -- host only
+	void Reset() { nsPrep = 0; nsTexture = 0; nsDevice = 0; nsReadback = 0; }
+};
+extern MVS_API CUDAEstimateBreakdown g_cudaEstimateBreakdown;
+#endif // _USE_CUDA
 	
 // Forward declarations
 class MVS_API Scene;
@@ -125,6 +150,11 @@ struct MVS_API DenseDepthMapData {
 	SEACAVE::EventQueue events; // internal events queue (processed by the working threads)
 	Semaphore sem;
 	CAutoPtr<Util::Progress> progress;
+	// number of worker threads running the estimation event-loop in the current
+	// pass; the loop needs it to post one EVTClose per still-blocked worker when
+	// the terminal EVTProcessImage is reached (exactly one such event is ever
+	// produced, so a single EVTClose only ever releases one extra worker)
+	unsigned nEstWorkers;
 	int nEstimationGeometricIter;
 	int nFusionMode;
 	STEREO::SemiGlobalMatcher sgm;

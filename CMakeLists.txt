@@ -297,6 +297,26 @@ INCLUDE_DIRECTORIES("${OpenMVS_SOURCE_DIR}")
 INCLUDE_DIRECTORIES("${CMAKE_BINARY_DIR}")
 
 # Add modules
+# Diagnostic instrumentation. The DENSIFY_DIAG / MESH_DIAG / TEXTURE_DIAG /
+# REFINE_DIAG gates in libs/MVS/Common.h are compile-time switches (see the long
+# comment there for what each covers and why they are not runtime flags). OFF by
+# default: a normal build reports what each stage produced, not how, and pays
+# nothing for the instrumentation left in place. Enable the master to get all
+# four, or one module on its own.
+option(OpenMVS_ENABLE_DIAG "Compile in ALL module diagnostic logging (densify, mesh, texture, refine)" OFF)
+option(OpenMVS_ENABLE_DENSIFY_DIAG "Compile in densify diagnostic logging only" OFF)
+option(OpenMVS_ENABLE_MESH_DIAG "Compile in mesh diagnostic logging only" OFF)
+option(OpenMVS_ENABLE_TEXTURE_DIAG "Compile in texture diagnostic logging only" OFF)
+option(OpenMVS_ENABLE_REFINE_DIAG "Compile in mesh-refinement diagnostic logging only" OFF)
+if(OpenMVS_ENABLE_DIAG)
+	add_definitions(-DOPENMVS_DIAG=1)
+endif()
+foreach(_diag DENSIFY MESH TEXTURE REFINE)
+	if(OpenMVS_ENABLE_${_diag}_DIAG)
+		add_definitions(-DOPENMVS_${_diag}_DIAG=1)
+	endif()
+endforeach()
+
 ADD_SUBDIRECTORY(libs)
 if(OpenMVS_BUILD_TOOLS)
 	ADD_SUBDIRECTORY(apps)

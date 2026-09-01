@@ -3823,7 +3823,7 @@ void StatisticalOutlierRemoval(
 		removed += !keep;
 	}
 	_aligned_free(meanDist);
-	DEBUG_EXTRA("%d filtered (k=%d, stddevMul=%.2f, interiorMul=%.2f, mean=%.4f, stdev=%.4f)",
+	MESH_DIAG("%d filtered (k=%d, stddevMul=%.2f, interiorMul=%.2f, mean=%.4f, stdev=%.4f)",
 		removed, k, stddevMul, interiorMul, mean, stdev);
 }
 
@@ -4325,11 +4325,12 @@ static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_
 	if (numPoints == 0 || images.IsEmpty())
 		return 0.f;
 
-	// Collect valid camera centres and focal lengths once.
+	// Collect valid camera centres and 1/f^2 once. Keeping the reciprocal squared
+	// lets the sample loop stay entirely in squared units -- see below.
 	std::vector<Point3f> centers;
-	std::vector<float> focals;
+	std::vector<float> invFocals2;
 	centers.reserve((size_t)images.GetSize());
-	focals.reserve((size_t)images.GetSize());
+	invFocals2.reserve((size_t)images.GetSize());
 	for (size_t i = 0; i < (size_t)images.GetSize(); ++i) {
 		const Image& img = images[(IIndex)i];
 		if (!img.IsValid())
@@ -4338,7 +4339,7 @@ static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_
 		if (!(f > 0.f))
 			continue;
 		centers.emplace_back((float)img.camera.C.x, (float)img.camera.C.y, (float)img.camera.C.z);
-		focals.push_back(f);
+		invFocals2.push_back(1.f / (f*f));
 	}
 	if (centers.empty())
 		return 0.f;
@@ -4347,11 +4348,14 @@ static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_
 	const size_t kSamples = std::min<size_t>(numPoints, 20000);
 	const size_t stride = std::max<size_t>(1, numPoints / kSamples);
 	const size_t nq = (numPoints + stride - 1) / stride;
-	std::vector<float> gsd(nq, -1.f);
-	float* __restrict pG = gsd.data();
+	// Squared GSD per sample, (d/f)^2. sqrt() is monotone on non-negatives, so the
+	// median of the squares sits at the same element as the median of the values --
+	// one sqrt at the end instead of one per sample.
+	std::vector<float> gsd2(nq, -1.f);
+	float* __restrict pG = gsd2.data();
 	const size_t nc = centers.size();
 	const Point3f* __restrict pC = centers.data();
-	const float* __restrict pF = focals.data();
+	const float* __restrict pIF2 = invFocals2.data();
 #ifdef _USE_OPENMP
 	#pragma omp parallel for schedule(static)
 #endif
@@ -4364,7 +4368,7 @@ static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_
 			if (d2 < best) { best = d2; bestI = c; }
 		}
 		if (best > 0.f && best < FLT_MAX)
-			pG[q] = std::sqrt(best) / pF[bestI];
+			pG[q] = best * pIF2[bestI];
 	}
 	std::vector<float> valid;
 	valid.reserve(nq);
@@ -4373,7 +4377,7 @@ static float EstimateSceneGSD(const ImageArr& images, const float* ptsRaw, size_
 	if (valid.empty())
 		return 0.f;
 	std::nth_element(valid.begin(), valid.begin() + valid.size() / 2, valid.end());
-	return valid[valid.size() / 2];
+	return std::sqrt(valid[valid.size() / 2]);
 } // EstimateSceneGSD
 /*----------------------------------------------------------------*/
 
@@ -4728,16 +4732,24 @@ double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
 // which is the fraction AdaptiveFitPatches actually fills (measured: realized area lands
 // on 100% of that budget).
 //
-// KNOWN STALE -- do not "fix" without re-measuring the decimation cap it feeds.
-// 0.97 is the margin the fit ladder STARTS at, not the one it lands on. Measured over
-// six scenes, attempt 1 at 0.97 fails to pack and attempt 2 at 0.82 succeeds, on 5 of 6
-// at 16384 and also at 32768 (RichmondWater: 1041.5 Mpx budget -> overflow -> 885.3 Mpx
-// = 0.82). So the real usable fraction is 0.82 and this over-states atlas capacity by
-// 1.18x, i.e. the face cap here is ~18% too generous. Correcting it TIGHTENS the cap and
-// therefore decimates more, so it is an output change, not a pure bug fix -- and it is
-// moot on scenes where texCapMem binds first. Fix it together with the fit ladder itself
-// (see TEXTURE_ATLAS_FIT_MARGIN): if the packer is made to reach 0.97, this becomes
-// correct as written.
+// KNOWN 4% GENEROUS -- deliberately left at 0.97. Do not "fix" without re-measuring the
+// decimation cap it feeds.
+//
+// The real usable fraction is 0.93, now measured twice at two different atlas sizes on the
+// realized packing rather than inferred from which ladder attempt succeeded:
+//   16384: patches occupied 249.6 of 268.4 Mpx = 0.930
+//   32768: patches occupied 998.6 of 1071.3 Mpx = 0.930
+// It matches TEXTURE_ATLAS_FIT_MARGIN (0.93) exactly, which is the point -- shelf packing
+// genuinely needs ~7% slack, so that margin is ACCURATE rather than wasteful.
+//
+// SUPERSEDES an earlier note here claiming the true value was 0.82 and the cap 18% too
+// generous. That came from reading which fit-ladder attempt succeeded (0.97 -> overflow ->
+// 0.82) back when the ladder stepped by 0.85; the ladder now starts at 0.93 with a 0.95
+// step and lands on its first attempt, so the old inference no longer describes anything.
+//
+// Left at 0.97 on purpose: correcting to 0.93 tightens the face cap ~4% (4.07M -> 3.90M at
+// 16384), which costs geometry on a validated path to make a constant honest, with no
+// visible gain. Treat the atlas face budget as ~4% optimistic and size accordingly.
 #ifndef POISSON_ATLAS_USABLE_FRACTION
 #define POISSON_ATLAS_USABLE_FRACTION 0.97
 #endif
@@ -4746,13 +4758,52 @@ double ComputeTextureFaceBudget(size_t nViews, size_t freedBeforeStage)
 #ifndef POISSON_ATLAS_TEXELS_PER_FACE
 #define POISSON_ATLAS_TEXELS_PER_FACE 64.0
 #endif
+// Share of the atlas face budget withheld from THIS stage so RefineMesh has room to
+// subdivide inside it. The pre-refine decimation cap becomes budget / this.
+//
+// WHY THIS EXISTS. Two gates now enforce the same atlas ceiling: the decimation cap here
+// (pre-refine) and ClampSubdivideAreaToAtlasBudget in SceneRefine.cpp (during refine).
+// At 1.0 they are in series against the SAME number, so this stage spends the entire
+// budget and refine inherits nothing. MEASURED on RichmondHistoric at 16384 px: the cap
+// left 11,414 faces of headroom, 0.28% of the budget, and the finest refine scale then
+// got 258 splits against 672,252 it wanted -- 0.038%. Refine was not declining to work,
+// it was starved.
+//
+// At 1.7 (the measured subdivision factor; the range across scenes is 1.48-1.88) this
+// stage emits ~budget/1.7 and refine grows it back toward the full budget. Same final
+// face count, but the faces come from refine's PROJECTED-AREA test instead of Poisson
+// depth -- see the note at the refineHeadroom decision below, which measured that at
+// equal face counts the adaptive route wins.
+//
+// TWO REASONS IT DEFAULTS TO 1.0, i.e. off:
+//  - It is a PREDICTION. Everything else about this cap is deliberately estimate-free
+//    (see the texCap note below on why the atlas bound is not turned into a depth). A
+//    wrong factor here costs subdivision headroom in one direction and geometry in the
+//    other; it can never breach the ceiling, because refine's own clamp is exact.
+//  - This stage cannot know whether RefineMesh will actually RUN. If it does not, the
+//    withheld geometry is simply lost. The Global Mapper chain always runs it, so 1.7 is
+//    safe there, but that is a property of the caller, not of this file.
+// Applied to the ATLAS component only, never to the memory one -- refine's clamp enforces
+// the atlas ceiling and knows nothing about RAM, so under-capping the memory budget here
+// would hand the growth to a ceiling no later stage checks.
+#ifndef POISSON_ATLAS_REFINE_RESERVE
+#define POISSON_ATLAS_REFINE_RESERVE 1.0
+#endif
 // Defined in SceneTexture.cpp. Spins up a throwaway hidden-window WGL context once,
 // queries GL_MAX_TEXTURE_SIZE, caches it, and falls back to 16384 when no driver is
 // reachable. Shared rather than duplicated so this stage sizes its face cap from the
-// SAME number the texturing stage will actually pack into: TextureMesh resolves
-// --max-texture-size < 0 through this identical probe. If the two disagree the face
+// SAME number the texturing stage will actually pack into. If the two disagree the face
 // capacity is wrong by (dim ratio)^2 -- 4x on a 32768-capable host, which silently
 // decimates the mesh for an atlas that is not the one being built.
+//
+// Sharing the PROBE is necessary but was not sufficient: TextureMesh used to resolve
+// --max-texture-size < 0 by calling this probe directly, which honoured the host limit
+// but silently ignored OPENMVS_ATLAS_MAX_DIM -- so an env pin moved this stage's face
+// cap without moving the atlas it was being sized for, reintroducing the same (dim
+// ratio)^2 error the shared probe exists to prevent. MeshTexture::GenerateTexture now
+// calls ResolveAtlasMaxDimEx below instead, so all three stages share the whole
+// POLICY (pin > probe > fallback), not just the probe, and it warns when an explicit
+// --max-texture-size disagrees with the pin.
 extern int GetOpenGLMaxTextureSize();
 
 // Atlas dimension the texturing stage will pack into, in precedence order:
@@ -4766,21 +4817,45 @@ extern int GetOpenGLMaxTextureSize();
 // job produce different texture resolution on different machines. Pinning one
 // dimension here and the matching --max-texture-size on TextureMesh is the only way
 // to make a quality tier mean the same thing everywhere.
-int ResolveAtlasMaxDim(int atlasMaxDim)
+// The dimension alone is not enough to report the DECISION. "Atlas 8192" reads as a
+// setting; "atlas 8192, host supports 16384" reads as a loss, and only the second tells
+// an operator that the mesh was decimated 4x harder than this host could have carried.
+// So the resolution is done once here and the inputs are handed back, deliberately as
+// plain ints so ReconstructMesh.cpp can declare it extern without a shared header (see
+// the note on ComputeTextureFaceBudget at its call site).
+//   pHostLimit : GL_MAX_TEXTURE_SIZE as probed, or 0 if no driver was reachable
+//   pEnvPin    : OPENMVS_ATLAS_MAX_DIM if set, else 0
+// Either may be null.
+int ResolveAtlasMaxDimEx(int atlasMaxDim, int* pHostLimit, int* pEnvPin)
 {
-	if (atlasMaxDim > 0)
-		return atlasMaxDim;
 	static const int envDim = []() -> int {
 		const char* v = std::getenv("OPENMVS_ATLAS_MAX_DIM");
 		const int d = v ? std::atoi(v) : 0;
 		return d > 0 ? d : 0;
 	}();
+	// Probed even when an explicit argument or the env pin decides the answer: the
+	// point of the report is the gap between what we take and what the host offers,
+	// and the probe caches after the first call so this costs nothing to ask twice.
+	const int glDim = GetOpenGLMaxTextureSize();
+	if (pHostLimit) *pHostLimit = glDim;
+	if (pEnvPin)    *pEnvPin    = envDim;
+	if (atlasMaxDim > 0)
+		return atlasMaxDim;
 	if (envDim > 0)
 		return envDim;
-	const int glDim = GetOpenGLMaxTextureSize();
 	return (glDim > 0) ? glDim : (int)POISSON_ATLAS_MAX_DIM;
 }
 
+int ResolveAtlasMaxDim(int atlasMaxDim)
+{
+	return ResolveAtlasMaxDimEx(atlasMaxDim, nullptr, nullptr);
+}
+
+// The TRUE atlas ceiling: how many faces the atlas can texture at the target texel
+// density. This is the hard limit, so it is what the stage that sees the FINAL mesh must
+// enforce -- ClampSubdivideAreaToAtlasBudget in SceneRefine.cpp, and RefineMesh's
+// [REFINE-FACES] audit. Do not apply the refine reserve here; that would move the
+// ceiling itself rather than reserving room beneath it.
 double ComputeAtlasFaceBudget(int atlasMaxDim)
 {
 	const double dim = (double)ResolveAtlasMaxDim(atlasMaxDim);
@@ -4789,6 +4864,128 @@ double ComputeAtlasFaceBudget(int atlasMaxDim)
 	const double texels = dim * dim * POISSON_ATLAS_USABLE_FRACTION;
 	return texels / POISSON_ATLAS_TEXELS_PER_FACE;
 }
+
+// The same ceiling minus the share reserved for RefineMesh's subdivision -- what the
+// PRE-REFINE decimation cap in ReconstructMesh.cpp should use. Identical to
+// ComputeAtlasFaceBudget when POISSON_ATLAS_REFINE_RESERVE is 1.0 (the default), so the
+// two are interchangeable until an operator opts into the split.
+double ComputeAtlasFaceBudgetPreRefine(int atlasMaxDim)
+{
+	const double budget = ComputeAtlasFaceBudget(atlasMaxDim);
+	const double reserve = (double)POISSON_ATLAS_REFINE_RESERVE;
+	if (!(budget > 0.0) || !(reserve > 1.0))
+		return budget; // unknown, or no reserve requested
+	return budget / reserve;
+}
+
+// Fraction of an atlas that carries actual triangle coverage, i.e. what is left after
+// per-patch bounding-box slack. Needed because the atlas holds the patches' BOUNDING
+// BOXES, not the surface itself, so sizing on covered area alone under-asks by ~2x.
+//
+// CALIBRATED against TextureMesh's own measured appetite, by inverting
+// fill = surface / (gsd^2 * wantedDim^2) on finished runs:
+//
+//     Randy           1.57M faces, sub-ceiling    -> 0.442   gsd 0.0069, surface 6824
+//     RichmondWater  11.59M faces, capped 32768   -> 0.557
+//     RichmondWater  11.13M faces, uncapped       -> 0.584
+//     Niwot           1.60M faces, capped 16384   -> 0.637
+//
+// The earlier 0.52 came from the ATLAS-GUTTER coverage figure (138.9 of 268.4 Mpx
+// cleared), which measures a related but DIFFERENT quantity -- texels cleared and regrown,
+// not the packing efficiency the sizing needs -- and it ran predictions 6-12% high.
+//
+// TREAT THIS AS A ROUGH SIZING FIGURE, NOT A CALIBRATED CONSTANT. The measured spread is
+// 0.442-0.637, a 1.44x range, and it is NOT monotonic in tessellation (Randy is the finest
+// gsd and the lowest fill; the tidy "coarser mesh packs better" story from the first three
+// points does not survive the fourth). Predictions run roughly +-20% in dim, in BOTH
+// directions -- 12% high on RichmondWater, 12% low on Randy.
+//
+// Why a loose figure is still acceptable: this value never sets the atlas. TextureMesh
+// resolves its own ceiling and sizes from actual patch rects, so it lands on the right
+// dimension regardless (Randy predicted 15794, TextureMesh built 16384). All this feeds is
+// the pre-refine face BUDGET, which across five validated runs has never once bound --
+// GM's --decimate (0.25 / 0.4 / 0.98) always cut first. The exposure is a low prediction
+// meeting a mesh near the budget, which would over-decimate by up to ~25%. Do not add a
+// fudge factor to compensate; measure more scenes first.
+#ifndef POISSON_ATLAS_PATCH_FILL
+#define POISSON_ATLAS_PATCH_FILL 0.59
+#endif
+
+// THE ATLAS DIMENSION FOR THIS SCENE.
+//
+// The atlas size is a property of the SCENE, not of the mesh and not of the machine.
+// Measured: TextureMesh's own "full resolution needed about N px" held at
+// 30132 / 30046 / 30028 / 29989 across face counts of 7.22M / 4.54M / 4.07M / 3.64M --
+// a 0.5% spread against a 2x change in tessellation. Patch size follows the SOURCE
+// PIXELS covering the surface, so the appetite is
+//
+//     texels = surfaceArea / (gsd^2 * POISSON_ATLAS_PATCH_FILL)
+//
+// which every stage can evaluate from data it already holds. That is what lets
+// ReconstructMesh, RefineMesh and TextureMesh agree on one dimension in a SINGLE RUN
+// with nothing passed between them -- no environment variable, no file, no prior run.
+// They agree because they measure the same invariant, not because they were told.
+//
+// VALIDATED against a real run: surface 1.6e5 units^2 at gsd 0.0155424 predicts 35689 px
+// where TextureMesh measured 34887 px from the actual patch rects -- 2.3% high.
+//
+// The CEILING is the host's GL_MAX_TEXTURE_SIZE, deliberately: this deliverable is
+// displayed on the machine that builds it, so an atlas it cannot sample natively is not
+// a higher-quality result, it is a broken one. That does mean the same scene yields a
+// larger atlas on a 32768-capable host -- an intended product behaviour, not the silent
+// stage-to-stage disagreement ResolveAtlasMaxDimEx warns about.
+//
+// Returns the ceiling unchanged when the scene cannot be measured (no poses, empty mesh),
+// which reproduces the previous behaviour exactly. Out-params are for the log line that
+// has to explain the choice; any may be null.
+int ComputeSceneAtlasDim(const ImageArr& images, const Mesh& mesh,
+	int* pCeiling, double* pWantDim, double* pSurfaceArea, double* pGsd)
+{
+	const int ceiling = ResolveAtlasMaxDim(0);
+	if (pCeiling) *pCeiling = ceiling;
+	if (pWantDim) *pWantDim = 0.0;
+	if (pSurfaceArea) *pSurfaceArea = 0.0;
+	if (pGsd) *pGsd = 0.0;
+	if (mesh.faces.IsEmpty() || mesh.vertices.IsEmpty() || ceiling <= 0)
+		return ceiling;
+
+	// Same estimator the depth policy uses; it needs only poses, so it works on a mesh
+	// whose vertices stand in for the cloud.
+	const float gsd = EstimateSceneGSD(images,
+		reinterpret_cast<const float*>(mesh.vertices.Begin()), mesh.vertices.GetSize());
+	if (!(gsd > 0.f))
+		return ceiling; // no usable poses: cannot size, keep the ceiling
+
+	double surfaceArea = 0.0;
+	const Mesh::VertexArr& V = mesh.vertices;
+#ifdef _USE_OPENMP
+	#pragma omp parallel for reduction(+:surfaceArea) schedule(static)
+#endif
+	for (ptrdiff_t i = 0; i < (ptrdiff_t)mesh.faces.GetSize(); ++i) {
+		const Mesh::Face& f = mesh.faces[(Mesh::FIndex)i];
+		const Mesh::Vertex& a = V[f[0]];
+		const Mesh::Vertex& b = V[f[1]];
+		const Mesh::Vertex& c = V[f[2]];
+		const double ux = (double)b.x-a.x, uy = (double)b.y-a.y, uz = (double)b.z-a.z;
+		const double vx = (double)c.x-a.x, vy = (double)c.y-a.y, vz = (double)c.z-a.z;
+		const double cx = uy*vz - uz*vy, cy = uz*vx - ux*vz, cz = ux*vy - uy*vx;
+		surfaceArea += 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz);
+	}
+	if (pSurfaceArea) *pSurfaceArea = surfaceArea;
+	if (pGsd) *pGsd = (double)gsd;
+	if (!(surfaceArea > 0.0))
+		return ceiling;
+
+	const double wantTexels = surfaceArea / ((double)gsd * gsd * POISSON_ATLAS_PATCH_FILL);
+	const double wantDim = std::sqrt(wantTexels);
+	if (pWantDim) *pWantDim = wantDim;
+
+	// Never below a floor that can hold anything at all, never above what the host can
+	// sample. A scene wanting less than the ceiling gets a SMALLER atlas -- correct, and
+	// its face budget scales down with it so texels/face stays on target.
+	const int dim = (int)std::lround(wantDim);
+	return std::max(64, std::min(dim, ceiling));
+} // ComputeSceneAtlasDim
 /*----------------------------------------------------------------*/
 
 static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
@@ -4928,9 +5125,9 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 			pol.refineLevel = std::clamp((int)std::lround(
 				std::log2(pol.cell / (kRefinePixelsPerCell * gsdFull))), 0, 4);
 
-		VERBOSE("[MESH-POLICY] ext=%.4g spacing=%.4g k=%.2f budget=%.1fM faces",
+		MESH_DIAG("[MESH-POLICY] ext=%.4g spacing=%.4g k=%.2f budget=%.1fM faces",
 			pol.extent, pol.spacing, pol.k, pol.facesBudget * 1e-6);
-		VERBOSE("[MESH-POLICY] depth: budget=%d data=%d texture=%d pixels=%d (raw %.3f"
+		MESH_DIAG("[MESH-POLICY] depth: budget=%d data=%d texture=%d pixels=%d (raw %.3f"
 			" +tol %.2f) -> %d%s"
 			" | cell_single=%.4g target=%.4g tiles=%dx%d cell=%.4g | refineLevel=%d",
 			depthBudget, depthData, depthTexture, depthPixels,
@@ -4946,7 +5143,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 		if (pol.cubePad > 1.0001f) {
 			const double cellWas =
 				(double)scaleFactor * (double)pol.extent / (double)(1u << depthPixels);
-			VERBOSE("[MESH-POLICY] CUBE PAD x%.4g: cube %.4g -> %.4g to reach depth %d"
+			MESH_DIAG("[MESH-POLICY] CUBE PAD x%.4g: cube %.4g -> %.4g to reach depth %d"
 				" instead of %d. Cell %.4g instead of %.4g (%.2fx finer), sitting ON the"
 				" %.4g floor rather than under it. Costs a full level: ~4x faces,"
 				" ~4x refine view-planes, ~4x textured faces."
@@ -4967,14 +5164,14 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 		if (depthPixelsRaw > 0.0 && depthPixels == chosen) {
 			const double frac = depthPixelsRaw - std::floor(depthPixelsRaw);
 			if (frac > 1.0 - 2.0 * (double)POISSON_DEPTH_PIXELS_TOL)
-				VERBOSE("[MESH-POLICY] NOTE: pixel ceiling is %.3f -- within %.1f%% of a cell"
+				MESH_DIAG("[MESH-POLICY] NOTE: pixel ceiling is %.3f -- within %.1f%% of a cell"
 					" of depth %d. The tolerance (%.2f) decided this; a scene this close to a"
 					" boundary is where the headroom calibration is least reliable.",
 					depthPixelsRaw, 100.0 * (std::pow(2.0, 1.0 - frac) - 1.0),
 					(int)std::floor(depthPixelsRaw) + 1, (double)POISSON_DEPTH_PIXELS_TOL);
 		}
 		if (pol.tilesPerAxis > 1)
-			VERBOSE("[MESH-POLICY] cell %.4g needs %dx%d tiled meshing; an untiled run"
+			MESH_DIAG("[MESH-POLICY] cell %.4g needs %dx%d tiled meshing; an untiled run"
 				" delivers %.4g instead", desired, pol.tilesPerAxis, pol.tilesPerAxis,
 				pol.cellSingle);
 		return pol;
@@ -5020,7 +5217,12 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 	// only -- the fix is to REMOVE the outliers so Poisson's own bbox shrinks too;
 	// shrinking this number alone would make the policy disagree with the solver and
 	// produce cells of a size nobody asked for.
-	{
+	//
+	// REPORT-ONLY, so the whole block rides MESH_DIAG -- nothing below it reads a
+	// single value computed here. That matters beyond the log lines: this copies up
+	// to three 200k-float arrays, nth_elements them a dozen times, runs a cyclic
+	// Jacobi PCA and a 2048-bin sliding-window band search, all to print three lines.
+	if (MESH_DIAG_ENABLED()) {
 		const size_t kExtSamples = std::min<size_t>(numPoints, 200000);
 		const size_t extStride = std::max<size_t>(1, numPoints / kExtSamples);
 		std::vector<float> ax, ay, az;
@@ -5045,7 +5247,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 		const float robust = std::max(std::max(rx, ry), rz);
 		if (robust > 0.f) {
 			const double inflation = (double)ext / (double)robust;
-			VERBOSE("[MESH-EXTENT] raw bbox %.4g vs 0.2-99.8 percentile %.4g"
+			MESH_DIAG("[MESH-EXTENT] raw bbox %.4g vs 0.2-99.8 percentile %.4g"
 				" -> inflation x%.2f | per-axis raw %.4g/%.4g/%.4g robust %.4g/%.4g/%.4g%s",
 				ext, robust, inflation,
 				maxx - minx, maxy - miny, maxz - minz, rx, ry, rz,
@@ -5166,7 +5368,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 					// (clearly a rod at 5.2:1 middle-to-longest) as a SLAB.
 					const bool isRod  = (e1 * 3.0 < e2);
 					const bool isSlab = !isRod && (e0 * 5.0 < e1);
-					VERBOSE("[MESH-EXTENT] principal extents %.4g / %.4g / %.4g"
+					MESH_DIAG("[MESH-EXTENT] principal extents %.4g / %.4g / %.4g"
 						" (thinnest axis dir %.3f,%.3f,%.3f)"
 						" | mid:long 1:%.1f thin:long 1:%.1f -- %s",
 						e2, e1, e0, V[0][cn], V[1][cn], V[2][cn],
@@ -5225,7 +5427,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 					const double bandHi = (double)lo + (bestHi + 1) * binW;
 					const double bandSpan = bandHi - bandLo;
 					const double rawSpan = (double)hi - (double)lo;
-					VERBOSE("[MESH-EXTENT] densest band holding %.3f of points on axis %c:"
+					MESH_DIAG("[MESH-EXTENT] densest band holding %.3f of points on axis %c:"
 						" [%.6g .. %.6g] span %.4g of raw %.4g -> cube could shrink x%.2f"
 						" (cell and every downstream size improve by the same factor)",
 						kBandFrac, (domAxis == 0) ? 'x' : ((domAxis == 1) ? 'y' : 'z'),
@@ -5233,7 +5435,7 @@ static MeshPolicy ComputeMeshPolicy(const float* ptsRaw, size_t numPoints,
 						(bandSpan > 0.0) ? rawSpan / bandSpan : 1.0);
 				}
 			}
-			VERBOSE("[MESH-EXTENT] dominant axis %c ladder:"
+			MESH_DIAG("[MESH-EXTENT] dominant axis %c ladder:"
 				" p0=%.4g p1=%.4g p5=%.4g p25=%.4g p50=%.4g p75=%.4g p95=%.4g p99=%.4g p100=%.4g"
 				" | core p5-p95 spans %.4g of the raw %.4g",
 				(domAxis == 0) ? 'x' : ((domAxis == 1) ? 'y' : 'z'),
@@ -5341,16 +5543,16 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	TD_TIMER_STARTD();
 	ASSERT(!pointcloud.IsEmpty());
 	mesh.Release();
-	VERBOSE("Poisson reconstruction (OpenMVS-bmg build %d)", OPENMVS_BMG_BUILD);
+	VERBOSE("Mesh reconstruction (OpenMVS-bmg build %d)", OPENMVS_BMG_BUILD);
 
 	// Poisson requires oriented normals; estimate them if the cloud has none.
 	if (!pointcloud.NormalStream()) {
-		VERBOSE("Poisson: cloud has no normals, estimating them...");
+		VERBOSE("Estimating point normals...");
 		// Larger neighborhood (32 vs default 16) yields smoother, more stable
 		// PCA normals on flat surfaces, reducing Poisson waviness (e.g. bumpy road).
 		EstimatePointNormals(images, pointcloud, 32);
 		if (!pointcloud.NormalStream()) {
-			VERBOSE("error: Poisson reconstruction requires normals; estimation failed");
+			VERBOSE("error: mesh reconstruction requires point normals; estimation failed");
 			return false;
 		}
 	}
@@ -5388,7 +5590,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			poissonCount = numPoints;
 		} else {
 			// Some non-finite — filter into contiguous arrays.
-			VERBOSE("Poisson: skipping %u/%u points with non-finite position/normal",
+			VERBOSE("Skipping %u/%u points with non-finite position/normal",
 				(unsigned)numBad, (unsigned)numPoints);
 			std::vector<uint32_t> validIdx;
 			validIdx.reserve(numPoints - numBad);
@@ -5401,7 +5603,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			}
 			const size_t numValid = validIdx.size();
 			if (numValid == 0) {
-				VERBOSE("error: no finite oriented points for Poisson reconstruction");
+				VERBOSE("error: no finite oriented points for mesh reconstruction");
 				return false;
 			}
 			pts.resize(numValid * 3);
@@ -5450,7 +5652,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 	if (depth <= 0) {
 		const float gsd = EstimateSceneGSD(images, poissonPts, poissonCount);
 		if (!(gsd > 0.f))
-			VERBOSE("[MESH-POLICY] warning: could not measure GSD (no valid poses?);"
+			MESH_DIAG("[MESH-POLICY] warning: could not measure GSD (no valid poses?);"
 				" refineLevel will be reported as unknown");
 		// Views and RefineMesh affordability, both needed BEFORE the depth is chosen.
 		// The whole loaded cloud is released before RefineMesh/TextureMesh run (they are
@@ -5467,7 +5669,11 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		// big box is atlas-bound; a 1940-view scene is RAM-bound. Take the min so the
 		// same build is correct on both without knowing which it is.
 		const double texCapMem   = ComputeTextureFaceBudget(nViewsValid, cloudBytesFreed);
-		const double texCapAtlas = ComputeAtlasFaceBudget(0);
+		// PreRefine, matching what the decimation cap in ReconstructMesh.cpp will actually
+		// apply -- otherwise this line's "-bound at decimation" verdict names a figure the
+		// decimation does not use, which is exactly the sort of two-numbers-for-one-thing
+		// confusion the shared resolver was introduced to end.
+		const double texCapAtlas = ComputeAtlasFaceBudgetPreRefine(0);
 		// REPORT-ONLY here, deliberately. The atlas cap is a face count, and turning a
 		// face count into a DEPTH goes through k -- which is the least reliable number in
 		// this file. MEASURED: applying it to depthTexture drops the 1251 m / 227-view
@@ -5481,7 +5687,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		// mesh. Same ceiling, applied where it cannot be corrupted by an estimate.
 		// Revisit binding it here once k prediction is trustworthy.
 		const double texCap = texCapMem;
-		VERBOSE("[MESH-ATLAS] texture face cap: memory %.1fM (%u views) vs atlas %.1fM"
+		MESH_DIAG("[MESH-ATLAS] texture face cap: memory %.1fM (%u views) vs atlas %.1fM"
 			" (%d px, %.0f texels/face) -> %s-bound at decimation"
 			" | depth ceiling uses memory only (k too noisy to divide by)",
 			texCapMem * 1e-6, (unsigned)nViewsValid, texCapAtlas * 1e-6,
@@ -5567,7 +5773,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		const int kIndepDepth = std::min(pol.depthData,   pol.depthPixels);
 		const bool kCanBind   = kDepDepth < kIndepDepth;
 		if (!kCanBind)
-			VERBOSE("[MESH-CALIB] probe skipped: depth is set by the %s ceiling (%d),"
+			MESH_DIAG("[MESH-CALIB] probe skipped: depth is set by the %s ceiling (%d),"
 				" which does not depend on k (budget=%d texture=%d)",
 				(pol.depthPixels <= pol.depthData) ? "pixel" : "data",
 				kIndepDepth, pol.depthBudget, pol.depthTexture);
@@ -5584,7 +5790,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			rp.pointWeight    = pointWeight;
 			rp.density        = false;   // not needed; skips a pass
 			rp.verbose        = false;
-			VERBOSE("[MESH-CALIB] probing at depth %d to measure k...", probeDepth);
+			MESH_DIAG("[MESH-CALIB] probing at depth %d to measure k...", probeDepth);
 			if (PoissonReconLib::Reconstruct(poissonPts, poissonNrm, poissonCount, rp, probe)
 				&& probe.TriangleCount() > 0)
 			{
@@ -5636,7 +5842,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 						if (kRaw2 > 0.0 && kRaw > 0.0) {
 							const double lambda = std::log(kRaw2 / kRaw); // per level, d-1 -> d
 							const int off = pol.depth - probeDepth;
-							VERBOSE("[MESH-SLOPE] k(%d)=%.3f k(%d)=%.3f -> lambda=%.3f/level"
+							MESH_DIAG("[MESH-SLOPE] k(%d)=%.3f k(%d)=%.3f -> lambda=%.3f/level"
 								" (assumed %.3f) | at depth %d predicts %.3f vs assumed-constant %.3f"
 								" | %.0f points/cell at probe depth | MEASUREMENT ONLY",
 								rp2.depth, kRaw2, probeDepth, kRaw, lambda,
@@ -5646,7 +5852,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 								(double)poissonCount * sc2 / std::pow(4.0, (double)probeDepth));
 						}
 					} else {
-						VERBOSE("[MESH-SLOPE] second probe failed; no slope measured");
+						MESH_DIAG("[MESH-SLOPE] second probe failed; no slope measured");
 					}
 				}
 #endif
@@ -5669,14 +5875,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 						1.1f, 0.f, 0.0, (float)kMeas, gsd, 8, 14,
 						pol.extent, pol.spacing,    // reuse measurements
 						texCap, refineHeadroom);
-					VERBOSE("[MESH-CALIB] probe faces=%u -> k=%.3f (assumed %.3f);"
+					MESH_DIAG("[MESH-CALIB] probe faces=%u -> k=%.3f (assumed %.3f);"
 						" depth %d -> %d, cell %.4g -> %.4g",
 						(unsigned)probe.TriangleCount(), kMeas, pol.k,
 						pol.depth, pol2.depth, pol.cell, pol2.cell);
 					pol = pol2;
 				}
 			} else {
-				VERBOSE("[MESH-CALIB] probe failed; keeping the assumed k");
+				MESH_DIAG("[MESH-CALIB] probe failed; keeping the assumed k");
 			}
 		}
 #endif
@@ -5741,7 +5947,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				// while RefineMesh reloads from the ORIGINAL files. A 16x gap between the
 				// two (densify --resolution-level 2, i.e. Image::scale 1/4) is invisible
 				// otherwise, and it moves lvlAfford by two whole levels.
-				VERBOSE("[MESH-REFINE] cell=%.4g gsd=%.4g views=%u @ %.2f MPix headroom=%.1f"
+				MESH_DIAG("[MESH-REFINE] cell=%.4g gsd=%.4g views=%u @ %.2f MPix headroom=%.1f"
 					" | signal down to level %d | finest affordable level %d"
 					" (%.1f GB of %.1f GB allowed) => %s at level %d",
 					pol.cell, gsd, (unsigned)nValid,
@@ -5773,7 +5979,11 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				" refine_level=%d texture_level=0\n",
 				pol.depth, (double)pol.cell, pol.tilesPerAxis, (double)gsd,
 				refineRun ? "RUN" : "SKIP", pol.refineLevel);
-			VERBOSE("%s", planLine);
+			// The FILE is the contract with the orchestrator and is written either way.
+			// The log copy is not: it spells out the octree depth, the cell size and the
+			// downstream stage plan, which is exactly the internal detail the default log
+			// should not carry. Read mesh_plan.txt, or open the gate.
+			MESH_DIAG("%s", planLine);
 			const String planPath(MAKE_PATH("mesh_plan.txt"));
 			std::ofstream planOut(planPath.c_str(), std::ios::out | std::ios::trunc);
 			if (planOut)
@@ -5808,7 +6018,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		// else: the non-finite filter already built pts/nrm as filtered copies
 		// that do not alias the cloud -- nothing to move.
 		pointcloud.Release();
-		VERBOSE("Poisson: released the dense point cloud (%u points kept as %u MB of xyz+normals)",
+		MESH_DIAG("Poisson: released the dense point cloud (%u points kept as %u MB of xyz+normals)",
 			(unsigned)poissonCount, (unsigned)((poissonCount * 6 * sizeof(float)) >> 20));
 	}
 
@@ -5832,7 +6042,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			kept <= poissonCount - poissonCount / 4)
 		{
 			reconPts = subPts.data(); reconNrm = subNrm.data(); reconCount = kept;
-			VERBOSE("Poisson: solve input subsampled at voxel %.4g (cell/%u):"
+			MESH_DIAG("Poisson: solve input subsampled at voxel %.4g (cell/%u):"
 				" %u -> %u points (%.1fx), %u MB",
 				voxel, 1u << POISSON_INPUT_SUBSAMPLE_SHIFT,
 				(unsigned)poissonCount, (unsigned)kept,
@@ -5841,7 +6051,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		} else {
 			subPts.clear(); subPts.shrink_to_fit();
 			subNrm.clear(); subNrm.shrink_to_fit();
-			VERBOSE("Poisson: solve-input subsample rejected (kept %u of %u);"
+			MESH_DIAG("Poisson: solve-input subsample rejected (kept %u of %u);"
 				" cloud may not be spatially sorted -- using the full cloud",
 				(unsigned)kept, (unsigned)poissonCount);
 		}
@@ -5857,10 +6067,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		rp.samplesPerNode = samplesPerNode;
 		rp.pointWeight    = pointWeight;
 		rp.density        = true;
-		rp.verbose        = true;
-		VERBOSE("Poisson: running PoissonRecon (depth=%d)...", depth);
+		// The solver's own banner and per-level trace are the most detailed statement of
+		// method anything in this stage emits, so they follow the same gate as our own
+		// instrumentation rather than being unconditionally on.
+		rp.verbose        = MESH_DIAG_ENABLED();
+		VERBOSE("Reconstructing surface...");
+		MESH_DIAG("Poisson: running PoissonRecon (depth=%d)...", depth);
 		if (!PoissonReconLib::Reconstruct(reconPts, reconNrm, reconCount, rp, pmesh) || pmesh.TriangleCount() == 0) {
-			VERBOSE("error: Poisson reconstruction failed");
+			VERBOSE("error: mesh reconstruction failed");
 			return false;
 		}
 	}
@@ -5893,13 +6107,13 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// error can move the chosen depth. Flag on that, not on incidental drift.
 			if (probeK > 0.0) {
 				const double errPct = (probeK - kMeas) / kMeas * 100.0;
-				VERBOSE("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f;"
+				MESH_DIAG("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f;"
 					" probe predicted %.3f (%+.1f%%)%s",
 					(unsigned)pmesh.TriangleCount(), depth, kMeas, probeK, errPct,
 					(std::fabs(errPct) > POISSON_PROBE_ERROR_WARN_PCT)
 						? " -- PROBE MISPREDICTED" : "");
 			} else {
-				VERBOSE("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f"
+				MESH_DIAG("[MESH-CALIB] solve: raw faces=%u at depth=%d -> true k=%.3f"
 					" (no probe ran; set OPENMVS_POISSON_FACE_K=%.3f to use it)",
 					(unsigned)pmesh.TriangleCount(), depth, kMeas, kMeas);
 			}
@@ -5919,13 +6133,13 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		tp.aRatio        = (islandRatio > 0.f) ? islandRatio : 0.001f;
 		tp.removeIslands = (islandRatio > 0.f);
 		tp.verbose       = true;
-		VERBOSE("Poisson: running SurfaceTrimmer (--trim %g%s)...", (double)trimThreshold,
+		MESH_DIAG("Poisson: running SurfaceTrimmer (--trim %g%s)...", (double)trimThreshold,
 			(islandRatio > 0.f) ? String::FormatString(" --aRatio %g --removeIslands", (double)islandRatio).c_str() : "");
 		PoissonReconLib::Mesh tmesh;
 		if (PoissonReconLib::Trim(pmesh, tp, tmesh) && tmesh.TriangleCount() > 0)
 			pmesh = std::move(tmesh);
 		else
-			VERBOSE("warning: SurfaceTrimmer produced no output; using untrimmed Poisson mesh");
+			VERBOSE("warning: density trimming produced no output; using the untrimmed mesh");
 	}
 #endif // !POISSON_ADAPTIVE_TRIM
 
@@ -5968,7 +6182,10 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 		//                   so the trim is inert on this scene at this depth and the number
 		//                   needs re-picking from these percentiles, not nudging.
 		// To cut roughly the lowest X% of surface, aim the threshold near pX.
-		if (nv > 0) {
+		//
+		// Pure instrumentation -- no threshold, no geometry, nothing else reads it --
+		// so the 200k-sample gather and sort go behind the gate along with the line.
+		if (nv > 0 && MESH_DIAG_ENABLED()) {
 			std::vector<float> ds;
 			const size_t dstride = std::max<size_t>(1, (size_t)nv / 200000);
 			ds.reserve((size_t)nv / dstride + 1);
@@ -5993,7 +6210,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				// p1 7.31 -- and p1 is far too coarse to calibrate
 				// POISSON_TRIM_PERCENTILE_X100 against. These are the numbers to read when
 				// matching a known-good raw threshold to a portable percentile.
-				VERBOSE("Poisson: vertex density percentiles (n=%zu of %zu sampled, %s):"
+				MESH_DIAG("Poisson: vertex density percentiles (n=%zu of %zu sampled, %s):"
 					" min=%.3g | LOW TAIL p0.1=%.3g p0.2=%.3g p0.35=%.3g p0.5=%.3g p0.75=%.3g"
 					" p1=%.3g p2=%.3g | p5=%.3g p25=%.3g p50=%.3g p75=%.3g p95=%.3g p99=%.3g"
 					" max=%.3g | --poisson-trim %.2f -- this scale shifts with depth and"
@@ -6105,7 +6322,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				: INT_MAX;
 			const int marginCells = std::min(marginBase, marginCellsCap);
 			if (marginCells < marginBase)
-				VERBOSE("Poisson: hard-cut margin capped %d -> %d cells (%.4g -> %.4g units)"
+				MESH_DIAG("Poisson: hard-cut margin capped %d -> %d cells (%.4g -> %.4g units)"
 					" -- a %.4g cell puts the margin past the %.4g-unit ceiling; cells track"
 					" point density, not extrapolation reach",
 					marginBase, marginCells,
@@ -6113,7 +6330,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					(double)((float)marginCells * cellSz),
 					(double)cellSz, (double)POISSON_TRIM_MARGIN_CAP_UNITS);
 			if (marginCells > (int)POISSON_TRIM_MARGIN_CELLS)
-				VERBOSE("Poisson: hard-cut margin floored %d -> %d cells (%.4g -> %.4g units)"
+				MESH_DIAG("Poisson: hard-cut margin floored %d -> %d cells (%.4g -> %.4g units)"
 					" -- %d cells is %.3f%% of the %.4g extent, below the %.3f%% floor;"
 					" the grid cell tracks point density, not balloon reach",
 					(int)POISSON_TRIM_MARGIN_CELLS, marginCells,
@@ -6169,7 +6386,11 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// no points at all, the surface over it is pure extrapolation, and the hard cut is
 			// working as designed -- at which point the question is whether that cut is wanted,
 			// not what its threshold should be.
-			{
+			//
+			// The ladder is read off `cnt`, which is dropped immediately below, so the
+			// six-way tally has to happen here or not at all -- hence the gate around
+			// the counting pass and not merely around the line it prints.
+			if (MESH_DIAG_ENABLED()) {
 				size_t c1 = 0, c2 = 0, c4 = 0, c8 = 0, c16 = 0, c64 = 0;
 				for (size_t k = 0; k < nCells; ++k) {
 					const uint32_t n = cnt[k];
@@ -6178,7 +6399,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					if (n >= 16) ++c16;  if (n >= 64) ++c64;
 				}
 				const double inv = nCells ? 1.0 / (double)nCells : 0.0;
-				VERBOSE("[MESH-OCCUPANCY] cells=%zu | >=1 %zu (%.4f) >=2 %zu (%.4f) >=4 %zu (%.4f)"
+				MESH_DIAG("[MESH-OCCUPANCY] cells=%zu | >=1 %zu (%.4f) >=2 %zu (%.4f) >=4 %zu (%.4f)"
 					" >=8 %zu (%.4f) >=16 %zu (%.4f) >=64 %zu (%.4f) | threshold=%d cell=%.4g"
 					" (%.0fx median spacing %.4g, ~%.0f pts at median density)",
 					nCells, c1, c1 * inv, c2, c2 * inv, c4, c4 * inv, c8, c8 * inv,
@@ -6298,7 +6519,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					vOutFrom(ext);
 					size_t nCut = 0;
 					const size_t compAfter = compCount(true, nCut);
-					VERBOSE("Poisson: footprint hard-cut attempt %d: margin %d cells (%.4g units, seal %d)"
+					MESH_DIAG("Poisson: footprint hard-cut attempt %d: margin %d cells (%.4g units, seal %d)"
 						" -> would cut %zu faces, components %zu -> %zu (budget %zu)",
 						attempt + 1, dr, (double)((float)dr * cellSz), (int)POISSON_TRIM_CLOSE_CELLS, nCut,
 						compBase, compAfter, compBudget);
@@ -6312,7 +6533,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					// DENSITY threshold still runs, and leave the hard cut off for this scene.
 					buildExt(POISSON_TRIM_CLOSE_CELLS, ext);
 					drUsed = POISSON_TRIM_CLOSE_CELLS;
-					VERBOSE("Poisson: footprint hard-cut ABANDONED after %d attempts -- every"
+					MESH_DIAG("Poisson: footprint hard-cut ABANDONED after %d attempts -- every"
 						" dilation severed the surface past the %zu-component budget. Falling back"
 						" to the density ramp alone.", (int)POISSON_TRIM_GUARD_ATTEMPTS, compBudget);
 				}
@@ -6374,7 +6595,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// a long way shows a fat tail here regardless of its grid cell or its margin.
 			// Measured PRE-cut, so it describes the balloon the trim has to deal with, not
 			// what survived.
-			{
+			//
+			// The chamfer transform below has ONE non-diagnostic consumer, the reach cut,
+			// so the block runs whenever that is compiled in and otherwise only when the
+			// diagnostics are asked for. With POISSON_REACH_CUT off (the shipped setting)
+			// this is a second full two-pass DT over the occupancy grid plus a sort of
+			// every mesh-covered cell, feeding nothing but one line.
+			if (POISSON_REACH_CUT || MESH_DIAG_ENABLED()) {
+				const bool bDiag = MESH_DIAG_ENABLED();
 				std::vector<float> dOcc(nCells, BIG);
 				for (size_t k = 0; k < nCells; ++k) if (occ[k]) dOcc[k] = 0.f;
 				for (int cy = 0; cy < gh; ++cy) for (int cx = 0; cx < gw; ++cx) {
@@ -6398,31 +6626,35 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					int cx, cy; cellOf(mesh.vertices[v].x, mesh.vertices[v].y, cx, cy);
 					mcov[(size_t)cy * gw + cx] = 1;
 				}
+				// nMeshCells is also reported by the reach-cut line below, so it is counted
+				// either way; `oh` is the overhang distribution and exists only to be printed.
 				std::vector<float> oh;
 				size_t nMeshCells = 0;
 				for (size_t k = 0; k < nCells; ++k) {
 					if (!mcov[k]) continue;
 					++nMeshCells;
-					if (!occ[k]) oh.push_back(dOcc[k]);
+					if (bDiag && !occ[k]) oh.push_back(dOcc[k]);
 				}
-				std::sort(oh.begin(), oh.end());
-				const auto pctl = [&](double p) -> double {
-					if (oh.empty()) return 0.0;
-					size_t i = (size_t)(p * (double)(oh.size() - 1) + 0.5);
-					if (i >= oh.size()) i = oh.size() - 1;
-					return (double)oh[i];
-				};
-				VERBOSE("[MESH-OVERHANG] dataCells=%zu meshCells=%zu (x%.3f) outside=%zu (%.4f)"
-					" | overhang cells p50=%.2f p90=%.2f p99=%.2f max=%.2f"
-					" | units p50=%.4g p90=%.4g p99=%.4g max=%.4g | cell=%.4g extent=%.4g",
-					nOcc, nMeshCells,
-					nOcc ? (double)nMeshCells / (double)nOcc : 0.0,
-					oh.size(), nMeshCells ? (double)oh.size() / (double)nMeshCells : 0.0,
-					pctl(0.50), pctl(0.90), pctl(0.99), oh.empty() ? 0.0 : (double)oh.back(),
-					pctl(0.50) * (double)cellSz, pctl(0.90) * (double)cellSz,
-					pctl(0.99) * (double)cellSz,
-					(oh.empty() ? 0.0 : (double)oh.back()) * (double)cellSz,
-					(double)cellSz, (double)footExtent);
+				if (bDiag) {
+					std::sort(oh.begin(), oh.end());
+					const auto pctl = [&](double p) -> double {
+						if (oh.empty()) return 0.0;
+						size_t i = (size_t)(p * (double)(oh.size() - 1) + 0.5);
+						if (i >= oh.size()) i = oh.size() - 1;
+						return (double)oh[i];
+					};
+					MESH_DIAG("[MESH-OVERHANG] dataCells=%zu meshCells=%zu (x%.3f) outside=%zu (%.4f)"
+						" | overhang cells p50=%.2f p90=%.2f p99=%.2f max=%.2f"
+						" | units p50=%.4g p90=%.4g p99=%.4g max=%.4g | cell=%.4g extent=%.4g",
+						nOcc, nMeshCells,
+						nOcc ? (double)nMeshCells / (double)nOcc : 0.0,
+						oh.size(), nMeshCells ? (double)oh.size() / (double)nMeshCells : 0.0,
+						pctl(0.50), pctl(0.90), pctl(0.99), oh.empty() ? 0.0 : (double)oh.back(),
+						pctl(0.50) * (double)cellSz, pctl(0.90) * (double)cellSz,
+						pctl(0.99) * (double)cellSz,
+						(oh.empty() ? 0.0 : (double)oh.back()) * (double)cellSz,
+						(double)cellSz, (double)footExtent);
+				}
 
 #if POISSON_REACH_CUT
 				// Threshold in world units: an absolute floor so small scenes are untouched,
@@ -6456,7 +6688,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					}
 					for (size_t k = 0; k < nCells; ++k)
 						if (mcov[k] && dOcc[k] > dLimit) ++nFarCells;
-					VERBOSE("Poisson: reach cut armed at %.4g units (%.1f cells) = max(%.4g,"
+					MESH_DIAG("Poisson: reach cut armed at %.4g units (%.1f cells) = max(%.4g,"
 						" %.3f x extent %.4g) -- %zu of %zu mesh cells are beyond it",
 						(double)reachCutUnits, (double)dLimit,
 						(double)POISSON_REACH_CUT_MIN_UNITS,
@@ -6492,7 +6724,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					const double q = (double)POISSON_TRIM_PERCENTILE_X100 / 10000.0;
 					const size_t kq = (size_t)(q * (double)(dsq.size() - 1) + 0.5);
 					const float qv = dsq[kq < dsq.size() ? kq : dsq.size() - 1];
-					VERBOSE("Poisson: trim from distribution: p%.2f = %.3g (raw --poisson-trim was"
+					MESH_DIAG("Poisson: trim from distribution: p%.2f = %.3g (raw --poisson-trim was"
 						" %.2f) -- percentile is depth- and dataset-invariant, the raw value is not",
 						q * 100.0, (double)qv, (double)trimThreshold);
 					trimBase = qv;
@@ -6553,7 +6785,10 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// Read it as: to cut roughly the top X% of low-density surface, set the EDGE
 			// threshold near pX. The interior should sit near p1-p5 so the well-surveyed middle
 			// keeps its coverage.
-			{
+			//
+			// Instrumentation only (the threshold itself comes from the percentile block
+			// above), so the gather and sort go behind the gate with the line.
+			if (MESH_DIAG_ENABLED()) {
 				std::vector<float> ds;
 				const size_t dstride = std::max<size_t>(1, (size_t)numV / 200000);
 				ds.reserve((size_t)numV / dstride + 1);
@@ -6565,7 +6800,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 						const size_t k = (size_t)(q * (double)(ds.size() - 1) + 0.5);
 						return (double)ds[k];
 					};
-					VERBOSE("Poisson: vertex density percentiles (n=%zu of %u sampled):"
+					MESH_DIAG("Poisson: vertex density percentiles (n=%zu of %u sampled):"
 						" p1=%.3g p5=%.3g p25=%.3g p50=%.3g p75=%.3g p95=%.3g p99=%.3g max=%.3g"
 						" | current interior=%.2f edge=%.2f -- set these from THIS distribution,"
 						" they do not transfer across depths",
@@ -6641,7 +6876,12 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				mesh.vertices.Swap(nvarr);
 				mesh.faces.Swap(newFaces);
 			}
-			VERBOSE("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f)"
+			// The trim CHANGES the mesh, so the headline count stays at normal verbosity;
+			// the parameter dump that explains how it was arrived at does not.
+			MESH_DIAG("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f) [%s]",
+				(unsigned)culled, (unsigned)numF,
+				numF ? (double)culled / (double)numF : 0.0, TD_TIMER_GET_FMT().c_str());
+			MESH_DIAG("Poisson: adaptive footprint trim removed %u of %u faces (fraction %.3f)"
 				" | interior=%.2f (x%.2f of base %.2f, full at %d cells) edge=%.2f"
 				" ramp=%d cells (%.4g units)"
 				" | grid %dx%d cell=%.4g, %zu of %zu cells occupied (fraction %.3f)"
@@ -6722,7 +6962,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			_aligned_free(fKeep);
 			mesh.vertices.Swap(newVerts);
 			mesh.faces.Swap(newFaces);
-			VERBOSE("Poisson: removed %u non-finite vertices (and incident faces)", (unsigned)numBad);
+			VERBOSE("Removed %u non-finite vertices (and incident faces)", (unsigned)numBad);
 		}
 		_aligned_free(pKeep);
 	}
@@ -6809,11 +7049,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			const float thrFloor = 0.5f * globalThr;
 
 			const Mesh::VIndex numV = mesh.vertices.GetSize();
+			const bool bDiag = MESH_DIAG_ENABLED();
 			std::vector<uint8_t> farV(numV);
-			std::vector<float> ratioV(numV, 0.f);   // d1/s_local, for the diagnostic below
+			// d1/s_local, for the diagnostic below and nothing else -- 4 B/vertex that
+			// only exists to be sorted once, so it is not allocated unless it is wanted.
+			std::vector<float> ratioV(bDiag ? (size_t)numV : (size_t)0, 0.f);
 			const Mesh::Vertex* __restrict pV = mesh.vertices.GetData();
 			uint8_t* __restrict pFar = farV.data();
-			float* __restrict pRatio = ratioV.data();
+			float* __restrict pRatio = ratioV.empty() ? nullptr : ratioV.data();
 #ifdef _USE_OPENMP
 			#pragma omp parallel for schedule(static)
 #endif
@@ -6830,7 +7073,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				float thr = factor * sLocal;
 				if (thr < thrFloor) thr = thrFloor;
 				pFar[v] = (d1 > thr) ? 1 : 0;
-				pRatio[v] = (sLocal > 0.f) ? (d1 / sLocal) : 0.f;
+				if (pRatio) pRatio[v] = (sLocal > 0.f) ? (d1 / sLocal) : 0.f;
 			}
 
 			// Is there anything separable at ANY threshold? The cull firing zero times
@@ -6845,7 +7088,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// surface for invented surface at roughly one-for-one. That is the difference
 			// between "tune the factor" and "abandon this approach", and it cannot be read
 			// off a single pass/fail count.
-			{
+			if (bDiag) {
 				std::vector<float> r(pRatio, pRatio + numV);
 				const auto pct = [&r](double p) -> float {
 					if (r.empty()) return 0.f;
@@ -6855,7 +7098,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				};
 				const float p50 = pct(0.50), p90 = pct(0.90), p99 = pct(0.99);
 				const float p999 = pct(0.999), pMax = pct(1.0);
-				VERBOSE("[MESH-CULL] d1/s_local distribution over %u vertices:"
+				MESH_DIAG("[MESH-CULL] d1/s_local distribution over %u vertices:"
 					" p50=%.2f p90=%.2f p99=%.2f p99.9=%.2f max=%.2f (cull fires above %.2f)"
 					" -- a usable cull needs a GAP between the bulk and the tail",
 					(unsigned)numV, p50, p90, p99, p999, pMax, factor);
@@ -6895,7 +7138,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				cullAbandoned = true;
 				// No percent signs in this format -- they do not survive the log macro
 				// (see the [ATLAS-FIT] note in SceneTexture.cpp). Fractions instead.
-				VERBOSE("[MESH-CULL] distance cull wanted %u of %u faces"
+				MESH_DIAG("[MESH-CULL] distance cull wanted %u of %u faces"
 					" (fraction %.3f > cap %.3f) -- ABANDONED, keeping the full mesh."
 					" The local density estimate is not discriminating on this scene;"
 					" raise POISSON_CULL_FACTOR_X100 (now %.2fx) or set POISSON_DISTANCE_CULL 0.",
@@ -6935,13 +7178,13 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				const size_t keptFaces = newFaces.GetSize();
 				mesh.vertices.Swap(newVerts);
 				mesh.faces.Swap(newFaces);
-				VERBOSE("[MESH-CULL] distance cull removed %u/%u faces"
+				MESH_DIAG("[MESH-CULL] distance cull removed %u/%u faces"
 					" (%.2fx LOCAL spacing, floor %.4g = 0.5 x %.2fx global median %.4g) [%s]",
 					(unsigned)culled, (unsigned)(culled + keptFaces),
 					factor, 0.5f * globalThr, factor, medianSpacing,
 					TD_TIMER_GET_FMT().c_str());
 			} else if (!cullAbandoned) {
-				VERBOSE("[MESH-CULL] distance cull removed no faces"
+				MESH_DIAG("[MESH-CULL] distance cull removed no faces"
 					" (%.2fx LOCAL spacing, global median %.4g)", factor, medianSpacing);
 			}
 		}
@@ -7107,7 +7350,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 					}
 					mesh.vertices.Swap(newVertsF);
 				}
-				VERBOSE("Poisson: skirt cull removed %u boundary faces (Z-descent)", (unsigned)totalSkirtCulled);
+				MESH_DIAG("Poisson: skirt cull removed %u boundary faces (Z-descent)", (unsigned)totalSkirtCulled);
 			}
 		}
 	}
@@ -7295,15 +7538,14 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			// What the filter deletes, kept so it can be written out and LOOKED AT rather
 			// than inferred from counts. See the export below.
 			Mesh::FaceArr cutFaces;
-			// -v 3 OR OPENMVS_DUMP_REMOVED=1. The env trigger exists because the command
-			// line is generated by the orchestrator, so raising verbosity for a one-off
-			// diagnostic would mean changing the caller; an env var can be set in the shell
-			// for a single run and unset again.
-			static const bool bDumpRemoved = []() -> bool {
-				const char* v = std::getenv("OPENMVS_DUMP_REMOVED");
-				return v && *v && *v != '0';
-			}();
-			const bool bWantCut = (g_nVerbosityLevel > 2) || bDumpRemoved;
+			// -v 4 (MVS_DUMP_FILES), NOT the MESH_DIAG build switch: a build compiled for
+			// readable logs must not also start writing a 5.9M-vertex PLY every run. The
+			// two previous triggers were both wrong for the same reason in different
+			// ways -- -v 3 is a level reached for routinely, and OPENMVS_DUMP_REMOVED,
+			// once exported, stays exported -- so this wrote on every run unnoticed.
+			// See MVS_DUMP_FILES in Common.h for why file dumps sit on verbosity while
+			// log text sits on a compile define.
+			const bool bWantCut = MVS_DUMP_FILES();
 			for (Mesh::FIndex f = 0; f < numF; ++f) {
 				const uint32_t cid = compId[f];
 				if (compSize[cid] < minCompSize && !compRescue[cid]) {
@@ -7315,7 +7557,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				newFaces.Insert(pF[f]);
 			}
 			if (nRescued > 0)
-				VERBOSE("Poisson: gap rescue kept %zu of %zu small components (%zu faces,"
+				MESH_DIAG("Poisson: gap rescue kept %zu of %zu small components (%zu faces,"
 					" %.4f of mesh) whose ground the kept mesh does not already cover"
 					" (overlap < %.2f)", nRescued, compSize.size(), nRescuedFaces,
 					numF ? (double)nRescuedFaces / (double)numF : 0.0,
@@ -7340,7 +7582,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				const bool bSaved = mesh.Save(cutPath);
 				mesh.faces.Swap(cutFaces);          // restore; cutFaces := removed again
 				if (bSaved)
-					VERBOSE("Poisson: wrote the %u removed faces to %s (-v 3 diagnostic)",
+					VERBOSE("Poisson: wrote the %u removed faces to %s (-v 4 diagnostic)",
 						(unsigned)cutFaces.GetSize(), cutPath.c_str());
 			}
 			if (blobsRemoved > 0) {
@@ -7373,33 +7615,42 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				// NOTE the second %u is the TOTAL component count, not the number removed
 				// -- the old wording ("in %u small components") read as the latter and was
 				// misleading when the two differ by orders of magnitude.
-				VERBOSE("Poisson: removed %u faces, %u components total (threshold %u faces)",
+				MESH_DIAG("Poisson: removed %u faces, %u components total (threshold %u faces)",
 					(unsigned)blobsRemoved, (unsigned)compSize.size(), (unsigned)minCompSize);
 			}
-			// Emitted unconditionally, including when nothing was removed -- a run that
-			// fragmented but stayed above the threshold is exactly as interesting for
-			// calibration as one that did not.
-			char fragLine[512];
-			snprintf(fragLine, sizeof(fragLine),
-				"[MESH-FRAG] depth=%d faces=%u components=%u perM=%.1f"
-				" largest=%u largestFrac=%.4f removed=%u removedFrac=%.4f threshold=%u",
-				depth, (unsigned)numF, (unsigned)compSize.size(),
-				numF ? (1.0e6 * (double)compSize.size() / (double)numF) : 0.0,
-				(unsigned)largestComp,
-				numF ? (double)largestComp / (double)numF : 0.0,
-				(unsigned)blobsRemoved,
-				numF ? (double)blobsRemoved / (double)numF : 0.0,
-				(unsigned)minCompSize);
-			VERBOSE("%s", fragLine);
-			// Durable copy at a STABLE path. The app logs carry a fresh timestamp suffix
-			// every run and live in a temp folder, so collecting this across a corpus by
-			// hand means globbing for the newest file each time. Its own file rather than
-			// a second line in mesh_plan.txt, which the orchestrator parses.
-			{
-				const String fragPath(MAKE_PATH("mesh_frag.txt"));
-				std::ofstream fragOut(fragPath.c_str(), std::ios::out | std::ios::trunc);
-				if (fragOut)
-					fragOut << fragLine << "\n";
+			// Emitted whenever the diagnostics are asked for, including when nothing was
+			// removed -- a run that fragmented but stayed above the threshold is exactly
+			// as interesting for calibration as one that did not.
+			//
+			// mesh_frag.txt no longer goes with it. Unlike mesh_plan.txt nothing consumes
+			// that file -- it exists so a corpus of runs can be collected by hand -- and
+			// the LINE is what makes it collectable in the first place. Printing text and
+			// dropping a file in the output directory are separate decisions, so the line
+			// rides MESH_DIAG and the file rides -v 4 (MVS_DUMP_FILES), same split as
+			// poisson_removed_components.ply above.
+			if (MESH_DIAG_ENABLED()) {
+				char fragLine[512];
+				snprintf(fragLine, sizeof(fragLine),
+					"[MESH-FRAG] depth=%d faces=%u components=%u perM=%.1f"
+					" largest=%u largestFrac=%.4f removed=%u removedFrac=%.4f threshold=%u",
+					depth, (unsigned)numF, (unsigned)compSize.size(),
+					numF ? (1.0e6 * (double)compSize.size() / (double)numF) : 0.0,
+					(unsigned)largestComp,
+					numF ? (double)largestComp / (double)numF : 0.0,
+					(unsigned)blobsRemoved,
+					numF ? (double)blobsRemoved / (double)numF : 0.0,
+					(unsigned)minCompSize);
+				VERBOSE("%s", fragLine);
+				// Durable copy at a STABLE path. The app logs carry a fresh timestamp suffix
+				// every run and live in a temp folder, so collecting this across a corpus by
+				// hand means globbing for the newest file each time. Its own file rather than
+				// a second line in mesh_plan.txt, which the orchestrator parses.
+				if (MVS_DUMP_FILES()) {
+					const String fragPath(MAKE_PATH("mesh_frag.txt"));
+					std::ofstream fragOut(fragPath.c_str(), std::ios::out | std::ios::trunc);
+					if (fragOut)
+						fragOut << fragLine << "\n";
+				}
 			}
 		}
 	}
@@ -7497,7 +7748,7 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 			for (Mesh::VIndex v = 0; v < numV; ++v) {
 				if (!vClass[v]) continue;
 				Point3f& n = vNormals[v];
-				const float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+				const float len = FastSqrtS(n.x*n.x + n.y*n.y + n.z*n.z);
 				if (len > 1e-8f) { n.x /= len; n.y /= len; n.z /= len; }
 				else { n.x = 0.f; n.y = 0.f; n.z = 1.f; } // fallback: up
 			}
@@ -7534,18 +7785,23 @@ bool Scene::ReconstructMeshPoisson(int depth, float trimThreshold, float samples
 				for (Mesh::VIndex v = 0; v < numV; ++v)
 					if (vClass[v]) pV[v] = tmp[v];
 			}
-			unsigned nBnd = 0, nBand = 0, nBand2 = 0;
-			for (Mesh::VIndex v = 0; v < numV; ++v) {
-				if (vClass[v] == 1) ++nBnd;
-				else if (vClass[v] == 2) ++nBand;
-				else if (vClass[v] == 3) ++nBand2;
+			// The per-class tally is only ever printed, so it is counted only when asked for.
+			if (MESH_DIAG_ENABLED()) {
+				unsigned nBnd = 0, nBand = 0, nBand2 = 0;
+				for (Mesh::VIndex v = 0; v < numV; ++v) {
+					if (vClass[v] == 1) ++nBnd;
+					else if (vClass[v] == 2) ++nBand;
+					else if (vClass[v] == 3) ++nBand2;
+				}
+				MESH_DIAG("Poisson: boundary smooth (%d iter, lambda=%.2f/%.2f/%.2f, %u boundary + %u band1 + %u band2 vertices)",
+					kBoundarySmooth, lambdaBnd, lambdaBand, lambdaBand2, nBnd, nBand, nBand2);
 			}
-			VERBOSE("Poisson: boundary smooth (%d iter, lambda=%.2f/%.2f/%.2f, %u boundary + %u band1 + %u band2 vertices)",
-				kBoundarySmooth, lambdaBnd, lambdaBand, lambdaBand2, nBnd, nBand, nBand2);
 		}
 	}
 
-	DEBUG_EXTRA("Poisson (Tier 2: PoissonRecon%s) reconstructed: %u vertices, %u faces (%s)",
+	DEBUG_EXTRA("Surface reconstructed: %u vertices, %u faces (%s)",
+		mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+	MESH_DIAG("Poisson (Tier 2: PoissonRecon%s) reconstructed: %u vertices, %u faces (%s)",
 		trimThreshold > 0.f ? "+SurfaceTrimmer" : "", mesh.vertices.GetSize(), mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	return !mesh.faces.IsEmpty();
 } // ReconstructMeshPoisson
@@ -7969,7 +8225,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const size_t dropped = before - outIdx;
 					numVertices = outIdx;
 
-					DEBUG_EXTRA("Voxel pre-filter (auto: kPeak=%u, grid=%d, voxel=%.4g, bbox=[%.1f x %.1f x %.1f]): %zu/%zu dropped (%.1f%%) [%s]",
+					MESH_DIAG("Voxel pre-filter (auto: kPeak=%u, grid=%d, voxel=%.4g, bbox=[%.1f x %.1f x %.1f]): %zu/%zu dropped (%.1f%%) [%s]",
 						kPeak, kGrid, voxel, spanX, spanY, spanZ,
 						dropped, before,
 						100.0 * (double)dropped / (double)before,
@@ -7977,10 +8233,10 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 					_aligned_free(entries);
 				} else {
-					DEBUG_EXTRA("Voxel pre-filter: degenerate bbox -- skipped");
+					MESH_DIAG("Voxel pre-filter: degenerate bbox -- skipped");
 				}
 			} else {
-				DEBUG_EXTRA("Voxel pre-filter: skipped (%s)",
+				MESH_DIAG("Voxel pre-filter: skipped (%s)",
 					bUseOnlyROI ? "ROI mode" : "empty");
 			}
 #endif
@@ -8090,18 +8346,18 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 					const size_t dropped = before - outIdx;
 					numVertices = outIdx;
 
-					DEBUG_EXTRA("Early confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu/%zu dropped (%.1f%%) [%s]",
+					MESH_DIAG("Early confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu/%zu dropped (%.1f%%) [%s]",
 						kPct, gMin, gMax, thr, dropped, before,
 						100.0 * (double)dropped / (double)before,
 						TD_TIMER_GET_FMT().c_str());
 				} else {
-					DEBUG_EXTRA("Early confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
+					MESH_DIAG("Early confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
 						gMin, gMax, relSpread, kMinRelSpread * 100.0f);
 				}
 
 				_aligned_free(ptConf);
 			} else {
-				DEBUG_EXTRA("Early confidence filter: skipped (%s)",
+				MESH_DIAG("Early confidence filter: skipped (%s)",
 					bUseOnlyROI ? "ROI mode" : "no pointWeights");
 			}
 #endif
@@ -8186,7 +8442,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			// pointWeights are NOT permuted by permuteScatter2 -- look up the
 			// original index via 'indices' (still alive at this point).
 			if (pointcloud.pointWeightsMemory.empty()) {
-				DEBUG_EXTRA("Confidence filter: pointWeights empty -- skipped");
+				MESH_DIAG("Confidence filter: pointWeights empty -- skipped");
 			} else {
 				constexpr unsigned kPct = RECONSTRUCT_CONFIDENCE_FILTER_KPCT;
 				static_assert(kPct > 0 && kPct < 100,
@@ -8283,12 +8539,12 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 							++dropped;
 						}
 					}
-					DEBUG_EXTRA("Confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu points dropped (%.1f%% of %zu)",
+					MESH_DIAG("Confidence filter (bottom %u%%, range=[%.4g,%.4g], thr=%.4g): %zu points dropped (%.1f%% of %zu)",
 						kPct, gMin, gMax, thr, dropped,
 						100.0 * (double)dropped / (double)totalKept,
 						totalKept);
 				} else {
-					DEBUG_EXTRA("Confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
+					MESH_DIAG("Confidence filter: range=[%.4g,%.4g] relSpread=%.3f -- skipped (uniform or below %.0f%% threshold)",
 						gMin, gMax, relSpread, kMinRelSpread * 100.0f);
 				}
 
@@ -8332,7 +8588,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			}
 #endif
 
-			DEBUG_EXTRA("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
+			MESH_DIAG("Total prep time is: %s", TD_TIMER_GET_FMT().c_str());
 		}
 		Util::Progress progress(_T("Points inserted"), numVertices);
 
@@ -8344,14 +8600,14 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		// delaunay.info() is parallel can be used to make sure
 		// we are compiling and using the work with TBB.
 #if 1
-		DEBUG("------------------------------------------");
-		DEBUG("ReconstructMesh optimization version 1.1.23");
+		MESH_DIAG("------------------------------------------");
+		MESH_DIAG("ReconstructMesh optimization version 1.1.23");
 		const auto [isParallel, CGALversion] = CGAL::info();
-		DEBUG("Parallel: %s", isParallel ? "true" : "false");
-		DEBUG("CGAL version: = %d", CGALversion);
+		MESH_DIAG("Parallel: %s", isParallel ? "true" : "false");
+		MESH_DIAG("CGAL version: = %d", CGALversion);
 		constexpr int vcgVersion = vcg::tri::Info();
-		DEBUG("VCG version: = %d", vcgVersion);
-		DEBUG("------------------------------------------");
+		MESH_DIAG("VCG version: = %d", vcgVersion);
+		MESH_DIAG("------------------------------------------");
 #endif
 		// Fixed storage is slightly faster, but difficult to maintain.
 		constexpr size_t kMaxCells = 16384;
@@ -9034,7 +9290,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			_aligned_free(sizes);
 			sizes = 0;
 
-			DEBUG_EXTRA("View expansion pass completed: %u vertices, %llu view bound (%s)",
+			MESH_DIAG("View expansion pass completed: %u vertices, %llu view bound (%s)",
 				numVtxIDs, (unsigned long long)totalViewsBound, TD_TIMER_GET_FMT().c_str());
 		}
 #endif
@@ -9615,7 +9871,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 
 		auto t1 = rdtscEnd();
 
-		DEBUG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
+		MESH_DIAG("Median time %g", rdtscToSeconds(t1 - t0, cpuHz));
 
 		// Prefer memset as cell_info_t will value initialize multiple fields.
 		infoCells = (cell_info_t*)VirtualAlloc(
@@ -9680,12 +9936,12 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 			distsSq.Insert(normSq(CGAL2MVS<float>(c->vertex(ei->second)->point()) - CGAL2MVS<float>(c->vertex(ei->third)->point())));
 		}
 		DWORD64 t1 = __rdtsc();
-		DEBUG("Median time %llu\n", t1-t0);
+		MESH_DIAG("Median time %llu\n", t1-t0);
 
 		std::nth_element(distsSq.begin(), distsSq.begin() + distsSq.size()/2, distsSq.end());
 		const float sigma(SQRT(distsSq[distsSq.size()/2] ) * kSigma); // .GetMedian())* kSigma);
 		//const float sigma(SQRT(distsSq.GetMedian())*kSigma);
-		DEBUG_EXTRA("Sigma is %f", sigma);
+		MESH_DIAG("Sigma is %f", sigma);
 
 		// Notice we negate inv2SigmaSq here to aid the vector calculations below.
 		const float inv2SigmaSq(-0.5f/(sigma*sigma));
@@ -9693,7 +9949,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 		distsSq.Release();
 
 #else
-		DEBUG_EXTRA("Sigma is %f", sigma);
+		MESH_DIAG("Sigma is %f", sigma);
 		// Notice we negate inv2SigmaSq here to aid the vector calculations below.
 		float inv2SigmaSq(-0.5f/(sigma*sigma));
 		// distsSq may consume a lot of memory.  Delete it now.
@@ -10758,7 +11014,7 @@ bool Scene::ReconstructMesh(float distInsert, bool bUseFreeSpaceSupport, bool bU
 #endif
 
 	auto tfe = rdtscEnd();
-	DEBUG_EXTRA("Manifold time %g", rdtscToSeconds(tfe - tfs, cpuHz));
+	MESH_DIAG("Manifold time %g", rdtscToSeconds(tfe - tfs, cpuHz));
 
 #endif
 

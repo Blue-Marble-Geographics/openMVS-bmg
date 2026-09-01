@@ -149,7 +149,7 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 	boost::program_options::options_description config_clean("Clean options");
 	config_clean.add_options()
 		("decimate", boost::program_options::value(&OPT::fDecimateMesh)->default_value(1.f), "decimation factor in range (0..1] to be applied to the reconstructed surface (1 - disabled)")
-		("decimate-error", boost::program_options::value(&OPT::fDecimateMeshError)->default_value(0.f), "adaptive error-bounded decimation strength k (0 - disabled, use the --decimate ratio; >0 - stop at geometric error ~k*median-edge so flat areas collapse and detail is kept, with --decimate as the keep floor; try ~1.0 and calibrate)")
+		("decimate-error", boost::program_options::value(&OPT::fDecimateMeshError)->default_value(0.f), "adaptive error-bounded decimation strength k (0 - disabled, use the --decimate ratio; >0 - stop once the surface has moved ~k*median-edge, so decimation halts while detail remains instead of grinding to the ratio; --decimate is the KEEP FLOOR, so this can only ever keep MORE faces, never fewer). MEASURED: k=1 is far too loose to act -- on a 400-unit scene decimating to 0.4 moved the surface only 0.42mm against a 166mm tolerance, so the floor always won and the setting was inert. Useful values are ~0.001-0.005; read 'DIAG decimate stop' which reports the deviation reached vs allowed in world units and names the k that would bite")
 		("target-face-num", boost::program_options::value(&OPT::nTargetFaceNum)->default_value(0), "target number of faces to be applied to the reconstructed surface. (0 - disabled)")
 		("remove-spurious", boost::program_options::value(&OPT::fRemoveSpurious)->default_value(20.f), "spurious factor for removing faces with too long edges or isolated components (0 - disabled)")
 		("remove-spikes", boost::program_options::value(&OPT::bRemoveSpikes)->default_value(true), "flag controlling the removal of spike faces")
@@ -535,30 +535,150 @@ int main(int argc, LPCTSTR* argv)
 			// few atlas texels carries no texture, so the hardware bounds how many faces
 			// are worth keeping regardless of how much memory is free. Surface area
 			// cancels out of it, so it holds at any scene scale.
+			// PreRefine: the atlas ceiling minus the share reserved for RefineMesh's
+			// subdivision (POISSON_ATLAS_REFINE_RESERVE). Identical to the full ceiling at
+			// the default 1.0. Both are fetched because the report below has to name the
+			// ceiling AND what this stage is holding back from it -- "room for 2.4M faces"
+			// on a 4.1M atlas reads as a defect unless the reserve is stated.
 			extern double ComputeAtlasFaceBudget(int atlasMaxDim);
+			extern double ComputeAtlasFaceBudgetPreRefine(int atlasMaxDim);
+			// The atlas dimension plus where it came from -- see ResolveAtlasMaxDimEx.
+			// Reported rather than merely used: this is the one decision in the stage
+			// that silently shrinks the deliverable, and "atlas 8192" on its own does
+			// not tell anyone that this host could have carried 16384 and four times
+			// the faces.
+			extern int ResolveAtlasMaxDimEx(int atlasMaxDim, int* pHostLimit, int* pEnvPin);
+			int atlasHostLimit = 0, atlasEnvPin = 0;
+			ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
+				// The dimension the SCENE needs, capped by what this host can sample. Derived
+				// rather than assumed to be the ceiling: the atlas appetite is
+				// surfaceArea/(gsd^2*fill), a scene invariant measured stable to 0.5% across a
+				// 2x change in face count. A scene wanting less than the ceiling gets a smaller
+				// atlas AND a proportionally smaller face budget, which keeps texels/face on
+				// target instead of over-building both. RefineMesh and TextureMesh reach the
+				// same number from the same invariant, with nothing passed between the three
+				// processes -- no environment variable, no file, no prior run.
+				extern int ComputeSceneAtlasDim(const MVS::ImageArr& images, const MVS::Mesh& mesh,
+					int* pCeiling, double* pWantDim, double* pSurfaceArea, double* pGsd);
+				int atlasCeiling = 0;
+				double atlasWantDim = 0.0, atlasSurface = 0.0, atlasGsd = 0.0;
+				const int atlasDim = ComputeSceneAtlasDim(scene.images, scene.mesh,
+					&atlasCeiling, &atlasWantDim, &atlasSurface, &atlasGsd);
 			// 0: the dense cloud has already been released by this point, so availPhys
 			// here is what TextureMesh will genuinely see.
-			const double budgetMem   = ComputeTextureFaceBudget(nViews, 0);
-			const double budgetAtlas = ComputeAtlasFaceBudget(0);
+			const double budgetMem      = ComputeTextureFaceBudget(nViews, 0);
+			// Budgets from the dimension actually CHOSEN, not from the ceiling.
+				const double budgetAtlasMax = ComputeAtlasFaceBudget(atlasDim);
+			// The atlas figure this stage enforces. Reserve applies to the ATLAS component
+			// only: refine's clamp holds the atlas ceiling exactly but knows nothing about
+			// RAM, so shrinking the memory budget here would hand the regrowth to a
+			// ceiling no later stage checks.
+			const double budgetAtlas    = ComputeAtlasFaceBudgetPreRefine(atlasDim);
 			const double budget = (budgetMem > 0.0 && budgetAtlas > 0.0)
 				? std::min(budgetMem, budgetAtlas)
 				: std::max(budgetMem, budgetAtlas);
 			if (budget > 0.0) {
 				const double nFaces = (double)scene.mesh.faces.size();
 				const char* which = (budgetAtlas < budgetMem) ? "ATLAS" : "RAM";
+				// WHY this dimension, in one clause. Precedence is env pin > host probe >
+				// built-in fallback, so the source also says what the alternative was.
+				const char* srcAtlas =
+					(atlasEnvPin > 0)     ? "pinned by OPENMVS_ATLAS_MAX_DIM" :
+					(atlasHostLimit > 0)  ? "host GPU limit" :
+					                        "fallback, no GPU reachable";
+				// The largest dimension this host would have allowed. An env pin BELOW the
+				// probe is a deliberate operator choice and still worth naming; a pin ABOVE
+				// it is an atlas the local GPU cannot sample, which is the more dangerous
+				// direction and must not be reported as a win.
+				const int atlasCould = atlasCeiling;
+				String atlasWant;
+				if (atlasWantDim > 0.0 && atlasWantDim <= atlasCould * 1.01)
+					atlasWant = String::FormatString(
+						", sized to the scene (surface %.4g at gsd %.4g wants %.0f px);"
+							" this host allows %d px",
+						atlasSurface, atlasGsd, atlasWantDim, atlasCould);
+				else if (atlasWantDim > 0.0)
+					atlasWant = String::FormatString(
+						", CAPPED BY THIS HOST: the scene wants about %.0f px"
+							" (%.2fx the texture area) but this GPU samples at most %d px",
+							atlasWantDim,
+							(atlasWantDim * atlasWantDim) / ((double)atlasDim * atlasDim),
+							atlasCould);
+					else
+						atlasWant = String::FormatString(
+							", scene not measurable (no poses or empty mesh) -- using the %d px ceiling",
+							atlasCould);
+				// NOTE the budget below is enforced against the mesh AS IT STANDS HERE, i.e.
+				// BEFORE RefineMesh, which then subdivides by a measured 1.48x-1.88x.
+				//
+				// That overshoot USED to be unenforced, and this comment documented it as
+				// accepted on the grounds that texel SIZE would not improve at all, being
+				// set by surface area rather than face count. THAT REASONING IS CORRECT and
+				// is now measured: across four runs on the same scene at 7.22M / 4.54M /
+				// 4.07M / 3.64M faces, TextureMesh's "full resolution needed about N px"
+				// held at 30132 / 30046 / 30028 / 29989 -- a 0.5% spread against a 2x change
+				// in face count. Patch size follows the SOURCE PIXELS covering the surface,
+				// not the tessellation, so the atlas appetite is a scene constant (~903 Mpx
+				// here) and every one of those runs kept the same 0.27-0.28x of the pixels
+				// it asked for.
+				//
+				// What the overshoot DID degrade is texels-per-FACE (37 -> 66 as the count
+				// came down), which is what decides whether an individual face has enough
+				// atlas area to carry detail, plus patch count and therefore seam length
+				// (117583 -> 61648). Those are the wins from enforcing the cap. Texture
+				// RESOLUTION is not among them and cannot be bought here -- only a larger
+				// atlas moves it.
+				//
+				// RefineMesh now holds itself inside the same budget instead -- see
+				// ClampSubdivideAreaToAtlasBudget in SceneRefine.cpp. It withholds
+				// subdivision from the faces with the SMALLEST projected area, so the
+				// budget is spent where the imagery supports detail, which is strictly
+				// better than either overshooting or decimating back afterwards. So the
+				// cap here is the first of two gates rather than the only one, and it no
+				// longer needs to anticipate the refine factor.
+				// Name the reserve explicitly when one is in force: without it, "room for
+				// 2.4M faces" against a 4.1M atlas looks like a miscalculation rather than
+				// a deliberate hand-off to the next stage.
+				String atlasReserve;
+				if (budgetAtlasMax > budgetAtlas)
+					atlasReserve = String::FormatString(
+						" (atlas ceiling is %.1fM; %.0f%% held back for RefineMesh"
+						" subdivision, POISSON_ATLAS_REFINE_RESERVE)",
+						budgetAtlasMax * 1e-6,
+						100.0 * (1.0 - budgetAtlas / budgetAtlasMax));
+				VERBOSE("[ATLAS] texture atlas %d px (%s%s) -> room for %.1fM faces%s;"
+					" %u views leave room for %.1fM by memory"
+					" (enforced here pre-refine; RefineMesh clamps subdivision to the atlas ceiling)",
+					atlasDim, srcAtlas, atlasWant.c_str(),
+					budgetAtlas * 1e-6, atlasReserve.c_str(),
+					(unsigned)nViews, budgetMem * 1e-6);
 				if (budget < nFaces) {
 					capRatio = budget / nFaces;
-					VERBOSE("[MESH-CAP] %u views -> texture budget %.1fM faces"
-						" (memory %.1fM, atlas %.1fM -> %s-bound);"
-						" cap ratio %.3f against %u faces",
-						(unsigned)nViews, budget * 1e-6, budgetMem * 1e-6,
-						budgetAtlas * 1e-6, which, capRatio, (unsigned)nFaces);
+					// This CHANGES the deliverable -- it forces decimation the caller did
+					// not ask for -- so it stays visible at normal verbosity.
+					VERBOSE("[ATLAS] %s-bound: reducing %u faces to %.1fM (x%.3f)",
+						which, (unsigned)nFaces, budget * 1e-6, capRatio);
+						// WHY the deliverable is smaller than the imagery supports, and what
+						// would change it. Without this an operator sees a long densify produce
+						// a mesh the atlas then discards most of, with nothing saying that the
+						// CEILING -- not the settings -- is what bound it. At a capped atlas the
+						// texture resolution is atlas-area / surface-area, so it is the same for
+						// every quality tier, and denser densification cannot reach the output.
+						if (atlasWantDim > atlasCould * 1.01 && budgetAtlas <= budgetMem) {
+							const double wantBudget = ComputeAtlasFaceBudget((int)atlasWantDim);
+							VERBOSE("[ATLAS] NOTE: this host's %d px sampling ceiling is the"
+								" binding constraint, not the imagery. The scene wants %.0f px,"
+								" which would carry %.1fM faces and %.2fx the texture area."
+								" At this ceiling %.0f%% of the solved mesh is discarded"
+								" regardless of settings, so a denser cloud cannot reach the"
+								" output and quality tiers converge here.",
+								atlasCould, atlasWantDim, wantBudget * 1e-6,
+								(atlasWantDim * atlasWantDim) / ((double)atlasDim * atlasDim),
+								100.0 * (1.0 - capRatio));
+						}
 				} else {
-					VERBOSE("[MESH-CAP] %u views -> texture budget %.1fM faces"
-						" (memory %.1fM, atlas %.1fM -> %s-bound);"
-						" mesh has %u -- cap not binding",
-						(unsigned)nViews, budget * 1e-6, budgetMem * 1e-6,
-						budgetAtlas * 1e-6, which, (unsigned)nFaces);
+					VERBOSE("[ATLAS] %s-bound at %.1fM faces; mesh has %u -- not reduced",
+						which, budget * 1e-6, (unsigned)nFaces);
 				}
 			}
 		}

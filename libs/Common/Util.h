@@ -732,6 +732,13 @@ public:
 	};
 	static ProcessMemoryInfo GetSelfMemoryInfo();
 
+	// total CPU time (kernel+user, summed over every thread) this process has
+	// consumed so far, in nanoseconds; 0 when the platform does not report it.
+	// Divided by the wall time elapsed over the same interval it gives the
+	// average number of cores kept busy -- the cheapest way to tell whether a
+	// phase is compute-saturated or stalling on serial work.
+	static int64_t GetSelfCpuTimeNs();
+
 	static LPSTR* CommandLineToArgvA(LPCSTR CmdLine, size_t& _argc);
 	static String CommandLineToString(size_t argc, LPCTSTR* argv) {
 		String strCmdLine;

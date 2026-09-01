@@ -71,6 +71,33 @@ cxx_library_with_type(MVS "Libs" "" "${cxx_default}"
 	${CUDA_LIBRARY_FILES_C} ${CUDA_LIBRARY_FILES_H}
 )
 
+# A/B switch for DensifyPointCloud's CUDA PatchMatch depth-map estimator:
+# OFF (default) builds the reworked estimator (PatchMatchCUDA.inl/.cpp/.cu), ON
+# builds the original one restored from commit 235b9712 (PatchMatchCUDALegacy.*).
+# Both variants are always in the source list -- the unselected one preprocesses
+# away -- so flipping this needs only a re-configure, not a file-list edit.
+# See PatchMatchCUDASelect.h for what actually differs. PUBLIC because
+# PatchMatchCUDA.h is an installed public header whose class definition depends
+# on the value.
+option(OpenMVS_PATCHMATCH_CUDA_LEGACY "Build the original (pre-rework) CUDA PatchMatch estimator for A/B testing" OFF)
+
+# Make nvcc report per-kernel register counts and local-memory spill. The
+# checkerboard kernels carry enough per-thread state to spill, and spill traffic
+# (not texture throughput) is the suspected limit -- see the occupancy notes in
+# PatchMatchCUDA.cu. Off by default because it is noisy; turn it on when tuning
+# PMCUDA_BLOCK_H / PMCUDA_MIN_BLOCKS and read the "spill stores"/"registers"
+# lines for BlackPixelProcess and RedPixelProcess.
+option(OpenMVS_CUDA_PTXAS_VERBOSE "Report CUDA register usage and local-memory spill at compile time" OFF)
+if(_USE_CUDA AND OpenMVS_CUDA_PTXAS_VERBOSE)
+	target_compile_options(MVS PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+endif()
+if(_USE_CUDA AND OpenMVS_PATCHMATCH_CUDA_LEGACY)
+	target_compile_definitions(MVS PUBLIC PATCHMATCH_CUDA_LEGACY=1)
+	message(STATUS "MVS: CUDA PatchMatch estimator = LEGACY (original, 235b9712)")
+elseif(_USE_CUDA)
+	message(STATUS "MVS: CUDA PatchMatch estimator = current (reworked)")
+endif()
+
 # Keep AVX2 code in one translation unit so the rest of MVS retains the
 # baseline x64/SSE2 instruction set. Disable LTCG for this source to prevent
 # cross-module inlining from leaking AVX2 instructions into baseline code.
@@ -89,7 +116,36 @@ endif()
 
 # Link its dependencies
 if(_USE_CUDA)
-	set_target_properties(MVS PROPERTIES CUDA_ARCHITECTURES "50;72;75")
+	# Native SASS for every desktop generation end-users actually run, gated by
+	# what the building toolkit supports. The former hardcoded "50;72;75" left
+	# every Ampere/Ada/Blackwell card JIT-compiling the compute_75 PTX at first
+	# launch (start-up stalls, re-JITs whenever the driver cache evicts, no
+	# arch-tuned code), and sm_50/sm_72 are deprecated in CUDA 12 and REMOVED in
+	# CUDA 13, where they break the build outright (sm_72 is an embedded Tegra
+	# target no desktop Windows user has). Plain numeric entries embed both SASS
+	# and PTX per arch, so the newest PTX keeps forward-compatibility with GPUs
+	# newer than the toolkit.
+	# An explicit -DCMAKE_CUDA_ARCHITECTURES is respected; the value "75" is
+	# indistinguishable from the root CMakeLists' fallback default, so it is
+	# treated as unset (native 75 stays in the list regardless). When
+	# OpenMVS_MAX_CUDA_COMPATIBILITY is on, the -gencode flags assembled in the
+	# root CMakeLists carry the arch list instead.
+	if(OpenMVS_MAX_CUDA_COMPATIBILITY OR (DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT "${CMAKE_CUDA_ARCHITECTURES}" STREQUAL "75"))
+		set_target_properties(MVS PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+	else()
+		set(MVS_CUDA_ARCHS 75)
+		if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.1")
+			list(APPEND MVS_CUDA_ARCHS 86)
+		endif()
+		if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "11.8")
+			list(APPEND MVS_CUDA_ARCHS 89 90)
+		endif()
+		if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+			list(APPEND MVS_CUDA_ARCHS 100 120)
+		endif()
+		message(STATUS "MVS CUDA architectures: ${MVS_CUDA_ARCHS}")
+		set_target_properties(MVS PROPERTIES CUDA_ARCHITECTURES "${MVS_CUDA_ARCHS}")
+	endif()
 endif()
 # TODO: CGAL::TBB_support should be controlled by a configuration option
 TARGET_LINK_LIBRARIES(MVS PRIVATE Common Math IO CGAL::CGAL CGAL::TBB_support ${CERES_LIBRARIES} ${CUDA_CUDA_LIBRARY} PoissonReconLib)

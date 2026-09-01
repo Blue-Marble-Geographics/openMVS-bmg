@@ -115,7 +115,7 @@ constexpr int TILEY = 16;
 // faceMaps resident (un-streaming) would save ~that at +~7 GB RAM.
 // Set to 1 to emit the full per-scale phase breakdown (see MeshProf below);
 // set BACK TO 0 for any release/quality build (adds per-call timing overhead).
-#define MESHOPT_PROFILE 0
+#define MESHOPT_PROFILE 1 // MEASUREMENT BUILD (tile-skip phase-2 sizing) -- restore to 0
 
 #if MESHOPT_PROFILE
 // ---------------------------------------------------------------------------
@@ -135,16 +135,22 @@ namespace MeshProf {
 		P_ScoreMesh, P_Momentum, P_MaxDisp,                                 // iter (wall)
 		P_ListCameraFaces, P_PairLoopWall, P_Smooth1, P_Smooth2, P_Combine, // ScoreMesh (wall)
 		P_StreamPrep, P_StreamFaceAreas, P_StreamBatches, P_StreamResident,  // view-stream (wall)
-		P_Rasterize, P_RefVar, P_Warp, P_WarpVar, P_ZNCC, P_PhotoGrad, // pair loop (thread-summed)
+		P_Rasterize, P_RefVar, P_Warp, P_WarpVar, P_ZNCC, P_ZNCCRoll, P_ZNCCEmit, P_PhotoGrad, // pair loop (thread-summed)
 		P_COUNT
 	};
+	// P_ZNCCRoll (priming + rolling column-sum updates), P_ZNCCEmit (the
+	// windowed kernel's ring accumulation + derivative emission, excluding the
+	// consumeBand callback) and P_PhotoGrad (banded gradient callbacks) are
+	// SUB-buckets measured INSIDE the P_ZNCC call, so they are excluded from
+	// the pair-loop percentage base to avoid double counting; the term pass =
+	// ZNCC - ZNCC:roll - ZNCC:emit - ZNCC:grad.
 	static const int kFirstPairPhase = (int)P_Rasterize;
 	static const char* const kName[P_COUNT] = {
 		"InitImages", "ListVtxPre", "Subdivide", "ListVtxPost",
 		"ScoreMesh(total)", "MomentumUpdate", "MaxDispScan",
 		"  ListCameraFaces", "  PairLoop(wall)", "  Smooth1", "  Smooth2", "  Combine",
 		"  StreamPrepChunked", "  StreamFaceAreas", "  StreamBuildBatches", "  StreamResident",
-		"    Rasterize", "    RefVariance", "    Warp", "    WarpVariance", "    ZNCC", "    PhotoGrad"
+		"    Rasterize", "    RefVariance", "    Warp", "    WarpVariance", "    ZNCC", "      ZNCC:roll", "      ZNCC:emit", "      ZNCC:grad"
 	};
 	struct Acc { double ms[P_COUNT] = {}; unsigned long long calls[P_COUNT] = {}; };
 	static Acc gScale; // reset each scale
@@ -161,15 +167,21 @@ namespace MeshProf {
 		for (int i = 0; i < (int)P_COUNT; ++i) if (tlCalls[i]) { gScale.ms[i] += tlMs[i]; gScale.calls[i] += tlCalls[i]; tlMs[i] = 0; tlCalls[i] = 0; }
 	}
 	static void Report(const char* tag, const Acc& a) {
-		double pairSum = 0; for (int i = kFirstPairPhase; i < (int)P_COUNT; ++i) pairSum += a.ms[i];
-		DEBUG_EXTRA("[PROFILE] ================ %s ================", tag);
+		double pairSum = 0;
+		for (int i = kFirstPairPhase; i < (int)P_COUNT; ++i)
+			if (i != (int)P_ZNCCRoll && i != (int)P_ZNCCEmit && i != (int)P_PhotoGrad) // sub-buckets inside P_ZNCC
+				pairSum += a.ms[i];
+		// VERBOSE, not DEBUG_EXTRA: the tables are the entire point of a profile
+		// build, and the pipeline that drives this exe runs at default verbosity
+		// where DEBUG_EXTRA is silent (per-iteration [PROFILE] lines stay gated)
+		VERBOSE("[PROFILE] ================ %s ================", tag);
 		for (int i = 0; i < (int)P_COUNT; ++i) {
 			if (!a.calls[i]) continue;
 			if (i >= kFirstPairPhase) {
-				DEBUG_EXTRA("[PROFILE] %-20s %10.1f ms  %5.1f%% pair  (%llu calls)",
+				VERBOSE("[PROFILE] %-20s %10.1f ms  %5.1f%% pair  (%llu calls)",
 					kName[i], a.ms[i], pairSum > 0.0 ? 100.0 * a.ms[i] / pairSum : 0.0, a.calls[i]);
 			} else {
-				DEBUG_EXTRA("[PROFILE] %-20s %10.1f ms  (%llu calls, %.4f ms/call)",
+				VERBOSE("[PROFILE] %-20s %10.1f ms  (%llu calls, %.4f ms/call)",
 					kName[i], a.ms[i], a.calls[i], a.ms[i] / (double)a.calls[i]);
 			}
 		}
@@ -249,6 +261,22 @@ namespace MeshProf {
 #define MESHOPT_PG_UNNORM_RAY 1
 #endif
 
+// Eight-wide group kernel for the photometric-gradient per-pixel pipeline
+// (SceneRefinePGGroupAVX2): ray, grazing test, projection into B, masked
+// bilinear gradient gathers and the gradient scale run 8 lanes at a time,
+// bit-identical per lane; the face-setup cache prepass and the barycentric +
+// tile-slot accumulation stay scalar IN PIXEL ORDER, so the accumulated
+// result is byte-identical to the scalar path. Runtime CPUID-gated; kill
+// switch OPENMVS_REFINE_PG_SIMD=0 (OPENMVS_REFINE_BASELINE=1 disables too).
+// Only implemented for the live configuration; self-disables otherwise.
+#ifndef MESHOPT_PG_AVX2
+#define MESHOPT_PG_AVX2 1
+#endif
+#if MESHOPT_PG_AVX2 && !(MESHOPT_PG_UNNORM_RAY && MESHOPT_PG_FACECACHE && MESHOPT_PG_BILERP_MERGE && !MESHOPT_GRAD_F32)
+#undef MESHOPT_PG_AVX2
+#define MESHOPT_PG_AVX2 0
+#endif
+
 // Fuse warped-image variance and A*B covariance into the ZNCC derivative pass.
 // Uses width-only scratch instead of three full-image intermediates. Set to 0
 // for an immediate performance/quality A/B against the previous split path.
@@ -320,7 +348,30 @@ namespace MeshProf {
 // Scene-adaptive (keyed to the current mean); 0 disables (original behaviour).
 #define MESHOPT_GRAD_CLIP_K 0.0f
 
-#define MESHOPT_DISABLE_TILE_SKIP 1
+// Tile skipping: gate the photometric-gradient tile loop (and, when a whole
+// reference view is quiescent, its variance pass and every pair warp/ZNCC) by
+// the per-tile photo-energy active set, so converged regions stop paying for
+// re-evaluation. Re-enabled with the safeguards the original mechanism lacked
+// (it was defined out, and even enabled it skipped nothing because ScoreMesh
+// re-armed every tile each iteration):
+//   - persistent per-tile energy, kept PER PAIR-DIRECTION PARITY, carried
+//     forward for skipped tiles, so a skipped tile can neither deactivate
+//     itself for lack of fresh accumulation nor fake a photoEnergy drop for
+//     the converged-exit plateau test;
+//   - a warmup + odd-cadence full-refresh schedule (set by the iteration
+//     loop via tileSkipForceFull) so both pair-direction parities keep being
+//     re-measured and quiescent tiles can reactivate; the final
+//     both-directions iteration of every scale always runs full-frame;
+//   - a 1-tile halo dilation of the active set, so faces and ZNCC windows
+//     spanning a tile seam are never starved;
+//   - a vertex FREEZE rule in the gradient combine: a vertex whose photo
+//     support vanished only because its tiles were skipped holds position
+//     instead of drifting under the now-unopposed smoothing term.
+// Runtime kill-switch for quality A/B: OPENMVS_REFINE_TILE_SKIP=0.
+#define MESHOPT_DISABLE_TILE_SKIP 0
+#define MESHOPT_TILE_SKIP_WARMUP 2  // full evaluations at the start of each scale (the active set needs measured energy first)
+#define MESHOPT_TILE_SKIP_REFRESH 3 // every Nth iteration runs full; odd on purpose so --alternate-pair 1 re-measures both parities
+#define MESHOPT_TILE_SKIP_HALO 1    // active set dilated by this many tile rings
 #define MESHOPT_DISABLE_EARLY_EXIT 1
 #define MESHOPT_CUDA_PARITY_MASK 1
 
@@ -415,6 +466,50 @@ namespace MeshProf {
 // surface. Keep 1 (== GPU/upstream parity, photoGradNorm > 0).
 #ifndef MESHOPT_MIN_PAIR_SUPPORT
 #define MESHOPT_MIN_PAIR_SUPPORT 1
+#endif
+
+// Atlas face-budget clamp on subdivision.
+//
+// ReconstructMesh caps the mesh against the texture atlas BEFORE this stage
+// (budgetAtlas = D^2 * POISSON_ATLAS_USABLE_FRACTION / POISSON_ATLAS_TEXELS_PER_FACE),
+// and subdivision here then multiplies the count and walks straight past it -- measured
+// x1.70 on a 16384 px run, which is why RefineMesh's [REFINE-FACES] line ends in "OVER
+// the atlas budget". That line DETECTED the overrun and nothing acted on it, so the
+// realised density landed at ~36 allocated texels/face against a 64 target: the cap did
+// not hold.
+//
+// Enforced here, PREVENTIVELY, rather than by decimating afterwards. This is the only
+// place that knows each face's PROJECTED AREA, so the budget can be spent on the faces
+// the imagery most supports instead of subdividing 1.7x of the mesh and then collapsing
+// the excess back out by quadric error, which both wastes the refinement and lets a
+// geometric metric -- not the imagery -- choose what survives. Raising the effective
+// threshold is also free: faces that no longer qualify are simply never split.
+//
+// The ATLAS budget only, deliberately -- NOT min(atlas, memory) the way ReconstructMesh
+// does it. The atlas ceiling is pure hardware and reads the same from any process, while
+// the RAM ceiling is measured against availPhys and this process holds a different
+// working set than TextureMesh will. Importing that here would be a guess.
+//
+// 0 restores the previous behaviour exactly: subdivide to the projected-area threshold
+// alone, atlas budget ignored.
+#ifndef MESHOPT_ATLAS_BUDGET_CLAMP
+#define MESHOPT_ATLAS_BUDGET_CLAMP 1
+#endif
+// Worst-case faces created per fully-split face, used to size the clamp.
+//
+// PROVABLE BOUND, not a guess. Mesh::Subdivide splits a face into 4 when its area
+// exceeds 2*maxArea (net +3 faces), then forces every edge-neighbour that is not itself
+// fully split to conform by splitting into 2, 3 or 4 (net +1, +2, +3 for 1, 2 or 3 split
+// edges). Each fully-split face contributes exactly 3 split edges and each is shared
+// with exactly one neighbour, so the net extra from ALL conformity splits is at most 3
+// per fully-split face:
+//     numFaces + 3*nFull  <=  final  <=  numFaces + 6*nFull
+// 6 is therefore the guaranteed-safe divisor. It is conservative by up to 2x when split
+// faces are adjacent (they share edges, so those cost no conformity split) -- and
+// clustering is the norm, since projected area is spatially correlated. [SUBDIV-BUDGET]
+// reports allowed vs wanted so this can be tightened against evidence, not taste.
+#ifndef MESHOPT_ATLAS_BUDGET_SPLIT_FANOUT
+#define MESHOPT_ATLAS_BUDGET_SPLIT_FANOUT 6
 #endif
 
 // A/B refinement-quality gate. Groups the three settings that most limit how
@@ -521,7 +616,8 @@ static inline void* PlaneAlloc(size_t bytes) {
 		// Turn a genuine OOM here into a clean, catchable failure instead of the
 		// null-deref crash that would otherwise happen on the very next write into
 		// this plane (see the try/catch around RefineMesh's caller).
-		VERBOSE("error: out of memory allocating a %.2f MB gradient plane", bytes / (1024.0 * 1024.0));
+		VERBOSE("error: mesh refinement ran out of memory (a %.2f MB allocation failed)", bytes / (1024.0 * 1024.0));
+		REFINE_DIAG("the failed allocation was a per-view gradient plane (PlaneAlloc)");
 		throw std::bad_alloc();
 	}
 	return p;
@@ -982,11 +1078,31 @@ public:
 		int allocatedSize = 0;
 		std::vector<float> tileEnergyAccum;  // accumulated across threads
 		std::vector<uint8_t> tileActive;     // used for skipping
+		// persistent per-tile photo energy, indexed by pair-direction parity
+		// (both slots alias parity 0 unless nAlternatePair==1): tiles skipped by
+		// tile-skip carry their last measured value forward here, so the
+		// active-set threshold and the converged-exit plateau sum never see a
+		// tile's energy drop to zero merely because it was not re-evaluated
+		std::vector<float> tileEnergyLast[2];
 		int tilesX, tilesY;
 		//std::vector<uint8_t> marks;
 		//uint8_t currentMark;
 	};
 	typedef CLISTDEF2(View) ViewsArr;
+
+	// Column plan for tile-gated fused ZNCC (see MESHOPT_DISABLE_TILE_SKIP):
+	// which pixel-column ranges of a reference view the kernel must actually
+	// evaluate on a reduced iteration. EXACT by construction, not an
+	// approximation: the (already tile-gated) gradient consumer reads
+	// imageDZNCC only inside active tiles, so dZNCC computed in inactive tiles
+	// is write-only dead work; the rolling column sums only need the columns an
+	// active tile can read, dilated by the ZNCC window half-size (HalfSize <
+	// TILEX, so the dilation can never bridge two separate runs). Built once
+	// per reference view per evaluation, cached thread-local in ThProcessPair.
+	struct ZNCCActivePlan {
+		std::vector<std::vector<std::pair<int, int>>> bandSegs; // per TILEY-row band: active [x0,x1) pixel column ranges
+		std::vector<std::pair<int, int>> neededCols; // union of active tile columns +-HalfSize, for priming + rolling sums
+	};
 
 	// used to render a mesh for optimization
 	struct RasterMesh : TRasterMesh<RasterMesh> {
@@ -1058,7 +1174,12 @@ public:
 	// streamMaps: rasterize+release each view's maps inside the loop instead of
 	// requiring them all resident up front (subdivision pass only; see definition)
 	void ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps = false);
-	void SubdivideMesh(uint32_t maxArea, float fDecimate = 1.f, unsigned nCloseHoles = 15, unsigned nEnsureEdgeSize = 1);
+	// atlasDim: the scene's atlas dimension, resolved ONCE by the caller before any
+	// per-scale rescaling. Must not be derived in here -- InitImages rescales the cameras
+	// per scale, so EstimateSceneGSD would return a resolution-dependent gsd and the
+	// dimension would halve at every coarser scale (observed 10236/5140/2570 px in one run
+	// where the answer is a single 16384).
+	void SubdivideMesh(uint32_t maxArea, int atlasDim, float fDecimate = 1.f, unsigned nCloseHoles = 15, unsigned nEnsureEdgeSize = 1);
 
 	double ScoreMesh(float* gradients, bool rebuildOctree = true);
 
@@ -1101,16 +1222,19 @@ public:
 		const ImageStore& imageA, const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
 		const TImage<uint16_t>& imageB, const TImage<uint16_t>& imageMeanB, const TImage<Real>& imageVarB,
 		const std::vector<uint8_t>& mask, TImage<Real>& imageDZNCC);
+	static void BuildZNCCActivePlan(const View& view, ZNCCActivePlan& plan);
 	static float ComputeLocalZNCCFused(
 		const ImageStore& imageA, const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
 		const TImage<uint16_t>& imageB, const std::vector<uint8_t>& mask,
 		TImage<Real>& imageDZNCC,
-		const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand = {});
+		const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand = {},
+		const ZNCCActivePlan* activePlan = nullptr);
 	static float ComputeLocalZNCCFusedWindowed(
 		const ImageStore& imageA, const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
 		const TImage<uint16_t>& imageB, const std::vector<uint8_t>& mask,
 		TImage<Real>& imageDZNCC,
-		const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand = {});
+		const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand = {},
+		const ZNCCActivePlan* activePlan = nullptr);
 	static void ComputePhotometricGradient(
 		const View& viewA,
 		const CameraRenderData& rd,
@@ -1164,6 +1288,18 @@ public:
 	unsigned nAlternatePair; // using an image pair alternatively as reference image (0 - both, 1 - alternate, 2 - only left, 3 - only right)
 	unsigned iteration; // current refinement iteration
 	double photoEnergyLast = 0.0;
+	// --- tile-skip runtime state (see MESHOPT_DISABLE_TILE_SKIP) ---
+	// DEFAULT OFF: measured on Randy (2026-08-31), tile-skip raises the final
+	// gradient norm ~3% at every scale (frozen vertices stop relaxing during
+	// reduced iterations) while saving only ~10s of 2m -- the wrong trade now
+	// that the byte-identical SIMD kernels carry the speedup. Opt back in with
+	// OPENMVS_REFINE_TILE_SKIP=1 (worth retesting on long iteration schedules).
+	bool tileSkipEnabled = false; // master switch; OPENMVS_REFINE_TILE_SKIP=0/1 overrides (read in the ctor)
+	bool tileSkipForceFull = true; // set per iteration by the refinement loop; defaults to FULL so any caller that never manages it (legacy loop, Ceres functor) keeps pre-tile-skip behaviour
+	bool tileSkipThisIter = false; // decided at ScoreMesh entry: THIS evaluation may skip quiescent tiles
+	std::vector<uint8_t> vertexHadSupport; // photo support at the last FULL evaluation; drives the freeze rule in the gradient combine
+	uint64_t tileSkipStatSkippedTiles = 0, tileSkipStatTotalTiles = 0; // per-scale [TILE-SKIP] stats
+	uint64_t tileSkipStatSkippedViews = 0, tileSkipStatReducedIters = 0;
 	double tProjectMeshMs = 0.0; // [PROFILE] wall time of the ProjectMesh phase in the last ListCameraFaces
 	double tRasterizeMs = 0.0; // [PROFILE] summed per-thread time of RasterizeFaceMap in the last pair loop
 	uint64_t faceSetupEpoch = 0; // invalidates worker-local face setup caches after geometry updates
@@ -1412,6 +1548,20 @@ MeshRefine::MeshRefine(Scene& _scene, unsigned _nReduceMemory, unsigned _nAltern
 	vertexBoundary(_scene.mesh.vertexBoundary),
 	images(_scene.images)
 {
+	// tile-skip master switch: compiled in (MESHOPT_DISABLE_TILE_SKIP 0) but
+	// OFF by default (see the member declaration: +3% final gradient norm for
+	// ~10s); OPENMVS_REFINE_TILE_SKIP=1 opts in without a rebuild or a
+	// command-line change in the pipeline that drives this exe
+	if (const char* szTileSkip = std::getenv("OPENMVS_REFINE_TILE_SKIP"))
+		tileSkipEnabled = MESHOPT_DISABLE_TILE_SKIP == 0 && String(szTileSkip) != _T("0");
+	// OPENMVS_REFINE_BASELINE=1: verification mode -- one switch that turns off
+	// EVERY optimization added in the tile-skip/SIMD effort at once (tile-skip
+	// with its freeze rule, whole-view skip and ZNCC plan gating here; the
+	// windowed-ZNCC AVX2 kernels check it themselves). Strongest override: it
+	// wins even over an explicit OPENMVS_REFINE_TILE_SKIP=1.
+	if (const char* szBaseline = std::getenv("OPENMVS_REFINE_BASELINE"))
+		if (String(szBaseline) != _T("0"))
+			tileSkipEnabled = false;
 	// start worker threads
 	ASSERT(nMaxThreads > 0);
 	ASSERT(threads.IsEmpty());
@@ -1470,13 +1620,17 @@ MeshRefine::MeshRefine(Scene& _scene, unsigned _nReduceMemory, unsigned _nAltern
 			const uint64_t returned = (before > after) ? (before - after) : 0;
 			retainedFreeBytes = (freedBytes > returned) ? (freedBytes - returned) : 0;
 			constexpr double GBd = 1024.0 * 1024.0 * 1024.0;
-			DEBUG_EXTRA("released the dense point cloud (%zu points, %.2f GB of capacity) after "
-				"neighbor selection: unused by refinement. commit %.2f -> %.2f GB (returned "
-				"%.2f GB; %.2f GB not returned by the allocator and therefore excluded from "
-				"`pinned`, since those pages are never touched again). NOTE the saved scene "
-				"will contain no point cloud (the refined mesh is unaffected).",
-				numPoints, freedBytes / GBd, before / GBd, after / GBd,
-				returned / GBd, retainedFreeBytes / GBd);
+			// Only the CONSEQUENCE stays visible at the default verbosity -- it changes
+			// what lands on disk, so it is the user's business. When it happened, why,
+			// and what it recovered describe the refiner's internals and ride the gate.
+			DEBUG_EXTRA("Mesh refinement: the saved scene will not contain the dense point "
+				"cloud (%zu points, %.2f GB); the refined mesh is unaffected.",
+				numPoints, freedBytes / GBd);
+			REFINE_DIAG("point-cloud release: dropped after neighbor selection (unused by "
+				"refinement). commit %.2f -> %.2f GB (returned %.2f GB; %.2f GB not returned by "
+				"the allocator and therefore excluded from `pinned`, since those pages are never "
+				"touched again)",
+				before / GBd, after / GBd, returned / GBd, retainedFreeBytes / GBd);
 		}
 	}
 #endif
@@ -2000,12 +2154,12 @@ void MeshRefine::LogPinnedBreakdown(uint64_t commit, uint64_t reclaimable, uint6
 	const uint64_t pinnedMeasured = (commit > reclaimable) ? (commit - reclaimable) : 0;
 	const uint64_t pinnedTotal = pinnedMeasured + scratch;
 	const int64_t unaccounted = (int64_t)pinnedTotal - (int64_t)accounted;
-	DEBUG_EXTRA("[PINNED] %.2f GB total = mesh %.2f + adjacency %.2f + per-vertex %.2f + "
+	REFINE_DIAG("[PINNED] %.2f GB total = mesh %.2f + adjacency %.2f + per-vertex %.2f + "
 		"g_cameraData %.2f + pointcloud %.2f (+views %.2f) + srcImages %.2f + scratch %.2f "
 		"-> UNACCOUNTED %.2f GB",
 		pinnedTotal / GBd, bMesh / GBd, bAdj / GBd, bRefine / GBd, bCam / GBd,
 		bPC / GBd, bPCViews / GBd, bSrcImg / GBd, scratch / GBd, unaccounted / GBd);
-	DEBUG_EXTRA("[PINNED] g_cameraData detail: %llu verts / %llu faces (V/F %.2f -- expect ~0.5 "
+	REFINE_DIAG("[PINNED] g_cameraData detail: %llu verts / %llu faces (V/F %.2f -- expect ~0.5 "
 		"for a manifold; ~3.0 means shared vertices are NOT being deduplicated), "
 		"reserved-but-unused %.2f GB",
 		(unsigned long long)camVerts, (unsigned long long)camFaces,
@@ -2174,7 +2328,7 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 			if (totalPhysT == 0) {
 				// cannot size a ceiling without knowing the machine: hold everything
 				// rather than invent a number and batch for no reason
-				DEBUG_EXTRA("view-stream budget: unlimited (physical memory query failed)");
+				REFINE_DIAG("view-stream budget: unlimited (physical memory query failed)");
 				return std::numeric_limits<uint64_t>::max();
 			}
 			target = ResolveTargetBytesFromTotal(totalPhysT);
@@ -2271,7 +2425,11 @@ uint64_t MeshRefine::ResolveStreamBudget(uint64_t maxNeighbourhoodBytes, uint64_
 		budget = maxNeighbourhoodBytes;
 		src += String::FormatString(_T(" -> floored to %.2f GB (largest reference neighbourhood)"), budget / (double)GB);
 	}
-	DEBUG_EXTRA("view-stream budget: %s", src.c_str());
+	// `src` is assembled unconditionally above: the branches that build it are the
+	// same branches that decide the budget, and splitting the two would put the
+	// gate in the middle of the decision. It is a handful of FormatString calls per
+	// scale, unlike the loops below, so only the printing is gated here.
+	REFINE_DIAG("view-stream budget: %s", src.c_str());
 	return budget;
 }
 
@@ -2320,7 +2478,11 @@ void MeshRefine::BuildViewBatches()
 		// condition ScoreMesh retries on, so it lands here again every iteration.
 		if (!streamNoPairGraphWarned) {
 			streamNoPairGraphWarned = true;
-			DEBUG_EXTRA("view-stream: no pair graph (%zu neighbour lists for %zu views) -- "
+			// The user-visible half is that refinement will not improve the mesh; the
+			// structure that is missing, and what consumes it, is internal.
+			VERBOSE("warning: mesh refinement found no usable image pairs; the mesh will pass "
+				"through this stage essentially unchanged");
+			REFINE_DIAG("view-stream: no pair graph (%zu neighbour lists for %zu views) -- "
 				"no view batches built; the pair loop has nothing to process",
 				refViewNeighbors.size(), numViews);
 		}
@@ -2464,16 +2626,17 @@ void MeshRefine::BuildViewBatches()
 		}
 	}
 	streamSingleBatch = (viewBatches.size() <= 1);
-	if (!streamSingleBatch) {
+	if (!streamSingleBatch && REFINE_DIAG_ENABLED()) {
 		// Imbalance is expensive twice over: a small batch still pays a full
 		// evict/reload transition, and the largest batch sets the per-thread scratch.
+		// The string exists only for this line, so it is built inside the gate.
 		std::string sizes;
 		for (const ViewBatch& b : viewBatches) {
 			char buf[64];
 			sprintf(buf, "%s%zu/%zu", sizes.empty() ? "" : ", ", b.refViews.size(), b.allViews.size());
 			sizes += buf;
 		}
-		DEBUG_EXTRA("view-stream batch balance (refViews/resident): %s", sizes.c_str());
+		REFINE_DIAG("view-stream batch balance (refViews/resident): %s", sizes.c_str());
 	}
 	// The parity claim lives or dies here: one batch means EnsureViewsResident is
 	// called exactly once per ScoreMesh over every view, which is precisely what
@@ -2483,7 +2646,7 @@ void MeshRefine::BuildViewBatches()
 	// there is no need to re-walk every view and re-derive its bytes for the log.
 	const uint64_t totalBytes = totalStreamBytes;
 	constexpr double GBd = 1024.0 * 1024.0 * 1024.0;
-	DEBUG_EXTRA("view-stream: %zu batch(es) over %zu views, %.2f GB streamed planes total%s",
+	REFINE_DIAG("view-stream: %zu batch(es) over %zu views, %.2f GB streamed planes total%s",
 		viewBatches.size(), numViews, totalBytes / GBd,
 		streamSingleBatch ? " [SINGLE BATCH -> non-streamed parity]" : "");
 	// A budget that is only a small multiple of ONE reference neighbourhood cannot
@@ -2494,7 +2657,14 @@ void MeshRefine::BuildViewBatches()
 	// pass, which no view budget can influence -- so shrinking the budget further
 	// buys nothing and costs everything. Say so rather than silently thrashing.
 	if (!streamSingleBatch && viewBatches.size() > 8) {
-		DEBUG_EXTRA("WARNING: view-stream batching is deep -- %zu batches (budget %.2f GB vs "
+		// The user needs to know the run will be slow and that more RAM is the cure.
+		// Everything about HOW it goes slow -- the partition, the budget, the internal
+		// knobs that move it -- is the refiner's business. The gated line keeps the
+		// exact "view-stream batching is deep" wording that docs/MESH_AUTOTUNING.md
+		// refers to, so that reference still resolves with diagnostics on.
+		VERBOSE("warning: mesh refinement is short of memory on this machine and will run "
+			"substantially slower than it would with more RAM free (the result is unaffected)");
+		REFINE_DIAG("WARNING: view-stream batching is deep -- %zu batches (budget %.2f GB vs "
 			"%.2f GB for the largest single reference neighbourhood). Every batch transition "
 			"rebuilds the planes it evicted, so each iteration re-does roughly a full pass of "
 			"ThInitImage + ProjectMesh. The budget does now bound the pair loop, so this is a "
@@ -3046,9 +3216,110 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps)
 #endif
 }
 
+// Raise the subdivision threshold, if needed, so subdivision cannot carry the mesh past
+// the texture atlas face budget. Returns the effective max-face-area to hand
+// Mesh::Subdivide -- never LOWER than the requested one, so it can only ever WITHHOLD
+// subdivision, never add it.
+//
+// See MESHOPT_ATLAS_BUDGET_CLAMP / MESHOPT_ATLAS_BUDGET_SPLIT_FANOUT above for the why
+// and for the bound this relies on.
+//
+// NOT static, and deliberately not in a header: SceneRefineCUDA.cpp declares it extern
+// and calls it from MeshRefineCUDA::SubdivideMesh, which is a SEPARATE implementation of
+// this same step. Both refine devices must honour the same ceiling -- otherwise the mesh
+// TextureMesh receives depends on which device happened to win, which is worse than not
+// clamping at all. Same local-extern pattern ComputeAtlasFaceBudget itself uses. Keeping
+// the MESHOPT_ATLAS_BUDGET_* knobs readable only here is intentional: one definition
+// point, and the GPU path picks up the policy without duplicating it.
+//
+// Applied at EVERY scale, against the full budget, rather than only on the finest. That
+// is not a coarse scale eating the whole budget: projected area grows with resolution, so
+// a coarse scale barely trips the threshold at all (measured +0.27% at resolution level
+// 2, where a 0.525 cell projects to ~20 px^2 against a 32 threshold). The clamp
+// therefore binds where the subdivision actually is -- the finest scales -- while keeping
+// the running count under budget throughout.
+uint32_t ClampSubdivideAreaToAtlasBudget(const Mesh::AreaArr& maxAreas, size_t nFaces, uint32_t maxArea,
+	int atlasDim)
+{
+#if MESHOPT_ATLAS_BUDGET_CLAMP
+	// maxArea == 0 means subdivision is disabled; callers return before reaching here,
+	// but a 0 threshold would make every face "want splitting", so guard it anyway.
+	if (maxAreas.IsEmpty() || maxArea == 0)
+		return maxArea;
+	// Defined in SceneReconstruct.cpp at global scope; declared locally rather than via a
+	// header, the same way ReconstructMesh.cpp and RefineMesh.cpp declare it.
+	extern double ComputeAtlasFaceBudget(int atlasMaxDim);
+	// The dimension the CALLER derived from this scene (ComputeSceneAtlasDim), not the raw
+	// ceiling -- otherwise this clamp would budget for an atlas larger than the one
+	// ReconstructMesh sized the mesh for, and the two stages would disagree.
+	const double budgetAtlas = ComputeAtlasFaceBudget(atlasDim);
+	if (!(budgetAtlas > 0.0))
+		return maxArea; // budget unknown -> no cap, exactly the pre-clamp behaviour
+
+	const uint32_t maxAreaTh(2*maxArea); // Mesh::Subdivide's REAL test, not maxArea
+	size_t nFullWanted = 0;
+	FOREACH(fi, maxAreas)
+		if (maxAreas[fi] > maxAreaTh)
+			++nFullWanted;
+	const size_t headroom = (budgetAtlas > (double)nFaces)
+		? (size_t)(budgetAtlas - (double)nFaces) : 0;
+	const size_t nFullAllowed = headroom / MESHOPT_ATLAS_BUDGET_SPLIT_FANOUT;
+	if (nFullWanted <= nFullAllowed) {
+		REFINE_DIAG("[SUBDIV-BUDGET] atlas allows %.1fM faces, mesh has %u;"
+			" %u faces want splitting against %u allowed -- not clamped",
+			budgetAtlas * 1e-6, (unsigned)nFaces,
+			(unsigned)nFullWanted, (unsigned)nFullAllowed);
+		return maxArea;
+	}
+
+	uint32_t effArea;
+	if (nFullAllowed == 0) {
+		// No headroom: the mesh is already at or over budget. A threshold cannot express
+		// "split nothing", so use one nothing can meet -- areas are uint16_t, so
+		// 0x3FFFFFFF is unreachable by construction.
+		effArea = 0x3FFFFFFFu;
+	} else {
+		// Keep the nFullAllowed LARGEST projected areas -- the faces the imagery most
+		// supports -- and put the threshold just under the next one down. (A+1)/2 is
+		// correct for odd and even A alike: Subdivide tests area > 2*maxArea, so this can
+		// only ever split FEWER faces than allowed, never more, which is the direction
+		// that keeps the bound valid.
+		//
+		// nFullAllowed < nFullWanted <= maxAreas.GetSize() on this branch, so the
+		// nth_element pivot is always in range.
+		//
+		// NOTE areas are uint16_t and therefore SATURATE at 65535. If nFullAllowed lands
+		// inside a block of saturated faces, A is 65535, the threshold becomes 32768, and
+		// 2*32768 exceeds every representable area -- subdivision stops entirely for this
+		// scale. Safe (it errs toward fewer faces), and the log below names it rather than
+		// leaving it to look like a bug.
+		std::vector<uint16_t> areas;
+		areas.reserve(maxAreas.GetSize());
+		FOREACH(fi, maxAreas)
+			areas.push_back(maxAreas[fi]);
+		std::nth_element(areas.begin(), areas.begin() + nFullAllowed, areas.end(),
+			[](uint16_t a, uint16_t b) { return a > b; });
+		const uint32_t A = (uint32_t)areas[nFullAllowed];
+		effArea = std::max<uint32_t>(maxArea, (A + 1u) / 2u);
+	}
+	// This CHANGES the deliverable -- it withholds subdivision the caller asked for -- so
+	// it stays visible at normal verbosity, matching ReconstructMesh's [ATLAS] cap line.
+	VERBOSE("[SUBDIV-BUDGET] atlas allows %.1fM faces, mesh has %u:"
+		" splitting the %u largest-area faces instead of %u (max-face-area %u -> %u%s)",
+		budgetAtlas * 1e-6, (unsigned)nFaces,
+		(unsigned)nFullAllowed, (unsigned)nFullWanted,
+		maxArea, effArea,
+		(effArea >= 32768u) ? ", i.e. no subdivision at this scale" : "");
+	return effArea;
+#else
+	return maxArea;
+#endif
+} // ClampSubdivideAreaToAtlasBudget
+/*----------------------------------------------------------------*/
+
 // decimate or subdivide mesh such that for each face there is no image pair in which
 // its projection area is bigger than the given number of pixels in both images
-void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nCloseHoles, unsigned nEnsureEdgeSize)
+void MeshRefine::SubdivideMesh(uint32_t maxArea, int atlasDim, float fDecimate, unsigned nCloseHoles, unsigned nEnsureEdgeSize)
 {
 	Mesh::AreaArr maxAreas;
 
@@ -3126,7 +3397,7 @@ void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nClos
 			// in two tight clusters rather than a spread). Log both sides and the
 			// decision so a cross-configuration output difference can be attributed
 			// here -- or ruled out -- instead of inferred.
-			DEBUG_EXTRA("[SUBDIV] auto-decimate test: fMedianArea=%.6f vs fMaxArea=%.6f -> %s",
+			REFINE_DIAG("[SUBDIV] auto-decimate test: fMedianArea=%.6f vs fMaxArea=%.6f -> %s",
 				fMedianArea, fMaxArea, (fMedianArea < fMaxArea) ? "DECIMATE" : "keep");
 			if (fMedianArea < fMaxArea) {
 				maxAreas.Empty();
@@ -3212,6 +3483,12 @@ void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nClos
 	// subdivide mesh faces if its projection area is bigger than the given number of pixels
 	const size_t numVertsOld(vertices.GetSize());
 	const size_t numFacesOld(faces.GetSize());
+
+	// Hold subdivision inside the texture atlas face budget -- see
+	// ClampSubdivideAreaToAtlasBudget. Must run BEFORE the [SUBDIV] diagnostic below so
+	// that line reports the threshold actually used.
+	maxArea = ClampSubdivideAreaToAtlasBudget(maxAreas, faces.GetSize(), maxArea, atlasDim);
+
 	// [QUALITY] The count of faces over the threshold is what DIRECTLY sets the output
 	// face count, so if two configurations (different memory, different batching)
 	// disagree on the final mesh, this line says whether they disagreed about the
@@ -3219,14 +3496,21 @@ void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nClos
 	// sit within 1 unit of the threshold: a large boundary population means the face
 	// count is inherently sensitive to last-bit differences and a small delta between
 	// runs is expected rather than a defect.
-	if (!maxAreas.IsEmpty()) {
+	// The counting pass feeds nothing but the line, so it rides the gate too.
+	//
+	// Counted against 2*maxArea, which is Mesh::Subdivide's actual test (maxAreaTh).
+	// This line used to compare against maxArea alone and so over-reported the split
+	// population -- harmless as a trend, actively misleading when validating the
+	// budget clamp above, which has to reason about the real threshold.
+	if (!maxAreas.IsEmpty() && REFINE_DIAG_ENABLED()) {
+		const uint32_t maxAreaTh(2*maxArea);
 		size_t nOver = 0, nBoundary = 0;
 		FOREACH(fi, maxAreas) {
-			if (maxAreas[fi] > maxArea) ++nOver;
-			if (maxAreas[fi] == maxArea || maxAreas[fi] + 1 == maxArea) ++nBoundary;
+			if (maxAreas[fi] > maxAreaTh) ++nOver;
+			if (maxAreas[fi] == maxAreaTh || maxAreas[fi] + 1 == maxAreaTh) ++nBoundary;
 		}
-		DEBUG_EXTRA("[SUBDIV] %zu/%zu faces over maxArea=%u (%zu within 1 of the threshold)",
-			nOver, maxAreas.GetSize(), maxArea, nBoundary);
+		REFINE_DIAG("[SUBDIV] %zu/%zu faces over 2*maxArea=%u (%zu within 1 of the threshold)",
+			nOver, maxAreas.GetSize(), maxAreaTh, nBoundary);
 	}
 	scene.mesh.Subdivide(maxAreas, maxArea);
 
@@ -3244,7 +3528,9 @@ void MeshRefine::SubdivideMesh(uint32_t maxArea, float fDecimate, unsigned nClos
 	// re-map vertex and camera faces
 	ListVertexFacesPre();
 
-	DEBUG_EXTRA("Mesh subdivided: %u/%u -> %u/%u vertices/faces", numVertsOld, numFacesOld, vertices.GetSize(), faces.GetSize());
+	// Gated: RefineMesh's completion line already reports the final vertex/face count,
+	// so at the default verbosity this only says which internal stage moved it.
+	REFINE_DIAG("Mesh subdivided: %u/%u -> %u/%u vertices/faces", numVertsOld, numFacesOld, vertices.GetSize(), faces.GetSize());
 
 #if TD_VERBOSE != TD_VERBOSE_OFF
 	if (VERBOSITY_LEVEL > 3)
@@ -3281,6 +3567,14 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 	MeshProf::Add(MeshProf::P_ListCameraFaces, _tLCF.ms());
 #endif
 
+	// Tile-skip: decide whether THIS evaluation may skip quiescent tiles. Full
+	// evaluations (feature off, warmup/refresh/final iterations per the schedule
+	// the iteration loop sets in tileSkipForceFull, and any caller that never
+	// manages that flag) re-arm every tile below, which makes the pair loop, the
+	// gradient kernel gate and the energy bookkeeping at the end of this function
+	// behave exactly as they did before tile skipping.
+	tileSkipThisIter = tileSkipEnabled && !tileSkipForceFull && iteration > 0;
+
 	int64_t numImages = (int64_t)images.size();
 #pragma omp parallel for
 	for (int64_t ID = 0; ID < numImages; ++ID)
@@ -3297,17 +3591,34 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #if MESHOPT_NEEDS_TILE_ENERGY
 		view.tileEnergyAccum.assign(numTiles, 0.f);
 
-		// Only reset tileActive when relevant
-		if (iteration == 0 || rebuildOctree) {
-			if (view.tileActive.size() != numTiles) {
-				view.tileActive.assign(numTiles, 1);
-			}
-			else {
-				std::fill(view.tileActive.begin(), view.tileActive.end(), 1);
-			}
-		}
+		// (re)size the persistent per-tile state when the tile grid changes (the
+		// image scale changed; iteration 0 of a scale is always a full evaluation
+		// so the zeroed energies are measured before they are ever thresholded).
+		// A full evaluation re-arms every tile; a skipping one consumes the active
+		// set computed at the end of the previous iteration.
+		if (view.tileActive.size() != numTiles) {
+			view.tileActive.assign(numTiles, 1);
+			view.tileEnergyLast[0].assign(numTiles, 0.f);
+			view.tileEnergyLast[1].assign(numTiles, 0.f);
+		} else if (!tileSkipThisIter)
+			std::fill(view.tileActive.begin(), view.tileActive.end(), 1);
 #endif
 	}
+#if MESHOPT_NEEDS_TILE_ENERGY && !MESHOPT_DISABLE_TILE_SKIP
+	if (iteration == 0)
+		tileSkipStatSkippedTiles = tileSkipStatTotalTiles = tileSkipStatSkippedViews = tileSkipStatReducedIters = 0;
+	if (tileSkipThisIter) {
+		// per-scale [TILE-SKIP] stats: how much of the gradient-stage tile grid
+		// this reduced evaluation retired
+		++tileSkipStatReducedIters;
+		FOREACH(vid, views) {
+			const View& view = views[vid];
+			tileSkipStatTotalTiles += view.tileActive.size();
+			for (uint8_t a : view.tileActive)
+				if (!a) ++tileSkipStatSkippedTiles;
+		}
+	}
+#endif
 
 	// JPB WIP BUG Nneded twice?
 	//scene.mesh.ComputeNormalFaces();
@@ -3500,6 +3811,25 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 			}
 			if (!hasEnabledPair)
 				continue;
+#if !MESHOPT_DISABLE_TILE_SKIP
+			// tile-skip: a reference view whose tiles are ALL quiescent contributes
+			// no photometric gradient this evaluation, so its variance pass and the
+			// full-frame warp/ZNCC of every pair it references are dead work -- skip
+			// the whole reference view. Its per-tile energies carry forward in the
+			// fold below, and the next scheduled full evaluation re-measures it, so
+			// it can reactivate.
+			if (tileSkipThisIter) {
+				const std::vector<uint8_t>& activeA = views[a].tileActive;
+				bool anyActive = false;
+				for (uint8_t t : activeA)
+					if (t) { anyActive = true; break; }
+				if (!anyActive) {
+#pragma omp atomic
+					++tileSkipStatSkippedViews;
+					continue;
+				}
+			}
+#endif
 #if !MESHOPT_FACEMAP_RESIDENT
 			// regenerate the reference-view faceMap on demand
 #if MESHOPT_PROFILE
@@ -3610,46 +3940,92 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 	}
 #endif
 
-	// --------------------------------------------------
-	// DIAGNOSTICS: accumulate photometric energy
-	// (must be done BEFORE clearing tileEnergyAccum)
-	// photoEnergyLast is only read by the iteration diagnostics and the
-	// converged-exit plateau test; skip the O(tiles) reduction otherwise.
-	// --------------------------------------------------
-#if MESHOPT_ITER_DIAGNOSTICS || MESHOPT_CONVERGED_EXIT
-	double photoEnergyIter = 0.0;
-	for (size_t vid = 0; vid < views.size(); ++vid) {
-		const View& view = views[vid];
-		for (float e : view.tileEnergyAccum)
-			photoEnergyIter += e;
-	}
-
-	photoEnergyLast = photoEnergyIter;
-#endif
-
-	// -----------------------------------------
-	// Update tileActive for the NEXT iteration
-	// -----------------------------------------
+	// --------------------------------------------------------------------
+	// Fold this evaluation's measured tile energy into the persistent
+	// per-tile energy, then derive the NEXT iteration's active set from it.
+	//
+	// The persistent array exists because a skipped tile accumulates
+	// nothing: thresholding the raw accumulator would deactivate it forever
+	// (no fresh energy -> inactive -> no fresh energy) and would understate
+	// photoEnergyLast, faking convergence for the plateau test. Tiles that
+	// ran overwrite their entry, skipped tiles carry the last measured value
+	// forward; both the plateau sum and the threshold read the persistent
+	// array. Under --alternate-pair 1 the pair set alternates with iteration
+	// parity, so the energy is kept per parity and the threshold reads the
+	// parity the NEXT iteration will run with -- the same reason the plateau
+	// test compares same-parity iterations. With tile-skip off every tile
+	// "ran", the fold degenerates to a copy of the accumulator and
+	// photoEnergyLast is bit-identical to the pre-tile-skip sum.
+	// --------------------------------------------------------------------
 #if MESHOPT_NEEDS_TILE_ENERGY
-// Start conservative, get aggressive as we converge
+	{
+		const unsigned parityNow(nAlternatePair == 1 ? (iteration & 1u) : 0u);
+		const unsigned parityNext(nAlternatePair == 1 ? ((iteration + 1) & 1u) : 0u);
+		// Start conservative, get aggressive as we converge
 #if MESHOPT_REFINE_QUALITY
-	float tileThreshold = (iteration < 3) ? 1e-4f : 2e-4f;
+		const float tileThreshold = (iteration < 3) ? 1e-4f : 2e-4f;
 #else
-	float tileThreshold = (iteration < 3) ? 5e-4f : 1e-3f;
+		const float tileThreshold = (iteration < 3) ? 5e-4f : 1e-3f;
 #endif
-
-	for (size_t vid = 0; vid < views.size(); ++vid) {
-		View& view = views[vid];
-		size_t tcount = view.tilesX * view.tilesY;
-
-		for (size_t t = 0; t < tcount; ++t) {
-			float E = view.tileEnergyAccum[t];
-
-			view.tileActive[t] = (E > tileThreshold ? 1 : 0);
-
-			// Clear AFTER energy was captured
-			view.tileEnergyAccum[t] = 0.f;
+		// per-view partial sums, reduced serially below: photoEnergyLast feeds the
+		// converged-exit plateau test, so its float-summation ORDER must not
+		// depend on the OpenMP schedule (same reasoning as the eager per-thread
+		// tile buffers in the pair loop above). Deliberately a plain local so the
+		// OpenMP team SHARES it (each thread writes only its own vid slots); a
+		// thread_local here resolves to a different -- unsized -- instance in
+		// every worker thread.
+		std::vector<double> viewEnergy(views.size(), 0.0);
+#pragma omp parallel for schedule(dynamic)
+		for (int64_t vid = 0; vid < (int64_t)views.size(); ++vid) {
+			View& view = views[vid];
+			const size_t tcount = view.tileEnergyAccum.size();
+			if (tcount == 0)
+				continue;
+			double viewEnergySum = 0.0;
+			std::vector<float>& energyNow = view.tileEnergyLast[parityNow];
+			for (size_t t = 0; t < tcount; ++t) {
+				if (!tileSkipThisIter || view.tileActive[t])
+					energyNow[t] = view.tileEnergyAccum[t];
+				// Clear AFTER energy was captured
+				view.tileEnergyAccum[t] = 0.f;
+				viewEnergySum += energyNow[t];
+			}
+			viewEnergy[vid] = viewEnergySum;
+#if !MESHOPT_DISABLE_TILE_SKIP
+			if (tileSkipEnabled) {
+				// threshold -> candidate active set for the NEXT iteration (whose
+				// ScoreMesh entry decides whether it honors the set or re-arms all)
+				const std::vector<float>& energyNext = view.tileEnergyLast[parityNext];
+				for (size_t t = 0; t < tcount; ++t)
+					view.tileActive[t] = (energyNext[t] > tileThreshold ? 1 : 0);
+				// halo: keep every tile within MESHOPT_TILE_SKIP_HALO rings of an
+				// active tile armed, so face support and ZNCC windows spanning a
+				// tile seam are never starved by the skip
+				static thread_local std::vector<uint8_t> seed;
+				seed.assign(view.tileActive.begin(), view.tileActive.end());
+				const int tX = view.tilesX, tY = view.tilesY;
+				for (int ty = 0; ty < tY; ++ty) {
+					for (int tx = 0; tx < tX; ++tx) {
+						if (!seed[(size_t)ty * tX + tx])
+							continue;
+						const int y1 = std::min(ty + MESHOPT_TILE_SKIP_HALO, tY - 1);
+						const int x1 = std::min(tx + MESHOPT_TILE_SKIP_HALO, tX - 1);
+						for (int y = std::max(ty - MESHOPT_TILE_SKIP_HALO, 0); y <= y1; ++y)
+							for (int x = std::max(tx - MESHOPT_TILE_SKIP_HALO, 0); x <= x1; ++x)
+								view.tileActive[(size_t)y * tX + x] = 1;
+					}
+				}
+			}
+#endif
 		}
+#if MESHOPT_ITER_DIAGNOSTICS || MESHOPT_CONVERGED_EXIT
+		{
+			double photoEnergyIter = 0.0;
+			for (double e : viewEnergy)
+				photoEnergyIter += e;
+			photoEnergyLast = photoEnergyIter;
+		}
+#endif
 	}
 #endif
 #else
@@ -3715,6 +4091,27 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 	MeshProf::Timer _tCombine;
 #endif
 
+	// Photometric-support memory for the tile-skip freeze rule. On a skipping
+	// evaluation, a vertex whose faces land only in quiescent tiles arrives at
+	// the combine below with photoGradNorm == 0 even though its photo term is
+	// merely FROZEN -- and the unsupported branch would then advance it under
+	// the smoothing term alone, walking it away from the photo/smooth
+	// equilibrium it had converged to (detail erosion, exactly what "the results
+	// must not change" forbids). So: on every FULL evaluation record who had
+	// photo support; on a skipping evaluation a vertex that had support but
+	// shows none now is frozen in place -- no photo term, no smoothing, no
+	// motion -- until the next full evaluation resumes it. Vertices without
+	// support on a FULL evaluation are genuinely unobserved and keep the
+	// original smoothing-only behaviour on every iteration.
+	if (!tileSkipThisIter) {
+		vertexHadSupport.resize(vertices.GetSize());
+		const int nVertsSupport = (int)vertices.GetSize();
+#pragma omp parallel for schedule(static)
+		for (int v = 0; v < nVertsSupport; ++v)
+			vertexHadSupport[v] = photoGradNorm[v] >= (float)MESHOPT_MIN_PAIR_SUPPORT ? 1 : 0;
+	}
+	const bool bFreezeUnsupported(tileSkipThisIter && vertexHadSupport.size() == (size_t)vertices.GetSize());
+
 	// set the final gradient as the combination of photometric and smoothness gradients
 	const int numVertsCombine = (int)vertices.GetSize();
 	if (ratioRigidityElasticity >= 1.f) {
@@ -3722,6 +4119,7 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 		for (int v = 0; v < numVertsCombine; ++v)
 			((Point3f*)gradients)[v] = photoGradNorm[v] >= (float)MESHOPT_MIN_PAIR_SUPPORT ?
 			Cast<float>(photoGrad[v] / photoGradNorm[v] + smoothGrad2[v] * weightRegularity) :
+			bFreezeUnsupported && vertexHadSupport[v] ? Point3f(0, 0, 0) :
 			Cast<float>(smoothGrad2[v] * weightRegularity);
 	} else {
 		// compute smoothing gradient as a combination of level 1 and 2 of the Laplacian operator;
@@ -3732,6 +4130,7 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 		for (int v = 0; v < numVertsCombine; ++v)
 			((Point3f*)gradients)[v] = photoGradNorm[v] >= (float)MESHOPT_MIN_PAIR_SUPPORT ?
 			Cast<float>(photoGrad[v] / photoGradNorm[v] + smoothGrad2[v] * elasticity - smoothGrad1[v] * rigidity) :
+			bFreezeUnsupported && vertexHadSupport[v] ? Point3f(0, 0, 0) :
 			Cast<float>(smoothGrad2[v] * elasticity - smoothGrad1[v] * rigidity);
 	}
 #if MESHOPT_PROFILE
@@ -6113,16 +6512,61 @@ float MeshRefine::ComputeLocalZNCC(
 #endif
 }
 
+// Build the tile-gated ZNCC column plan for a reference view (see the
+// ZNCCActivePlan declaration for the exactness argument).
+void MeshRefine::BuildZNCCActivePlan(const View& view, ZNCCActivePlan& plan)
+{
+	const int tX = view.tilesX, tY = view.tilesY;
+	const int width = view.width;
+	plan.bandSegs.assign((size_t)tY, {});
+	plan.neededCols.clear();
+	std::vector<uint8_t> colAny((size_t)tX, 0);
+	for (int ty = 0; ty < tY; ++ty) {
+		std::vector<std::pair<int, int>>& segs = plan.bandSegs[(size_t)ty];
+		int runStart = -1;
+		for (int tx = 0; tx <= tX; ++tx) {
+			const bool on = tx < tX && view.tileActive[(size_t)ty * tX + tx] != 0;
+			if (on) {
+				colAny[(size_t)tx] = 1;
+				if (runStart < 0) runStart = tx;
+			} else if (runStart >= 0) {
+				segs.emplace_back(runStart * TILEX, MINF(tx * TILEX, width));
+				runStart = -1;
+			}
+		}
+	}
+	int runStart = -1;
+	for (int tx = 0; tx <= tX; ++tx) {
+		const bool on = tx < tX && colAny[(size_t)tx] != 0;
+		if (on) {
+			if (runStart < 0) runStart = tx;
+		} else if (runStart >= 0) {
+			// dilate by 2*HalfSize: enough for the windowed-derivative path too
+			// (terms are needed +-HalfSize beyond the active tiles, and each term
+			// reads the column sums another +-HalfSize out); a superset of what
+			// the center-only fused path needs, and 2*HalfSize < TILEX so the
+			// dilation still cannot bridge two separate runs
+			plan.neededCols.emplace_back(MAXF(runStart * TILEX - 2 * (int)HalfSize, 0), MINF(tx * TILEX + 2 * (int)HalfSize, width));
+			runStart = -1;
+		}
+	}
+}
+
 // Compute warped-image mean/variance, A*B covariance and the ZNCC derivative
 // in one rolling-window pass. Scratch is O(image width), replacing the full
 // imageMeanAB/imageVarAB/integralAB buffers used by the split path.
+// activePlan (tile-skip reduced iterations only): restricts the per-pixel pass
+// to active-tile column segments and the priming/rolling sums to the columns
+// those segments read -- every value the tile-gated gradient consumer can
+// reach is still computed identically; only write-only work is dropped.
 float MeshRefine::ComputeLocalZNCCFused(
 	const ImageStore& imageA,
 	const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA,
 	const TImage<uint16_t>& imageB,
 	const std::vector<uint8_t>& mask,
 	TImage<Real>& imageDZNCC,
-	const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand)
+	const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand,
+	const ZNCCActivePlan* activePlan)
 {
 	ASSERT(imageA.size() == imageB.size());
 	ASSERT(imageA.size() == mask.size());
@@ -6144,7 +6588,7 @@ float MeshRefine::ComputeLocalZNCCFused(
 		return 0.0f;
 	static const bool useAVX2 = [] {
 		const bool enabled = MESHOPT_AVX2 && SupportsAVX2();
-		LOG(_T("Mesh refinement ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("SSE2"));
+		REFINE_DIAG(_T("Mesh refinement ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("SSE2"));
 		return enabled;
 	}();
 
@@ -6153,6 +6597,20 @@ float MeshRefine::ComputeLocalZNCCFused(
 	colB2.assign(cols, 0.f);
 	colAB.assign(cols, 0.f);
 
+	// prime/roll only the columns the gated per-pixel pass can read; a fixed
+	// column is either always maintained or never read, so this stays exact
+	const std::pair<int, int> allCols(0, cols);
+	const std::pair<int, int>* colSegs = &allCols;
+	size_t numColSegs = 1;
+	if (activePlan && !activePlan->neededCols.empty()) {
+		colSegs = activePlan->neededCols.data();
+		numColSegs = activePlan->neededCols.size();
+	}
+
+#if MESHOPT_PROFILE
+	double _rollMs = 0.0; // ZNCC:roll -- priming + per-row rolling column-sum updates
+	MeshProf::Timer _tPrime;
+#endif
 	for (int rr = 0; rr <= 2 * hs; ++rr) {
 #if MESHOPT_IMAGE_U16
 		const uint16_t* __restrict aRow = imageA.ptr<uint16_t>(rr);
@@ -6160,7 +6618,16 @@ float MeshRefine::ComputeLocalZNCCFused(
 		const float* __restrict aRow = imageA.ptr<float>(rr);
 #endif
 		const uint16_t* __restrict bRow = imageB.ptr<uint16_t>(rr);
-		for (int c = 0; c < cols; ++c) {
+#if MESHOPT_IMAGE_U16
+		if (useAVX2) {
+			// bit-identical eight-wide mirror of the scalar loop below
+			for (size_t s = 0; s < numColSegs; ++s)
+				SceneRefineZNCCPrimeRowAVX2(aRow, bRow, colB.data(), colB2.data(), colAB.data(), colSegs[s].first, colSegs[s].second);
+			continue;
+		}
+#endif
+		for (size_t s = 0; s < numColSegs; ++s)
+		for (int c = colSegs[s].first; c < colSegs[s].second; ++c) {
 			const float b = float(bRow[c]) * scale16;
 #if MESHOPT_IMAGE_U16
 			const float a = float(aRow[c]) * scale16;
@@ -6172,6 +6639,9 @@ float MeshRefine::ComputeLocalZNCCFused(
 			colAB[c] += a * b;
 		}
 	}
+#if MESHOPT_PROFILE
+	_rollMs += _tPrime.ms();
+#endif
 
 #ifdef MESHOPT_CERES
 	float score = 0.f;
@@ -6197,7 +6667,11 @@ float MeshRefine::ComputeLocalZNCCFused(
 		const float* __restrict varARow = imageVarA.ptr<float>(r);
 		float* __restrict gradRow = imageDZNCC.ptr<float>(banded ? r % TILEY : r);
 
-		int i = colStart;
+		// per-pixel ZNCC + derivative over one column range [lo,hi): the AVX2
+		// row kernel takes an arbitrary range, the 4-wide and scalar tails
+		// finish it, so the tile-gated dispatch below can call this per segment
+		const auto processCols = [&](const int lo, const int hi) {
+		int i = lo;
 #if MESHOPT_IMAGE_U16
 #ifdef MESHOPT_CERES
 		float* avx2Score = useAVX2 ? &score : nullptr;
@@ -6208,10 +6682,10 @@ float MeshRefine::ComputeLocalZNCCFused(
 			i = SceneRefineZNCCRowAVX2(
 				maskRow, aRow, bRow, meanARow, varARow,
 				colB.data(), colB2.data(), colAB.data(), gradRow,
-					colStart, colEnd, invN, avx2Score);
+					lo, hi, invN, avx2Score);
 		}
 #endif
-		const int vecEnd = colStart + ((colEnd - colStart) & ~3);
+		const int vecEnd = lo + ((hi - lo) & ~3);
 		for (; i < vecEnd; i += 4) {
 			uint32_t mask4;
 			memcpy(&mask4, maskRow + i, sizeof(mask4));
@@ -6276,7 +6750,7 @@ float MeshRefine::ComputeLocalZNCCFused(
 #endif
 		}
 
-		for (; i < colEnd; ++i) {
+		for (; i < hi; ++i) {
 			if (!maskRow[i])
 				continue;
 				float sumB = 0.f, sumB2 = 0.f, sumAB = 0.f;
@@ -6309,10 +6783,25 @@ float MeshRefine::ComputeLocalZNCCFused(
 				score += reliability * (1.f - zncc);
 #endif
 		}
+		};
+		if (activePlan) {
+			// evaluate only this band's active-tile column segments; every other
+			// pixel of this row is unread by the tile-gated gradient consumer
+			for (const std::pair<int, int>& seg : activePlan->bandSegs[(size_t)(r / TILEY)]) {
+				const int lo = MAXF(seg.first, colStart);
+				const int hi = MINF(seg.second, colEnd);
+				if (lo < hi)
+					processCols(lo, hi);
+			}
+		} else
+			processCols(colStart, colEnd);
 
 		const int addR = r + hs + 1;
 		const int remR = r - hs;
 		if (addR < rows && remR >= 0) {
+#if MESHOPT_PROFILE
+			MeshProf::Timer _tRoll;
+#endif
 #if MESHOPT_IMAGE_U16
 			const uint16_t* __restrict addA = imageA.ptr<uint16_t>(addR);
 			const uint16_t* __restrict remA = imageA.ptr<uint16_t>(remR);
@@ -6322,7 +6811,16 @@ float MeshRefine::ComputeLocalZNCCFused(
 #endif
 			const uint16_t* __restrict addB = imageB.ptr<uint16_t>(addR);
 			const uint16_t* __restrict remB = imageB.ptr<uint16_t>(remR);
-			for (int x = 0; x < cols; ++x) {
+#if MESHOPT_IMAGE_U16
+			if (useAVX2) {
+				// bit-identical eight-wide mirror of the scalar loop below
+				for (size_t s = 0; s < numColSegs; ++s)
+					SceneRefineZNCCRollRowAVX2(addA, remA, addB, remB, colB.data(), colB2.data(), colAB.data(), colSegs[s].first, colSegs[s].second);
+			} else
+#endif
+			{
+			for (size_t s = 0; s < numColSegs; ++s)
+			for (int x = colSegs[s].first; x < colSegs[s].second; ++x) {
 				const float bAdd = float(addB[x]) * scale16;
 				const float bRem = float(remB[x]) * scale16;
 #if MESHOPT_IMAGE_U16
@@ -6336,6 +6834,10 @@ float MeshRefine::ComputeLocalZNCCFused(
 				colB2[x] += bAdd * bAdd - bRem * bRem;
 				colAB[x] += aAdd * bAdd - aRem * bRem;
 			}
+			}
+#if MESHOPT_PROFILE
+			_rollMs += _tRoll.ms();
+#endif
 		}
 
 		if (banded && (((r + 1) % TILEY) == 0 || r + 1 == rowEnd)) {
@@ -6344,6 +6846,9 @@ float MeshRefine::ComputeLocalZNCCFused(
 		}
 	}
 
+#if MESHOPT_PROFILE
+	MeshProf::AddTL(MeshProf::P_ZNCCRoll, _rollMs);
+#endif
 #ifdef MESHOPT_CERES
 	return score;
 #else
@@ -6364,7 +6869,10 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	const TImage<uint16_t>& imageB,
 	const std::vector<uint8_t>& mask,
 	TImage<Real>& imageDZNCC,
-	const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand)
+	const std::function<void(const TImage<Real>&, size_t, size_t, bool)>& consumeBand,
+	const ZNCCActivePlan* /*activePlan: accepted for signature parity with the
+	fused kernel but IGNORED -- this path always evaluates the full frame, which
+	is an exact superset of what the plan would allow (correct, just unreduced)*/)
 {
 	ASSERT(imageA.size() == imageB.size());
 	ASSERT(imageA.size() == mask.size());
@@ -6385,6 +6893,26 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	if (rowStart >= rowEnd || colStart >= colEnd)
 		return 0.0f;
 
+	// Eight-wide kernels for every full-width phase of this function (terms,
+	// prime/roll, ring accumulation, emission) live in SceneRefineAVX2.cpp and
+	// mirror the scalar loops below op-for-op (no FMA, masked blend-stores):
+	// byte-identical output, runtime CPUID-gated. They hardcode the 5-tap window.
+	static_assert(HalfSize == 2, "the WZNCC AVX2 kernels hardcode the 5-tap ZNCC window");
+	static const bool useAVX2 = [] {
+		bool enabled = MESHOPT_AVX2 && SupportsAVX2();
+		// kill switch for the byte-identity A/B: run twice with --max-threads 1
+		// (single-threaded => deterministic pair order), once with
+		// OPENMVS_REFINE_WZNCC_SIMD=0, and the refined meshes must match
+		// byte-for-byte -- that is the definitive verification of these kernels
+		if (const char* szSimd = std::getenv("OPENMVS_REFINE_WZNCC_SIMD"))
+			enabled = enabled && String(szSimd) != _T("0");
+		// OPENMVS_REFINE_BASELINE=1 turns this off too (see the MeshRefine ctor)
+		if (const char* szBaseline = std::getenv("OPENMVS_REFINE_BASELINE"))
+			enabled = enabled && String(szBaseline) == _T("0");
+		REFINE_DIAG(_T("Mesh refinement windowed-ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
+		return enabled;
+	}();
+
 	// double accumulators (see ComputeLocalVariance2Unmasked): the rolling sums
 	// otherwise drift across thousands of row slides vs the GPU's exact windows
 	static thread_local std::vector<double> colB, colB2, colAB;
@@ -6392,6 +6920,13 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	colB2.assign(cols, 0.0);
 	colAB.assign(cols, 0.0);
 
+#if MESHOPT_PROFILE
+	// ZNCC:roll = priming + per-row rolling of the double column sums;
+	// ZNCC:emit = emitRow's ring accumulation + derivative emission (excluding
+	// the consumeBand callback, which P_PhotoGrad times separately)
+	double _rollMs = 0.0, _emitMs = 0.0;
+	MeshProf::Timer _tPrime;
+#endif
 	for (int rr = 0; rr <= 2 * hs; ++rr) {
 #if MESHOPT_IMAGE_U16
 		const uint16_t* __restrict aRow = imageA.ptr<uint16_t>(rr);
@@ -6399,6 +6934,12 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		const float* __restrict aRow = imageA.ptr<float>(rr);
 #endif
 		const uint16_t* __restrict bRow = imageB.ptr<uint16_t>(rr);
+#if MESHOPT_IMAGE_U16
+		if (useAVX2) {
+			SceneRefineWZNCCPrimeRowAVX2(aRow, bRow, colB.data(), colB2.data(), colAB.data(), cols);
+			continue;
+		}
+#endif
 		for (int c = 0; c < cols; ++c) {
 			const float b = float(bRow[c]) * scale16;
 #if MESHOPT_IMAGE_U16
@@ -6411,6 +6952,9 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 			colAB[c] += (double)a * b;
 		}
 	}
+#if MESHOPT_PROFILE
+	_rollMs += _tPrime.ms();
+#endif
 
 	// per-row derivative-term ring (zero-filled at invalid pixels so the box
 	// sums stay branch-free); RING rows cover the emission delay exactly
@@ -6434,6 +6978,9 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	colN.resize(cols);
 
 	const auto emitRow = [&](int rOut) {
+#if MESHOPT_PROFILE
+		MeshProf::Timer _tEmit;
+#endif
 		std::fill(colInv.begin(), colInv.end(), 0.f);
 		std::fill(colZ.begin(), colZ.end(), 0.f);
 		std::fill(colM.begin(), colM.end(), 0.f);
@@ -6450,6 +6997,10 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 			float* __restrict cz = colZ.data();
 			float* __restrict cm = colM.data();
 			float* __restrict cn = colN.data();
+			if (useAVX2) {
+				SceneRefineWZNCCEmitAccumAVX2(ci, cz, cm, cn, ri, rz, rm, rv, cols);
+				continue;
+			}
 			for (int c = 0; c < cols; ++c) {
 				ci[c] += ri[c];
 				cz[c] += rz[c];
@@ -6467,6 +7018,12 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		const float* __restrict varARow = imageVarA.ptr<float>(rOut);
 		const float* __restrict varBRow = ringVarB.data() + (size_t)(rOut % RING) * plane;
 		float* __restrict gradRow = imageDZNCC.ptr<float>(banded ? rOut % TILEY : rOut);
+#if MESHOPT_IMAGE_U16
+		if (useAVX2) {
+			SceneRefineWZNCCEmitRowAVX2(maskRow, aRow, bRow, varARow, varBRow,
+				colInv.data(), colZ.data(), colM.data(), colN.data(), gradRow, colStart, colEnd);
+		} else
+#endif
 		for (int i = colStart; i < colEnd; ++i) {
 			if (!maskRow[i])
 				continue;
@@ -6491,6 +7048,9 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 			// when the window holds a single valid term
 			gradRow[i] = reliability * (bVal * sZ - aVal * sInv + sM) * invCnt;
 		}
+#if MESHOPT_PROFILE
+		_emitMs += _tEmit.ms(); // stop BEFORE consumeBand: the gradient times itself
+#endif
 		if (banded && (((rOut + 1) % TILEY) == 0 || rOut + 1 == rowEnd)) {
 			const size_t bandBegin = (size_t)(rOut / TILEY) * TILEY;
 			consumeBand(imageDZNCC, bandBegin, (size_t)rOut + 1, rOut + 1 == rowEnd);
@@ -6518,6 +7078,19 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		const uint8_t* __restrict maskRow = &mask[(size_t)r * cols];
 		const uint16_t* __restrict meanARow = imageMeanA.ptr<uint16_t>(r);
 		const float* __restrict varARow = imageVarA.ptr<float>(r);
+#if MESHOPT_IMAGE_U16
+		if (useAVX2) {
+			SceneRefineWZNCCTermsRowAVX2(maskRow, meanARow, varARow,
+				colB.data(), colB2.data(), colAB.data(),
+				rowInvS, rowZovb, rowMean, rowVarB, rowValid,
+				colStart, colEnd, invN,
+#ifdef MESHOPT_CERES
+				&score);
+#else
+				nullptr);
+#endif
+		} else
+#endif
 		for (int i = colStart; i < colEnd; ++i) {
 			if (!maskRow[i])
 				continue;
@@ -6552,6 +7125,9 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		const int addR = r + hs + 1;
 		const int remR = r - hs;
 		if (addR < rows && remR >= 0) {
+#if MESHOPT_PROFILE
+			MeshProf::Timer _tRoll;
+#endif
 #if MESHOPT_IMAGE_U16
 			const uint16_t* __restrict addA = imageA.ptr<uint16_t>(addR);
 			const uint16_t* __restrict remA = imageA.ptr<uint16_t>(remR);
@@ -6561,6 +7137,11 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 #endif
 			const uint16_t* __restrict addB = imageB.ptr<uint16_t>(addR);
 			const uint16_t* __restrict remB = imageB.ptr<uint16_t>(remR);
+#if MESHOPT_IMAGE_U16
+			if (useAVX2) {
+				SceneRefineWZNCCRollRowAVX2(addA, remA, addB, remB, colB.data(), colB2.data(), colAB.data(), cols);
+			} else
+#endif
 			for (int x = 0; x < cols; ++x) {
 				const float bAdd = float(addB[x]) * scale16;
 				const float bRem = float(remB[x]) * scale16;
@@ -6575,6 +7156,9 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 				colB2[x] += (double)bAdd * bAdd - (double)bRem * bRem;
 				colAB[x] += (double)aAdd * bAdd - (double)aRem * bRem;
 			}
+#if MESHOPT_PROFILE
+			_rollMs += _tRoll.ms();
+#endif
 		}
 
 		// emission trails the term pass so rOut's full window is available
@@ -6584,6 +7168,10 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	while (nextEmit < rowEnd)
 		emitRow(nextEmit++);
 
+#if MESHOPT_PROFILE
+	MeshProf::AddTL(MeshProf::P_ZNCCRoll, _rollMs);
+	MeshProf::AddTL(MeshProf::P_ZNCCEmit, _emitMs);
+#endif
 #ifdef MESHOPT_CERES
 	return score;
 #else
@@ -6726,6 +7314,32 @@ void MeshRefine::ComputePhotometricGradient(
 	const GradStoreT* __restrict gradXB = viewB.gradX;
 	const GradStoreT* __restrict gradYB = viewB.gradY;
 
+#if MESHOPT_PG_AVX2
+	static const bool usePGAVX2 = [] {
+		bool enabled = MESHOPT_AVX2 && SupportsAVX2();
+		if (const char* szSimd = std::getenv("OPENMVS_REFINE_PG_SIMD"))
+			enabled = enabled && String(szSimd) != _T("0");
+		if (const char* szBaseline = std::getenv("OPENMVS_REFINE_BASELINE"))
+			enabled = enabled && String(szBaseline) == _T("0");
+		REFINE_DIAG(_T("Mesh refinement photometric-gradient SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
+		return enabled;
+	}();
+	PGPairCtxAVX2 pgCtx;
+	pgCtx.gradXB = gradXB;
+	pgCtx.gradYB = gradYB;
+	pgCtx.rA00 = rA00; pgCtx.rA01 = rA01; pgCtx.rA02 = rA02;
+	pgCtx.rA20 = rA20; pgCtx.rA21 = rA21; pgCtx.rA22 = rA22;
+	pgCtx.cxA = cxA; pgCtx.invFxA = invFxA;
+	pgCtx.p0 = p0; pgCtx.p1 = p1; pgCtx.p2 = p2;
+	pgCtx.p4 = p4; pgCtx.p5 = p5; pgCtx.p6 = p6;
+	pgCtx.p8 = p8; pgCtx.p9 = p9; pgCtx.p10 = p10;
+	pgCtx.projCX = projCX; pgCtx.projCY = projCY; pgCtx.projCW = projCW;
+	pgCtx.invScale = kInvScale;
+	pgCtx.regScale = (float)RegularizationScale;
+	pgCtx.gradShift = MESHOPT_PG_GRAD_CENTERED ? 0.5f : 0.f;
+	pgCtx.maxX = maxX; pgCtx.maxY = maxY; pgCtx.wB = wB;
+#endif
+
 #if MESHOPT_PG_FACECACHE
 	constexpr uint32_t FACE_SETUP_CACHE_SIZE = 128;
 	struct FaceSetup {
@@ -6785,6 +7399,41 @@ void MeshRefine::ComputePhotometricGradient(
 			alignas(64) uint32_t usedIdx[LOCAL_CAP];
 			size_t usedCount = 0;
 
+			// hoisted to tile scope so the AVX2 group path and the scalar path
+			// share the identical open-addressed tile-slot accumulation
+			auto accum = [&](uint32_t vi, const Grad& g)
+			{
+				uint32_t slot = (vi * 0x9E3779B1u) & (LOCAL_CAP - 1);
+				uint32_t step = 1;
+
+				uint32_t* __restrict tv = tileVertices;
+				TGrad* __restrict tg = tileGrad;
+
+				for (;;) {
+					uint32_t v = tv[slot];
+					if (v == vi) {
+						auto& t = tg[slot];
+						t.v[0] += g.x;
+						t.v[1] += g.y;
+						t.v[2] += g.z;
+						return;
+					}
+
+					if (v == 0xFFFFFFFF) {
+						tv[slot] = vi;
+						auto& t = tg[slot];
+						t.v[0] = g.x;
+						t.v[1] = g.y;
+						t.v[2] = g.z;
+						usedIdx[usedCount++] = slot;
+						return;
+					}
+
+					slot = (slot + step) & (LOCAL_CAP - 1);
+					step += 1;
+				}
+			};
+
 			//------------------------------------------------------------------
 			//  Tile inner loop
 			//------------------------------------------------------------------
@@ -6803,7 +7452,96 @@ void MeshRefine::ComputePhotometricGradient(
 				const float rayRowMulZ = rA12 * dyA;
 
 				const size_t cStart = MAXF(tx, (size_t)HalfSize);
-				for (size_t c = cStart; c < xEnd; ++c) {
+				size_t cScalar = cStart;
+#if MESHOPT_PG_AVX2
+				if (usePGAVX2) {
+					for (; cScalar + 8 <= xEnd; cScalar += 8) {
+						const size_t c = cScalar;
+						uint64_t m8;
+						memcpy(&m8, maskRow + c, sizeof(m8));
+						if (m8 == 0)
+							continue;
+						// scalar prepass in pixel order: face-setup cache fetch/fill
+						// (same fills the scalar path would do; the cache is a pure
+						// cache, so fill order only affects hit rate, never values).
+						// setups are copied BY VALUE at fetch time: the cache is
+						// direct-mapped, so a LATER lane's fill can overwrite an
+						// EARLIER lane's slot (two faces hashing together within one
+						// group); the scalar path fetches at the pixel, and the copy
+						// freezes exactly what it would have seen. Holding pointers
+						// here instead corrupted ~5% of groups (wrong triangle's
+						// barycentrics AND wrong vertices) -- caught as a +0.9%
+						// iteration-1 gradient-norm shift on Niwot.
+						FaceSetup setupsLocal[8];
+						uint32_t laneHasSetup = 0;
+						alignas(32) float nxl[8], nyl[8], nzl[8];
+						for (int k = 0; k < 8; ++k) {
+							if (!maskRow[c + (size_t)k]) {
+								nxl[k] = nyl[k] = nzl[k] = 0.f;
+								continue;
+							}
+							const FIndex fA = faceRowA[c + (size_t)k];
+							FaceSetup& setup = faceSetupCache[
+								((uint32_t)fA * 0x9E3779B1u) & (FACE_SETUP_CACHE_SIZE - 1)];
+							if (setup.key != fA) {
+								setup.key = fA;
+								const Face& faceA = rd.faces[fA];
+								const CamVert& cv0 = rd.verts[faceA[0]];
+								const CamVert& cv1 = rd.verts[faceA[1]];
+								const CamVert& cv2 = rd.verts[faceA[2]];
+								setup.g0 = rd.globalVert[faceA[0]];
+								setup.g1 = rd.globalVert[faceA[1]];
+								setup.g2 = rd.globalVert[faceA[2]];
+								const Grad& N = faceNormals[rd.globalFace[fA]];
+								setup.nx = N.x; setup.ny = N.y; setup.nz = N.z;
+								setup.invZ0 = cv0.invZ; setup.invZ1 = cv1.invZ; setup.invZ2 = cv2.invZ;
+								setup.su0 = cv0.x * setup.invZ0; setup.sv0 = cv0.y * setup.invZ0;
+								setup.su1 = cv1.x * setup.invZ1; setup.sv1 = cv1.y * setup.invZ1;
+								setup.su2 = cv2.x * setup.invZ2; setup.sv2 = cv2.y * setup.invZ2;
+								setup.invArea = 1.f / (
+									(setup.su1 - setup.su0) * (setup.sv2 - setup.sv0) -
+									(setup.sv1 - setup.sv0) * (setup.su2 - setup.su0));
+							}
+							setupsLocal[k] = setup;
+							laneHasSetup |= 1u << k;
+							nxl[k] = setup.nx; nyl[k] = setup.ny; nzl[k] = setup.nz;
+						}
+						// eight-wide: ray, grazing, projection, gradient gathers, sg
+						alignas(32) float sg8[8];
+						const uint32_t validLanes = SceneRefinePGGroupAVX2(pgCtx,
+							maskRow, depthRowA, pdZNCC,
+							rowF, rayRowMulX, rayRowMulY, rayRowMulZ,
+							nxl, nyl, nzl, (int)c, sg8);
+						if (validLanes == 0)
+							continue;
+						// scalar per-lane tail in pixel order: barycentric + tile-slot
+						// accumulation, byte-identical to the scalar path
+						for (int k = 0; k < 8; ++k) {
+							if (!(validLanes & (1u << k)))
+								continue;
+							ASSERT(laneHasSetup & (1u << k));
+							const float sg = sg8[k];
+#if MESHOPT_NEEDS_TILE_ENERGY
+							tileEnergy += sg * sg;
+#endif
+							const FaceSetup& setup = setupsLocal[k];
+							const float bpx = (float)(int)(c + (size_t)k), bpy = rowF;
+							const float bw0 = ((setup.su2 - setup.su1) * (bpy - setup.sv1) - (setup.sv2 - setup.sv1) * (bpx - setup.su1)) * setup.invArea;
+							const float bw1 = ((setup.su0 - setup.su2) * (bpy - setup.sv2) - (setup.sv0 - setup.sv2) * (bpx - setup.su2)) * setup.invArea;
+							const float bw2 = 1.f - bw0 - bw1;
+							const float bDen = 1.f / (bw0 * setup.invZ0 + bw1 * setup.invZ1 + bw2 * setup.invZ2);
+							const float bx = (bw0 * setup.invZ0) * bDen;
+							const float by = (bw1 * setup.invZ1) * bDen;
+							const float bz = 1.f - bx - by;
+							const Grad Ng(setup.nx * sg, setup.ny * sg, setup.nz * sg);
+							accum(setup.g0, Ng * bx);
+							accum(setup.g1, Ng * by);
+							accum(setup.g2, Ng * bz);
+						}
+					}
+				}
+#endif
+				for (size_t c = cScalar; c < xEnd; ++c) {
 					if (!maskRow[c]) {
 						// coalesce unmasked runs: skip 8 zero mask bytes at a time
 						while (c + 8 <= xEnd) {
@@ -6813,6 +7551,14 @@ void MeshRefine::ComputePhotometricGradient(
 								break;
 							c += 8;
 						}
+						// the landing pixel of a coalesce exit can itself be masked,
+						// and the loop's ++c silently dropped it (historical quirk:
+						// ~2e-4 relative on the iteration gradient norm, and the AVX2
+						// group path -- which checks every lane -- could never match
+						// bit-for-bit against it). Step back so ++c re-examines it.
+						// Safe: --c only runs after at least one 8-column jump.
+						if (maskRow[c])
+							--c;
 						continue;
 					}
 
@@ -7065,39 +7811,6 @@ void MeshRefine::ComputePhotometricGradient(
 #endif
 
 					const Grad Ng(Nx * sg, Ny * sg, Nz * sg);      // scale once
-
-					auto accum = [&](uint32_t vi, const Grad& g)
-					{
-						uint32_t slot = (vi * 0x9E3779B1u) & (LOCAL_CAP - 1);
-						uint32_t step = 1;
-
-						uint32_t* __restrict tv = tileVertices;
-						TGrad* __restrict tg = tileGrad;
-
-						for (;;) {
-							uint32_t v = tv[slot];
-							if (v == vi) {
-								auto& t = tg[slot];
-								t.v[0] += g.x;
-								t.v[1] += g.y;
-								t.v[2] += g.z;
-								return;
-							}
-
-							if (v == 0xFFFFFFFF) {
-								tv[slot] = vi;
-								auto& t = tg[slot];
-								t.v[0] = g.x;
-								t.v[1] = g.y;
-								t.v[2] = g.z;
-								usedIdx[usedCount++] = slot;
-								return;
-							}
-
-							slot = (slot + step) & (LOCAL_CAP - 1);
-							step += 1;
-						}
-					};
 
 #if MESHOPT_PG_FACECACHE
 					accum(setup.g0, Ng * bx);
@@ -7590,16 +8303,44 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 #endif
 #if MESHOPT_FUSED_ZNCC
 #if MESHOPT_ZNCC_BANDS
+#if !MESHOPT_DISABLE_TILE_SKIP
+	// tile-gated ZNCC column plan (reduced iterations only). Built once per
+	// reference view per evaluation: the pair loop is an omp-for over reference
+	// views, so this thread owns ALL of A's pairs consecutively; keyed by the
+	// pass counter because `iteration` resets every scale. A null plan means
+	// "evaluate everything" -- full iterations and tile-skip-off behave exactly
+	// as before this existed.
+	const ZNCCActivePlan* activePlan = nullptr;
+	if (tileSkipThisIter) {
+		static thread_local ZNCCActivePlan tlPlan;
+		static thread_local const View* tlPlanView = nullptr;
+		static thread_local uint64_t tlPlanPass = 0;
+		if (tlPlanView != &viewA || tlPlanPass != pairPassCounter) {
+			BuildZNCCActivePlan(viewA, tlPlan);
+			tlPlanView = &viewA;
+			tlPlanPass = pairPassCounter;
+		}
+		activePlan = &tlPlan;
+	}
+#else
+	constexpr const ZNCCActivePlan* activePlan = nullptr;
+#endif
 	const auto consumeZNCCBand = [&](const TImage<Real>& band, size_t rowBegin, size_t rowEnd, bool finalizePair) {
+#if MESHOPT_PROFILE
+		MeshProf::Timer _tPG; // ZNCC:grad -- the gradient share hiding inside the P_ZNCC call
+#endif
 		ComputePhotometricGradient(
 			viewA, g_cameraData[idxImageA], faceNormals, cameraA, cameraB, viewB,
 			band, mask, threadGrad, threadNorm, RegularizationScale, faceSetupEpoch,
 			tileEnergyLocal[idxImageA], rowBegin, rowEnd, rowBegin, finalizePair);
+#if MESHOPT_PROFILE
+		MeshProf::AddTL(MeshProf::P_PhotoGrad, _tPG.ms());
+#endif
 	};
 #ifdef MESHOPT_CERES
-	const float score(MESHOPT_FUSED_ZNCC_FN(imageA, imageMeanA, imageVarA, imageAB, mask, imageDZNCC, consumeZNCCBand));
+	const float score(MESHOPT_FUSED_ZNCC_FN(imageA, imageMeanA, imageVarA, imageAB, mask, imageDZNCC, consumeZNCCBand, activePlan));
 #else
-	MESHOPT_FUSED_ZNCC_FN(imageA, imageMeanA, imageVarA, imageAB, mask, imageDZNCC, consumeZNCCBand);
+	MESHOPT_FUSED_ZNCC_FN(imageA, imageMeanA, imageVarA, imageAB, mask, imageDZNCC, consumeZNCCBand, activePlan);
 #endif
 #else
 #ifdef MESHOPT_CERES
@@ -7901,26 +8642,29 @@ static unsigned GetHostBaseClockMHz()
 // landing near the bar performs about the same either way, by definition, so a
 // wrong call there costs little. It is the far-from-the-bar cases -- a fast desktop
 // against a mid-range card, a laptop against the same card -- that this has to get
-// right, and those it gets right by a wide margin. Every number is logged, and all
-// five thresholds above are overridable, so a machine that contradicts the model
-// can be pinned with --cuda-policy instead of argued with.
+// right, and those it gets right by a wide margin. Every number is logged under
+// REFINE_DIAG, and all five thresholds above are overridable, so a machine that
+// contradicts the model can be pinned with --cuda-policy instead of argued with.
 //
 // Any input this platform cannot report (clock, RAM, device capability) simply stops
 // gating: an unreadable value is not evidence that the host is slow.
 bool Scene::PreferCPUMeshRefinement(unsigned nResolutionLevel, unsigned nMinResolution) const
 {
-	// Every branch below logs the reason it decided, because the caller cannot know
-	// it and must not paraphrase it: "the GPU lost on speed", "the GPU cannot hold
-	// the scene" and "there is no GPU path on this driver" are three different
-	// answers that all return true here.
+	// Every branch below says which device won, and -- under REFINE_DIAG -- why,
+	// because the caller cannot know it and must not paraphrase it: "the GPU lost on
+	// speed", "the GPU cannot hold the scene" and "there is no GPU path on this
+	// driver" are three different answers that all return true here. The two
+	// unconditional branches phrase themselves in terms of what the user can act on
+	// (a driver, a card that is too small); the reasoning behind them is gated.
 	//
 	// No usable GPU path at all on a CUDA-12+ driver (the refine kernels are on the
 	// legacy driver API -- see CUDA::HasLegacyDriverAPI), so there is nothing to
 	// weigh. Answering early keeps the caller from snapshotting the mesh and
 	// entering RefineMeshCUDA only to be refused there.
 	if (!SEACAVE::CUDA::HasLegacyDriverAPI()) {
-		LOG(_T("Mesh refinement device check: this driver does not export the legacy CUDA entry points the GPU ")
-			_T("refinement kernels are built on (removed in CUDA 12.0); there is no GPU path here -- refining on the CPU"));
+		LOG(_T("Mesh refinement: GPU acceleration is not available with this display driver; using the CPU"));
+		REFINE_DIAG(_T("device check: this driver does not export the legacy CUDA entry points the GPU ")
+			_T("refinement kernels are built on (removed in CUDA 12.0); there is no GPU path here"));
 		return true;
 	}
 
@@ -7930,8 +8674,9 @@ bool Scene::PreferCPUMeshRefinement(unsigned nResolutionLevel, unsigned nMinReso
 	// run's worth of time back to the CPU path (see EstimateRefineMeshCUDAVRAM).
 	uint64_t needBytes(0), budgetBytes(0);
 	if (EstimateRefineMeshCUDAVRAM(nResolutionLevel, nMinResolution, needBytes, budgetBytes) && needBytes > budgetBytes) {
-		LOG(_T("Mesh refinement device check: the finest scale needs about %s of device memory but this GPU ")
-			_T("offers only %s; refining on the CPU"),
+		LOG(_T("Mesh refinement: this GPU does not have enough memory for a scene this size; using the CPU"));
+		REFINE_DIAG(_T("device check: the finest scale needs about %s of device memory but this GPU ")
+			_T("offers only %s"),
 			Util::formatBytes(needBytes).c_str(), Util::formatBytes(budgetBytes).c_str());
 		return true;
 	}
@@ -7967,15 +8712,43 @@ bool Scene::PreferCPUMeshRefinement(unsigned nResolutionLevel, unsigned nMinReso
 	const bool bFastEnough = mhz == 0 || ghzThreads >= reqGhzThreads;
 	const bool bPreferCPU = bEnoughRAM && bEnoughThreads && bAVX2 && bFastEnough;
 
-	LOG(_T("Mesh refinement device check: GPU %s"), gpuDesc.c_str());
-	LOG(_T("Mesh refinement host check: %.1f GB RAM, %u usable threads, %s base clock, %s, score %s -> %s path ")
-		_T("(CPU path needs >= %.0f GB, >= %u threads, AVX2, and >= %.0f GHz-threads against this device)"),
-		totalPhys / (double)GB, threads,
-		mhz > 0 ? String::FormatString(_T("%.2f GHz"), mhz / 1000.0).c_str() : _T("unknown"),
-		bAVX2 ? _T("AVX2") : _T("no AVX2"),
-		mhz > 0 ? String::FormatString(_T("%.0f GHz-threads"), ghzThreads).c_str() : _T("unknown (clock unavailable, not gated on it)"),
-		bPreferCPU ? _T("CPU") : _T("GPU"),
-		(double)MESHOPT_CPU_PATH_MIN_RAM_GB, (unsigned)MESHOPT_CPU_PATH_MIN_THREADS, reqGhzThreads);
+	// WHICH device runs is the user's business -- it sets what the stage costs, and
+	// they can override it with --cuda-policy. WHY this one won is not: the criteria,
+	// the thresholds and the scoring are how the refiner is tuned, so the reason and
+	// the capability dump behind it ride the gate.
+	//
+	// The four criteria are ANDed, so when the GPU wins it is the FIRST one that
+	// failed that decided it -- name that one, and when the CPU wins name the margin
+	// it won by.
+	LOG(_T("Mesh refinement: using the %s"), bPreferCPU ? _T("CPU") : _T("GPU"));
+	if (REFINE_DIAG_ENABLED()) {
+		String why;
+		if (!bEnoughRAM)
+			why = String::FormatString(_T("host has %.1f GB RAM, under the %.0f GB the CPU path needs"),
+				totalPhys / (double)GB, (double)MESHOPT_CPU_PATH_MIN_RAM_GB);
+		else if (!bEnoughThreads)
+			why = String::FormatString(_T("host has %u usable threads, under the %u the CPU path needs"),
+				threads, (unsigned)MESHOPT_CPU_PATH_MIN_THREADS);
+		else if (!bAVX2)
+			why = _T("host has no AVX2, which the CPU path's inner loops need to stay competitive");
+		else if (!bFastEnough)
+			why = String::FormatString(_T("host scores %.0f GHz-threads, under the %.0f needed against this device"),
+				ghzThreads, reqGhzThreads);
+		else if (mhz == 0)
+			why = _T("host meets RAM/threads/AVX2 and its clock is unreadable, so speed does not gate");
+		else
+			why = String::FormatString(_T("host scores %.0f GHz-threads against the %.0f needed for this device"),
+				ghzThreads, reqGhzThreads);
+		REFINE_DIAG(_T("device check: %s path -- %s"), bPreferCPU ? _T("CPU") : _T("GPU"), why.c_str());
+		REFINE_DIAG(_T("Mesh refinement device check: GPU %s"), gpuDesc.c_str());
+		REFINE_DIAG(_T("Mesh refinement host check: %.1f GB RAM, %u usable threads, %s base clock, %s, score %s ")
+			_T("(CPU path needs >= %.0f GB, >= %u threads, AVX2, and >= %.0f GHz-threads against this device)"),
+			totalPhys / (double)GB, threads,
+			mhz > 0 ? String::FormatString(_T("%.2f GHz"), mhz / 1000.0).c_str() : _T("unknown"),
+			bAVX2 ? _T("AVX2") : _T("no AVX2"),
+			mhz > 0 ? String::FormatString(_T("%.0f GHz-threads"), ghzThreads).c_str() : _T("unknown (clock unavailable, not gated on it)"),
+			(double)MESHOPT_CPU_PATH_MIN_RAM_GB, (unsigned)MESHOPT_CPU_PATH_MIN_THREADS, reqGhzThreads);
+	}
 	return bPreferCPU;
 }
 #endif // _USE_CUDA
@@ -8061,11 +8834,17 @@ void Scene::ResolveRefineMeshSafeSettings(unsigned& nResolutionLevel, unsigned n
 		const uint64_t ceiling = (pinnedEstimate < target) ? (target - pinnedEstimate) : 0;
 		if (floorBytes <= ceiling) {
 			if (level != requestedLevel || views != requestedViews) {
+				// Stays unconditional: it changes settings the user chose, and the result
+				// with them. Both settings are command-line options, so naming them
+				// exposes nothing internal -- unlike the search that picked them.
 				LOG(_T("Pre-flight memory check: this machine (%.1f GB RAM) can not fit the requested ")
 					_T("settings (max-views %u, resolution-level %u) for a scene this size; automatically ")
-					_T("using max-views %u, resolution-level %u instead (last-resort, quality-affecting ")
-					_T("fallback -- every memory-neutral option was assumed exhausted first)"),
+					_T("using max-views %u, resolution-level %u instead (this affects quality)"),
 					totalPhys / (double)GB, requestedViews, requestedLevel, views, level);
+				REFINE_DIAG(_T("pre-flight: settled after %u level bump(s); per-view floor %llu B/px, ")
+					_T("pinned estimate %.2f GB against a %.2f GB target"),
+					bump, (unsigned long long)kStreamBytesPerPixel,
+					pinnedEstimate / (double)GB, target / (double)GB);
 				nMaxViews = views;
 				nResolutionLevel = level;
 			}
@@ -8080,8 +8859,10 @@ void Scene::ResolveRefineMeshSafeSettings(unsigned& nResolutionLevel, unsigned n
 	// genuinely at or past what this machine can hold at full quality.
 	LOG(_T("Pre-flight memory check: this scene may exceed what this machine (%.1f GB RAM) can hold even at ")
 		_T("the most conservative settings tried (max-views %u, resolution-level %u); proceeding anyway -- ")
-		_T("expect heavy batching, or an out-of-memory abort if this estimate is still short"),
+		_T("expect a slow run, or an out-of-memory failure if this estimate is still short"),
 		totalPhys / (double)GB, views, level);
+	REFINE_DIAG(_T("pre-flight: exhausted %u level bump(s) without clearing the estimate; the runtime ")
+		_T("batching/eviction path and the PlaneAlloc backstop take it from here"), kMaxLevelBump);
 	nMaxViews = views;
 	nResolutionLevel = level;
 }
@@ -8110,9 +8891,27 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 	if (pointcloud.IsEmpty() && !ImagesHaveNeighbors())
 		SampleMeshWithVisibility();
 
+	// Resolve the scene's atlas dimension ONCE, here, while the cameras are still at the
+	// resolution the scene was stored at -- which is also the resolution TextureMesh will
+	// texture from. InitImages() rescales them per scale below, so deriving this inside the
+	// loop returns a gsd that grows with every coarser scale and a dimension that halves
+	// with it. Measured symptom before this moved out: budgets of 0.1M / 0.4M / 1.6M faces
+	// across three scales where the single right answer was 4.07M.
+	extern int ComputeSceneAtlasDim(const ImageArr& images, const Mesh& mesh,
+		int* pCeiling, double* pWantDim, double* pSurfaceArea, double* pGsd);
+	const int atlasDim = ComputeSceneAtlasDim(images, mesh, NULL, NULL, NULL, NULL);
+
 	MeshRefine refine(*this, nReduceMemory, nAlternatePair, fRegularityWeight, fRatioRigidityElasticity, nResolutionLevel, nMinResolution, nMaxViews, nMaxThreads);
 	if (!refine.IsValid())
 		return false;
+#if !MESHOPT_DISABLE_TILE_SKIP
+	// results-affecting mode, so the log states it up front either way (the
+	// per-scale [TILE-SKIP] line then says what it actually retired)
+	VERBOSE("Mesh refinement tile-skip: %s (warmup %d, full refresh every %d iterations, halo %d tile%s; OPENMVS_REFINE_TILE_SKIP=0/1 overrides, OPENMVS_REFINE_BASELINE=1 disables all refine optimizations)",
+		refine.tileSkipEnabled ? "enabled" : "disabled (default: costs ~3%% final gradient norm)",
+		MESHOPT_TILE_SKIP_WARMUP, MESHOPT_TILE_SKIP_REFRESH,
+		MESHOPT_TILE_SKIP_HALO, MESHOPT_TILE_SKIP_HALO == 1 ? "" : "s");
+#endif
 #if MESHOPT_MEM_DIAG
 	const auto memDiagT0 = std::chrono::steady_clock::now();
 #endif
@@ -8135,7 +8934,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 		// init images
 		const Real scale(POWI(fScaleStep, nScales - nScale - 1));
 		const Real step(POWI(2.f, nScales - nScale));
-		DEBUG_ULTIMATE("Refine mesh at: %.2f image scale", scale);
+		REFINE_DIAG("Refine mesh at: %.2f image scale", scale);
 		Real initScale = scale;
 #if MESHOPT_REFINE_HIRES_FINAL
 		// Option A: only the finest scale loads one resolution level finer.
@@ -8179,7 +8978,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #if MESHOPT_PROFILE
 		MeshProf::Timer _tSub;
 #endif
-		refine.SubdivideMesh(effMaxFaceArea, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
+		refine.SubdivideMesh(effMaxFaceArea, atlasDim, nScale == 0 ? fDecimateMesh : 1.f, nCloseHoles, nEnsureEdgeSize);
 #if MESHOPT_PROFILE
 		MeshProf::Add(MeshProf::P_Subdivide, _tSub.ms());
 		MeshProf::Timer _tLVPost;
@@ -8220,15 +9019,18 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 			ceres::GradientProblemSolver::Summary summary;
 			// SolveProblem
 			ceres::Solve(options, problem, problemData->GetParameters(), &summary);
-			DEBUG_ULTIMATE(summary.FullReport().c_str());
+			REFINE_DIAG(summary.FullReport().c_str());
 			switch (summary.termination_type) {
 			case ceres::TerminationType::NO_CONVERGENCE:
-				DEBUG_EXTRA("CERES: maximum number of iterations reached!");
+				REFINE_DIAG("CERES: maximum number of iterations reached!");
 			case ceres::TerminationType::CONVERGENCE:
 			case ceres::TerminationType::USER_SUCCESS:
 				break;
 			default:
-				VERBOSE("CERES surface refine error: %s!", summary.message.c_str());
+				// which solver, and what it said, is internal; that refinement failed
+				// is not
+				VERBOSE("error: mesh refinement failed");
+				REFINE_DIAG("CERES surface refine error: %s!", summary.message.c_str());
 				return false;
 			}
 			ASSERT(summary.IsSolutionUsable());
@@ -8273,8 +9075,20 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 			Util::Progress progress(_T("Processed iterations"), iters);
 			GET_LOGCONSOLE().Pause();
 
+			// Carried out of the loop for the one-line per-scale summary that replaced
+			// the per-iteration table below. `lastGradNorm` is only ever filled inside
+			// the gate, because that norm is an O(vertices) reduction this loop has no
+			// other use for; the summary reports it as unavailable when it is closed.
+			const auto scaleT0 = std::chrono::steady_clock::now();
+			int itersRun = 0;
+			double lastCost = 0.0, lastGradNorm = -1.0;
+
 			for (int iter = 0; iter < iters; ++iter)
 			{
+				// counted, not derived from `iter`: the converged-exit below
+				// fast-forwards the index, so iter+1 would claim the skipped
+				// iterations ran
+				++itersRun;
 #if MESHOPT_MEM_DIAG
 				{
 					const Util::MemoryInfo mi = Util::GetMemoryInfo();
@@ -8287,6 +9101,20 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				refine.nAlternatePair = (iter + 1 < iters ? nAlternatePair : 0);
 				refine.ratioRigidityElasticity =
 					(iter <= iters * 7 / 10 ? fRatioRigidityElasticity : 1.f);
+				// Tile-skip schedule (no effect while the feature is off): full
+				// evaluations for the first MESHOPT_TILE_SKIP_WARMUP iterations of the
+				// scale (the active set needs measured energy first), then on a fixed
+				// cadence so quiescent tiles are re-measured and can reactivate (the
+				// cadence is odd on purpose: under --alternate-pair 1 the pair set
+				// alternates with iteration parity, and an even cadence would only
+				// ever re-measure one parity), and on the final iteration so every
+				// scale still ends with the same full-frame, both-directions polish
+				// over the whole mesh as before. The converged-exit fast-forward jumps
+				// straight to that final iteration, so it lands on a full evaluation
+				// by construction.
+				refine.tileSkipForceFull = iter < MESHOPT_TILE_SKIP_WARMUP
+					|| (iter + 1) % MESHOPT_TILE_SKIP_REFRESH == 0
+					|| iter + 1 >= iters;
 
 				bool rebuildOctree = true;
 
@@ -8349,10 +9177,20 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #endif
 				}
 #endif
-				// convergence trace comparable across gate configs and with the CUDA
-				// path's per-iteration log (cost is 0 unless built with Ceres)
-				DEBUG_EXTRA("\t%2d. f: %.5f (%.4e)\tg: %.5f (%.4e)\ts: %.3f", iter + 1,
-					cost, cost / (double)nVerts, gradients.norm(), gradients.norm() / (double)nVerts, gstep);
+				// Convergence trace comparable across gate configs and with the CUDA
+				// path's per-iteration log (cost is 0 unless built with Ceres). One line
+				// per iteration per scale, and the log console is paused for the whole
+				// loop, so at the default verbosity these arrived 18-30 at a time in a
+				// single burst -- the per-scale summary after the loop is what remains
+				// there. gradients.norm() is an O(vertices) reduction with no other
+				// consumer, so it is computed once, inside the gate, rather than the
+				// twice this line used to ask for unconditionally.
+				lastCost = cost;
+				if (REFINE_DIAG_ENABLED()) {
+					lastGradNorm = gradients.norm();
+					REFINE_DIAG("\t%2d. f: %.5f (%.4e)\tg: %.5f (%.4e)\ts: %.3f", iter + 1,
+						cost, cost / (double)nVerts, lastGradNorm, lastGradNorm / (double)nVerts, gstep);
+				}
 				// Gradient update
 				// -------------------------------------------------------------
 				const float step = float(gstep);
@@ -8641,7 +9479,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 					cvPrevEnergy[par] = refine.photoEnergyLast;
 					if (prev > 0.0 && prev - refine.photoEnergyLast < prev * MESHOPT_CONVERGED_EXIT_RTOL) {
 						if (++cvHits >= MESHOPT_CONVERGED_EXIT_HITS) {
-							DEBUG_EXTRA("Photo-consistency converged at iteration %d/%d; skipping to the final iteration", iter + 1, iters);
+							REFINE_DIAG("Photo-consistency converged at iteration %d/%d; skipping to the final iteration", iter + 1, iters);
 							for (int k = iter; k < iters - 2; ++k)
 								gstep *= decay; // fast-forward the scheduled step decay
 							iter = iters - 2;
@@ -8656,6 +9494,34 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 
 			GET_LOGCONSOLE().Play();
 			progress.close();
+
+			// What the per-iteration table above used to say, once per scale instead of
+			// once per iteration: how big the mesh was, how many of the scheduled
+			// iterations actually ran (fewer means the converged-exit fired), and how
+			// long it took. Gated with the rest: the coarse-to-fine schedule, the
+			// iteration budget and the convergence values are all internal, and
+			// RefineMesh's caller already prints the finished mesh's size and runtime.
+			REFINE_DIAG("Refined scale %u/%u at %.2f image scale: %u vertices, %u faces, "
+				"%d/%d iterations%s (%.1fs)",
+				nScale + 1, nScales, (double)scale, mesh.vertices.GetSize(), mesh.faces.GetSize(),
+				itersRun, iters,
+				lastGradNorm >= 0.0
+					? String::FormatString(_T(", final f: %.5f g: %.5f"), lastCost, lastGradNorm).c_str()
+					: (lastCost != 0.0 ? String::FormatString(_T(", final f: %.5f"), lastCost).c_str() : _T("")),
+				std::chrono::duration<double>(std::chrono::steady_clock::now() - scaleT0).count());
+#if !MESHOPT_DISABLE_TILE_SKIP
+			// what the active set actually retired at this scale: gradient-stage
+			// tile evaluations gated per pair, plus reference views so quiescent
+			// that their variance pass and every pair warp/ZNCC were skipped whole
+			if (refine.tileSkipEnabled && refine.tileSkipStatReducedIters > 0)
+				REFINE_DIAG("[TILE-SKIP] scale %u/%u: %llu reduced iteration(s) retired %llu/%llu tile evaluations (%.1f%%), %llu whole reference-view passes skipped",
+					nScale + 1, nScales,
+					(unsigned long long)refine.tileSkipStatReducedIters,
+					(unsigned long long)refine.tileSkipStatSkippedTiles,
+					(unsigned long long)refine.tileSkipStatTotalTiles,
+					refine.tileSkipStatTotalTiles != 0 ? 100.0 * (double)refine.tileSkipStatSkippedTiles / (double)refine.tileSkipStatTotalTiles : 0.0,
+					(unsigned long long)refine.tileSkipStatSkippedViews);
+#endif
 #else
 			// loop a constant number of iterations and apply the gradient
 			int iters(75);

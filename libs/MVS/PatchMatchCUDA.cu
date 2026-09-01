@@ -29,7 +29,13 @@
 *	  containing it.
 */
 
+#include "PatchMatchCUDASelect.h"
+
+#if !PATCHMATCH_CUDA_LEGACY
+
 #include "PatchMatchCUDA.inl"
+
+#include <cuda_fp16.h>
 
 // =====================================================================
 // Optional perf toggles (semantics-preserving; flip to 0 to A/B test).
@@ -45,13 +51,20 @@
 //                           reorder loads. Pure annotation, zero runtime
 //                           cost when off.
 //
-// PMCUDA_OPT_DROP_REDUNDANT_SYNC :
-//                           remove the per-iteration cudaDeviceSynchronize
-//                           calls in RunCUDA. Default-stream kernels are
-//                           already serialized w.r.t. each other and the
-//                           trailing cudaMemcpy is a sync copy, so the
-//                           syncs are pure host round-trips. Identical
-//                           results; just no host stalls between launches.
+// PMCUDA_TDR_MAX_PIXEL_VIEWS :
+//                           cap on (pixels x views) processed by a single
+//                           checkerboard kernel launch. Windows' WDDM driver
+//                           resets the GPU when one kernel runs longer than
+//                           TdrDelay (2s default); the propagation kernels
+//                           scale with image area x views, so on low-end
+//                           GPUs a full-frame launch can cross that line and
+//                           kill the whole run. Each checkerboard phase only
+//                           reads OPPOSITE-parity cells written by the
+//                           previous phase (every neighbor offset in the
+//                           sampling tables has odd |dx|+|dy|), so splitting
+//                           one phase into several row-band launches is
+//                           bit-identical to a single launch -- banding is a
+//                           pure reliability measure, not an approximation.
 // =====================================================================
 #ifndef PMCUDA_OPT_FAST_INTRIN
 #define PMCUDA_OPT_FAST_INTRIN 1
@@ -59,8 +72,56 @@
 #ifndef PMCUDA_OPT_RESTRICT
 #define PMCUDA_OPT_RESTRICT 1
 #endif
-#ifndef PMCUDA_OPT_DROP_REDUNDANT_SYNC
-#define PMCUDA_OPT_DROP_REDUNDANT_SYNC 1
+#ifndef PMCUDA_TDR_MAX_PIXEL_VIEWS
+#define PMCUDA_TDR_MAX_PIXEL_VIEWS (4<<20)
+#endif
+
+// ---------------------------------------------------------------------
+// Occupancy controls for the checkerboard kernels.
+//
+// MEASURED, 276-image run, Quadro RTX 5000 (Turing SM 7.5), photometric device=:
+//
+//   no __launch_bounds__      27820 ms   <- default, and the fastest
+//   __launch_bounds__(512)    28168 ms
+//   __launch_bounds__(256)    31778 ms
+//
+// Monotonic, and the opposite of the obvious prediction. ProcessPixel carries a
+// lot of per-thread state -- costArray[8][MAXV] (dynamically indexed, hence
+// local-memory resident), the RefPatch, plus the sampling/selection arrays -- so
+// the expectation was that giving nvcc a bigger register budget would cut spill
+// and win. It loses. Turing has 64K registers and room for 1024 threads per SM,
+// so __launch_bounds__ caps registers at 65536/maxThreadsPerBlock: 128/thread at
+// 512 threads, 255 at 256. Raising that cap let nvcc keep more per thread, which
+// dropped resident threads per SM, and this kernel is latency-bound -- it needs
+// the occupancy far more than it needs to avoid the spill.
+//
+// So the knobs stay, defaulted OFF: the stock nvcc heuristic wins. The one
+// direction NOT yet tried is the tightening one -- PMCUDA_USE_LAUNCH_BOUNDS=1
+// with PMCUDA_MIN_BLOCKS=2 at BLOCK_H=16 pins 2 blocks x 512 threads = full
+// Turing occupancy at 64 registers/thread. That is the way the evidence points.
+//
+// Neither knob changes results. Every pixel in a checkerboard phase reads only
+// opposite-parity cells written by the previous phase, and the RNG is seeded from
+// the pixel index, so which thread owns a pixel is irrelevant.
+// ---------------------------------------------------------------------
+#ifndef PMCUDA_BLOCK_W
+#define PMCUDA_BLOCK_W 32
+#endif
+#ifndef PMCUDA_BLOCK_H
+#define PMCUDA_BLOCK_H 16
+#endif
+#ifndef PMCUDA_USE_LAUNCH_BOUNDS
+#define PMCUDA_USE_LAUNCH_BOUNDS 0
+#endif
+#ifndef PMCUDA_MIN_BLOCKS
+#define PMCUDA_MIN_BLOCKS 0
+#endif
+#if !PMCUDA_USE_LAUNCH_BOUNDS
+#define PMCUDA_LAUNCH_BOUNDS
+#elif PMCUDA_MIN_BLOCKS > 0
+#define PMCUDA_LAUNCH_BOUNDS __launch_bounds__(PMCUDA_BLOCK_W*PMCUDA_BLOCK_H, PMCUDA_MIN_BLOCKS)
+#else
+#define PMCUDA_LAUNCH_BOUNDS __launch_bounds__(PMCUDA_BLOCK_W*PMCUDA_BLOCK_H)
 #endif
 
 #if PMCUDA_OPT_FAST_INTRIN
@@ -93,13 +154,54 @@
 // patch stepping
 #define nSizeStep 2
 
+// number of samples the strided patch window visits: the loops run
+// -nSizeHalfWindow..+nSizeHalfWindow step nSizeStep in each axis
+#define nSizeTexels (((nSizeHalfWindow*2)/nSizeStep + 1) * ((nSizeHalfWindow*2)/nSizeStep + 1))
+
 
 namespace MVS {
 
 namespace CUDA {
 
 #define ImagePixels cudaTextureObject_t
-#define RandState curandState
+
+// ---------------------------------------------------------------------
+// Stateless per-pixel RNG.
+//
+// The original code kept one curandState (XORWOW) per pixel in global memory:
+// 48 B/pixel of VRAM, an expensive curand_init() sweep per scale, and a global
+// load+store around every draw. PatchMatch only needs decorrelated uniforms,
+// so each kernel instance derives a small register-resident xorshift32 state
+// from (pixel index, launch salt) through an integer finalizer. Determinism is
+// preserved (same inputs -> same outputs) and, because the seed depends only
+// on the pixel, results are independent of the TDR row-banding. The draw
+// SEQUENCE differs from curand's, so outputs differ from the old build the
+// same way a different fixed seed would: statistically equivalent.
+// ---------------------------------------------------------------------
+struct RNGState {
+	uint32_t s;
+};
+__device__ inline RNGState MakeRNG(int idx, uint32_t salt) {
+	uint32_t x = (uint32_t)idx * 0x9E3779B9u + salt * 0x85EBCA6Bu + 0x1234567u;
+	// splitmix32-style finalizer: adjacent (idx,salt) values map to well-mixed seeds
+	x ^= x >> 16; x *= 0x7FEB352Du;
+	x ^= x >> 15; x *= 0x846CA68Bu;
+	x ^= x >> 16;
+	RNGState r; r.s = x | 1u; // xorshift32 state must be non-zero
+	return r;
+}
+__device__ inline uint32_t RandNext(RNGState& r) {
+	uint32_t x = r.s;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	return r.s = x;
+}
+// uniform float in (0,1], matching curand_uniform()'s range
+__device__ inline float RandUniform(RNGState& r) {
+	return 1.f - (__uint_as_float(0x3F800000u | (RandNext(r) >> 9)) - 1.f);
+}
+#define RandState RNGState
 
 // set/check a bit
 __device__ constexpr void SetBit(unsigned& input, unsigned i) {
@@ -155,12 +257,12 @@ __device__ inline void PDF2CDF(float* probs, const int numProbs) {
 
 
 // generate a random normal
-__device__ inline Point3 GenerateRandomNormal(const CUDA::Camera& camera, const Point2i& p, RandState* randState)
+__device__ inline Point3 GenerateRandomNormal(const CUDA::Camera& camera, const Point2i& p, RandState& randState)
 {
 	float q1, q2, s;
 	do {
-		q1 = 2.f * curand_uniform(randState) - 1.f;
-		q2 = 2.f * curand_uniform(randState) - 1.f;
+		q1 = 2.f * RandUniform(randState) - 1.f;
+		q2 = 2.f * RandUniform(randState) - 1.f;
 		s = q1 * q1 + q2 * q2;
 	} while (s >= 1.f);
 	const float sq = PM_SQRTF(1.f - s);
@@ -176,13 +278,13 @@ __device__ inline Point3 GenerateRandomNormal(const CUDA::Camera& camera, const 
 }
 
 // randomly perturb a normal
-__device__ inline Point3 GeneratePerturbedNormal(const CUDA::Camera& camera, const Point2i& p, const Point3& normal, RandState* randState, const float perturbation)
+__device__ inline Point3 GeneratePerturbedNormal(const CUDA::Camera& camera, const Point2i& p, const Point3& normal, RandState& randState, const float perturbation)
 {
 	const Point3 viewDirection = camera.model.ViewDirection(p);
 
-	const float a1 = (curand_uniform(randState) - 0.5f) * perturbation;
-	const float a2 = (curand_uniform(randState) - 0.5f) * perturbation;
-	const float a3 = (curand_uniform(randState) - 0.5f) * perturbation;
+	const float a1 = (RandUniform(randState) - 0.5f) * perturbation;
+	const float a2 = (RandUniform(randState) - 0.5f) * perturbation;
+	const float a3 = (RandUniform(randState) - 0.5f) * perturbation;
 
 	const float sinA1 = PM_SINF(a1);
 	const float sinA2 = PM_SINF(a2);
@@ -208,14 +310,18 @@ __device__ inline Point3 GeneratePerturbedNormal(const CUDA::Camera& camera, con
 	return normalPerturbed.normalized();
 }
 
-// randomly perturb a normal
-__device__ inline float GeneratePerturbedDepth(float depth, RandState* randState, const float perturbation, const PatchMatch::Params& params)
+// randomly perturb a depth
+__device__ inline float GeneratePerturbedDepth(float depth, RandState& randState, const float perturbation, const PatchMatch::Params& params)
 {
 	const float depthMinPerturbed = (1.f - perturbation) * depth;
 	const float depthMaxPerturbed = (1.f + perturbation) * depth;
 	float depthPerturbed;
 	do {
-		depthPerturbed = curand_uniform(randState) * (depthMaxPerturbed - depthMinPerturbed) + depthMinPerturbed;
+		depthPerturbed = RandUniform(randState) * (depthMaxPerturbed - depthMinPerturbed) + depthMinPerturbed;
+	// NOTE: '&&' is unsatisfiable (a value cannot be below fDepthMin AND above
+	// fDepthMax), so this loop always exits after one draw -- upstream behavior,
+	// kept verbatim because "fixing" it to '||' would change the random sequence
+	// and therefore the results
 	} while (depthPerturbed < params.fDepthMin && depthPerturbed > params.fDepthMax);
 	return depthPerturbed;
 }
@@ -263,14 +369,28 @@ __device__ inline Point3 ComputeDepthGradient(const LinearCameraModel& model, fl
 		(model.p.x()-pos.x())*d.x()+(model.p.y()-pos.y())*d.y()-depth).normalized();
 }
 
-// compose tho homography matrix that transforms a point from reference to source camera through the given plane
-__device__ inline Matrix3 ComputeHomography(const CUDA::Camera& refCamera, const CUDA::Camera& trgCamera, const Point2& p, const Point4& plane)
+// compose the homography that maps a reference-image point to the source image
+// through the given plane, from the precomputed per-pair constants:
+//   H = A + b * (n^T K0^-1) / (n . X(p,d))
+// where A = K1*R1*R0^T*K0^-1 and b = K1*R1*(C0-C1) (see PairConstants); this is
+// algebraically identical to the former per-call K1*(R1*R0^T + t*n^T)*K0^-1
+// (which re-derived K0^-1 and two full 3x3 products for EVERY plane scored)
+__device__ inline Matrix3 ComputeHomography(const PatchMatch::PairConstants& pair, const LinearCameraModel& refModel, const Point2& p, const Point4& plane)
 {
-	const Point3 X = refCamera.model.TransformPointI2C(p, plane.w());
-	const Point3 normal = plane.topLeftCorner<3,1>();
-	const Point3 t = (refCamera.pose.C - trgCamera.pose.C) / (normal.dot(X));
-	const Matrix3 H = trgCamera.pose.R * (refCamera.pose.R.transpose() + t*normal.transpose());
-	return trgCamera.model.K() * H * refCamera.model.K().inverse();
+	const Point3 n = plane.topLeftCorner<3,1>();
+	const Point3 X = refModel.TransformPointI2C(p, plane.w());
+	const float s = 1.f / n.dot(X);
+	// kn = n^T * K0^-1, exploiting K0's upper-triangular structure
+	const Point3 kn(
+		n.x() / refModel.f.x(),
+		n.y() / refModel.f.y(),
+		n.z() - (n.x() * refModel.p.x()) / refModel.f.x() - (n.y() * refModel.p.y()) / refModel.f.y());
+	const Point3 bs(pair.b[0] * s, pair.b[1] * s, pair.b[2] * s);
+	Matrix3 H; H <<
+		pair.A[0] + bs.x() * kn.x(), pair.A[1] + bs.x() * kn.y(), pair.A[2] + bs.x() * kn.z(),
+		pair.A[3] + bs.y() * kn.x(), pair.A[4] + bs.y() * kn.y(), pair.A[5] + bs.y() * kn.z(),
+		pair.A[6] + bs.z() * kn.x(), pair.A[7] + bs.z() * kn.y(), pair.A[8] + bs.z() * kn.z();
+	return H;
 }
 
 // weight a neighbor texel based on color similarity and distance to the center texel
@@ -281,6 +401,61 @@ __device__ inline float ComputeBilateralWeight(int xDist, int yDist, float pix, 
 	const float spatialDistSq = float(xDist * xDist + yDist * yDist);
 	const float colorDistSq = Square(pix - centerPix);
 	return PM_EXPF(spatialDistSq * sigmaSpatial + colorDistSq * sigmaColor);
+}
+
+// ---------------------------------------------------------------------
+// Reference-patch invariants.
+//
+// Every quantity ScorePlane derives from the REFERENCE image depends only on the
+// pixel p -- not on the plane hypothesis and not on the target view. ProcessPixel
+// evaluates 13 hypotheses (8 checkerboard neighbors + the current plane + up to 4
+// refinements) against nNumViews targets, so the reference half of the patch loop
+// used to be recomputed 13*nNumViews times per pixel per iteration when one
+// computation would do: at the default 8 views that is 104 repetitions of 25
+// texture fetches and 25 bilateral exp() calls.
+//
+// Building it once and passing it in leaves the arithmetic untouched -- the sums
+// are accumulated over the same texels in the same order, so they are bit-identical
+// to the fused loop -- and removes roughly half of the kernel's texture traffic
+// along with nearly all of its exp() calls.
+// ---------------------------------------------------------------------
+struct RefPatch {
+	float weight[nSizeTexels];       // bilateral weight per texel
+	float weightRefPix[nSizeTexels]; // weight * reference pixel
+	float sumRef;                    // sum of weightRefPix
+	float bilateralWeightSum;        // sum of weight
+	float varRef;                    // sumRefRef*bilateralWeightSum - sumRef^2
+	float factorDeltaDepth;          // exp(varRef * smoothSigmaDepth); only read when lowDepth > 0
+};
+
+// Fill the invariants for pixel p. Texel order matches ScorePlane's loop exactly,
+// which is what keeps the accumulated sums bit-identical to the original.
+__device__ inline void BuildRefPatch(const ImagePixels refImage, const Point2i& p, const float lowDepth, RefPatch& rp)
+{
+	float sumRef = 0.f, sumRefRef = 0.f, bilateralWeightSum = 0.f;
+	const float refCenterPix = tex2D<float>(refImage, p.x() + 0.5f, p.y() + 0.5f);
+	int k = 0;
+	#pragma unroll
+	for (int i = -nSizeHalfWindow; i <= nSizeHalfWindow; i += nSizeStep) {
+		#pragma unroll
+		for (int j = -nSizeHalfWindow; j <= nSizeHalfWindow; j += nSizeStep, ++k) {
+			const Point2i refPt = Point2i(p.x() + j, p.y() + i);
+			const float refPix = tex2D<float>(refImage, refPt.x() + 0.5f, refPt.y() + 0.5f);
+			const float weight = ComputeBilateralWeight(j, i, refPix, refCenterPix);
+			const float weightRefPix = weight * refPix;
+			rp.weight[k] = weight;
+			rp.weightRefPix[k] = weightRefPix;
+			sumRef += weightRefPix;
+			sumRefRef += weightRefPix * refPix;
+			bilateralWeightSum += weight;
+		}
+	}
+	rp.sumRef = sumRef;
+	rp.bilateralWeightSum = bilateralWeightSum;
+	rp.varRef = sumRefRef * bilateralWeightSum - sumRef * sumRef;
+	// 0.12: patch texture variance below 0.02 (0.12^2) is considered texture-less
+	constexpr float smoothSigmaDepth(-1.f / (1.f * 0.02f));
+	rp.factorDeltaDepth = lowDepth > 0 ? PM_EXPF(rp.varRef * smoothSigmaDepth) : 0.f;
 }
 
 // compute the geometric consistency weight
@@ -302,11 +477,19 @@ __device__ inline float GeometricConsistencyWeight(const ImagePixels depthImage,
 }
 
 // compute photometric score using weighted ZNCC
-__device__ float ScorePlane(const ImagePixels refImage, const CUDA::Camera& refCamera, const ImagePixels trgImage, const CUDA::Camera& trgCamera, const Point2i& p, const Point4& plane, const float lowDepth, const PatchMatch::Params& params)
+__device__ float ScorePlane(const CUDA::Camera& refCamera, const ImagePixels trgImage, const CUDA::Camera& trgCamera, const PatchMatch::PairConstants& pair, const Point2i& p, const Point4& plane, const float lowDepth, const RefPatch& rp, const PatchMatch::Params& params)
 {
 	constexpr float maxCost = 1.2f;
-	
-	Matrix3 H = ComputeHomography(refCamera, trgCamera, p.cast<float>(), plane);
+
+	// Textureless reference patch. The original reached this test only after running
+	// the whole sample loop, but varRef depends on neither the plane nor the target
+	// view, so the outcome is the same -- and both this and the out-of-bounds test
+	// below return maxCost, so hoisting it above them cannot change the result. It
+	// now costs nothing: such a pixel issues no target fetch at all.
+	if (lowDepth <= 0 && rp.varRef < 1e-8f)
+		return maxCost;
+
+	Matrix3 H = ComputeHomography(pair, refCamera.model, p.cast<float>(), plane);
 	const Point2 pt = (H * p.cast<float>().homogeneous()).hnormalized();
 	if (pt.x() >= trgCamera.size.x() || pt.x() < 0.f || pt.y() >= trgCamera.size.y() || pt.y() < 0.f)
 		return maxCost;
@@ -314,69 +497,58 @@ __device__ float ScorePlane(const ImagePixels refImage, const CUDA::Camera& refC
 	Point3 baseX(X);
 	H *= float(nSizeStep);
 
-	float sumRef = 0.f;
-	float sumRefRef = 0.f;
+	// only the target-dependent sums remain; the reference ones come from rp,
+	// accumulated over these same texels in this same order
 	float sumTrg = 0.f;
 	float sumTrgTrg = 0.f;
 	float sumRefTrg = 0.f;
-	float bilateralWeightSum = 0.f;
-	const float refCenterPix = tex2D<float>(refImage, p.x() + 0.5f, p.y() + 0.5f);
+	int k = 0;
+	#pragma unroll
 	for (int i = -nSizeHalfWindow; i <= nSizeHalfWindow; i += nSizeStep) {
-		for (int j = -nSizeHalfWindow; j <= nSizeHalfWindow; j += nSizeStep) {
-			const Point2i refPt = Point2i(p.x() + j, p.y() + i);
+		#pragma unroll
+		for (int j = -nSizeHalfWindow; j <= nSizeHalfWindow; j += nSizeStep, ++k) {
 			const Point2 trgPt = X.hnormalized();
-			const float refPix = tex2D<float>(refImage, refPt.x() + 0.5f, refPt.y() + 0.5f);
 			const float trgPix = tex2D<float>(trgImage, trgPt.x() + 0.5f, trgPt.y() + 0.5f);
-			const float weight = ComputeBilateralWeight(j, i, refPix, refCenterPix);
-			const float weightRefPix = weight * refPix;
-			const float weightTrgPix = weight * trgPix;
-			sumRef += weightRefPix;
+			const float weightTrgPix = rp.weight[k] * trgPix;
 			sumTrg += weightTrgPix;
-			sumRefRef += weightRefPix * refPix;
 			sumTrgTrg += weightTrgPix * trgPix;
-			sumRefTrg += weightRefPix * trgPix;
-			bilateralWeightSum += weight;
+			sumRefTrg += rp.weightRefPix[k] * trgPix;
 			X += H.col(0);
 		}
 		baseX += H.col(1);
 		X = baseX;
 	}
 
-	const float varRef = sumRefRef * bilateralWeightSum - sumRef * sumRef;
-	if (lowDepth <= 0 && varRef < 1e-8f)
-		return maxCost;
-	const float varTrg = sumTrgTrg * bilateralWeightSum - sumTrg * sumTrg;
-	const float varRefTrg = varRef * varTrg;
+	const float varTrg = sumTrgTrg * rp.bilateralWeightSum - sumTrg * sumTrg;
+	const float varRefTrg = rp.varRef * varTrg;
 	if (varRefTrg < 1e-16f)
 		return maxCost;
-	const float covarTrgRef = sumRefTrg * bilateralWeightSum - sumRef * sumTrg;
+	const float covarTrgRef = sumRefTrg * rp.bilateralWeightSum - rp.sumRef * sumTrg;
 	float ncc = 1.f - covarTrgRef / PM_SQRTF(varRefTrg);
 
 	// apply depth prior weight based on patch textureless
 	if (lowDepth > 0) {
 		const float depth(plane.w());
 		const float deltaDepth(MIN((abs(lowDepth-depth) / lowDepth), 0.5f));
-		constexpr float smoothSigmaDepth(-1.f / (1.f * 0.02f)); // 0.12: patch texture variance below 0.02 (0.12^2) is considered texture-less
-		const float factorDeltaDepth(PM_EXPF(varRef * smoothSigmaDepth));
-		ncc = (1.f-factorDeltaDepth)*ncc + factorDeltaDepth*deltaDepth;
+		ncc = (1.f-rp.factorDeltaDepth)*ncc + rp.factorDeltaDepth*deltaDepth;
 	}
 	return max(0.f, min(2.f, ncc));
 }
 
 // compute photometric score for all neighbor images
-__device__ inline void MultiViewScorePlane(const ImagePixels *images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const Point2i& p, const Point4& plane, const float lowDepth, float* costVector, const PatchMatch::Params& params)
+__device__ inline void MultiViewScorePlane(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const PatchMatch::PairConstants* pairs, const Point2i& p, const Point4& plane, const float lowDepth, const RefPatch& rp, float* costVector, const PatchMatch::Params& params)
 {
 	for (int imgId = 1; imgId <= params.nNumViews; ++imgId)
-		costVector[imgId-1] = ScorePlane(images[0], cameras[0], images[imgId], cameras[imgId], p, plane, lowDepth, params);
+		costVector[imgId-1] = ScorePlane(cameras[0], images[imgId], cameras[imgId], pairs[imgId-1], p, plane, lowDepth, rp, params);
 	if (params.bGeomConsistency)
 		for (int imgId = 0; imgId < params.nNumViews; ++imgId)
 			costVector[imgId] += 0.1f * GeometricConsistencyWeight(depthImages[imgId], cameras[0], cameras[imgId+1], plane, p);
 }
 // same as above, but interpolate the plane to current pixel position
-__device__ inline float MultiViewScoreNeighborPlane(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const Point2i& p, const Point2i& np, Point4 plane, const float lowDepth, float* costVector, const PatchMatch::Params& params)
+__device__ inline float MultiViewScoreNeighborPlane(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const PatchMatch::PairConstants* pairs, const Point2i& p, const Point2i& np, Point4 plane, const float lowDepth, const RefPatch& rp, float* costVector, const PatchMatch::Params& params)
 {
 	plane.w() = InterpolatePixel(cameras[0], p, np, plane.w(), plane.topLeftCorner<3,1>(), params);
-	MultiViewScorePlane(images, depthImages, cameras, p, plane, lowDepth, costVector, params);
+	MultiViewScorePlane(images, depthImages, cameras, pairs, p, plane, lowDepth, rp, costVector, params);
 	return plane.w();
 }
 
@@ -392,17 +564,28 @@ __device__ inline float AggregateMultiViewScores(const unsigned* viewWeights, co
 
 // propagate and refine the plane estimate for the current pixel employing the asymmetric approach described in:
 // "Multi-View Stereo with Asymmetric Checkerboard Propagation and Multi-Hypothesis Joint View Selection", 2018
-__device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, Point4* planes, const float* lowDepths, float* costs, RandState* randStates, unsigned* selectedViews, const Point2i& p, const PatchMatch::Params& params, const int iter)
+// MAXV bounds the per-thread scratch arrays: they are dynamically indexed, hence
+// local-memory resident, and sizing them to the true view count (<=8 in the
+// default configuration) instead of the static MAX_VIEWS cuts the spill
+// footprint ~4x, which is what limits this kernel
+template <int MAXV>
+__device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const PatchMatch::PairConstants* pairs, Point4* planes, const float* lowDepths, float* costs, unsigned* selectedViews, const Point2i& p, const PatchMatch::Params& params, const int iter, const uint32_t rngSalt)
 {
 	const int width = cameras[0].size.x();
 	const int height = cameras[0].size.y();
 	if (p.x() >= width || p.y() >= height)
 		return;
 	const int idx = Point2Idx(p, width);
-	RandState* randState = &randStates[idx];
+	RandState randState = MakeRNG(idx, rngSalt);
 	float lowDepth = 0;
 	if (params.bLowResProcessed)
 		lowDepth = lowDepths[idx];
+	// Every hypothesis scored below -- 8 checkerboard neighbors, the current plane
+	// and up to 4 refinements -- shares this pixel's reference patch, and so does
+	// every view within each of them. Building it once here is what collapses
+	// 13*nNumViews reconstructions of it into one.
+	RefPatch rp;
+	BuildRefPatch(images[0], p, lowDepth, rp);
 
 	// adaptive sampling: 0 up-near, 1 down-near, 2 left-near, 3 right-near, 4 up-far, 5 down-far, 6 left-far, 7 right-far
 	static constexpr int2 dirs[8][11] = {
@@ -425,7 +608,7 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 	bool valid[8] = {false, false, false, false, false, false, false, false};
 	int positions[8];
 	float neighborDepths[8];
-	float costArray[8][MAX_VIEWS];
+	float costArray[8][MAXV];
 
 	for (int posId=0; posId<8; ++posId) {
 		const int2* samples = dirs[posId];
@@ -445,12 +628,12 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 		if (bestConf < FLT_MAX) {
 			valid[posId] = true;
 			positions[posId] = Point2Idx(bestNx, width);
-			neighborDepths[posId] = MultiViewScoreNeighborPlane(images, depthImages, cameras, p, bestNx, planes[positions[posId]], lowDepth, costArray[posId], params);
+			neighborDepths[posId] = MultiViewScoreNeighborPlane(images, depthImages, cameras, pairs, p, bestNx, planes[positions[posId]], lowDepth, rp, costArray[posId], params);
 		}
 	}
 
 	// multi-hypothesis view selection
-	float viewSelectionPriors[MAX_VIEWS] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+	float viewSelectionPriors[MAXV] = {};
 	for (int posId = 0; posId < 4; ++posId) {
 		if (valid[posId]) {
 			const unsigned selectedView = selectedViews[neighborPositions[posId]];
@@ -458,7 +641,7 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 				viewSelectionPriors[j] += (IsBitSet(selectedView, j) ? 0.9f : 0.1f);
 		}
 	}
-	float samplingProbs[MAX_VIEWS];
+	float samplingProbs[MAXV];
 	constexpr float thCostBad = 1.2f;
 	const float thCost = 0.8f * PM_EXPF(Square((float)iter) / (-2.f * 4.f*4.f));
 	for (int imgId = 0; imgId < params.nNumViews; ++imgId) {
@@ -484,9 +667,9 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 		}
 	}
 	PDF2CDF(samplingProbs, params.nNumViews);
-	unsigned viewWeights[MAX_VIEWS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+	unsigned viewWeights[MAXV] = {};
 	for (int sample = 0; sample < NUM_SAMPLES; ++sample) {
-		const float randProb = curand_uniform(randState);
+		const float randProb = RandUniform(randState);
 		for (int imgId = 0; imgId < params.nNumViews; ++imgId) {
 			if (samplingProbs[imgId] > randProb) {
 				++viewWeights[imgId];
@@ -506,8 +689,8 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 	for (int posId = 0; posId < 8; ++posId)
 		finalCosts[posId] = AggregateMultiViewScores(viewWeights, costArray[posId], params.nNumViews);
 	const int minCostIdx = FindMinIndex(finalCosts, 8);
-	float costVector[MAX_VIEWS];
-	MultiViewScorePlane(images, depthImages, cameras, p, plane, lowDepth, costVector, params);
+	float costVector[MAXV];
+	MultiViewScorePlane(images, depthImages, cameras, pairs, p, plane, lowDepth, rp, costVector, params);
 	cost = AggregateMultiViewScores(viewWeights, costVector, params.nNumViews);
 	if (finalCosts[minCostIdx] < cost && valid[minCostIdx]) {
 		plane = planes[positions[minCostIdx]];
@@ -543,7 +726,7 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 		Point4 newPlane;
 		newPlane.topLeftCorner<3,1>() = normals[i];
 		newPlane.w() = depths[i];
-		MultiViewScorePlane(images, depthImages, cameras, p, newPlane, lowDepth, costVector, params);
+		MultiViewScorePlane(images, depthImages, cameras, pairs, p, newPlane, lowDepth, rp, costVector, params);
 		const float costPlane = AggregateMultiViewScores(viewWeights, costVector, params.nNumViews);
 		if (cost > costPlane) {
 			cost = costPlane;
@@ -553,7 +736,8 @@ __device__ void ProcessPixel(const ImagePixels* images, const ImagePixels* depth
 }
 
 // compute the score of the current plane estimate
-__device__ void InitializePixelScore(const ImagePixels *images, const ImagePixels* depthImages, const CUDA::Camera* cameras, Point4* planes, const float* lowDepths, float* costs, RandState* randStates, unsigned* selectedViews, const Point2i& p, const PatchMatch::Params params)
+template <int MAXV>
+__device__ void InitializePixelScore(const ImagePixels *images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const PatchMatch::PairConstants* pairs, Point4* planes, const float* lowDepths, float* costs, unsigned* selectedViews, const Point2i& p, const PatchMatch::Params params)
 {
 	const int width = cameras[0].size.x();
 	const int height = cameras[0].size.y();
@@ -564,23 +748,24 @@ __device__ void InitializePixelScore(const ImagePixels *images, const ImagePixel
 	if (params.bLowResProcessed)
 		lowDepth = lowDepths[idx];
 	// initialize estimate randomly if not set
-	RandState* randState = &randStates[idx];
-	curand_init(1234/*threadIdx.x*/, p.y(), p.x(), randState);
+	RandState randState = MakeRNG(idx, 0u);
 	Point4& plane = planes[idx];
 	float depth = plane.w();
 	if (depth <= 0.f) {
 		// generate random plane
 		plane.topLeftCorner<3,1>() = GenerateRandomNormal(cameras[0], p, randState);
-		plane.w() = curand_uniform(randState) * (params.fDepthMax - params.fDepthMin) + params.fDepthMin;
+		plane.w() = RandUniform(randState) * (params.fDepthMax - params.fDepthMin) + params.fDepthMin;
 	} else if (plane.topLeftCorner<3,1>().dot(cameras[0].model.ViewDirection(p)) >= 0.f) {
 		// generate random normal
 		plane.topLeftCorner<3,1>() = GenerateRandomNormal(cameras[0], p, randState);
 	}
 	// compute costs
-	float costVector[MAX_VIEWS];
-	MultiViewScorePlane(images, depthImages, cameras, p, plane, lowDepth, costVector, params);
+	RefPatch rp;
+	BuildRefPatch(images[0], p, lowDepth, rp);
+	float costVector[MAXV];
+	MultiViewScorePlane(images, depthImages, cameras, pairs, p, plane, lowDepth, rp, costVector, params);
 	// select best views
-	float costVectorSorted[MAX_VIEWS];
+	float costVectorSorted[MAXV];
 	Sort(costVector, costVectorSorted, params.nNumViews);
 	float cost = 0.f;
 	for (int i = 0; i < params.nInitTopK; ++i)
@@ -593,24 +778,31 @@ __device__ void InitializePixelScore(const ImagePixels *images, const ImagePixel
 			SetBit(selectedView, imgId);
 	costs[idx] = cost / params.nInitTopK;
 }
-__global__ void InitializeScore(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, curandState* PM_RESTRICT randStates, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params)
+template <int MAXV>
+__global__ void PMCUDA_LAUNCH_BOUNDS InitializeScore(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, const PatchMatch::PairConstants* PM_RESTRICT pairs, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params, const int yBase)
 {
-	const Point2i p = GetThreadIndex2();
-	InitializePixelScore((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, planes, lowDepths, costs, (RandState*)randStates, selectedViews, p, params);
+	Point2i p = GetThreadIndex2();
+	p.y() += yBase;
+	InitializePixelScore<MAXV>((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, pairs, planes, lowDepths, costs, selectedViews, p, params);
 }
 
-// traverse image in a back/red checkerboard pattern
-__global__ void BlackPixelProcess(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, curandState* PM_RESTRICT randStates, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params, const int iter)
+// traverse image in a black/red checkerboard pattern
+// yBase is a half-row offset used by the TDR row-banding (see
+// PMCUDA_TDR_MAX_PIXEL_VIEWS above); the RNG seed depends only on the pixel,
+// so results are independent of how the frame is split into bands
+template <int MAXV>
+__global__ void PMCUDA_LAUNCH_BOUNDS BlackPixelProcess(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, const PatchMatch::PairConstants* PM_RESTRICT pairs, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params, const int iter, const int yBase)
 {
 	Point2i p = GetThreadIndex2();
-	p.y() = p.y() * 2 + (threadIdx.x % 2 == 0 ? 0 : 1);
-	ProcessPixel((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, planes, lowDepths, costs, (RandState*)randStates, selectedViews, p, params, iter);
+	p.y() = (p.y() + yBase) * 2 + (threadIdx.x % 2 == 0 ? 0 : 1);
+	ProcessPixel<MAXV>((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, pairs, planes, lowDepths, costs, selectedViews, p, params, iter, 1u + 2u * (uint32_t)iter);
 }
-__global__ void RedPixelProcess(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, curandState* PM_RESTRICT randStates, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params, const int iter)
+template <int MAXV>
+__global__ void PMCUDA_LAUNCH_BOUNDS RedPixelProcess(const cudaTextureObject_t* PM_RESTRICT textureImages, const cudaTextureObject_t* PM_RESTRICT textureDepths, const CUDA::Camera* PM_RESTRICT cameras, const PatchMatch::PairConstants* PM_RESTRICT pairs, Point4* PM_RESTRICT planes, const float* PM_RESTRICT lowDepths, float* PM_RESTRICT costs, unsigned* PM_RESTRICT selectedViews, const PatchMatch::Params params, const int iter, const int yBase)
 {
 	Point2i p = GetThreadIndex2();
-	p.y() = p.y() * 2 + (threadIdx.x % 2 == 0 ? 1 : 0);
-	ProcessPixel((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, planes, lowDepths, costs, (RandState*)randStates, selectedViews, p, params, iter);
+	p.y() = (p.y() + yBase) * 2 + (threadIdx.x % 2 == 0 ? 1 : 0);
+	ProcessPixel<MAXV>((const ImagePixels*)textureImages, (const ImagePixels*)textureDepths, cameras, pairs, planes, lowDepths, costs, selectedViews, p, params, iter, 2u + 2u * (uint32_t)iter);
 }
 
 // filter depth/normals
@@ -632,47 +824,189 @@ __global__ void FilterPlanes(Point4* PM_RESTRICT planes, float* PM_RESTRICT cost
 /*----------------------------------------------------------------*/
 
 
-__host__ void PatchMatch::RunCUDA(float* ptrCostMap, uint32_t* ptrViewsMap)
+// convert a linear fp32 image to fp16 before it is copied into a texture array
+__global__ void KConvertFloatToHalf(const float* PM_RESTRICT src, __half* PM_RESTRICT dst, const int count)
 {
-	const unsigned width = cameras[0].size.x();
-	const unsigned height = cameras[0].size.y();
+	const int i = GetThreadIndex();
+	if (i < count)
+		dst[i] = __float2half(src[i]);
+}
 
-	constexpr unsigned BLOCK_W = 32;
-	constexpr unsigned BLOCK_H = (BLOCK_W / 2);
+// fuse the uploaded depth and normal maps into the per-pixel plane estimates
+// (replaces the serial host-side pack loop)
+__global__ void KPackPlanes(const float* PM_RESTRICT depthIn, const float* PM_RESTRICT normalIn, Point4* PM_RESTRICT planes, const int count)
+{
+	const int i = GetThreadIndex();
+	if (i >= count)
+		return;
+	Point4 dn;
+	dn.x() = normalIn[i*3+0];
+	dn.y() = normalIn[i*3+1];
+	dn.z() = normalIn[i*3+2];
+	dn.w() = depthIn[i];
+	planes[i] = dn;
+}
 
+// split the plane estimates back into depth/normal maps and, on the final
+// scale, convert the ZNCC cost to a confidence and the selected-views bit-mask
+// to the up-to-4 view indices of the ViewsID layout
+// (replaces the serial host-side unpack loop)
+__global__ void KUnpackResults(const Point4* PM_RESTRICT planes, const float* PM_RESTRICT costs, const unsigned* PM_RESTRICT views, float* PM_RESTRICT depthOut, float* PM_RESTRICT normalOut, float* PM_RESTRICT confOut, uint8_t* PM_RESTRICT viewsOut, const int count, const int maxPixelViews)
+{
+	const int i = GetThreadIndex();
+	if (i >= count)
+		return;
+	const Point4 dn = planes[i];
+	const float depth = dn.w();
+	depthOut[i] = depth;
+	normalOut[i*3+0] = dn.x();
+	normalOut[i*3+1] = dn.y();
+	normalOut[i*3+2] = dn.z();
+	if (confOut) {
+		// converted ZNCC [0-2] score, where 0 is best, to [0-1] confidence, where 1 is best
+		const float c = costs[i];
+		confOut[i] = (c >= 1.f ? 0.f : 1.f - c);
+	}
+	if (viewsOut) {
+		// map pixel views from bit-mask to index
+		uint8_t v[4] = {255, 255, 255, 255};
+		if (depth > 0) {
+			const unsigned bits = views[i];
+			int j = 0;
+			for (int k = 0; k < 32; ++k) {
+				if (bits & (1u << k)) {
+					v[j] = (uint8_t)k;
+					if (++j == maxPixelViews)
+						break;
+				}
+			}
+		}
+		viewsOut[i*4+0] = v[0];
+		viewsOut[i*4+1] = v[1];
+		viewsOut[i*4+2] = v[2];
+		viewsOut[i*4+3] = v[3];
+	}
+}
+/*----------------------------------------------------------------*/
+
+
+// host wrappers for the helper kernels (callable from PatchMatchCUDA.cpp)
+__host__ void PMConvertFloatToHalf(const float* d_src, void* d_dstHalf, int count, cudaStream_t stream)
+{
+	constexpr int nThreads = 256;
+	KConvertFloatToHalf<<<(count + nThreads - 1) / nThreads, nThreads, 0, stream>>>(d_src, (__half*)d_dstHalf, count);
+}
+
+__host__ void PMPackPlanes(const float* d_depthIn, const float* d_normalIn, Point4* d_planes, int count, cudaStream_t stream)
+{
+	constexpr int nThreads = 256;
+	KPackPlanes<<<(count + nThreads - 1) / nThreads, nThreads, 0, stream>>>(d_depthIn, d_normalIn, d_planes, count);
+}
+
+__host__ void PMUnpackResults(const Point4* d_planes, const float* d_costs, const unsigned* d_views,
+	float* d_depthOut, float* d_normalOut, float* d_confOut, uint8_t* d_viewsOut,
+	int count, int maxPixelViews, cudaStream_t stream)
+{
+	constexpr int nThreads = 256;
+	KUnpackResults<<<(count + nThreads - 1) / nThreads, nThreads, 0, stream>>>(d_planes, d_costs, d_views, d_depthOut, d_normalOut, d_confOut, d_viewsOut, count, maxPixelViews);
+}
+/*----------------------------------------------------------------*/
+
+
+template <int MAXV>
+__host__ void PatchMatch::RunCUDAT(const int width, const int height)
+{
+	// must match the __launch_bounds__ the kernels were compiled with
+	constexpr unsigned BLOCK_W = PMCUDA_BLOCK_W;
+	constexpr unsigned BLOCK_H = PMCUDA_BLOCK_H;
 	const dim3 blockSize(BLOCK_W, BLOCK_H, 1);
-	const dim3 gridSizeFull((width + BLOCK_H - 1) / BLOCK_H, (height + BLOCK_H - 1) / BLOCK_H, 1);
-	const dim3 gridSizeCheckerboard((width + BLOCK_W - 1) / BLOCK_W, ((height / 2) + BLOCK_H - 1) / BLOCK_H, 1);
+	const unsigned gridW = ((unsigned)width + BLOCK_W - 1) / BLOCK_W;
 
-	InitializeScore<<<gridSizeFull, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params);
-#if !PMCUDA_OPT_DROP_REDUNDANT_SYNC
-	cudaDeviceSynchronize();
-#endif
+	// TDR row-banding: bound the work of a single launch by
+	// PMCUDA_TDR_MAX_PIXEL_VIEWS (pixels x views); see the note at the top.
+	// Band boundaries do not affect results.
+	const int64_t pixelViewBudget = (int64_t)PMCUDA_TDR_MAX_PIXEL_VIEWS;
+	const int views = params.nNumViews > 1 ? params.nNumViews : 1;
 
-	for (int iter = 0; iter < params.nEstimationIters; ++iter) {
-		BlackPixelProcess<<<gridSizeCheckerboard, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
-#if !PMCUDA_OPT_DROP_REDUNDANT_SYNC
-		cudaDeviceSynchronize();
-#endif
-		RedPixelProcess<<<gridSizeCheckerboard, blockSize>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaDepthNormalEstimates, cudaLowDepths, cudaDepthNormalCosts, cudaRandStates, cudaSelectedViews, params, iter);
-#if !PMCUDA_OPT_DROP_REDUNDANT_SYNC
-		cudaDeviceSynchronize();
-#endif
+	// full-frame rows per launch for InitializeScore: it evaluates a single
+	// hypothesis per pixel (~an order of magnitude lighter than the
+	// propagation kernels), so it gets 8x the budget
+	int bandRowsInit = (int)((pixelViewBudget * 8) / ((int64_t)width * views));
+	if (bandRowsInit < (int)BLOCK_H)
+		bandRowsInit = (int)BLOCK_H;
+	if (bandRowsInit > height)
+		bandRowsInit = height;
+	bandRowsInit = ((bandRowsInit + BLOCK_H - 1) / BLOCK_H) * BLOCK_H;
+	for (int y = 0; y < height; y += bandRowsInit) {
+		const int rows = (height - y < bandRowsInit) ? height - y : bandRowsInit;
+		const dim3 grid(gridW, ((unsigned)rows + BLOCK_H - 1) / BLOCK_H, 1);
+		InitializeScore<MAXV><<<grid, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaPairs, cudaPlanes, cudaDepthIn, cudaCosts, cudaViews, params, y);
 	}
 
-	if (params.fThresholdKeepCost > 0)
-		FilterPlanes<<<gridSizeFull, blockSize>>>(cudaDepthNormalEstimates, cudaDepthNormalCosts, cudaSelectedViews, width, height, params);
+	// checkerboard rows per launch (each checkerboard row covers 2 image rows);
+	// (height+1)/2 instead of the former height/2 so the last image row of an
+	// odd-height frame is processed too (it previously never was whenever
+	// height/2 happened to be a multiple of the block height)
+	const int halfRows = (height + 1) / 2;
+	int bandHalfRows = (int)(pixelViewBudget / ((int64_t)width * views * 2));
+	if (bandHalfRows < (int)BLOCK_H)
+		bandHalfRows = (int)BLOCK_H;
+	if (bandHalfRows > halfRows)
+		bandHalfRows = halfRows;
+	bandHalfRows = ((bandHalfRows + BLOCK_H - 1) / BLOCK_H) * BLOCK_H;
 
-	cudaMemcpy(depthNormalEstimates, cudaDepthNormalEstimates, sizeof(Point4) * width * height, cudaMemcpyDeviceToHost);
-	if (ptrCostMap)
-		cudaMemcpy(ptrCostMap, cudaDepthNormalCosts, sizeof(float) * width * height, cudaMemcpyDeviceToHost);
-	if (ptrViewsMap)
-		cudaMemcpy(ptrViewsMap, cudaSelectedViews, sizeof(uint32_t) * width * height, cudaMemcpyDeviceToHost);
+	for (int iter = 0; iter < params.nEstimationIters; ++iter) {
+		for (int y = 0; y < halfRows; y += bandHalfRows) {
+			const int rows = (halfRows - y < bandHalfRows) ? halfRows - y : bandHalfRows;
+			const dim3 grid(gridW, ((unsigned)rows + BLOCK_H - 1) / BLOCK_H, 1);
+			BlackPixelProcess<MAXV><<<grid, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaPairs, cudaPlanes, cudaDepthIn, cudaCosts, cudaViews, params, iter, y);
+		}
+		for (int y = 0; y < halfRows; y += bandHalfRows) {
+			const int rows = (halfRows - y < bandHalfRows) ? halfRows - y : bandHalfRows;
+			const dim3 grid(gridW, ((unsigned)rows + BLOCK_H - 1) / BLOCK_H, 1);
+			RedPixelProcess<MAXV><<<grid, blockSize, 0, stream>>>(cudaTextureImages, cudaTextureDepths, cudaCameras, cudaPairs, cudaPlanes, cudaDepthIn, cudaCosts, cudaViews, params, iter, y);
+		}
+	}
 
-	cudaDeviceSynchronize();
+	if (params.fThresholdKeepCost > 0) {
+		const dim3 grid(gridW, ((unsigned)height + BLOCK_H - 1) / BLOCK_H, 1);
+		FilterPlanes<<<grid, blockSize, 0, stream>>>(cudaPlanes, cudaCosts, cudaViews, width, height, params);
+	}
+}
+
+__host__ void PatchMatch::RunCUDA(const int width, const int height)
+{
+	// Dispatch on the compile-time bound of the per-thread scratch arrays.
+	//
+	// MAXV sizes costArray[8][MAXV] -- the largest per-thread array, dynamically
+	// indexed and therefore local-memory resident -- plus viewSelectionPriors,
+	// samplingProbs, viewWeights and costVector. It therefore drives register
+	// pressure and spill directly, which is what limits this kernel. Instantiating
+	// the small view counts as well as 8 keeps that footprint proportional to the
+	// views actually in use: a run with --number-views 6 (5.9 views/image measured,
+	// max 6) was paying 8-view scratch on every thread of every launch.
+	//
+	// Semantics are unaffected. MAXV only bounds the arrays; every loop still runs
+	// to params.nNumViews, and the dispatch guarantees MAXV >= nNumViews.
+	if (params.nNumViews <= 4)
+		RunCUDAT<4>(width, height);
+	else if (params.nNumViews <= 6)
+		RunCUDAT<6>(width, height);
+	else if (params.nNumViews <= 8)
+		RunCUDAT<8>(width, height);
+	else
+		RunCUDAT<MAX_VIEWS>(width, height);
 }
 /*----------------------------------------------------------------*/
 
 } // namespace CUDA
 
 } // namespace MVS
+
+#else
+
+// Variant not selected: this file preprocesses away completely. The typedef
+// only keeps the translation unit non-empty (MSVC C4206 / nvcc).
+namespace MVS { namespace CUDA { typedef int PatchMatchCUDAKernelsNotBuilt; } }
+
+#endif // !PATCHMATCH_CUDA_LEGACY

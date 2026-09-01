@@ -267,6 +267,27 @@ int main(int argc, LPCTSTR* argv)
 	// adequately sized machine -- the common case.
 	scene.ResolveRefineMeshSafeSettings(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews);
 
+	// Face count entering refinement, for the [REFINE-FACES] accounting line after it
+	// finishes. Declared out here rather than inside the try{} so it is still in scope at
+	// the completion log, which sits after the catch.
+	//
+	// ReconstructMesh's atlas cap is applied to the mesh BEFORE this stage, and this stage
+	// then subdivides -- measured 1.48x to 1.88x across scenes -- so the mesh TextureMesh
+	// actually receives can be well above the budget that cap enforced. Nothing reported
+	// that, which is why it went unnoticed.
+	const unsigned nFacesBeforeRefine(scene.mesh.faces.GetSize());
+
+	// The atlas dimension, captured HERE and not after refinement. Scene::RefineMesh
+	// rescales the cameras per scale and leaves them at the last scale's resolution, so
+	// EstimateSceneGSD run afterwards returns a gsd several times too large and the
+	// dimension comes out several times too small -- observed as "atlas 10236 px allows
+	// 1.6M faces" on a run whose real answer was 16384 px and 4.07M.
+	extern int ComputeSceneAtlasDim(const MVS::ImageArr& images, const MVS::Mesh& mesh,
+		int* pCeiling, double* pWantDim, double* pSurfaceArea, double* pGsd);
+	int atlasCeiling = 0; double atlasWantDim = 0.0;
+	const int atlasDim = ComputeSceneAtlasDim(scene.images, scene.mesh,
+		&atlasCeiling, &atlasWantDim, NULL, NULL);
+
 	TD_TIMER_START();
 	try {
 	#ifdef _USE_CUDA
@@ -305,20 +326,23 @@ int main(int argc, LPCTSTR* argv)
 	// AND a host slow enough to lose to it. Note the settings passed here are the
 	// ones ResolveRefineMeshSafeSettings just resolved, not the requested ones.
 	//
-	// Whichever way this goes, the log says which path ran and why: the three
-	// suppressed cases below each name themselves, and in auto mode
-	// PreferCPUMeshRefinement logs the actual reason (it can be driver, VRAM or
-	// speed, so this level must not paraphrase it).
+	// Whichever way this goes, the log says WHICH device ran: the three suppressed
+	// cases below each name themselves in terms of the switch the user set, and in
+	// auto mode PreferCPUMeshRefinement names the device it picked. WHY it picked
+	// that one is a property of the tuning model rather than of this run, so it is
+	// gated (OPENMVS_REFINE_DIAG=1, or -v 4) along with the rest of the refiner's
+	// internals -- this level must not paraphrase it either way.
 	bool bTryCUDA(nPolicy != 2 && SEACAVE::CUDA::desiredDeviceID >= -1);
 	if (nPolicy == 2) {
-		VERBOSE("Mesh refinement: CPU path pinned by --cuda-policy 2; any requested CUDA device is ignored");
+		VERBOSE("Mesh refinement: using the CPU (pinned by --cuda-policy 2; any requested CUDA device is ignored)");
 	} else if (SEACAVE::CUDA::desiredDeviceID < -1) {
-		VERBOSE("Mesh refinement: no CUDA device requested (--cuda-device %d); refining on the CPU", SEACAVE::CUDA::desiredDeviceID);
+		VERBOSE("Mesh refinement: using the CPU (no CUDA device requested, --cuda-device %d)", SEACAVE::CUDA::desiredDeviceID);
 	} else if (nPolicy == 1) {
-		VERBOSE("Mesh refinement: GPU path pinned by --cuda-policy 1; the host-vs-device checks are skipped");
+		VERBOSE("Mesh refinement: using the GPU (pinned by --cuda-policy 1)");
 	} else if (scene.PreferCPUMeshRefinement(OPT::nResolutionLevel, OPT::nMinResolution)) {
-		VERBOSE("Mesh refinement: taking the CPU path for the reason logged above "
-				"(--cuda-policy 1, or OPENMVS_REFINE_DEVICE=gpu, to use the requested device anyway)");
+		// PreferCPUMeshRefinement already logged which device it chose; all this adds
+		// is how to overrule it.
+		VERBOSE("Mesh refinement: pass --cuda-policy 1, or set OPENMVS_REFINE_DEVICE=gpu, to use the requested device anyway");
 		bTryCUDA = false;
 	}
 	if (bTryCUDA) {
@@ -340,17 +364,17 @@ int main(int argc, LPCTSTR* argv)
 							  OPT::fRatioRigidityElasticity,
 							  OPT::fGradientStep);
 	if (bTryCUDA && !bRefinedCUDA) {
-		VERBOSE("GPU mesh refinement did not complete; restoring the input mesh and refining on the CPU");
+		VERBOSE("Mesh refinement: the GPU did not complete this scene; refining on the CPU instead");
 		scene.mesh.EmptyExtra();
 		scene.mesh.vertices.CopyOfRemove(meshVerticesBackup);
 		scene.mesh.faces.CopyOfRemove(meshFacesBackup);
 	}
 	if (!bRefinedCUDA)
 	#else
-	// Same guarantee as the CUDA build above: the log always states which path ran
-	// and why, so "why did this refine on the CPU?" is answerable from the log in
-	// every build configuration rather than only where a GPU path exists.
-	VERBOSE("Mesh refinement: CPU path (this build has no CUDA support)");
+	// Same guarantee as the CUDA build above: the log always states which device ran,
+	// so "why did this refine on the CPU?" is answerable from the log in every build
+	// configuration rather than only where a GPU path exists.
+	VERBOSE("Mesh refinement: using the CPU (this build has no CUDA support)");
 	#endif
 	if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 						  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,
@@ -370,6 +394,46 @@ int main(int argc, LPCTSTR* argv)
 		return EXIT_FAILURE;
 	}
 	VERBOSE("Mesh refinement completed: %u vertices, %u faces (%s)", scene.mesh.vertices.GetSize(), scene.mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+	if (REFINE_DIAG_ENABLED()) {
+		// [REFINE-FACES] The subdivision factor, and what it means for the atlas budget.
+		//
+		// ReconstructMesh caps faces against the atlas (budgetAtlas = D^2*0.97/64, i.e. a
+		// 64-texel-per-face target) and applies that cap to the mesh BEFORE this stage.
+		// Subdivision here then multiplies the count. Print both so the relationship is
+		// visible instead of having to be reconstructed from three logs.
+		//
+		// Subdivision now clamps itself to the same budget -- see
+		// ClampSubdivideAreaToAtlasBudget in SceneRefine.cpp, honoured by both the CPU and
+		// CUDA refiners -- so the mesh SHOULD land inside it and the OVER-budget notice
+		// below should no longer fire. If it does fire, that is real information, not the
+		// old known-broken state: the clamp bounds the count it can PREDICT, and the two
+		// ways past it are the conformity-split fanout being under-estimated (see
+		// MESHOPT_ATLAS_BUDGET_SPLIT_FANOUT, a proven upper bound, so this should be
+		// impossible) or a later stage adding faces -- EnsureEdgeSize and hole closing
+		// both run after Subdivide. Treat a surviving OVER as a bug worth tracing rather
+		// than as the documented status quo.
+		//
+		// On the REFINE_DIAG gate rather than always-on: it names the atlas budget formula
+		// and the 64-texel target, which is mechanism, and it is only actionable next to
+		// TextureMesh's [ATLAS-FINAL] -- which sits on TEXTURE_DIAG, so a -DOPENMVS_DIAG=1
+		// build carries both halves of the texel-budget accounting or neither.
+		extern double ComputeAtlasFaceBudget(int atlasMaxDim);
+		extern int ResolveAtlasMaxDimEx(int atlasMaxDim, int* pHostLimit, int* pEnvPin);
+		const unsigned nFacesAfter(scene.mesh.faces.GetSize());
+		// atlasDim was captured BEFORE refinement (see above) -- the cameras are rescaled by
+		// then. Audited against the dimension this scene resolved to, which is the atlas the
+		// mesh was sized for and the one TextureMesh converges on from its own patch rects.
+		const double budgetAtlas = ComputeAtlasFaceBudget(atlasDim);
+		const double factor = nFacesBeforeRefine ? (double)nFacesAfter / (double)nFacesBeforeRefine : 0.0;
+		const double texelsPerFace = (nFacesAfter && atlasDim > 0)
+			? ((double)atlasDim * (double)atlasDim * 0.97) / (double)nFacesAfter : 0.0;
+		REFINE_DIAG("[REFINE-FACES] %u -> %u faces (x%.2f) | atlas %d px allows %.1fM faces at"
+			" 64 texels/face -- this mesh gets %.0f texels/face%s",
+			nFacesBeforeRefine, nFacesAfter, factor,
+			atlasDim, budgetAtlas * 1e-6, texelsPerFace,
+			(budgetAtlas > 0.0 && (double)nFacesAfter > budgetAtlas)
+				? " | OVER the atlas budget: the cap was applied pre-refine" : "");
+	}
 
 	// save the final mesh
 	const String baseFileName(MAKE_PATH_SAFE(Util::getFileFullName(OPT::strOutputFileName)));

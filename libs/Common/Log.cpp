@@ -156,7 +156,10 @@ void Log::_Record(Idx lt, LPCTSTR szFormat, va_list args)
 		// enough space for all the string, print directly
 		m_message.Format("%s [%s] %s" LINE_SEPARATOR_STR, szTime, logType, szBuffer);
 	}
-	TRACE(m_message);
+	// "%s", m_message -- same reason as LogConsole::Record below: TRACE expands to
+	// _sntprintf(buffer, 2048, __VA_ARGS__), so passing the already-formatted message
+	// as the format string re-parses any literal '%' it contains.
+	TRACE(_T("%s"), m_message.c_str());
 
 	// signal listeners
 	FOREACHPTR(pClbk, *m_arrRecordClbk)
@@ -407,7 +410,20 @@ void LogConsole::Close()
 void LogConsole::Record(const String& msg)
 {
 	ASSERT(IsOpen());
-	printf(msg);
+	// "%s", msg -- NOT printf(msg). msg is a fully-formatted message, not a format
+	// string, and it routinely contains a literal '%': Log::_Record has already run
+	// the caller's format through _vsntprintf, which collapses every "%%" to "%".
+	// Passing that back in as a format made printf read a SECOND set of arguments
+	// that were never pushed. Observed in the wild:
+	//     "kept >= 1% of largest=..."      -> "% o" parsed as space-flag + octal
+	//                                          -> "kept >= 133062457200f largest=..."
+	//     "below the 0.600% floor"         -> "% f" parsed as space-flag + float
+	//                                          -> "below the 0.600 0.000000loor"
+	// Both are undefined behaviour reading whatever happened to be on the stack, and
+	// a message containing "%s" would have dereferenced a garbage pointer and crashed
+	// the process from a log line. The non-MSVC branch below always did this right;
+	// only this copy was wrong.
+	printf(_T("%s"), msg.c_str());
 	fflush(stdout);
 }
 

@@ -212,38 +212,44 @@ bool GetDeviceCapability(int deviceID, DeviceCapability& cap)
 bool HasLegacyDriverAPI()
 {
 	#ifdef _MSC_VER
-	// -1 unknown, 0 absent, 1 present
-	static int s_state = -1;
-	if (s_state >= 0)
-		return s_state != 0;
-	s_state = 0;
-	// GetModuleHandle first: if nvcuda.dll is already mapped (a CUDA context was
-	// created earlier) reuse it rather than bumping its reference count.
-	HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
-	if (hCuda == NULL)
-		hCuda = LoadLibraryA("nvcuda.dll");
-	if (hCuda == NULL) {
-		// VERBOSE, not DEBUG: this is only reached when the caller explicitly asked
-		// for a GPU (--cuda-device >= -1), so the user needs to see why they are
-		// getting CPU processing instead. Logged once; the result is cached.
-		VERBOSE("CUDA: no NVIDIA driver found (nvcuda.dll); using CPU processing");
-		return false;
-	}
-	// the exact set removed in CUDA 12.0 that KernelRT/TTextureRT/TSurfaceRT need
-	static LPCSTR const szLegacyProcs[] = {
-		"cuParamSetSize", "cuParamSetv", "cuFuncSetBlockShape", "cuLaunchGrid",
-		"cuModuleGetTexRef", "cuTexRefSetArray", "cuTexRefSetFormat",
-		"cuModuleGetSurfRef", "cuSurfRefSetArray"
-	};
-	for (LPCSTR szProc: szLegacyProcs) {
-		if (GetProcAddress(hCuda, szProc) == NULL) {
-			VERBOSE("CUDA: driver does not export '%s' (removed in CUDA 12.0); "
-					"falling back to CPU for kernel-launch/texture-reference paths", szProc);
+	// Function-local static with a lambda initializer: C++11 guarantees the probe
+	// runs exactly once and that every other caller BLOCKS until it finishes.
+	// A hand-rolled "static int s_state" cache cannot do that -- it has to publish
+	// some value before probing, so a concurrent caller reads the not-yet-computed
+	// state and gets a wrong answer. Publishing the "absent" value first (the
+	// previous shape here) made that failure silent and timing-dependent: a second
+	// thread calling in while the first was still inside LoadLibrary/GetProcAddress
+	// saw "no legacy driver API" on a machine that has one, and that run quietly
+	// dropped to the CPU path. Same probe, computed once, no race.
+	static const bool bHasLegacy = []() -> bool {
+		// GetModuleHandle first: if nvcuda.dll is already mapped (a CUDA context was
+		// created earlier) reuse it rather than bumping its reference count.
+		HMODULE hCuda = GetModuleHandleA("nvcuda.dll");
+		if (hCuda == NULL)
+			hCuda = LoadLibraryA("nvcuda.dll");
+		if (hCuda == NULL) {
+			// VERBOSE, not DEBUG: this is only reached when the caller explicitly asked
+			// for a GPU (--cuda-device >= -1), so the user needs to see why they are
+			// getting CPU processing instead. Logged once; the result is cached.
+			VERBOSE("CUDA: no NVIDIA driver found (nvcuda.dll); using CPU processing");
 			return false;
 		}
-	}
-	s_state = 1;
-	return true;
+		// the exact set removed in CUDA 12.0 that KernelRT/TTextureRT/TSurfaceRT need
+		static LPCSTR const szLegacyProcs[] = {
+			"cuParamSetSize", "cuParamSetv", "cuFuncSetBlockShape", "cuLaunchGrid",
+			"cuModuleGetTexRef", "cuTexRefSetArray", "cuTexRefSetFormat",
+			"cuModuleGetSurfRef", "cuSurfRefSetArray"
+		};
+		for (LPCSTR szProc: szLegacyProcs) {
+			if (GetProcAddress(hCuda, szProc) == NULL) {
+				VERBOSE("CUDA: driver does not export '%s' (removed in CUDA 12.0); "
+						"falling back to CPU for kernel-launch/texture-reference paths", szProc);
+				return false;
+			}
+		}
+		return true;
+	}();
+	return bHasLegacy;
 	#else
 	return true;
 	#endif

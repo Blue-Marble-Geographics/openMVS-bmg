@@ -38,7 +38,14 @@
 // I N C L U D E S /////////////////////////////////////////////////
 
 #include "SceneDensify.h"
+#include "PatchMatchCUDASelect.h"
+
+// exactly one estimator variant is compiled -- see PatchMatchCUDASelect.h
+#if PATCHMATCH_CUDA_LEGACY
+#include "PatchMatchCUDALegacy.inl"
+#else
 #include "PatchMatchCUDA.inl"
+#endif
 
 
 // D E F I N E S ///////////////////////////////////////////////////
