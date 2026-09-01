@@ -77,48 +77,42 @@
 #endif
 
 // ---------------------------------------------------------------------
-// Occupancy controls for the checkerboard kernels.
+// Launch bounds and block geometry for the checkerboard kernels.
 //
-// MEASURED, 276-image run, Quadro RTX 5000 (Turing SM 7.5), photometric device=:
+// __launch_bounds__ IS NOT OPTIONAL. It is the contract that makes the launch
+// legal, not a tuning knob. ProcessPixel carries a lot of per-thread state --
+// costArray[8][MAXV] (dynamically indexed, hence local-memory resident), the
+// RefPatch, plus the sampling/selection arrays. Without the annotation nvcc has
+// no idea how many threads a block will hold, so it is free to allocate more
+// than 65536/PMCUDA_BLOCK_W*PMCUDA_BLOCK_H registers per thread -- and the
+// launch then fails at RUNTIME with cudaErrorLaunchOutOfResources (701) on any
+// device whose per-block register file cannot cover it. That is exactly what a
+// CI machine hit after this was briefly defaulted off; the app caught it and
+// silently dropped to CPU-only, which is the worst possible outcome: no crash to
+// investigate, just a machine that quietly stopped using its GPU.
 //
-//   no __launch_bounds__      27820 ms   <- default, and the fastest
+// With the annotation nvcc caps registers to fit and spills the remainder, so
+// the launch is valid on every supported architecture. It costs about 1.2%
+// (photometric device= 27820 -> 28168 ms on a Quadro RTX 5000) which is well
+// inside this pipeline's run-to-run noise. Portability wins that trade outright.
+//
+// PMCUDA_MIN_BLOCKS is the remaining knob, and it only ever TIGHTENS the budget:
+// measured on that same host, loosening it is what hurts --
+//
 //   __launch_bounds__(512)    28168 ms
-//   __launch_bounds__(256)    31778 ms
+//   __launch_bounds__(256)    31778 ms   (BLOCK_H=8; more registers, fewer
+//                                         resident threads, clearly worse)
 //
-// Monotonic, and the opposite of the obvious prediction. ProcessPixel carries a
-// lot of per-thread state -- costArray[8][MAXV] (dynamically indexed, hence
-// local-memory resident), the RefPatch, plus the sampling/selection arrays -- so
-// the expectation was that giving nvcc a bigger register budget would cut spill
-// and win. It loses. Turing has 64K registers and room for 1024 threads per SM,
-// so __launch_bounds__ caps registers at 65536/maxThreadsPerBlock: 128/thread at
-// 512 threads, 255 at 256. Raising that cap let nvcc keep more per thread, which
-// dropped resident threads per SM, and this kernel is latency-bound -- it needs
-// the occupancy far more than it needs to avoid the spill.
-//
-// So the knobs stay, defaulted OFF: the stock nvcc heuristic wins. The one
-// direction NOT yet tried is the tightening one -- PMCUDA_USE_LAUNCH_BOUNDS=1
-// with PMCUDA_MIN_BLOCKS=2 at BLOCK_H=16 pins 2 blocks x 512 threads = full
-// Turing occupancy at 64 registers/thread. That is the way the evidence points.
+// ProcessPixel is latency-bound, so it wants occupancy far more than it wants to
+// avoid spill. The untried direction is PMCUDA_MIN_BLOCKS=2 at BLOCK_H=16: two
+// resident 512-thread blocks, i.e. full occupancy at 64 registers/thread.
 //
 // Neither knob changes results. Every pixel in a checkerboard phase reads only
 // opposite-parity cells written by the previous phase, and the RNG is seeded from
 // the pixel index, so which thread owns a pixel is irrelevant.
 // ---------------------------------------------------------------------
-#ifndef PMCUDA_BLOCK_W
-#define PMCUDA_BLOCK_W 32
-#endif
-#ifndef PMCUDA_BLOCK_H
-#define PMCUDA_BLOCK_H 16
-#endif
-#ifndef PMCUDA_USE_LAUNCH_BOUNDS
-#define PMCUDA_USE_LAUNCH_BOUNDS 0
-#endif
-#ifndef PMCUDA_MIN_BLOCKS
-#define PMCUDA_MIN_BLOCKS 0
-#endif
-#if !PMCUDA_USE_LAUNCH_BOUNDS
-#define PMCUDA_LAUNCH_BOUNDS
-#elif PMCUDA_MIN_BLOCKS > 0
+// PMCUDA_BLOCK_W / PMCUDA_BLOCK_H / PMCUDA_MIN_BLOCKS come from PatchMatchCUDA.inl
+#if PMCUDA_MIN_BLOCKS > 0
 #define PMCUDA_LAUNCH_BOUNDS __launch_bounds__(PMCUDA_BLOCK_W*PMCUDA_BLOCK_H, PMCUDA_MIN_BLOCKS)
 #else
 #define PMCUDA_LAUNCH_BOUNDS __launch_bounds__(PMCUDA_BLOCK_W*PMCUDA_BLOCK_H)
@@ -913,12 +907,58 @@ __host__ void PMUnpackResults(const Point4* d_planes, const float* d_costs, cons
 /*----------------------------------------------------------------*/
 
 
+// Effective checkerboard block height actually launched, published for the .cpp to
+// report: PMCUDA_BLOCK_H normally, lower if this device would not accept that many
+// threads for the compiled kernel (see the clamp below).
+int g_pmcudaEffectiveBlockH = PMCUDA_BLOCK_H;
+
 template <int MAXV>
 __host__ void PatchMatch::RunCUDAT(const int width, const int height)
 {
-	// must match the __launch_bounds__ the kernels were compiled with
 	constexpr unsigned BLOCK_W = PMCUDA_BLOCK_W;
-	constexpr unsigned BLOCK_H = PMCUDA_BLOCK_H;
+	// Block height clamped to what THIS device will actually accept.
+	//
+	// __launch_bounds__ already guarantees the compiled kernel fits PMCUDA_BLOCK_H,
+	// so on a device the build has SASS for this is a no-op. It is a backstop for
+	// the case that has already bitten once: a kernel whose register demand cannot
+	// be met at the requested block size fails with cudaErrorLaunchOutOfResources
+	// (701) at launch, and checkCudaCall turns that into a hard exit which the
+	// caller reports as "switching to CPU-only" -- a machine that quietly stops
+	// using its GPU, with nothing actionable in the log. Degrading the block size
+	// keeps the GPU in play instead, and says so.
+	//
+	// Halving is safe: any block height computes the same result (each checkerboard
+	// phase reads only opposite-parity cells from the previous phase and the RNG is
+	// seeded from the pixel index), and the band arithmetic below rounds to it.
+	// Queried once per MAXV instantiation via a function-local static, so the
+	// initialisation is thread-safe and costs one call per run.
+	// NOTE: this file sees only CUDA/Camera.h (string, vector, Maths.h) -- none of
+	// the SEACAVE Common headers -- so no MINF and no VERBOSE here. The outcome is
+	// published through g_pmcudaEffectiveBlockH and reported by the .cpp, which does
+	// have the logger.
+	static const unsigned BLOCK_H = []() -> unsigned {
+		unsigned h = PMCUDA_BLOCK_H;
+		int maxThreads = 0;
+		cudaFuncAttributes attr;
+		// the propagation kernels are the register-hungry ones; take the tightest
+		if (cudaFuncGetAttributes(&attr, BlackPixelProcess<MAXV>) == cudaSuccess && attr.maxThreadsPerBlock > 0)
+			maxThreads = attr.maxThreadsPerBlock;
+		if (cudaFuncGetAttributes(&attr, RedPixelProcess<MAXV>) == cudaSuccess && attr.maxThreadsPerBlock > 0)
+			maxThreads = (maxThreads == 0 || attr.maxThreadsPerBlock < maxThreads) ? attr.maxThreadsPerBlock : maxThreads;
+		if (cudaFuncGetAttributes(&attr, InitializeScore<MAXV>) == cudaSuccess && attr.maxThreadsPerBlock > 0)
+			maxThreads = (maxThreads == 0 || attr.maxThreadsPerBlock < maxThreads) ? attr.maxThreadsPerBlock : maxThreads;
+		if (maxThreads <= 0)
+			return h; // could not ask; leave the compiled-for value alone
+		// PMCUDA_BLOCK_W, not the local BLOCK_W: this is a runtime expression, so
+		// naming the local would odr-use it and demand a lambda capture
+		while (h > 1 && (int)(PMCUDA_BLOCK_W * h) > maxThreads)
+			h /= 2;
+		g_pmcudaEffectiveBlockH = (int)h;
+		return h;
+	}();
+	// clear any error the attribute queries may have latched, so it is not
+	// misattributed to the launches below
+	cudaGetLastError();
 	const dim3 blockSize(BLOCK_W, BLOCK_H, 1);
 	const unsigned gridW = ((unsigned)width + BLOCK_W - 1) / BLOCK_W;
 
