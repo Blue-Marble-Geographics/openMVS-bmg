@@ -760,7 +760,7 @@ int main(int argc, LPCTSTR* argv)
 			TFinalize();
 			return EXIT_SUCCESS;
 		}
-		VERBOSE("Densifying point-cloud completed: %u points (%s)", scene.pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
+		DENSIFY_DIAG("Densifying point-cloud completed: %u points (%s)", scene.pointcloud.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 
 	// Single deliverable: the multi-view-consensus FUSED cloud (scene.pointcloud),
@@ -782,7 +782,7 @@ int main(int argc, LPCTSTR* argv)
 	if (OPT::thFilterPointCloud > 0 && !scene.pointcloud.IsEmpty()) {
 		const size_t nBefore(scene.pointcloud.GetSize());
 		scene.PointCloudFilter(-OPT::thFilterPointCloud, 0.5f);
-		VERBOSE("Filtered point-cloud (th<=-%d): %u -> %u points",
+		DENSIFY_DIAG("Filtered point-cloud (th<=-%d): %u -> %u points",
 			OPT::thFilterPointCloud, (unsigned)nBefore, (unsigned)scene.pointcloud.GetSize());
 	}
 

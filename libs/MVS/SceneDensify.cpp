@@ -1247,7 +1247,7 @@ namespace {
 	}
 }
 
-#define ESTIMATE_PROFILE 1
+#define ESTIMATE_PROFILE 0
 #if ESTIMATE_PROFILE
 namespace {
 	using est_clock = std::chrono::steady_clock;
@@ -2148,7 +2148,7 @@ bool DepthMapsData::GapInterpolation(DepthData& depthData)
 // totals exceed wall-clock -- the RATIOS reveal the bottleneck) and prints
 // one summary line at the end of the filter phase. Set to 0 to remove.
 // ===================================================================
-#define FILTER_PROFILE 1
+#define FILTER_PROFILE 0
 #if FILTER_PROFILE
 namespace {
 	using filter_clock = std::chrono::steady_clock;
@@ -8225,6 +8225,6 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 			vMemInit, pointcloud.pointViewsMemory.size(), wMemInit, pointcloud.pointWeightsMemory.size());
 	}
 
-	DEBUG_EXTRA("Point-cloud filtered: %u/%u points (%d%%%%) (%s)", pointcloud.NumPoints(), numInitPoints, ROUND2INT((100.f*pointcloud.NumPoints()) / numInitPoints), TD_TIMER_GET_FMT().c_str());
+	DENSIFY_DIAG("Point-cloud filtered: %u/%u points (%d%%%%) (%s)", pointcloud.NumPoints(), numInitPoints, ROUND2INT((100.f*pointcloud.NumPoints()) / numInitPoints), TD_TIMER_GET_FMT().c_str());
 	} // PointCloudFilter
 /*----------------------------------------------------------------*/

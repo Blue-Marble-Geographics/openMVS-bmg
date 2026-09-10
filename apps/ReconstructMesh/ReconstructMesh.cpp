@@ -646,7 +646,7 @@ int main(int argc, LPCTSTR* argv)
 						" subdivision, POISSON_ATLAS_REFINE_RESERVE)",
 						budgetAtlasMax * 1e-6,
 						100.0 * (1.0 - budgetAtlas / budgetAtlasMax));
-				VERBOSE("[ATLAS] texture atlas %d px (%s%s) -> room for %.1fM faces%s;"
+				MESH_DIAG("[ATLAS] texture atlas %d px (%s%s) -> room for %.1fM faces%s;"
 					" %u views leave room for %.1fM by memory"
 					" (enforced here pre-refine; RefineMesh clamps subdivision to the atlas ceiling)",
 					atlasDim, srcAtlas, atlasWant.c_str(),
@@ -677,7 +677,9 @@ int main(int argc, LPCTSTR* argv)
 								100.0 * (1.0 - capRatio));
 						}
 				} else {
-					VERBOSE("[ATLAS] %s-bound at %.1fM faces; mesh has %u -- not reduced",
+					// nothing was changed, so this is a statement about the budget
+					// rather than about the deliverable -- it rides the gate
+					MESH_DIAG("[ATLAS] %s-bound at %.1fM faces; mesh has %u -- not reduced",
 						which, budget * 1e-6, (unsigned)nFaces);
 				}
 			}

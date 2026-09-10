@@ -371,10 +371,11 @@ int main(int argc, LPCTSTR* argv)
 	}
 	if (!bRefinedCUDA)
 	#else
-	// Same guarantee as the CUDA build above: the log always states which device ran,
-	// so "why did this refine on the CPU?" is answerable from the log in every build
-	// configuration rather than only where a GPU path exists.
-	VERBOSE("Mesh refinement: using the CPU (this build has no CUDA support)");
+	// The CUDA-build siblings above are choices between two available devices, which
+	// the operator can act on; this one is a property of the BUILD -- there is no
+	// device to choose and no switch that would change it -- so it is gated with the
+	// rest of the refiner's internals rather than announced on every run.
+	REFINE_DIAG("Mesh refinement: using the CPU (this build has no CUDA support)");
 	#endif
 	if (!scene.RefineMesh(OPT::nResolutionLevel, OPT::nMinResolution, OPT::nMaxViews,
 						  OPT::fDecimateMesh, OPT::nCloseHoles, OPT::nEnsureEdgeSize,

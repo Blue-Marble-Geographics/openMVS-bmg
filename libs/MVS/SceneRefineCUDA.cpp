@@ -124,7 +124,7 @@ using namespace MVS;
 // what MESHOPT_CUDA_VISIBILITY_REUSE is actually worth on a given scene/GPU:
 // the saving is (cull share of an iteration) x (1 - reculls/iters).
 #ifndef MESHOPT_CUDA_PROFILE
-#define MESHOPT_CUDA_PROFILE 1
+#define MESHOPT_CUDA_PROFILE 0
 #endif
 // Synchronize before reading the profile clocks. Every CUDA call on this path is
 // asynchronous on the default stream, so without this the "project" bucket only
@@ -149,7 +149,7 @@ using namespace MVS;
 // set it to 0 for production runs and the "refproj" bucket folds back into "pairs"
 // while its COUNT stays exact.
 #ifndef MESHOPT_CUDA_PROFILE_REFPROJ
-#define MESHOPT_CUDA_PROFILE_REFPROJ 1
+#define MESHOPT_CUDA_PROFILE_REFPROJ 0
 #endif
 
 // Reference-local face/bary residency -- "rung 1" of the VRAM ladder.

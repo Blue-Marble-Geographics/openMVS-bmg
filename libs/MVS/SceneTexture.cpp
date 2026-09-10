@@ -95,7 +95,7 @@ static inline void TrimHeap() {
 // never inside an omp parallel-for body, or the log will be spammed per-item.
 // ============================================================================
 #ifndef TEXTURE_PROFILE
-#define TEXTURE_PROFILE 1
+#define TEXTURE_PROFILE 0
 #endif
 
 #if TEXTURE_PROFILE
@@ -8536,12 +8536,12 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 			if (bAtlasReduced && wantedAreaPixels > 0) {
 				const double keptFrac = (double)finalAreaPixels / (double)wantedAreaPixels;
 				const int wantedDim = (int)std::ceil(std::sqrt((double)wantedAreaPixels));
-				VERBOSE("[ATLAS] built %dx%d px, ceiling %d px -- SMALLER THAN WANTED:"
+				TEXTURE_DIAG("[ATLAS] built %dx%d px, ceiling %d px -- SMALLER THAN WANTED:"
 					" full resolution needed about %d px, so the texture keeps %.2fx the"
 					" pixels it asked for (about %.2fx linear detail)",
 					atlasW, atlasH, hardMaxDim, wantedDim, keptFrac, std::sqrt(keptFrac));
 			} else {
-				VERBOSE("[ATLAS] built %dx%d px, ceiling %d px -- full requested resolution",
+				TEXTURE_DIAG("[ATLAS] built %dx%d px, ceiling %d px -- full requested resolution",
 					atlasW, atlasH, hardMaxDim);
 			}
 		}
@@ -10629,7 +10629,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					}
 #endif // TEXTURE_DATACOLOR_FEATHER_RINGS
 					textureDiffuse = newTex;
-					DEBUG("Data-colored %d unobserved faces in %d component tiles (%d atlas rows"
+					TEXTURE_DIAG("Data-colored %d unobserved faces in %d component tiles (%d atlas rows"
 						" = %.3f of atlas, capped at real-texture density %.1f px/unit,"
 						" nearest-fill + %d seam-smooth iters)",
 						N, nComp, extraRows,
@@ -10784,7 +10784,7 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 						texcoords[2] = TexCoord(x2, y2);
 					}
 					textureDiffuse = newTex;
-					DEBUG("Data-colored %d unobserved faces (surface-propagated quadratic patch, %d atlas rows, %d smooth iters)", N, extraRows, (int)TEXTURE_DATACOLOR_SMOOTH_ITERS);
+					TEXTURE_DIAG("Data-colored %d unobserved faces (surface-propagated quadratic patch, %d atlas rows, %d smooth iters)", N, extraRows, (int)TEXTURE_DATACOLOR_SMOOTH_ITERS);
 #endif // TEXTURE_DATACOLOR_COMPONENT_BAKE (per-face cell fallback)
 				}
 			}
@@ -11149,7 +11149,7 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 		TD_TIMER_STARTD();
 		if (!texture.FaceViewSelection(labels, minCommonCameras, fOutlierThreshold, fRatioDataSmoothness, views))
 			return false;
-		DEBUG_EXTRA("Assigning the best view to each face completed: %u faces (%s)", mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
+		TEXTURE_DIAG("Assigning the best view to each face completed: %u faces (%s)", mesh.faces.GetSize(), TD_TIMER_GET_FMT().c_str());
 	}
 	LogPeakMem("after FaceViewSelection");
 
@@ -11163,9 +11163,11 @@ bool Scene::TextureMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsi
 			// [ATLAS-FINAL] What the atlas actually came out as. On the TEXTURE_DIAG build
 			// switch, paired with RefineMesh's [REFINE-FACES] on REFINE_DIAG: the two are
 			// the texel-budget audit trail and are only meaningful read together, so a
-			// -DOPENMVS_DIAG=1 build carries both. (ReconstructMesh's [ATLAS] cap line and
-			// the "SMALLER THAN WANTED" notice stay ungated on purpose -- those report a
-			// change to the deliverable, not a mechanism.)
+			// -DOPENMVS_DIAG=1 build carries both. ReconstructMesh's [ATLAS] budget line
+			// and the "SMALLER THAN WANTED" notice are on the same gates as of this
+			// change, so the whole atlas trail appears and disappears together; the one
+			// [ATLAS] line still ungated is the cap that actually DECIMATES the mesh,
+			// which changes the deliverable rather than describing the budget.
 			//
 			// The line above reports textureDiffuse.width() ONLY. The atlas is not square --
 			// measured 14876 x 16054 on one run -- so reading that single number as the atlas

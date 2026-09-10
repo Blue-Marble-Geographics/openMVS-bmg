@@ -190,7 +190,7 @@
 // the arguments stay referenced by the compiler and a closed gate does not
 // produce a wall of unused-variable warnings in the blocks that feed it.
 #ifndef OPENMVS_DIAG
-#define OPENMVS_DIAG 1
+#define OPENMVS_DIAG 0
 #endif
 #ifndef OPENMVS_DENSIFY_DIAG
 #define OPENMVS_DENSIFY_DIAG OPENMVS_DIAG
@@ -253,9 +253,18 @@
 //    ran and at what standard-deviation cutoffs). A default run should say what
 //    it produced, not how.
 //
-// So the default log keeps only the phase results and every error/warning; the
+// So the default log keeps only the DELIVERABLE lines and every error/warning; the
 // rest is a rebuild away -- build with -DOPENMVS_DENSIFY_DIAG=1 (or the master
 // -DOPENMVS_DIAG=1) and they come back unconditionally, at any verbosity.
+//
+// "Deliverable" is narrower than "phase result", and deliberately so: the intermediate
+// point counts ("Densifying point-cloud completed", "Point-cloud filtered: N/M",
+// "Filtered point-cloud (th<=-N)") now ride the gate as well. They report the same
+// cloud three times on its way through fusion and filtering, and the one number an
+// operator needs -- what actually landed on disk -- is in DensifyPointCloud's "Saved
+// dense point-cloud: <file> (N points, filtered fused)", which stays ungated. Keep
+// that line ungated if this ever gets reorganised, or the default log loses the
+// point count entirely.
 // Only VISIBILITY changes: every message keeps its text, its arguments, and the
 // conditions under which it is computed, so a build with the gate open logs
 // exactly what the ungated code logged.
@@ -323,9 +332,17 @@
 // blocks whole; anything whose result also DECIDES something stays outside the gate.
 //
 // What is NOT gated: anything that decides geometry or the atlas, any error or warning,
-// the per-stage result lines, the atlas-overflow/adaptive-downscale notices (they
-// explain a resolution loss in the deliverable), and the counts of faces the texturing
-// pass removes from or moves on the output mesh.
+// and the counts of faces the texturing pass removes from or moves on the output mesh.
+//
+// The atlas-overflow/adaptive-downscale notices ("[ATLAS] built ... SMALLER THAN
+// WANTED") USED to be excluded here on the grounds that they explain a resolution loss
+// in the deliverable. They now ride the gate with the rest of the atlas trail: the
+// resolution the atlas settles on is a consequence of the host's sampling ceiling and
+// the scene's texture area, neither of which the operator sets on the command line, so
+// the notice describes a mechanism they cannot act on -- and splitting the [ATLAS]
+// lines across two visibility levels made the surviving half unreadable on its own.
+// Same for the stage-completion lines ("Assigning the best view to each face
+// completed", the data-color fill summary): a default run reports what it produced.
 #if TD_VERBOSE == TD_VERBOSE_OFF || !OPENMVS_TEXTURE_DIAG
 #define TEXTURE_DIAG_ENABLED()	false
 #else
@@ -352,7 +369,10 @@
 //
 // What stays visible is what the operator can act on or must know, phrased as an
 // OUTCOME rather than a mechanism:
-//   * which device ran, and the switch that would change it;
+//   * which device ran, WHERE THERE WAS A CHOICE, and the switch that would change it.
+//     A build compiled without CUDA has no choice to report and no switch to name, so
+//     its "using the CPU (this build has no CUDA support)" line rides the gate; the
+//     CUDA build's device lines, which distinguish two available devices, do not;
 //   * settings this run reduced on their behalf, and that quality moved as a result
 //     (both are command-line options, so naming them exposes nothing internal);
 //   * that a run will be slow, or that memory is short, WITHOUT the partition,

@@ -115,7 +115,7 @@ constexpr int TILEY = 16;
 // faceMaps resident (un-streaming) would save ~that at +~7 GB RAM.
 // Set to 1 to emit the full per-scale phase breakdown (see MeshProf below);
 // set BACK TO 0 for any release/quality build (adds per-call timing overhead).
-#define MESHOPT_PROFILE 1 // MEASUREMENT BUILD (tile-skip phase-2 sizing) -- restore to 0
+#define MESHOPT_PROFILE 0 // production; set to 1 for a measurement build
 
 #if MESHOPT_PROFILE
 // ---------------------------------------------------------------------------
@@ -8905,9 +8905,11 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 	if (!refine.IsValid())
 		return false;
 #if !MESHOPT_DISABLE_TILE_SKIP
-	// results-affecting mode, so the log states it up front either way (the
-	// per-scale [TILE-SKIP] line then says what it actually retired)
-	VERBOSE("Mesh refinement tile-skip: %s (warmup %d, full refresh every %d iterations, halo %d tile%s; OPENMVS_REFINE_TILE_SKIP=0/1 overrides, OPENMVS_REFINE_BASELINE=1 disables all refine optimizations)",
+	// Results-affecting mode, but it names the internal schedule (warmup, refresh
+	// period, halo) and two environment overrides -- refiner mechanism, so it rides
+	// REFINE_DIAG like the rest. The per-scale [TILE-SKIP] line, also gated, then
+	// says what it actually retired.
+	REFINE_DIAG("Mesh refinement tile-skip: %s (warmup %d, full refresh every %d iterations, halo %d tile%s; OPENMVS_REFINE_TILE_SKIP=0/1 overrides, OPENMVS_REFINE_BASELINE=1 disables all refine optimizations)",
 		refine.tileSkipEnabled ? "enabled" : "disabled (default: costs ~3%% final gradient norm)",
 		MESHOPT_TILE_SKIP_WARMUP, MESHOPT_TILE_SKIP_REFRESH,
 		MESHOPT_TILE_SKIP_HALO, MESHOPT_TILE_SKIP_HALO == 1 ? "" : "s");
