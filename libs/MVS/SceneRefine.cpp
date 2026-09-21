@@ -32,7 +32,10 @@
 #include "Common.h"
 #include "Scene.h"
 #include "SceneRefineAVX2.h"
+#include <atomic>
 #include <chrono>
+#include <limits>
+#include <type_traits>
 #include <functional>
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <intrin.h>
@@ -75,8 +78,56 @@ bool SupportsAVX2()
 
 #undef VALIDATE_GRADIENT
 
-constexpr int TILEX = 16;
-constexpr int TILEY = 16;
+// Gradient accumulation tile. NOT symmetric, and not historically tuned:
+//
+//  TILEX  affects ONLY ComputePhotometricGradient's tile loop, and through
+//         LOCAL_CAP = TILEX*TILEY*4 the per-tile open-addressed vertex table.
+//         That 4 is a SAFETY ratio, not a tuning constant: worst case every pixel
+//         sits on its own face, so a tile can touch 3*pixels distinct vertices, and
+//         4 slots/pixel holds that at 75% load. `accum`'s probe loop is for(;;)
+//         with no termination check, so the table must never fill. Keep TILEX and
+//         TILEY powers of two -- the probe masks with (LOCAL_CAP-1), and the
+//         triangular sequence only covers every slot on a power-of-two table.
+//  TILEY  additionally sets the windowed-ZNCC BAND height (imageDZNCC is
+//         TILEY x cols) and therefore the consumeBand callback frequency. Changing
+//         it moves two unrelated things at once.
+//
+// Why the tiling exists at all, and which way it cuts: the gradient is
+// memory-stall-bound (~210 cycles per masked pixel against ~30-40 arithmetic ops;
+// vectorising the math bought 6.5%, while removing 64 B/px of struct copies and
+// 4 ops/px each bought NOTHING). Two effects pull opposite ways -- wider tiles
+// amortise each fetched row of viewB's gradX/gradY over more pixels, narrower tiles
+// pack the per-tile vertex table into fewer cache lines.
+//
+// MEASURED 2026-09-16 (RichmondHistoric), grad/Warp -- Warp depends on neither
+// value, so it normalises away the several percent this box drifts within a session
+// (raw ms across runs is NOT comparable):
+//   TILEX/Y   grad/Warp   roll/Warp  emit/Warp   (grad+roll+emit)/Warp
+//     16/16      3.443       0.1476     0.2781       3.869   n=10
+//      8/16      3.245       0.1470     0.2737       3.665   -5.3%   n=2
+//       8/8      3.137       0.1522     0.2676       3.557   -8.1%   <== OPTIMUM
+//       8/4      3.138       0.1617     0.2740       3.573   -7.6%
+// 8/4 is where it turns: grad stops improving (3.138 vs 3.137, flat to four digits)
+// while roll pays 6.2% -- 4-row bands interleave the gradient callback into the ZNCC
+// row loop twice as often, and the rolling column sums (colB/colB2/colAB, ~58 KB at
+// this width) get evicted between bands. DO NOT go below TILEY 8.
+//
+// The MECHANISM of the 16->8 gains is NOT identified: with ~5 live vertices per tile
+// the table's touched line count barely moves, and at TILEX 8 both A-side line
+// utilisation and B-side row reuse get WORSE -- yet it measured better. Most likely
+// the total per-tile working set simply fits cache better. Treat that as a
+// hypothesis; do not optimise against it without measuring.
+//
+// TILEX 8 is the FLOOR -- the AVX2 group loop needs `cScalar + 8 <= xEnd`, so a
+// narrower tile would silently retire the whole PG-AVX2 path to the scalar fallback.
+//
+// NOTE: changing either value RE-GROUPS the per-tile gradient partial sums, so the
+// output can shift within the usual scheduling-noise band and photoEnergyLast moves.
+// Check ScoreMesh's call count is unchanged before comparing timings. And when TILEY
+// moves, roll/emit stop being clean controls (the band buffer resizes with it) --
+// Warp does not depend on either value and stays valid.
+constexpr int TILEX = 8;
+constexpr int TILEY = 8;
 
 // uncomment to ensure edge size and improve vertex valence
 // (should enable more stable flow)
@@ -115,7 +166,7 @@ constexpr int TILEY = 16;
 // faceMaps resident (un-streaming) would save ~that at +~7 GB RAM.
 // Set to 1 to emit the full per-scale phase breakdown (see MeshProf below);
 // set BACK TO 0 for any release/quality build (adds per-call timing overhead).
-#define MESHOPT_PROFILE 0 // production; set to 1 for a measurement build
+#define MESHOPT_PROFILE 0 // MEASUREMENT BUILD
 
 #if MESHOPT_PROFILE
 // ---------------------------------------------------------------------------
@@ -134,7 +185,10 @@ namespace MeshProf {
 		P_InitImages, P_ListVtxPre, P_Subdivide, P_ListVtxPost,             // scale (wall)
 		P_ScoreMesh, P_Momentum, P_MaxDisp,                                 // iter (wall)
 		P_ListCameraFaces, P_PairLoopWall, P_Smooth1, P_Smooth2, P_Combine, // ScoreMesh (wall)
+		P_TileReset, P_TileFold,                                            // ScoreMesh (wall)
 		P_StreamPrep, P_StreamFaceAreas, P_StreamBatches, P_StreamResident,  // view-stream (wall)
+		P_ProjectMeshTS, P_InitImageTS,                                     // THREAD-SUMMED (see below)
+		P_PMRasterTS, P_PMClearTS, P_PMValidTS,                             // ProjectMesh, broken out
 		P_Rasterize, P_RefVar, P_Warp, P_WarpVar, P_ZNCC, P_ZNCCRoll, P_ZNCCEmit, P_PhotoGrad, // pair loop (thread-summed)
 		P_COUNT
 	};
@@ -144,15 +198,79 @@ namespace MeshProf {
 	// SUB-buckets measured INSIDE the P_ZNCC call, so they are excluded from
 	// the pair-loop percentage base to avoid double counting; the term pass =
 	// ZNCC - ZNCC:roll - ZNCC:emit - ZNCC:grad.
+	// P_ProjectMeshTS is the odd one out: it is THREAD-SUMMED like a pair phase but
+	// lives in the wall group, because the work it measures runs on the SEACAVE
+	// worker pool (EVTProjectMesh), not on the OpenMP team, so AddTL/FlushTL -- which
+	// only ever flush from OMP threads inside the pair loop's critical section --
+	// would silently drop it. Accumulated lock-free in microseconds instead.
+	//
+	// It exists to answer ONE question: StreamResident is ~21% of the run and is
+	// entered under `#pragma omp single`, so 32 OpenMP threads sit at that barrier
+	// while the worker pool projects. Divide this by StreamResident wall to get the
+	// round's effective thread count. The pair loop next to it runs at 30.7 of 32
+	// (thread-summed compute / (PairLoop - StreamResident)); if this comes out near
+	// 30 the round is already saturating the box and there is nothing to win, and if
+	// it comes out near 16 the spin is eating half the machine.
+	static std::atomic<uint64_t> gProjUs{0}; // ThProjectMesh, summed over worker threads
+	// ProjectMesh is 590 s of thread time (~17% of the run) under ONE timer. Its three
+	// phases have completely different cost models -- a per-FACE scanline rasterizer, a
+	// per-PIXEL clear, and a per-PIXEL validity/prune sweep -- so one bucket cannot say
+	// which to attack. Raster and clear are measured directly; validity is the remainder
+	// (gProjUs - raster - clear), which is why it needs no timer of its own and no extra
+	// instrumentation across the function's several exits.
+	static std::atomic<uint64_t> gPMRasterUs{0};
+	static std::atomic<uint64_t> gPMClearUs{0};
+	// rasterizer shape: faces in / faces that reach the scanline / rows / bbox pixels
+	// tested / pixels that won the depth test. Ratios, not times: pixels-per-face says
+	// whether setup or fill dominates, and won/scanned says how much of the bbox walk
+	// is wasted on pixels outside the triangle.
+	static std::atomic<uint64_t> gPMFaces{0}, gPMFacesRast{0}, gPMRows{0}, gPMPixScan{0}, gPMPixWon{0};
+	// How many ListCameraFaces calls actually REBUILD the candidate list versus reuse it.
+	// NOT reset in the pair-loop block below with the gPM* counters: ScoreMesh calls
+	// ListCameraFaces at its HEAD, before that reset runs, so zeroing them there wiped
+	// every count. The exchange at the dump is their only reset -- which also means a
+	// cull done by SubdivideMesh is tallied into the NEXT ScoreMesh's line.
+	// ListCameraFaces(wall) lumps both, so it cannot price the visibility pad: the pad
+	// trades wasted rasterizer rejects (measured: 88 s of thread time, 96% of it at
+	// scale 1) against recull cost, and without the recull COUNT neither side is known.
+	static std::atomic<uint64_t> gCullRebuilds{0}, gCullReuses{0};
+	static std::atomic<uint64_t> gInitUs{0}; // ThInitImage, likewise (same worker pool,
+	// same omp-single caller): StreamResident covers BOTH rounds plus its own serial
+	// bookkeeping, so sizing the projection round alone cannot say how much of the
+	// residency gap is under-parallelism and how much is simply other work.
 	static const int kFirstPairPhase = (int)P_Rasterize;
 	static const char* const kName[P_COUNT] = {
 		"InitImages", "ListVtxPre", "Subdivide", "ListVtxPost",
 		"ScoreMesh(total)", "MomentumUpdate", "MaxDispScan",
 		"  ListCameraFaces", "  PairLoop(wall)", "  Smooth1", "  Smooth2", "  Combine",
+		"  TileEnergyReset", "  TileEnergyFold",
 		"  StreamPrepChunked", "  StreamFaceAreas", "  StreamBuildBatches", "  StreamResident",
+		"  ProjectMesh(thr-sum)", "  InitImage(thr-sum)",
+		"    PM:raster(thr-sum)", "    PM:clear(thr-sum)", "    PM:valid(thr-sum)",
 		"    Rasterize", "    RefVariance", "    Warp", "    WarpVariance", "    ZNCC", "      ZNCC:roll", "      ZNCC:emit", "      ZNCC:grad"
 	};
-	struct Acc { double ms[P_COUNT] = {}; unsigned long long calls[P_COUNT] = {}; };
+	// [PG] gradient mask counters. COUNTERS, not timers: the phases inside the
+	// gradient interleave per 8-pixel group, so no clock can separate them, but a
+	// couple of adds per group can still say how often the `m8 == 0` early-out
+	// fires and how dense the warp mask is. pg[] = {groups, emptyGroups, maskedPx}.
+	// Counted on the AVX2 group path only; the scalar remainder is 6 px of the
+	// tx==0 tile per row and nothing elsewhere (a 16-wide tile divides exactly into
+	// two groups), i.e. ~0.25% of the frame -- so these are frame-representative.
+	// Mask density is also the coverage number that decides whether the full-frame
+	// warp and ZNCC, which are mask-INDEPENDENT by construction, are doing wasted
+	// work.
+	struct Acc {
+		double ms[P_COUNT] = {}; unsigned long long calls[P_COUNT] = {}; unsigned long long pg[9] = {};
+		// PM ROUND accounting (see PMRoundBegin). Written by the MAIN thread only,
+		// between rounds, so these need no synchronisation of their own.
+		double pmWallMs = 0;     // sum of round MAKESPANs (dispatch -> barrier released)
+		double pmSumMs = 0;      // sum of per-view thread time across all rounds
+		double pmMaxMs = 0;      // sum of each round's SLOWEST WORKER
+		double pmViewMaxMs = 0;  // sum of each round's SLOWEST SINGLE VIEW
+		double pmCpuMs = 0;      // WHOLE-PROCESS cpu (kernel+user) burned during those rounds
+		unsigned long long pmRounds = 0, pmViews = 0;
+	};
+	static thread_local unsigned long long tlPG[9];
 	static Acc gScale; // reset each scale
 	static Acc gTotal; // whole run
 	static thread_local double tlMs[P_COUNT] = {};
@@ -165,6 +283,117 @@ namespace MeshProf {
 	static inline void AddTL(Phase p, double ms) { tlMs[p] += ms; ++tlCalls[p]; }
 	static inline void FlushTL() { // call inside an omp critical section
 		for (int i = 0; i < (int)P_COUNT; ++i) if (tlCalls[i]) { gScale.ms[i] += tlMs[i]; gScale.calls[i] += tlCalls[i]; tlMs[i] = 0; tlCalls[i] = 0; }
+		for (int i = 0; i < 9; ++i) { gScale.pg[i] += tlPG[i]; tlPG[i] = 0; }
+	}
+	// -----------------------------------------------------------------------
+	// PM ROUND instrumentation -- THE GATE.
+	//
+	// MESHOPT_RASTER_Z_DIRECT removed ~9 flops/pixel, cut PM:raster thread time by
+	// 7.6% (46 s), and moved WALL BY ZERO across three runs. 46 s over ~26 threads
+	// should have been ~1.8 s. No mechanism was identified, and until one is, every
+	// ProjectMesh optimisation -- SIMD, tiling, scheduling -- has an expected value
+	// of zero. This measures the bridge that failed.
+	//
+	// A ROUND is one dispatch-to-barrier window: the AddEvent loop that queues
+	// EVTProjectMesh for N views, plus the WaitThreadWorkers that drains it. Four
+	// numbers per round, and together they discriminate every hypothesis:
+	//
+	//   wall     the round's MAKESPAN. This is what ProjectMesh actually costs the
+	//            run. If sum/wall comes out near the worker count the phase is
+	//            saturating the box; if it comes out near 1 the pool is idle.
+	//   sum      per-view thread time, summed. This is what gProjUs already reports
+	//            and what the -7.6% was measured against.
+	//   max      the SLOWEST WORKER in the round. A barrier releases when the last
+	//            worker finishes, so `max` IS the round's compute makespan; the gap
+	//            between `max` and `wall` is dispatch/queue/spin overhead, and the
+	//            gap between `max` and `sum/P` is load imbalance.
+	//   viewMax  the slowest SINGLE VIEW. This splits the imbalance in two:
+	//              viewMax ~= max -> ONE VIEW is the tail. Scheduling cannot help;
+	//                               only sub-view granularity (row-band tiling) can.
+	//              viewMax << max -> the tail is PICK ORDER. Sorting the dispatch
+	//                               longest-first (LPT) recovers it in ~5 lines.
+	//
+	// The headline is `wall - sum/P`: the wall milliseconds that perfect scheduling
+	// could return. If that is small, scheduling is closed and the 58 cycles/pixel
+	// locality question is the only thing left here. If `sum/wall` is far below the
+	// worker count AND `max` is close to `wall`, the phase is simply not on the
+	// critical path and nothing here is worth optimising at all.
+	//
+	// Cost: one steady_clock pair per round (tens per scale) and one relaxed
+	// fetch_add per view. Nothing in any inner loop.
+	static constexpr int kMaxPMSlots = 256;
+	static std::atomic<int> gPMSlotNext{0};
+	static std::atomic<uint64_t> gPMSlotUs[kMaxPMSlots];
+	static std::atomic<uint64_t> gPMViewMaxUs{0};
+	static std::atomic<uint64_t> gPMViewCount{0};
+	static int gPMThreads = 0; // worker-pool size, stamped by the dispatch sites
+	// Stable per-worker index. The SEACAVE pool threads are long-lived, so a slot is
+	// assigned once per thread for the whole run and the array stays small.
+	static inline int PMSlot() {
+		static thread_local int slot = gPMSlotNext.fetch_add(1, std::memory_order_relaxed);
+		return slot < kMaxPMSlots ? slot : kMaxPMSlots - 1;
+	}
+	// WHOLE-PROCESS cpu time, kernel+user, in ms. Divided by a round's makespan this
+	// gives the average number of cores the PROCESS kept busy -- which is the only way
+	// to separate the two candidates for the 14% gap between `sum/P` and `wall`:
+	//
+	//   cores ~= pool effective threads  -> nobody else is burning cpu. The gap is the
+	//            pool's own ramp/drain and imbalance; there is nothing to reclaim by
+	//            changing which pool runs the work.
+	//   cores >> pool effective threads  -> the 31 OpenMP pair-loop threads parked at
+	//            the `omp single` barrier are SPINNING against the worker pool. 32 pool
+	//            threads + 31 spinners on 32 hardware threads is 2x oversubscription,
+	//            and the fix is to run the projection on the OpenMP team itself (an
+	//            `omp for` over toProject outside the single region) instead of handing
+	//            it to a second pool while the first one burns cores waiting.
+	//
+	// vcomp140 (this build's OpenMP runtime, confirmed by dumpbin) has no
+	// OMP_WAIT_POLICY / KMP_BLOCKTIME equivalent, so this cannot be probed by env var.
+	static double gPMCpuAtBegin = 0;
+	static inline double ProcessCpuMs() {
+#ifdef _WIN32
+		FILETIME ftCreate, ftExit, ftKernel, ftUser;
+		if (!GetProcessTimes(GetCurrentProcess(), &ftCreate, &ftExit, &ftKernel, &ftUser))
+			return 0.0;
+		const auto to64 = [](const FILETIME& f) {
+			return ((uint64_t)f.dwHighDateTime << 32) | (uint64_t)f.dwLowDateTime;
+		};
+		// FILETIME ticks are 100 ns
+		return (double)(to64(ftKernel) + to64(ftUser)) / 10000.0;
+#else
+		return 0.0;
+#endif
+	}
+	static inline void PMRoundBegin() {
+		for (int i = 0; i < kMaxPMSlots; ++i) gPMSlotUs[i].store(0, std::memory_order_relaxed);
+		gPMViewMaxUs.store(0, std::memory_order_relaxed);
+		gPMViewCount.store(0, std::memory_order_relaxed);
+		gPMCpuAtBegin = ProcessCpuMs();
+	}
+	// called from the worker pool, once per projected view
+	static inline void PMRoundAddView(double ms) {
+		const uint64_t us = (uint64_t)(ms * 1000.0);
+		gPMSlotUs[PMSlot()].fetch_add(us, std::memory_order_relaxed);
+		gPMViewCount.fetch_add(1, std::memory_order_relaxed);
+		uint64_t prev = gPMViewMaxUs.load(std::memory_order_relaxed);
+		while (us > prev && !gPMViewMaxUs.compare_exchange_weak(prev, us, std::memory_order_relaxed))
+			; // a failed exchange refreshes prev
+	}
+	// called from the MAIN thread once WaitThreadWorkers has returned
+	static inline void PMRoundEnd(double wallMs) {
+		double sum = 0, mx = 0;
+		for (int i = 0; i < kMaxPMSlots; ++i) {
+			const double v = (double)gPMSlotUs[i].load(std::memory_order_relaxed) / 1000.0;
+			sum += v;
+			if (v > mx) mx = v;
+		}
+		gScale.pmWallMs += wallMs;
+		gScale.pmSumMs += sum;
+		gScale.pmMaxMs += mx;
+		gScale.pmViewMaxMs += (double)gPMViewMaxUs.load(std::memory_order_relaxed) / 1000.0;
+		gScale.pmCpuMs += MAXF(0.0, ProcessCpuMs() - gPMCpuAtBegin);
+		gScale.pmViews += gPMViewCount.load(std::memory_order_relaxed);
+		++gScale.pmRounds;
 	}
 	static void Report(const char* tag, const Acc& a) {
 		double pairSum = 0;
@@ -185,8 +414,91 @@ namespace MeshProf {
 					kName[i], a.ms[i], a.calls[i], a.ms[i] / (double)a.calls[i]);
 			}
 		}
+		if (a.pg[0]) {
+			const double px = (double)a.pg[0] * 8.0;
+			VERBOSE("[PROFILE] %-20s %.3g groups, %.1f%% skipped all-mask-empty, mask density %.1f%%",
+				"  PG mask", (double)a.pg[0],
+				100.0 * (double)a.pg[1] / (double)a.pg[0],
+				100.0 * (double)a.pg[2] / px);
+		}
+		if (a.pg[7]) {
+			// Face-setup cache behaviour. The MISS BODY is 53% of the prepass in uProf
+			// (a chain of ~8 dependent random loads ending in a 48 MB faceNormals
+			// gather), so the question is whether those misses are CAPACITY (128 entries
+			// too few -> bump the constant) or COMPULSORY (each face must be filled once
+			// per reference view anyway -> only precomputing the setup array per view
+			// can help). Compare `misses per view-pass` against the number of distinct
+			// faces a view rasterizes: if they are close, the misses are compulsory.
+			VERBOSE("[PROFILE] %-20s %.4g probes, %.4g misses (%.2f%%), %.4g cache lifetimes -> %.3g misses per lifetime",
+				"  PG faceSetup", (double)a.pg[7], (double)a.pg[8],
+				100.0 * (double)a.pg[8] / (double)a.pg[7],
+				(double)a.calls[P_ScoreMesh] * 368.0,
+				(double)a.pg[8] / ((double)a.calls[P_ScoreMesh] * 368.0));
+		}
+		if (a.pmRounds) {
+			const int P = gPMThreads > 0 ? gPMThreads : 1;
+			const double ideal = a.pmSumMs / (double)P;         // perfectly balanced compute
+			const double eff = a.pmWallMs > 0.0 ? a.pmSumMs / a.pmWallMs : 0.0;
+			VERBOSE("[PROFILE] %-20s %llu rounds, %llu views, %d workers | wall %.1f ms | thread %.1f ms"
+				" -> %.1f effective threads (%.0f%% of %d)",
+				"  PM round", a.pmRounds, a.pmViews, P, a.pmWallMs, a.pmSumMs,
+				eff, 100.0 * eff / (double)P, P);
+			VERBOSE("[PROFILE] %-20s balanced compute would be %.1f ms; slowest worker %.1f ms"
+				" (imbalance %.2fx); dispatch/spin overhead %.1f ms (%.1f%% of wall)",
+				"  PM balance", ideal, a.pmMaxMs,
+				ideal > 0.0 ? a.pmMaxMs / ideal : 0.0,
+				a.pmWallMs - a.pmMaxMs,
+				a.pmWallMs > 0.0 ? 100.0 * (a.pmWallMs - a.pmMaxMs) / a.pmWallMs : 0.0);
+			// viewMax/max is THE discriminator: near 1.0 means one view IS the tail
+			// (only row-band tiling helps), well under 1.0 means it is pick order
+			// (sorting the dispatch longest-first recovers it).
+			VERBOSE("[PROFILE] %-20s slowest single view %.1f ms = %.0f%% of the slowest worker"
+				" -> tail is %s",
+				"  PM tail", a.pmViewMaxMs,
+				a.pmMaxMs > 0.0 ? 100.0 * a.pmViewMaxMs / a.pmMaxMs : 0.0,
+				(a.pmMaxMs > 0.0 && a.pmViewMaxMs / a.pmMaxMs > 0.6) ? "ONE VIEW (needs sub-view tiling)"
+					: "PICK ORDER (sort dispatch longest-first)");
+			VERBOSE("[PROFILE] %-20s %.1f ms of wall recoverable by perfect scheduling"
+				" (%.1f%% of PM wall)%s",
+				"  PM recoverable", MAXF(0.0, a.pmWallMs - ideal),
+				a.pmWallMs > 0.0 ? 100.0 * MAXF(0.0, a.pmWallMs - ideal) / a.pmWallMs : 0.0,
+				(a.pmWallMs - ideal) < 0.05 * a.pmWallMs ? "  <- CLOSED: scheduling has nothing to give" : "");
+			// THE OVERSUBSCRIPTION TEST. `cores` counts every thread in the process;
+			// `eff` counts only the worker pool. The difference is cpu burned by threads
+			// that are not projecting -- i.e. the parked OpenMP team spinning.
+			if (a.pmCpuMs > 0.0) {
+				const double cores = a.pmWallMs > 0.0 ? a.pmCpuMs / a.pmWallMs : 0.0;
+				const double spin = cores - eff;
+				VERBOSE("[PROFILE] %-20s process burned %.1f cores during PM rounds; the pool accounts"
+					" for %.1f -> %.1f cores (%.0f%%) spent elsewhere%s",
+					"  PM oversub", cores, eff, spin, cores > 0.0 ? 100.0 * spin / cores : 0.0,
+					spin > 2.0 ? "  <- OMP TEAM IS SPINNING: run the projection on the omp team instead"
+						: "  <- no spin; the gap is pool ramp/drain, nothing to reclaim here");
+			}
+		}
+		if (a.pg[4] && a.pg[6]) {
+			// SHAPE of the covered region. The ZNCC's prime/roll/terms/emit phases and
+			// the ring memsets are full-width and mask-INDEPENDENT by construction, so
+			// what they could skip is bounded by this: rows with no mask at all are
+			// skippable outright, and within a covered row only [firstMasked-HalfSize,
+			// lastMasked+HalfSize] is ever read back. `retained` is the fraction of
+			// full-frame work that survives BOTH restrictions -- compare it against the
+			// mask density above: equal means the coverage is a clean rectangle and
+			// gating captures all of the slack; near 100% means it does not.
+			const double rowCov = (double)a.pg[3] / (double)a.pg[4];
+			const double spanFrac = (double)a.pg[5] / (double)a.pg[6];
+			VERBOSE("[PROFILE] %-20s rows covered %.1f%%, mean row span %.1f%% of width -> row+col gating retains %.1f%% of full-frame work",
+				"  PG shape", 100.0 * rowCov, 100.0 * spanFrac, 100.0 * rowCov * spanFrac);
+		}
 	}
-	static inline void RollUp() { for (int i = 0; i < (int)P_COUNT; ++i) { gTotal.ms[i] += gScale.ms[i]; gTotal.calls[i] += gScale.calls[i]; } }
+	static inline void RollUp() {
+		for (int i = 0; i < (int)P_COUNT; ++i) { gTotal.ms[i] += gScale.ms[i]; gTotal.calls[i] += gScale.calls[i]; }
+		for (int i = 0; i < 9; ++i) gTotal.pg[i] += gScale.pg[i];
+		gTotal.pmWallMs += gScale.pmWallMs; gTotal.pmSumMs += gScale.pmSumMs;
+		gTotal.pmMaxMs += gScale.pmMaxMs; gTotal.pmViewMaxMs += gScale.pmViewMaxMs;
+		gTotal.pmCpuMs += gScale.pmCpuMs;
+		gTotal.pmRounds += gScale.pmRounds; gTotal.pmViews += gScale.pmViews;
+	}
 	static inline void ResetScale() { gScale = Acc(); }
 	struct Scope { Phase p; Timer t; explicit Scope(Phase p_) : p(p_) {} ~Scope() { Add(p, t.ms()); } };
 } // namespace MeshProf
@@ -194,6 +506,22 @@ namespace MeshProf {
 #else
 #define MESHPROF_SCOPE(ph) ((void)0)
 #endif // MESHOPT_PROFILE
+
+// Which code path actually ran. In a MEASUREMENT build this MUST be visible:
+// every A/B here is driven by an environment variable read once per process
+// (OPENMVS_REFINE_WZNCC_SIMD, OPENMVS_REFINE_PG_SIMD, OPENMVS_REFINE_TILE_SKIP,
+// and the OPENMVS_REFINE_BASELINE master override), and these lines are the only
+// confirmation the variable reached the process at all -- which matters because
+// the exe is normally spawned by the host pipeline, not from a shell, so an
+// export in a terminal does NOT propagate to it. They rode REFINE_DIAG, which is
+// a COMPILE-TIME gate (OPENMVS_REFINE_DIAG, default 0) that no verbosity flag can
+// open, so a profile build could not see them and a null A/B was indistinguishable
+// from a flag that never arrived. Outside a profile build they stay on REFINE_DIAG.
+#if MESHOPT_PROFILE
+#define REFINE_MODE_DIAG(...)	VERBOSE(__VA_ARGS__)
+#else
+#define REFINE_MODE_DIAG(...)	REFINE_DIAG(__VA_ARGS__)
+#endif
 
 // [PERF] ComputePhotometricGradient hot loop: cache the barycentric setup
 // (bsu*/bsv*/invZ/bInvArea) by A-side face. The fixed-size thread-local cache
@@ -372,6 +700,39 @@ namespace MeshProf {
 #define MESHOPT_TILE_SKIP_WARMUP 2  // full evaluations at the start of each scale (the active set needs measured energy first)
 #define MESHOPT_TILE_SKIP_REFRESH 3 // every Nth iteration runs full; odd on purpose so --alternate-pair 1 re-measures both parities
 #define MESHOPT_TILE_SKIP_HALO 1    // active set dilated by this many tile rings
+
+// MESHOPT_PAIR_SCHEDULE_DETERMINISTIC: make the pair loop's reference-view
+// assignment REPRODUCIBLE across runs.
+//
+// THE PROBLEM IT SOLVES IS MEASUREMENT, NOT SPEED. Each thread accumulates the
+// photometric gradient into its own buffer and the fold sums those buffers in
+// thread order -- deterministic given a fixed assignment. But `schedule(dynamic)`
+// hands a DIFFERENT set of reference views to each thread on every run, so the
+// partial sums differ, the fold rounds differently, `photoEnergyLast` wobbles, and
+// the converged-exit fires at a different iteration. Measured on Randy (322 images)
+// over three runs, two of them the identical binary: scale 2 exited at 12 / 13 / 17
+// iterations and scale 3 at 8 / 6 / 6 -- a +-16 s swing on a ~100 s run with no code
+// change at all. Anything under ~15% is unmeasurable against that.
+//
+// `schedule(static, 1)` is round-robin: thread t always takes refs t, t+P, t+2P...
+// Fixed assignment -> deterministic partials -> deterministic energies -> the same
+// iteration counts every run, so total wall becomes a usable yardstick again.
+//
+// Round-robin rather than plain `schedule(static)`: large static chunks would give
+// each thread a contiguous run of reference views, and per-ref cost is proportional
+// to the driving neighbour list (see the note at the pair loop), so contiguous
+// chunks correlate. Round-robin interleaves them and keeps most of the balance.
+//
+// COST: some load imbalance. The pair loop currently runs at ~30.4 of 32 effective
+// threads, so there is not much to give up -- but measure it, do not assume: compare
+// thread-summed pair compute against PairLoop(wall) minus StreamResident, exactly as
+// the PM balance line does for ProjectMesh.
+//
+// Output is NOT bit-identical to a dynamic-schedule run (different summation order,
+// same math), but it IS identical run-to-run, which is the whole point.
+#ifndef MESHOPT_PAIR_SCHEDULE_DETERMINISTIC
+#define MESHOPT_PAIR_SCHEDULE_DETERMINISTIC 0
+#endif
 #define MESHOPT_DISABLE_EARLY_EXIT 1
 #define MESHOPT_CUDA_PARITY_MASK 1
 
@@ -385,12 +746,265 @@ namespace MeshProf {
 // iteration (never skipped; step decay fast-forwarded). Costs the tile-energy
 // accumulation in release builds (~1% of the pair loop). 0 = fixed iteration
 // count (previous behaviour); set 0 for quality-parity A/B runs.
+//
+// MEASURED VALUE 2026-09-21 (Randy, 322 images, --resolution-level 1): the run executed
+// 39 iterations against a scheduled 93 (15/45, 16/33, 8/15). At that run's measured
+// per-iteration costs -- 0.73 / 2.06 / 8.14 s -- the full schedule would be ~223 s
+// against the 116 s actually taken. **This flag is worth ~1.9x on wall, more than every
+// other lever in this file combined.** Do NOT set it to 0 except for a deliberate
+// quality-parity A/B; you will roughly double the runtime.
+//
+// TWO LIVE CAVEATS, neither of which is a reason to turn it off:
+//
+// 1. THE TEST CANNOT TELL A PLATEAU FROM DIVERGENCE. `prev - cur < prev * RTOL` has no
+//    lower bound, so a RISING energy satisfies it and the loop logs "Photo-consistency
+//    converged" while the objective is getting worse. See the MESHOPT_STEP_BACKOFF_PCT
+//    block below for the evidence and for why every attempted fix was dropped. Note the
+//    missing bound is ACCIDENTALLY PROTECTIVE: it halts when the PHOTOMETRIC term stops
+//    improving, which for a photometric refinement is the right thing to stop on (the
+//    two-term exit was tried and cost +117% wall for a smoother, photometrically worse
+//    mesh).
+//
+// 2. WHERE IT FIRES IS NONDETERMINISTIC, AND THAT DECIDES OUTPUT QUALITY. Four runs of
+//    the same scene, same binary: scale 3 exited at 8 / 6 / 6 / 8 iterations and the
+//    final regularity energy landed at 2050 / 2265 / 2231 / 2014 -- two cleanly separated
+//    modes ~10% apart, selected by thread timing. The cause is float summation order in
+//    the threaded pair-loop reduction feeding photoEnergyLast; MESHOPT_PAIR_SCHEDULE_
+//    DETERMINISTIC above fixes that reduction (iteration-0 photo energy becomes
+//    bit-identical) but NOT the whole chain, so the mesh still varies. This is a
+//    reproducibility defect in the PRODUCT, not just a measurement nuisance: the same
+//    input can ship either mode.
+//
+// Consequence for measurement: total wall on this scene spans 95.9-116.0 s across runs
+// with no code change, so it cannot resolve anything under ~15%. Use the per-phase
+// [PROFILE] buckets.
 #ifndef MESHOPT_CONVERGED_EXIT
-#define MESHOPT_CONVERGED_EXIT 1 // JPB WIP BUG Let's just test this.  Should be restored... looks very good.
+#define MESHOPT_CONVERGED_EXIT 1 // KEEP AT 1 -- ~1.9x wall; read the caveats above first
 #endif
 // plateau = same-parity relative improvement below RTOL, HITS times in a row
 #define MESHOPT_CONVERGED_EXIT_RTOL 0.001
 #define MESHOPT_CONVERGED_EXIT_HITS 2
+
+// Step backoff on overshoot. MEASURED 2026-09-17 with MESHOPT_CONV_TRACE: the FINEST
+// scale diverges. At scale 3 both halves of the objective get worse together -- photo
+// energy +0.29%/+0.37% and the regularity energy 36,997 -> 37,463 -- which no weighting
+// can excuse (genuine detail is smooth UP, photo DOWN; this is both UP). The regularity
+// energy, a pure function of vertex positions, OSCILLATES with period 2
+// (36,997 / 37,721 / 37,463 / 37,738) where scale 1's falls monotonically over 13
+// iterations, and the gradient norm climbs 24.37 -> 27.50 where scale 1's falls
+// 52.5 -> 15.0. That is textbook overshoot.
+//
+// Cause: the schedule below scales the iteration COUNT per level
+// (iters = baseIters / (nScale + 1)) but NOT the step -- the trace shows
+// step 0.499992 at iteration 0 of all three scales. Scale 1 tolerates it, scale 3 does not.
+//
+// Two bugs, one fix, because they are the same observation. The plateau test
+// `prev - cur < prev * RTOL` has NO LOWER BOUND, so a RISING energy satisfies it and
+// divergence is reported as "Photo-consistency converged" -- which is exactly why this
+// went unseen. Treating rel < 0 as overshoot instead both (a) stops calling divergence
+// convergence and (b) backs the step off so the scale can actually make progress.
+// Adaptive, so it costs nothing on a scale that never overshoots: scale 1 has no
+// negative rel at all and is unaffected.
+//
+// VERDICT 2026-09-18: DROPPED, along with MESHOPT_STEP_PER_SCALE. Measured on a second
+// scene (GEOTAG, 192 images), trace-to-trace: **+17.6% wall (1m19.4 -> 1m33.4) AND a 19%
+// WORSE mesh** -- scale 3's regularity energy ended at 38,767 against the original's
+// 32,480, because the smaller step simply makes less progress in the iterations available
+// (base reached 33,232 by iter 4; this was still at 43,636). Scale 2 went 6 -> 8
+// iterations, scale 3 6 -> 7. That scene was never overshooting, so there was nothing to
+// fix and the divisor is pure cost.
+//
+// On RichmondHistoric, where the divergence IS real, it cost +1.1% and bought an
+// improvement the user could not distinguish from the diverged mesh by eye.
+// One scene helped imperceptibly, one hurt measurably. The DIAGNOSIS stands (see the
+// oscillation evidence below); what fails is every fix tried for it.
+//
+// EXPECT THE RUN TO GET LONGER. Scale 3 currently exits at iteration 3 of 15 because
+// the broken test fires immediately; with this it runs until it genuinely plateaus.
+// Worst case is the full schedule, which with MESHOPT_ITER_REBALANCE is 45/33/15
+// (not the 45/22/15 quoted here before the rebalance landed), ~5 min against 2m10.
+// Expressed as an INTEGER PERCENT, not a float, because MESHOPT_SCORE_SMOOTH below has
+// to test it in an #if and the preprocessor cannot evaluate a floating literal -- with
+// `0.5` here, turning MESHOPT_CONV_TRACE off dropped scoreSmooth while this code still
+// read it, and the build failed with "'scoreSmooth': is not a member of 'MeshRefine'".
+// One knob, one source of truth, testable in both worlds.
+// 0 disables the backoff (the guard folds away).
+#ifndef MESHOPT_STEP_BACKOFF_PCT
+#define MESHOPT_STEP_BACKOFF_PCT 0 // DROPPED with it: reactive form costs +40% alone
+#endif
+#define MESHOPT_STEP_BACKOFF ((double)MESHOPT_STEP_BACKOFF_PCT / 100.0)
+
+// Scale the INITIAL step per level, the way the iteration count already is.
+//
+// The backoff above is REACTIVE: the finest scale spends its first iterations
+// overshooting, halves, then needs several more to recover -- measured at +53.6 s
+// (+40%) on RichmondHistoric. This is the PROACTIVE form of the same fix, and the
+// backoff run is what sizes it: after its single halving the step settled at 0.235
+// and scale 3 then improved for five consecutive iterations. So ~0.2 is simply the
+// right step for that level, and starting there should skip both the overshoot and
+// the recovery.
+//
+// Divisor is (nScale + 1), mirroring `iters = baseIters / (nScale + 1)` immediately
+// below -- 0.5 / 0.25 / 0.167 for a 3-scale run. The finest gets 0.167 against the
+// 0.235 measured as good: on the conservative side by ~1.4x, which costs a little
+// convergence rate and cannot overshoot.
+//
+// KEEP MESHOPT_STEP_BACKOFF_PCT NONZERO WHILE TESTING THIS. It is a free instrument: if the
+// proactive step is right, `back` stays 0/0 for the whole run. If it still fires,
+// the step is still too large and the divisor needs to be steeper.
+// 0 = previous behaviour (same initial step at every scale).
+#ifndef MESHOPT_STEP_PER_SCALE
+#define MESHOPT_STEP_PER_SCALE 0 // DROPPED: +17.6% and a 19% WORSE mesh on GEOTAG
+#endif
+
+// Judge the plateau on BOTH energy terms instead of the photometric one alone: do not
+// declare convergence while the regularity term is still improving by more than RTOL.
+// Without this, a scene whose finest scale is legitimately smoothing a rough mesh exits
+// after 4 iterations because its photo term ticked up -- measured, and that scene went
+// on to take another 65% off its regularity energy in the iterations it was denied.
+//
+// TO REPRODUCE THE ORIGINAL BEHAVIOUR EXACTLY, set BOTH this and MESHOPT_STEP_BACKOFF_PCT
+// to 0. MESHOPT_STEP_BACKOFF_PCT alone is NOT sufficient -- the exit criterion below is
+// the other half of the change, and it fires on different iterations.
+//
+// NOTE: MESHOPT_STEP_BACKOFF_PCT 0 with TWOTERM 0 also drops MESHOPT_SCORE_SMOOTH, so the
+// per-vertex norm() in ComputeSmoothnessGradient1 disappears too. Since MESHOPT_STEP_PER_SCALE
+// makes the backoff never fire, that combination is the cheapest way to ship the fix.
+#ifndef MESHOPT_CONVERGED_EXIT_TWOTERM
+#define MESHOPT_CONVERGED_EXIT_TWOTERM 0 // MEASURED: 1 costs +117% wall to buy a
+                                        // SMOOTHER, photometrically WORSE mesh -- see above
+#endif
+
+// Machine-readable trace of the converged-exit test's OWN state, one [CONV] line per
+// iteration per scale. The pre-existing per-iteration trace at REFINE_DIAG prints cost
+// and gradient norm, which are NOT what the test reads -- it reads photoEnergyLast, the
+// same-parity previous value, and the hit counter, none of which were observable. Without
+// them you cannot tell "the energy is genuinely still falling" from "it plateaus early but
+// noise keeps resetting cvHits", and those want opposite fixes (leave RTOL alone vs raise
+// it / lower HITS).
+//
+// Emits BEHAVIOURALLY NOTHING: every value is captured from the existing test, which is
+// left byte-for-byte intact; the only added work is one steady_clock pair and a VERBOSE
+// per iteration (25 lines per run). Prints on EVERY iteration including the tail ones
+// where `iter + 2 < iters` is false and the test does not run, so the trace is complete.
+// rel = (prev - cur) / prev, i.e. the same-parity relative improvement RTOL is compared
+// against; rel < rtol is a hit. 0 = off (default).
+#ifndef MESHOPT_CONV_TRACE
+#define MESHOPT_CONV_TRACE 0 // [SCALE] lines come from MESHOPT_SCALE_CONTRIB, not this
+#endif
+
+// One [SCALE] line per scale: what that scale actually CONTRIBUTED, in the only terms
+// that are comparable -- first vs last SAME-PARITY photo energy and first vs last
+// regularity energy, both measured at that scale's own resolution.
+//
+// Why this exists: scale 3 is ~52% of the runtime, and on an atlas-budget-SATURATED scene
+// (RichmondHistoric: subdivision throttled to 55 faces of 4.07M, mesh grows 0.15% over the
+// whole run) it receives essentially the mesh scale 2 already finished and makes BOTH
+// terms worse -- photo +0.29%, smooth +1.4%. On an unsaturated scene (GEOTAG, mesh grows
+// 136%) the same scale takes 65% off the regularity energy. So the question "is the finest
+// scale worth running" has a per-scene answer, and the candidate PREDICTOR -- available
+// before the scale runs -- is how many faces subdivision actually added.
+//
+// Compare consecutive [SCALE] lines' face counts to get that growth; subdivision happens
+// between scales, so the count is constant within one.
+//
+// Parity matters: photoEnergy alternates with pair direction, so first-vs-last is reported
+// PER PARITY. Mixing them (iteration 0 is single-direction, the final iteration is both)
+// would compare different quantities.
+#ifndef MESHOPT_SCALE_CONTRIB
+#define MESHOPT_SCALE_CONTRIB 1
+#endif
+
+// Skip the FINEST scale's iterations when subdivision gave it no new geometry to work on.
+//
+// MEASURED over five scenes with the [SCALE] instrumentation above. The finest scale never
+// improves photometric energy on ANY of them -- the range is -0.20% to +0.32%, against
+// -2.5% to -10.5% at scales 1 and 2. What it sometimes does is smooth the roughness its
+// OWN subdivision just created, and that only happens where subdivision had room to run:
+//
+//   scene             scale-3 subdiv   photo        smooth    cost
+//   RichmondHistoric      0.15%        +0.29%       +1.4%     67 s  (52% of run)
+//   RichmondWater         0.31%        -0.04/+0.60% +0.98%    83 s  (47%)
+//   Marco                 0.46%        +0.18/+0.32% -0.5%     10 s  (21%)
+//   SchnellTests        +92%           +0.205%      -58%      48 s  (56%)
+//   GEOTAG              large          -0.20%       -65%     ~48 s  (58%)
+//
+// MECHANISM: each scale doubles image resolution, but finer photometric detail can only be
+// captured if the faces can get smaller. The atlas cap is D^2 * usable / texels-per-face,
+// = 4.1M faces at the hardware-queried D = 16384, and upstream decimation TARGETS it -- the
+// three scenes above arrive at 98-99% of the cap. With no headroom the extra image
+// resolution has nothing to attach to, so photo goes flat. This is a scene-size property,
+// not a quality-tier one: a higher tier arrives just as pinned, on a costlier run.
+//
+// The trigger is subdivision growth rather than the cap directly, because it also covers
+// the other reason a scale can be barren -- no face exceeding max-face-area. Either way,
+// no new geometry means nothing for the iterations to fit.
+//
+// Observed growths are 0.15-0.46% (barren) against 92%+ (productive), so the threshold sits
+// in a two-order-of-magnitude gap; 5% is nowhere near either cluster.
+//
+// NOT validated on output yet -- the energies say skipping costs at most +0.3% photo, i.e.
+// imperceptibly BETTER, but that is the same argument that preceded a mesh indistinguishable
+// from a diverged one. Compare the meshes before trusting it.
+#ifndef MESHOPT_SKIP_BARREN_FINE_SCALE
+#define MESHOPT_SKIP_BARREN_FINE_SCALE 1
+#endif
+#define MESHOPT_SKIP_BARREN_FRACTION 0.05
+
+// Rebalance the iteration budget between scales.
+//
+// The schedule is `iters = baseIters / (nScale + 1)` -> 45 / 22 / 15, which gives the LEAST
+// budget to the scale that measurably does the most good. From the [SCALE] instrumentation
+// across five scenes:
+//
+//   scale 3 iterations USED: 5, 5, 5, 6, 6 on the five scenes with no geometric headroom,
+//     because photo stops improving immediately there (see MESHOPT_SKIP_BARREN_FINE_SCALE).
+//     I cut its budget to 9 on that basis and it was WRONG -- Niwot, which HAS headroom
+//     (39% subdivision growth), ran 9/9 while still improving photo -1.32% and smooth
+//     -54.6%. The finest scale's budget is left alone; only the middle one is raised.
+//   scale 2 on Marco ran **22/22** -- it EXHAUSTED its budget while still improving photo
+//     2.5-4.2% per parity. It was cut off mid-refinement.
+//
+// So the surplus is ADDED to the middle scale and the finest is left alone:
+// **45 / 33 / 15** at baseIters 45. (An earlier revision of this note said 45 / 33 / 9,
+// describing a finest-scale cut that was measured as a REGRESSION and reverted -- see the
+// Niwot evidence above and the matching comment at the `iters` computation. The code only
+// ever raises `nScale == nScales - 2`; nothing reduces the finest scale.)
+//
+// NOT free, and I said otherwise once before correcting it. On the four scenes whose middle
+// scale converges early (5, 8, 8, 10 iterations used) this changes NOTHING -- the
+// converged-exit fires long before either budget binds. It only spends more on a scene like
+// Marco that was genuinely still improving, where the extra iterations are the point. That
+// is a quality/time trade to be measured per scene, not a free win.
+#ifndef MESHOPT_ITER_REBALANCE
+#define MESHOPT_ITER_REBALANCE 1
+#endif
+
+// The converged-exit tests photoEnergyLast -- the PHOTOMETRIC HALF ONLY. At scales 2
+// and 3 that half is RISING when the exit fires (rel goes negative, and the test
+// `prev - cur < prev*RTOL` has no lower bound, so "getting worse" satisfies "plateau").
+// Rising photo energy is LEGITIMATE if the regularity term is falling faster --
+// weightRegularity 1.5 exists to trade exactly that way -- and is DIVERGENCE if it is
+// not. Those want opposite fixes, so the regularity energy has to be visible.
+//
+// Only scoreSmooth is enabled here, NOT scorePhoto and NOT ScoreMesh's `cost` return.
+// Those look tempting (`f` prints 0 for want of them) but the ZNCC kernels themselves
+// `return 0.f` outside MESHOPT_CERES, so scorePhoto would stay 0 and `cost` would be a
+// PARTIAL sum -- a plausible-looking number that is silently missing its larger term.
+// Worse than no number. photoEnergyLast is in any case the better photometric signal
+// here: it is the exact quantity the exit test reads.
+//
+// Cost: one norm() per non-boundary vertex per iteration, already inside a threaded
+// loop that computes `grad` anyway.
+//
+// MESHOPT_CONVERGED_EXIT_TWOTERM is in this list because the exit criterion now READS
+// scoreSmooth -- it is no longer a diagnostic-only value, so it cannot be gated on the
+// trace alone or turning the trace off would fail to compile.
+#if defined(MESHOPT_CERES) || MESHOPT_CONV_TRACE || MESHOPT_CONVERGED_EXIT_TWOTERM || MESHOPT_STEP_BACKOFF_PCT || MESHOPT_SCALE_CONTRIB
+#define MESHOPT_SCORE_SMOOTH 1
+#else
+#define MESHOPT_SCORE_SMOOTH 0
+#endif
 
 #if !MESHOPT_DISABLE_TILE_SKIP || !MESHOPT_DISABLE_EARLY_EXIT || MESHOPT_ITER_DIAGNOSTICS || MESHOPT_CONVERGED_EXIT
 #define MESHOPT_NEEDS_TILE_ENERGY 1
@@ -623,6 +1237,13 @@ static inline void* PlaneAlloc(size_t bytes) {
 	return p;
 }
 static inline void PlaneFree(void* p) { _aligned_free(p); }
+// one predicate for "this view's gradient planes are loaded", so the three
+// residency checks below do not each need the layout #if
+#if MESHOPT_GRAD_INTERLEAVED
+#define ViewHasGradPlanes(v) ((v).gradXY != nullptr)
+#else
+#define ViewHasGradPlanes(v) ((v).gradX != nullptr && (v).gradY != nullptr)
+#endif
 
 // Current process COMMIT (private bytes), which is the number that matters for
 // "will this fit": Windows trims the working set under pressure, so WorkingSetSize
@@ -754,6 +1375,39 @@ static uint64_t ProcessCommitBytes() { return 0; }
 // iteration; displacements decay (gstep *= 0.98), so 16x covers a whole
 // scale's iterations with generous margin. Too small only costs extra reculls.
 #define MESHOPT_VISIBILITY_PAD_FACTOR 16.0f
+
+// Interpolate the rasterized depth as z = 1/denom directly, instead of building the
+// perspective-correct barycentrics and interpolating z with them.
+//
+// EXACT ALGEBRAICALLY: with bx = w0*iz0*invDen (by, bz likewise) and iz_i = 1/z_i,
+//     bx*z0 + by*z1 + bz*z2 = invDen * (w0 + w1 + w2) = invDen,
+// because the w_i are true barycentrics (each already divided by the triangle area, so
+// they sum to 1). Same identity already verified in-source for the gradient loop:
+// sum(bw_i * invZ_i) IS 1/z, checked to 3.5e-15 over 200k triangles.
+//
+// NOT bit-identical -- the two forms round differently, so the depth map moves in its
+// last bits and everything downstream moves with it. Will not match a stored reference.
+//
+// Removes ~9 flops per PIXEL (5 mul, 4 add/sub) and, less obviously, the c0.z/c1.z/c2.z
+// loads per FACE: only invZ is read now. But the MEASURED cost model puts the fill at
+// 387 s of the 610 s PM:raster, ~14.5 ns (~58 cycles) per pixel -- far more than these
+// flops can explain -- so the loop is probably latency- or store-bound and this may well
+// measure ZERO, exactly as five equivalent tail reductions did in the gradient loop.
+// MEASURED 2026-09-18 AND DROPPED. Thread time fell -7.6% of PM:raster (ratio against a
+// same-run ZNCC:grad control, 0.3365 vs a 0.3604-0.3696 baseline; coverage identical to
+// the digit; per-scale saving scaling monotonically with px/face). But WALL DID NOT MOVE:
+// 2m10.558 against baselines of 2m10.096 / 2m10.278, three runs inside 0.5 s. 46 s of
+// thread time divided by ~26 effective threads should have been ~1.8 s of wall and was not.
+// No mechanism identified -- the measurements are each sound, the bridge between them is
+// what fails. Since this is NOT bit-identical it must not ship on thread-time evidence.
+//
+// THE WIDER WARNING: ProjectMesh is 17% of thread time and may be ~0% of the critical
+// path. Before spending anything more there (137 s of face setup, 88 s of rejects), prove
+// that ProjectMesh thread time reaches wall at all.
+// 0 = the original barycentric form.
+#ifndef MESHOPT_RASTER_Z_DIRECT
+#define MESHOPT_RASTER_Z_DIRECT 0 // DROPPED: -7.6% of PM:raster thread time but ZERO wall
+#endif
 
 // MESHOPT_VIEW_STREAM (THE 16 GB lever): bounded resident view working-set.
 //   Partition views into camera-proximity BATCHES; per batch build the pyramids
@@ -1063,8 +1717,18 @@ public:
 		// It is now recomputed on demand in ComputePhotometricGradient from the
 		// kept maps (depthMap/faceMap) + camera + CameraRenderData. The barycentric
 		// coords are likewise recomputed there from faceMap + rd (no baryMap plane).
+#if MESHOPT_GRAD_INTERLEAVED
+		// INTERLEAVED (gx,gy) pairs, 2*width*height elements: element 2*i is the
+		// x-gradient of pixel i, 2*i+1 the y-gradient. Every consumer is a bilinear
+		// tap that needs BOTH at the same pixel, so two separate planes cost two
+		// cache lines and two TLB entries per tap row where one interleaved plane
+		// costs one -- and the gradient is transaction-bound, not bandwidth-bound
+		// (~12 GB/s effective against ~75 GB/s peak). Same bytes, half the streams.
+		GradStoreT* gradXY = nullptr;
+#else
 		GradStoreT* gradX = nullptr; // planar x-gradient (width*height; type per MESHOPT_GRAD_F32)
 		GradStoreT* gradY = nullptr; // planar y-gradient (width*height)
+#endif
 		std::vector<uint8_t, AlignedAllocator<uint8_t, 16>> isValid;
 		// MESHOPT_FACEMAP_RESIDENT=1: ProjectMesh persists it here each iteration
 		// and the pair loop / ListFaceAreas consume it directly (no re-raster).
@@ -1076,7 +1740,11 @@ public:
 		int width, height;
 		int blockWidth, blockStride;
 		int allocatedSize = 0;
-		std::vector<float> tileEnergyAccum;  // accumulated across threads
+		// per-tile photometric energy for the current evaluation. Written ONLY by
+		// the thread that owns this view as a reference in the pair loop (one
+		// thread per view per evaluation), so it needs no per-thread mirror and no
+		// reduction; ScoreMesh zeroes it before the pair loop and folds it after.
+		std::vector<float> tileEnergyAccum;
 		std::vector<uint8_t> tileActive;     // used for skipping
 		// persistent per-tile photo energy, indexed by pair-direction parity
 		// (both slots alias parity 0 unless nAlternatePair==1): tiles skipped by
@@ -1248,7 +1916,7 @@ public:
 		std::vector<uint32_t>& photoGradNorm,
 		Real RegularizationScale,
 		uint64_t setupEpoch,
-		std::vector<float>& tileEnergyLocal,
+		std::vector<float>& tileEnergyView,
 		size_t rowBegin = 0,
 		size_t rowEnd = SIZE_MAX,
 		size_t dznccRowOffset = 0,
@@ -1269,9 +1937,11 @@ public:
 	void ThreadWorker();
 	void WaitThreadWorkers(size_t nJobs);
 	void ThSelectNeighbors(uint32_t idxImage, std::unordered_set<uint64_t>& mapPairs, unsigned nMaxViews);
-	void ThInitImage(uint32_t idxImage, Real scale, Real sigma);
+	// gradients == false: build ONLY the camera rescale + view.width/height +
+	// view.image, skipping the Sobel and the gradX/gradY planes. See the body.
+	void ThInitImage(uint32_t idxImage, Real scale, Real sigma, bool gradients = true);
 	void ThProjectMesh(uint32_t idxImage, const Mesh::FaceIdxArr& cameraFaces, const CameraRenderData& rd);
-	void ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& localGrad, std::vector<uint32_t>& threadNorm, std::vector<std::vector<float>>& tileEnergyLocal,
+	void ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& localGrad, std::vector<uint32_t>& threadNorm,
 		const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA);
 	void ThSmoothVertices1(VIndex idxStart, VIndex idxEnd);
 	void ThSmoothVertices2(VIndex idxStart, VIndex idxEnd);
@@ -1317,6 +1987,13 @@ public:
 	// gradient related
 #ifdef MESHOPT_CERES
 	float scorePhoto;
+#endif
+#if MESHOPT_SCORE_SMOOTH
+	// regularity (umbrella-operator) energy, summed over non-boundary vertices and
+	// reset at the head of every ScoreMesh. Ceres consumes it; MESHOPT_CONV_TRACE
+	// also needs it, so it is gated on the wider MESHOPT_SCORE_SMOOTH -- which is
+	// implied by MESHOPT_CERES, so a Ceres build is unaffected. scorePhoto stays
+	// Ceres-only: the ZNCC kernels return 0 without it, so it could not be filled here.
 	float scoreSmooth;
 #endif
 	GradArr photoGrad;
@@ -1474,11 +2151,12 @@ class EVTInitImage : public Event
 public:
 	uint32_t idxImage;
 	Real scale, sigma;
+	bool gradients;
 	bool Run(void* pArgs) {
-		((MeshRefine*)pArgs)->ThInitImage(idxImage, scale, sigma);
+		((MeshRefine*)pArgs)->ThInitImage(idxImage, scale, sigma, gradients);
 		return true;
 	}
-	EVTInitImage(uint32_t _idxImage, Real _scale, Real _sigma) : Event(EVT_JOB), idxImage(_idxImage), scale(_scale), sigma(_sigma) {}
+	EVTInitImage(uint32_t _idxImage, Real _scale, Real _sigma, bool _gradients = true) : Event(EVT_JOB), idxImage(_idxImage), scale(_scale), sigma(_sigma), gradients(_gradients) {}
 };
 class EVTProjectMesh : public Event
 {
@@ -1644,10 +2322,15 @@ MeshRefine::~MeshRefine()
 	FOREACHPTR(pThread, threads)
 		pThread->join();
 	FOREACHPTR(pView, views) {
+#if MESHOPT_GRAD_INTERLEAVED
+		PlaneFree(pView->gradXY);
+		pView->gradXY = nullptr;
+#else
 		PlaneFree(pView->gradX);
 		PlaneFree(pView->gradY);
 		pView->gradX = nullptr;
 		pView->gradY = nullptr;
+#endif
 	}
 	scene.mesh.ReleaseExtra();
 }
@@ -1905,6 +2588,10 @@ void MeshRefine::ListCameraFaces(bool rebuildOctree)
 	if (rebuildOctree && candidateCacheValid && accumDispSinceCull <= frustumPadWorld)
 		rebuildOctree = false;
 #endif
+#if MESHOPT_PROFILE
+	if (rebuildOctree) MeshProf::gCullRebuilds.fetch_add(1, std::memory_order_relaxed);
+	else               MeshProf::gCullReuses.fetch_add(1, std::memory_order_relaxed);
+#endif
 
 	if (rebuildOctree) {
 #if MESHOPT_VISIBILITY_REUSE
@@ -2016,6 +2703,8 @@ void MeshRefine::ListCameraFaces(bool rebuildOctree)
 #if !MESHOPT_VIEW_STREAM
 	ASSERT(events.IsEmpty());
 #if MESHOPT_PROFILE
+	MeshProf::gPMThreads = (int)threads.GetSize();
+	MeshProf::PMRoundBegin();
 	const auto _tPM0 = std::chrono::steady_clock::now();
 #endif
 	FOREACH(idxImage, images)
@@ -2023,6 +2712,7 @@ void MeshRefine::ListCameraFaces(bool rebuildOctree)
 	WaitThreadWorkers(images.GetSize());
 #if MESHOPT_PROFILE
 	tProjectMeshMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tPM0).count();
+	MeshProf::PMRoundEnd(tProjectMeshMs);
 #endif
 #endif // !MESHOPT_VIEW_STREAM
 }
@@ -2180,20 +2870,18 @@ uint64_t MeshRefine::PairLoopScratchBytes() const
 	constexpr uint64_t kPerPixel = sizeof(uint16_t) + sizeof(Real);  // refMeanA + refVarA
 	uint64_t bytes = nThreads * (numVerts * kPerVertex + maxPx * kPerPixel);
 #if MESHOPT_NEEDS_TILE_ENERGY
-	// tileEnergyLocal: static thread_local, sized for EVERY view (not just the
-	// current batch), one float per 16x16 tile. At 4.65 MPix that is 18k tiles x
-	// 437 views x 4 B = ~32 MB per thread -- 1.02 GB at 32 threads, and it was
-	// charged to nothing, which is most of the thread scaling the model missed.
-	// Plus the per-view (not per-thread) accumulator and active flags.
+	// Tile energy is PER VIEW, not per thread: the per-thread mirror of this array
+	// is gone (a reference view has exactly one writer per evaluation, so the pair
+	// loop accumulates straight into views[a].tileEnergyAccum -- see ScoreMesh).
+	// That term used to dominate this estimate: sized for EVERY view rather than
+	// the current batch, one float per 16x16 tile, it was 18k tiles x 437 views x
+	// 4 B = ~32 MB per thread, i.e. 1.02 GB at 32 threads charged to `pinned` --
+	// and 31/32 of it was provably all-zero. What remains is the per-view
+	// accumulator, the per-parity persistent energies and the active flags, none
+	// of which scale with the thread count.
 	const uint64_t tilesPerView = (maxPx + (TILEX * TILEY) - 1) / (TILEX * TILEY);
 	const uint64_t numViews = (uint64_t)views.GetSize();
-	// Measured current usage, but it lags: at the FIRST budget of a scale the
-	// buffers still hold the previous scale's (smaller) tile count, so scale it to
-	// this scale's tiles. Floored at one pass' worth (each thread references at
-	// least numViews/nThreads reference views) so a cold counter cannot under-charge
-	// to zero.
-	bytes += nThreads * numViews * tilesPerView * sizeof(float);
-	bytes += numViews * tilesPerView * (sizeof(float) + sizeof(uint8_t));
+	bytes += numViews * tilesPerView * (3 * sizeof(float) + sizeof(uint8_t));
 #endif
 	return bytes;
 }
@@ -2730,8 +3418,12 @@ void MeshRefine::EvictView(uint32_t idxImage, bool alsoMaps)
 {
 	View& view = views[idxImage];
 	view.image.release();
+#if MESHOPT_GRAD_INTERLEAVED
+	PlaneFree(view.gradXY); view.gradXY = nullptr;
+#else
 	PlaneFree(view.gradX); view.gradX = nullptr;
 	PlaneFree(view.gradY); view.gradY = nullptr;
+#endif
 	viewResident[idxImage] = 0;
 #if MESHOPT_VIEW_STREAM_EVICT_MAPS
 	if (alsoMaps) {
@@ -2776,12 +3468,20 @@ void MeshRefine::PrepareViewGeometryChunked()
 	FOREACH(idxImage, images)
 		if (images[idxImage].IsValid())
 			all.push_back((uint32_t)idxImage);
-	const size_t chunk = MAXF(size_t(1), threads.GetSize());
-	for (size_t i = 0; i < all.size(); i += chunk) {
+	// Chunked ONLY so the eviction below can bound memory. One chunk is exactly one
+	// task per worker, so every chunk ends on a barrier that waits for the SLOWEST of
+	// 32 views and nothing self-balances -- 12 barriers over 368 views. When
+	// streamKeepPlanes turns out true nothing is ever evicted, so that structure buys
+	// nothing at all and the remainder goes out in a single round (below).
+	size_t chunk = MAXF(size_t(1), threads.GetSize());
+	for (size_t i = 0; i < all.size(); ) {
 		const size_t end = MINF(i + chunk, all.size());
 		ASSERT(events.IsEmpty());
 		for (size_t k = i; k < end; ++k)
-			events.AddEvent(new EVTInitImage(all[k], streamScale, streamSigma));
+			// gradients=false: this pass wants ThInitImage's SIDE EFFECTS only, and
+			// it never sets viewResident -- so the first EnsureViewsResident of the
+			// scale rebuilds every gradient plane anyway (see ThInitImage).
+			events.AddEvent(new EVTInitImage(all[k], streamScale, streamSigma, false));
 		WaitThreadWorkers(end - i);
 		// ThInitImage populates imageColorCache, so record those entries: this path
 		// bypasses EnsureViewsResident, and without the bookkeeping the cache is
@@ -2811,6 +3511,13 @@ void MeshRefine::PrepareViewGeometryChunked()
 			const uint64_t commit = ProcessCommitBytes();
 			streamKeepPlanes = (target == std::numeric_limits<uint64_t>::max())
 				|| (commit + estTotal < target);
+			// Keeping the planes means the eviction below never runs, which was the
+			// only reason to chunk. Hand the rest to the pool in ONE round so it can
+			// balance across all remaining views instead of paying a barrier every
+			// 32. Same work, same peak -- only 32 views are ever in flight either
+			// way, since that is the worker count.
+			if (streamKeepPlanes)
+				chunk = all.size();
 		}
 		if (!streamKeepPlanes) {
 			// drop the pixels; keep only camera + dimensions. alsoMaps=false because
@@ -2818,6 +3525,7 @@ void MeshRefine::PrepareViewGeometryChunked()
 			for (size_t k = i; k < end; ++k)
 				EvictView(all[k], false);
 		}
+		i = end; // NOT i += chunk: chunk may have just grown to cover the remainder
 	}
 }
 
@@ -2841,9 +3549,18 @@ void MeshRefine::ProjectAllViews()
 	if (toProject.empty())
 		return;
 	ASSERT(events.IsEmpty());
+#if MESHOPT_PROFILE
+	MeshProf::gPMThreads = (int)threads.GetSize();
+	MeshProf::PMRoundBegin();
+	const auto _tPMRound = std::chrono::steady_clock::now();
+#endif
 	for (uint32_t v : toProject)
 		events.AddEvent(new EVTProjectMesh(v, kEmptyFaces, g_cameraData[v]));
 	WaitThreadWorkers(toProject.size());
+#if MESHOPT_PROFILE
+	MeshProf::PMRoundEnd(std::chrono::duration<double, std::milli>(
+		std::chrono::steady_clock::now() - _tPMRound).count());
+#endif
 	for (uint32_t v : toProject)
 		viewProjEpoch[v] = faceSetupEpoch;
 }
@@ -2878,7 +3595,7 @@ void MeshRefine::EnsureViewsResident(const std::vector<uint32_t>& neededViews, b
 			continue;
 		const View& view = views[idxImage];
 		const bool holdsAnything =
-			viewResident[idxImage] || !view.image.empty() || view.gradX || view.gradY
+			viewResident[idxImage] || !view.image.empty() || ViewHasGradPlanes(view)
 			|| !view.depthMap.empty() || !view.faceMap.empty();
 		if (holdsAnything)
 			EvictView((uint32_t)idxImage);
@@ -2977,9 +3694,18 @@ void MeshRefine::EnsureViewsResident(const std::vector<uint32_t>& neededViews, b
 				toProject.push_back(v);
 	if (!toProject.empty()) {
 		ASSERT(events.IsEmpty());
+#if MESHOPT_PROFILE
+		MeshProf::gPMThreads = (int)threads.GetSize();
+		MeshProf::PMRoundBegin();
+		const auto _tPMRound = std::chrono::steady_clock::now();
+#endif
 		for (uint32_t v : toProject)
 			events.AddEvent(new EVTProjectMesh(v, kEmptyFaces, g_cameraData[v]));
 		WaitThreadWorkers(toProject.size());
+#if MESHOPT_PROFILE
+		MeshProf::PMRoundEnd(std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - _tPMRound).count());
+#endif
 		for (uint32_t v : toProject)
 			viewProjEpoch[v] = faceSetupEpoch;
 	}
@@ -2998,7 +3724,7 @@ void MeshRefine::VerifyBatchResidency(const std::vector<uint32_t>& allViews,
 	size_t notLoaded = 0, staleProj = 0, missingEndpoint = 0, missingMap = 0;
 	for (uint32_t v : allViews) {
 		const View& view = views[v];
-		if (!viewResident[v] || view.image.empty() || !view.gradX || !view.gradY)
+		if (!viewResident[v] || view.image.empty() || !ViewHasGradPlanes(view))
 			++notLoaded;
 		// depthMap/faceMap must match the CURRENT mesh generation
 		if (viewProjEpoch[v] != faceSetupEpoch)
@@ -3016,7 +3742,7 @@ void MeshRefine::VerifyBatchResidency(const std::vector<uint32_t>& allViews,
 	// faceMap/depthMap/image, B supplies image + gradX/gradY + depthMap
 	for (uint32_t a : refViews)
 		for (uint32_t b : refViewNeighbors[a])
-			if (!viewResident[b] || views[b].image.empty() || !views[b].gradX)
+			if (!viewResident[b] || views[b].image.empty() || !ViewHasGradPlanes(views[b]))
 				++missingEndpoint;
 	if (notLoaded || staleProj || missingEndpoint || missingMap)
 		ABORT("view-stream residency violation (batch: %zu refs, %zu views): "
@@ -3069,6 +3795,10 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps)
 
 	typedef cList<Mesh::AreaArr> ImageAreaArr;
 	ImageAreaArr viewAreas(images.GetSize());
+	// Global-face indices this view actually rasterized. `viewAreas` has to stay
+	// DENSE -- the pair reduction looks the other view up by global index -- but the
+	// side being swept does not, and a view covers only a fraction of the mesh.
+	std::vector<std::vector<uint32_t>> viewNZ(images.GetSize());
 
 #pragma omp parallel for schedule(dynamic, 1)
 	for (int idxImage = 0; idxImage < (int)images.GetSize(); ++idxImage) {
@@ -3111,6 +3841,11 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps)
 		const CameraRenderData& rd = g_cameraData[idxImage];
 		const uint32_t numLocal = (uint32_t)rd.globalFace.size();
 
+		// ...recording each face the FIRST time it is touched. That costs one compare
+		// on a value this loop already loads, and it is what lets the pair reduction
+		// below stop sweeping all faces.GetSize() entries.
+		std::vector<uint32_t>& nz = viewNZ[idxImage];
+		nz.clear();
 		for (int j = 0; j < faceMap.rows; ++j) {
 			const FIndex* facePtr = faceMap.ptr<FIndex>(j);
 			for (int i = 0; i < faceMap.cols; ++i) {
@@ -3119,7 +3854,8 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps)
 					continue;
 				ASSERT(idxLocal < numLocal);
 				const FIndex idxGlobal = rd.globalFace[idxLocal];   // <-- translate
-				++areas[idxGlobal];
+				if (areas[idxGlobal]++ == 0)
+					nz.push_back(idxGlobal);
 			}
 		}
 #if !MESHOPT_FACEMAP_RESIDENT
@@ -3152,16 +3888,58 @@ void MeshRefine::ListFaceAreas(Mesh::AreaArr& maxAreas, bool streamMaps)
 	maxAreas.Resize(faces.GetSize());
 	maxAreas.Memset(0);
 
-#pragma omp parallel for
+	// Sweep the SHORTER of the two views' covered-face lists and look the other view
+	// up, instead of walking every face in the mesh for every pair.
+	//
+	// EXACT. MINF is symmetric, so either list may drive. A face absent from the
+	// driving view has area 0 there, so MINF(0, x) == 0, and AtomicMax16(m, 0)
+	// returns without even a CAS -- the iterations dropped were provably no-ops. max
+	// is commutative and associative, so the parallel reduction is unaffected.
+	//
+	// This was ~1,650-1,850 pairs x 4.07M faces = ~7 BILLION iterations per call,
+	// ~135 GB of reads across the run, and ~90% of it compared two zeros. Measured at
+	// 9.4 ns per iteration (~42 cycles), which is what three loads cost when two of
+	// them miss into separate 8 MB arrays.
+	//
+	// schedule(dynamic): per-pair cost is now proportional to the driving list, which
+	// varies a lot between views, so a static split would leave threads idle.
+	// `pairs` is materialized by iterating an unordered_set (see the ctor), so it is
+	// in HASH order: consecutive entries touch unrelated views' 8 MB arrays and a
+	// dynamic chunk of 8 hits ~16 of them with no reuse. Sweep grouped by view
+	// instead, so every pair sharing a lower index reuses that view's areas and nz
+	// while they are still hot.
+	//
+	// A LOCAL permutation, deliberately -- `pairs` itself must keep its order,
+	// because ScoreMesh builds refViewNeighbors from it and that ordering fixes the
+	// sequence ThProcessPair runs per reference view, i.e. the float accumulation
+	// order of the photometric gradient. Reordering the sweep here is safe only
+	// because this reduction is a max.
+	std::vector<uint32_t> order(pairs.size());
+	for (size_t k = 0; k < order.size(); ++k)
+		order[k] = (uint32_t)k;
+	std::sort(order.begin(), order.end(), [this](uint32_t a, uint32_t b) {
+		return pairs[a].i != pairs[b].i ? pairs[a].i < pairs[b].i : pairs[a].j < pairs[b].j;
+	});
+
+#pragma omp parallel for schedule(dynamic, 8)
 	for (int p = 0; p < (int)pairs.size(); ++p) {
-		const auto& pair = pairs[p];
+		const auto& pair = pairs[order[p]];
 		const Mesh::AreaArr& areasA = viewAreas[pair.i];
 		const Mesh::AreaArr& areasB = viewAreas[pair.j];
+		// an invalid view is skipped above and leaves both arrays empty; the lookup
+		// below indexes by GLOBAL face, so guard rather than read out of bounds
+		if (areasA.IsEmpty() || areasB.IsEmpty())
+			continue;
 		ASSERT(areasA.GetSize() == areasB.GetSize());
-		const size_t n = areasA.size();
-		for (size_t f = 0; f < n; ++f) {
-			const uint16_t minArea = MINF(areasA[f], areasB[f]);
-			AtomicMax16(maxAreas[f], minArea);
+		const bool driveA = viewNZ[pair.i].size() <= viewNZ[pair.j].size();
+		const std::vector<uint32_t>& nz = driveA ? viewNZ[pair.i] : viewNZ[pair.j];
+		const Mesh::AreaArr& self = driveA ? areasA : areasB;
+		const Mesh::AreaArr& other = driveA ? areasB : areasA;
+		for (uint32_t f : nz) {
+			const uint16_t o = other[f];
+			if (o == 0)
+				continue; // MINF would be 0 -> AtomicMax16 is a no-op; skip its load too
+			AtomicMax16(maxAreas[f], MINF(self[f], o));
 		}
 	}
 #else
@@ -3576,6 +4354,13 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 	tileSkipThisIter = tileSkipEnabled && !tileSkipForceFull && iteration > 0;
 
 	int64_t numImages = (int64_t)images.size();
+#if MESHOPT_PROFILE
+	// Not previously timed, and now load bearing: this loop is the ONLY thing
+	// that clears tileEnergyAccum since the per-thread mirror + reduction were
+	// removed. If that removal cost anything it shows up here or in PairLoop,
+	// and the sum of the ScoreMesh sub-buckets no longer leaves it unaccounted.
+	MeshProf::Timer _tTileReset;
+#endif
 #pragma omp parallel for
 	for (int64_t ID = 0; ID < numImages; ++ID)
 	{
@@ -3587,7 +4372,11 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 		view.tilesY = (view.height + TILEY - 1) / TILEY;
 		size_t numTiles = view.tilesX * view.tilesY;
 
-		// Reset accumulators (to be filled during ScoreMesh)
+		// Reset accumulators (to be filled during ScoreMesh). LOAD BEARING: the
+		// pair loop now accumulates into these directly rather than into a
+		// per-thread mirror that a reduction zero-initialised, so this assign is
+		// the only thing that clears them. It is also where a tile-grid change
+		// (new scale) resizes them.
 #if MESHOPT_NEEDS_TILE_ENERGY
 		view.tileEnergyAccum.assign(numTiles, 0.f);
 
@@ -3604,6 +4393,9 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 			std::fill(view.tileActive.begin(), view.tileActive.end(), 1);
 #endif
 	}
+#if MESHOPT_PROFILE
+	MeshProf::Add(MeshProf::P_TileReset, _tTileReset.ms());
+#endif
 #if MESHOPT_NEEDS_TILE_ENERGY && !MESHOPT_DISABLE_TILE_SKIP
 	if (iteration == 0)
 		tileSkipStatSkippedTiles = tileSkipStatTotalTiles = tileSkipStatSkippedViews = tileSkipStatReducedIters = 0;
@@ -3629,9 +4421,15 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #ifdef MESHOPT_CERES
 	scorePhoto = 0;
 #endif
-	photoGrad.assign(vertices.GetSize(), Grad(0, 0, 0));
+	// SIZED, not cleared. The per-thread reduction at the end of the pair loop
+	// writes photoGrad[v] and photoGradNorm[v] for EVERY v unconditionally (it
+	// sums the thread buffers into a local and assigns), and nothing reads either
+	// array between here and that assignment -- ThProcessPair accumulates into
+	// the per-thread localGrad/localNorm, never into these. Zeroing them first
+	// was therefore ~16 B per vertex of stores per iteration that the very next
+	// pass overwrote (64 MB per iteration at 4M vertices).
+	photoGrad.resize(vertices.GetSize());
 	photoGradNorm.Resize(vertices.GetSize());
-	photoGradNorm.Memset(0);
 #if MESHOPT_SUPPORT_STAGE_DIAG
 	if (iteration == 0) {
 		rasterSupport.Resize(vertices.GetSize());
@@ -3669,6 +4467,17 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #if MESHOPT_PROFILE
 	const auto _tPair0 = std::chrono::steady_clock::now();
 	tRasterizeMs = 0.0;
+	// confine the bucket to THIS pair loop: the same worker-pool path also runs
+	// from SubdivideMesh's full-residency spike, which is not what we are sizing
+	MeshProf::gProjUs.store(0, std::memory_order_relaxed);
+	MeshProf::gPMRasterUs.store(0, std::memory_order_relaxed);
+	MeshProf::gPMClearUs.store(0, std::memory_order_relaxed);
+	MeshProf::gPMFaces.store(0, std::memory_order_relaxed);
+	MeshProf::gPMFacesRast.store(0, std::memory_order_relaxed);
+	MeshProf::gPMRows.store(0, std::memory_order_relaxed);
+	MeshProf::gPMPixScan.store(0, std::memory_order_relaxed);
+	MeshProf::gPMPixWon.store(0, std::memory_order_relaxed);
+	MeshProf::gInitUs.store(0, std::memory_order_relaxed);
 #endif
 	++pairPassCounter;
 	int numPairThreads = 1;
@@ -3677,9 +4486,6 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #endif
 	std::vector<GradArr*> threadGradBuffers(numPairThreads, nullptr);
 	std::vector<std::vector<uint32_t>*> threadNormBuffers(numPairThreads, nullptr);
-#if MESHOPT_NEEDS_TILE_ENERGY
-	std::vector<std::vector<std::vector<float>>*> threadTileBuffers(numPairThreads, nullptr);
-#endif
 #pragma omp parallel
 	{
 #ifdef _OPENMP
@@ -3689,30 +4495,28 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #if MESHOPT_PROFILE
 		double _tRasterLocalMs = 0.0;
 #endif
-		static thread_local std::vector<std::vector<float>> tileEnergyLocal;
-		// Allocate per-thread tileEnergyLocal
-		// One-time resize per thread
-		if (tileEnergyLocal.size() != views.size()) {
-			tileEnergyLocal.resize(views.size());
-		}
-
-		// Ensure each view has a correctly sized, ZEROED tile buffer.
-		// This is deliberately eager for ALL views rather than lazy-per-reference-
-		// view: lazy allocation makes a thread's buffer state depend on the dynamic
-		// schedule, and that showed up as run-to-run non-determinism far larger than
-		// float-ordering noise (scale-3 iter-1 gradient 104.798 vs a 104.992+-0.002
-		// cluster, from an IDENTICAL binary). The ~1 GB it would save at 32 threads
-		// is not worth making the output schedule-dependent.
-#if MESHOPT_NEEDS_TILE_ENERGY
-		for (size_t v = 0; v < views.size(); v++) {
-			size_t tcount = views[v].tilesX * views[v].tilesY;
-			if (tileEnergyLocal[v].size() != tcount)
-				tileEnergyLocal[v].assign(tcount, 0.f);
-			else
-				std::fill(tileEnergyLocal[v].begin(), tileEnergyLocal[v].end(), 0.f);
-		}
-#endif
-
+		// Tile energy needs NO per-thread buffer. A reference view is scored by
+		// exactly ONE thread per evaluation -- the omp-for below is over reference
+		// views, BuildViewBatches' `assigned` flag puts each reference view in
+		// exactly one batch, and a batch lists it once -- and tile energy is only
+		// ever accumulated at the REFERENCE view (ThProcessPair hands the gradient
+		// kernel view A's row). So each thread writes a disjoint set of views and
+		// can accumulate straight into views[a].tileEnergyAccum, zeroed above.
+		//
+		// This replaces a nThreads x nViews x tilesPerView float array (1.02 GB at
+		// 32 threads on a 437-view scene, and charged in full to the streaming
+		// budget's `pinned` term) of which 31/32 was provably all-zero, plus the
+		// full-width zero-fill that opened every evaluation and the thread-major
+		// reduction that closed it. Bit-identical: the surviving adds are the same
+		// adds, in the same order, from the same thread; what is gone is a chain of
+		// `0.f +` around them.
+		//
+		// The determinism argument the eager per-thread fill was defending (lazy
+		// per-reference-view allocation made a thread's buffer state depend on the
+		// dynamic schedule, and that moved the scale-3 iter-1 gradient by far more
+		// than float-ordering noise) is satisfied a fortiori here: there is no
+		// per-thread buffer left to allocate, and the destination is indexed by
+		// view, not by thread.
 		static thread_local GradArr localGrad;
 		static thread_local std::vector<uint32_t> localNorm;
 
@@ -3728,9 +4532,6 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #endif
 		threadGradBuffers[pairThread] = &localGrad;
 		threadNormBuffers[pairThread] = &localNorm;
-#if MESHOPT_NEEDS_TILE_ENERGY
-		threadTileBuffers[pairThread] = &tileEnergyLocal;
-#endif
 
 		// Reference-view A mean/variance, computed ONCE per reference view (with
 		// a full mask) and reused for every neighbor b, instead of recomputing it
@@ -3782,12 +4583,20 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 			}
 #endif
 		}
+#if MESHOPT_PAIR_SCHEDULE_DETERMINISTIC
+#pragma omp for schedule(static, 1)
+#else
 #pragma omp for schedule(dynamic)
+#endif
 		for (int ai = 0; ai < (int)viewBatch.refViews.size(); ++ai) {
 			const int a = (int)viewBatch.refViews[ai];
 			const std::vector<uint32_t>& nbrs = refViewNeighbors[a];
 #else
+#if MESHOPT_PAIR_SCHEDULE_DETERMINISTIC
+#pragma omp for schedule(static, 1)
+#else
 #pragma omp for schedule(dynamic)
+#endif
 		for (int a = 0; a < (int)refViewNeighbors.size(); ++a) {
 			const std::vector<uint32_t>& nbrs = refViewNeighbors[a];
 #endif
@@ -3866,7 +4675,7 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #endif
 			for (uint32_t b : nbrs) {
 				if (pairEnabled(b))
-					ThProcessPair((uint32_t)a, b, localGrad, localNorm, tileEnergyLocal, refMeanA, refVarA);
+					ThProcessPair((uint32_t)a, b, localGrad, localNorm, refMeanA, refVarA);
 			}
 #if !MESHOPT_FACEMAP_RESIDENT
 			// free the streamed faceMap; keeps only ~nThreads maps alive at once
@@ -3903,34 +4712,45 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 			photoGradNorm[v] = (float)norm;
 		}
 
-		// -----------------------------
-		// REDUCE TILE ENERGIES
-		// -----------------------------
-#if MESHOPT_NEEDS_TILE_ENERGY
-#pragma omp for schedule(static)
-		for (int vi = 0; vi < (int)views.size(); ++vi) {
-			View& vw = views[vi];
-			const size_t T = (size_t)vw.tilesX * (size_t)vw.tilesY;
-			float* __restrict acc = vw.tileEnergyAccum.data();
-			std::fill(acc, acc + T, 0.f);
-			// Accumulate thread-major rather than tile-major: each thread's buffer is
-			// walked once, sequentially, and a thread that never referenced this view
-			// has no buffer to walk at all.
-			for (int thread = 0; thread < numPairThreads; ++thread) {
-				std::vector<float>& threadEnergy = (*threadTileBuffers[thread])[vi];
-				for (size_t t = 0; t < T; ++t) {
-					acc[t] += threadEnergy[t];
-					threadEnergy[t] = 0.f;
-				}
-			}
-		}
-#endif
+		// No tile-energy reduction: the pair loop accumulated directly into each
+		// view's tileEnergyAccum (single writer per view -- see the note where the
+		// per-thread buffers used to be allocated), so the totals are already
+		// there. The implicit barrier at the end of the combine above publishes
+		// them to the fold below.
 	} // end omp parallel
 
 #if MESHOPT_PROFILE
 	{
 		const double tPairMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _tPair0).count();
 		MeshProf::Add(MeshProf::P_PairLoopWall, tPairMs);
+		const double pmTotal = (double)MeshProf::gProjUs.exchange(0, std::memory_order_relaxed) / 1000.0;
+		const double pmRaster = (double)MeshProf::gPMRasterUs.exchange(0, std::memory_order_relaxed) / 1000.0;
+		const double pmClear = (double)MeshProf::gPMClearUs.exchange(0, std::memory_order_relaxed) / 1000.0;
+		MeshProf::Add(MeshProf::P_ProjectMeshTS, pmTotal);
+		MeshProf::Add(MeshProf::P_PMRasterTS, pmRaster);
+		MeshProf::Add(MeshProf::P_PMClearTS, pmClear);
+		// remainder, not a measurement: also absorbs EnsureCameraData and the tail
+		MeshProf::Add(MeshProf::P_PMValidTS, MAXF(0.0, pmTotal - pmRaster - pmClear));
+		{
+			const double f = (double)MeshProf::gPMFaces.exchange(0, std::memory_order_relaxed);
+			const double fr = (double)MeshProf::gPMFacesRast.exchange(0, std::memory_order_relaxed);
+			const double rw = (double)MeshProf::gPMRows.exchange(0, std::memory_order_relaxed);
+			const double ps = (double)MeshProf::gPMPixScan.exchange(0, std::memory_order_relaxed);
+			const double pw = (double)MeshProf::gPMPixWon.exchange(0, std::memory_order_relaxed);
+			const double cb = (double)MeshProf::gCullRebuilds.exchange(0, std::memory_order_relaxed);
+			const double cr = (double)MeshProf::gCullReuses.exchange(0, std::memory_order_relaxed);
+			if (cb + cr > 0.0)
+				VERBOSE("[PROFILE] %-20s %g rebuilds, %g reuses (pad factor %g)",
+					"  Cull", cb, cr, (double)MESHOPT_VISIBILITY_PAD_FACTOR);
+			if (f > 0.0)
+				VERBOSE("[PROFILE] %-20s %.4g faces, %.1f%% rasterized, %.4g rows (%.2f/face), "
+					"%.4g px scanned (%.2f/face), %.4g px won (%.1f%% of scanned, %.2f/face)",
+					"  PM shape", f, 100.0 * fr / f, rw, fr > 0.0 ? rw / fr : 0.0,
+					ps, fr > 0.0 ? ps / fr : 0.0, pw, ps > 0.0 ? 100.0 * pw / ps : 0.0,
+					fr > 0.0 ? pw / fr : 0.0);
+		}
+		MeshProf::Add(MeshProf::P_InitImageTS,
+			(double)MeshProf::gInitUs.exchange(0, std::memory_order_relaxed) / 1000.0);
 		const double pmPct = tPairMs > 0.0 ? 100.0 * tProjectMeshMs / tPairMs : 0.0;
 		const int nThr = (int)threads.GetSize();
 		const double tRasterWallMs = nThr > 0 ? tRasterizeMs / nThr : tRasterizeMs; // sum of per-thread time -> approx wall
@@ -3959,6 +4779,11 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 	// --------------------------------------------------------------------
 #if MESHOPT_NEEDS_TILE_ENERGY
 	{
+#if MESHOPT_PROFILE
+		// also previously untimed: this is where the accumulator is consumed, so
+		// PairLoop + TileReset + TileFold now bracket every touch of it
+		MeshProf::Timer _tTileFold;
+#endif
 		const unsigned parityNow(nAlternatePair == 1 ? (iteration & 1u) : 0u);
 		const unsigned parityNext(nAlternatePair == 1 ? ((iteration + 1) & 1u) : 0u);
 		// Start conservative, get aggressive as we converge
@@ -4026,6 +4851,9 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 			photoEnergyLast = photoEnergyIter;
 		}
 #endif
+#if MESHOPT_PROFILE
+		MeshProf::Add(MeshProf::P_TileFold, _tTileFold.ms());
+#endif
 	}
 #endif
 #else
@@ -4052,7 +4880,7 @@ double MeshRefine::ScoreMesh(float* gradients, bool rebuildOctree)
 #endif
 
 	// loop through all vertices and compute the smoothing score
-#ifdef MESHOPT_CERES
+#if MESHOPT_SCORE_SMOOTH
 	scoreSmooth = 0;
 #endif
 	const VIndex idxStep((vertices.GetSize() + (VIndex)threads.GetSize() - 1) / (VIndex)threads.GetSize());
@@ -4347,9 +5175,13 @@ void MeshRefine::ProjectMesh(
 	// Maps must be completely filled or have a generator.
 	depthMap.create(size);
 	faceMap.create(size);
-#if MESHOPT_FACEMAP_RESIDENT
+#if MESHOPT_FACEMAP_RESIDENT && !MESHOPT_DEPTH_CLEAR_UNCOVERED
 	// consumers gate validity on NO_ID (the raster only writes covered pixels);
-	// same fill RasterizeFaceMap performed on the streamed path
+	// same fill RasterizeFaceMap performed on the streamed path.
+	// Only needed when the clear-uncovered pass below is compiled out: that pass
+	// already visits every pixel and already knows, from the generation stamp,
+	// which ones the raster missed -- so it writes their NO_ID itself and this
+	// whole full-frame 4 B/px store pass (per view, per iteration) disappears.
 	faceMap.fill(NO_ID);
 #endif
 
@@ -4389,7 +5221,23 @@ void MeshRefine::ProjectMesh(
 	const float widthMinus1 = (float)(width - 1);
 	const float heightMinus1 = (float)(height - 1);
 
+#if MESHOPT_PROFILE
+	{ MeshProf::Timer _t;
+#endif
+#if MESHOPT_PROFILE
+	// PM:raster is 97.2% of ProjectMesh but one number cannot say whether it is
+	// SETUP-bound (per face: 3 perspective divides, bbox, 6 edge gradients) or
+	// FILL-bound (per pixel: a divide, 8 muls, depth test). At max-face-area 32 px^2
+	// a face spans ~5.7 px, so setup may be amortised over very few pixels -- and
+	// those two answers call for completely different fixes. Plain locals, not
+	// thread_local: ProjectMesh is one call per view per thread, so they accumulate
+	// per call and flush once at the end -- no atomic in any hot loop.
+	uint64_t nFaces = 0, nFacesRast = 0, nRows = 0, nPixScan = 0, nPixWon = 0;
+#endif
 	for (size_t fi = 0, cnt = rd.faces.size(); fi < cnt; ++fi) {
+#if MESHOPT_PROFILE
+		++nFaces;
+#endif
 		const Face& face = rd.faces[fi];
 #if MESHOPT_SUPPORT_STAGE_DIAG
 		const bool diagCount = (iteration == 0 && faceCandViews.GetSize() == faces.GetSize());
@@ -4527,9 +5375,11 @@ void MeshRefine::ProjectMesh(
 		float w2_row = EdgeFunction2(v1, v2, { px0, py0 }) * invArea;
 
 		// vertex depths
+#if !MESHOPT_RASTER_Z_DIRECT
 		const float z0 = c0.z;
 		const float z1 = c1.z;
 		const float z2 = c2.z;
+#endif
 
 		// reciprocal depths
 		const float iz0 = c0.invZ;
@@ -4543,7 +5393,13 @@ void MeshRefine::ProjectMesh(
 		uint8_t* __restrict validPtr = view.isValid.data();
 #endif
 
+#if MESHOPT_PROFILE
+		++nFacesRast;
+#endif
 		for (size_t y = boxMinI.y; y <= boxMaxI.y; ++y) {
+#if MESHOPT_PROFILE
+			++nRows;
+#endif
 			size_t base = size_t(y) * width;
 			uint16_t* __restrict depthGenRow = depthGenPtr + base;
 			Depth* __restrict depthRow = depthPtr + base;
@@ -4583,21 +5439,33 @@ void MeshRefine::ProjectMesh(
 			// Phase 2: inside span - no inside tests in main loop
 			// -------------------------------------------------------------------
 			for (; x <= boxMaxI.x; ++x) {
+#if MESHOPT_PROFILE
+				++nPixScan;
+#endif
 				// perspective correct barycentrics
 				float denom = w0 * iz0 + w1 * iz1 + w2 * iz2;
 				float invDen = 1.f / denom;
 
+#if !MESHOPT_RASTER_Z_DIRECT
 				float bx = (w0 * iz0) * invDen;
 				float by = (w1 * iz1) * invDen;
 				float bz = 1.f - bx - by;
+#endif
 
+#if MESHOPT_RASTER_Z_DIRECT
+				const float z = invDen;
+#else
 				float z = bx * z0 + by * z1 + bz * z2;
+#endif
 
 				float old = (depthGenRow[x] == depthCurGen)
 					? depthRow[x]
 					: std::numeric_limits<float>::infinity();
 
 				if (old > z) {
+#if MESHOPT_PROFILE
+					++nPixWon;
+#endif
 					depthGenRow[x] = depthCurGen;
 					depthRow[x] = z;
 #if MESHOPT_RASTER_NO_BACKFACE_CULL
@@ -4650,26 +5518,54 @@ void MeshRefine::ProjectMesh(
 		}
 #endif
 	}
+#if MESHOPT_PROFILE
+	MeshProf::gPMFaces.fetch_add(nFaces, std::memory_order_relaxed);
+	MeshProf::gPMFacesRast.fetch_add(nFacesRast, std::memory_order_relaxed);
+	MeshProf::gPMRows.fetch_add(nRows, std::memory_order_relaxed);
+	MeshProf::gPMPixScan.fetch_add(nPixScan, std::memory_order_relaxed);
+	MeshProf::gPMPixWon.fetch_add(nPixWon, std::memory_order_relaxed);
+	MeshProf::gPMRasterUs.fetch_add((uint64_t)(_t.ms() * 1000.0), std::memory_order_relaxed); }
+#endif
 
 #if MESHOPT_DEPTH_CLEAR_UNCOVERED
-	// coverage authority is the generation stamp, valid in both faceMap configs
+	// coverage authority is the generation stamp, valid in both faceMap configs.
+	// This pass also OWNS the uncovered faceMap entries: the rasterizer writes
+	// faceMap at every pixel it covers (a face id, or NO_ID for a back-face win
+	// under MESHOPT_RASTER_NO_BACKFACE_CULL) and never reads it, so the only
+	// pixels needing NO_ID are exactly the ones the stamp already identifies
+	// here. Doing it in this pass instead of a full-frame fill before the raster
+	// removes one 4 B/px store over every view on every iteration -- the maps are
+	// reused across iterations, so the uncovered entries would otherwise hold the
+	// previous generation's face ids.
+#if MESHOPT_PROFILE
+	{ MeshProf::Timer _t;
+#endif
 	{
 		const uint16_t* __restrict genPtr = depthGen.data();
 		Depth* __restrict clearPtr = depthMap.ptr<float>(0);
+		cuint32_t* __restrict crossPtr = faceMap.ptr<cuint32_t>(0);
 #if MESHOPT_RASTER_NO_BACKFACE_CULL
 		// GPU CrossCheckProjection parity: pixels won by a back face (depth
 		// written, faceMap NO_ID) are fully invalidated, depth included;
 		// covered-this-gen pixels always hold fresh face ids in both configs
-		const cuint32_t* __restrict crossPtr = faceMap.ptr<cuint32_t>(0);
-		for (size_t px = 0; px < numPixels; ++px)
-			if (genPtr[px] != depthCurGen || crossPtr[px] == (cuint32_t)NO_ID)
+		for (size_t px = 0; px < numPixels; ++px) {
+			if (genPtr[px] != depthCurGen) {
 				clearPtr[px] = 0;
+				crossPtr[px] = (cuint32_t)NO_ID;
+			} else if ((uint32_t)crossPtr[px] == (uint32_t)NO_ID)
+				clearPtr[px] = 0;
+		}
 #else
 		for (size_t px = 0; px < numPixels; ++px)
-			if (genPtr[px] != depthCurGen)
+			if (genPtr[px] != depthCurGen) {
 				clearPtr[px] = 0;
+				crossPtr[px] = (cuint32_t)NO_ID;
+			}
 #endif
 	}
+#if MESHOPT_PROFILE
+	MeshProf::gPMClearUs.fetch_add((uint64_t)(_t.ms() * 1000.0), std::memory_order_relaxed); }
+#endif
 #endif
 
 #ifdef VALIDATE_RASTERIZER
@@ -6588,7 +7484,7 @@ float MeshRefine::ComputeLocalZNCCFused(
 		return 0.0f;
 	static const bool useAVX2 = [] {
 		const bool enabled = MESHOPT_AVX2 && SupportsAVX2();
-		REFINE_DIAG(_T("Mesh refinement ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("SSE2"));
+		REFINE_MODE_DIAG(_T("Mesh refinement ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("SSE2"));
 		return enabled;
 	}();
 
@@ -6909,7 +7805,7 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		// OPENMVS_REFINE_BASELINE=1 turns this off too (see the MeshRefine ctor)
 		if (const char* szBaseline = std::getenv("OPENMVS_REFINE_BASELINE"))
 			enabled = enabled && String(szBaseline) == _T("0");
-		REFINE_DIAG(_T("Mesh refinement windowed-ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
+		REFINE_MODE_DIAG(_T("Mesh refinement windowed-ZNCC SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
 		return enabled;
 	}();
 
@@ -6976,6 +7872,45 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 	colZ.resize(cols);
 	colM.resize(cols);
 	colN.resize(cols);
+
+#if MESHOPT_PROFILE
+	// One-shot alignment probe. These arrays are plain std::vector (default
+	// allocator, so 16-byte aligned on MSVC) and every AVX2 kernel sweeps them with
+	// 32-byte loadu/storeu. A 32-byte load stepping by 32 from a base at 16 or 48
+	// mod 64 crosses a cache line on HALF its loads; from 0 mod 64, never. They are
+	// L2-resident and swept every row of every pair, so the penalty is not hidden by
+	// DRAM the way it would be on the multi-MB planes.
+	//
+	// Row stride matters as much as the base: the ring steps by `plane` floats, so a
+	// stride that is not a multiple of 16 floats puts every row at a different line
+	// offset and aligning the base fixes only row 0.
+	//
+	// MEASURED 2026-09-17 -- ANSWER: no change warranted. Reported
+	//   colB 32  colB2 32  colAB 32 | ringInvS 0  ringValid 32 | colInv 32  colN 16
+	//   ring row stride 2736 B (scale 1) -> mod 64 = 48
+	// A 32-byte load crosses a line iff (A mod 64) > 32, so 32 is as SAFE as 0 -- only
+	// 16 and 48 are bad classes, and only `colN` landed there. The stride is
+	// scale-dependent (48 / 32 / 0 for scales 1/2/3) and the FINEST scale, which is
+	// 65 s of the 113 s pair loop, is already 0. On top of that the terms kernel's
+	// sum5 does five OVERLAPPING 32-byte loads at consecutive 8-byte offsets, so it
+	// hits all eight positions equally -- 37.5% cross regardless of base alignment,
+	// which no allocator change can fix. Left as-is; probe kept as the record.
+	{
+		static std::atomic<bool> alignProbed{false};
+		bool expected = false;
+		if (alignProbed.compare_exchange_strong(expected, true)) {
+			const size_t stride = (size_t)plane * sizeof(float);
+			VERBOSE("[PROFILE] ZNCC array alignment, bytes mod 64 (0 = nothing to fix): "
+				"colB %zu colB2 %zu colAB %zu | ringInvS %zu ringValid %zu | colInv %zu colN %zu | "
+				"ring row stride %zu B -> mod 64 = %zu",
+				(size_t)((uintptr_t)colB.data() & 63), (size_t)((uintptr_t)colB2.data() & 63),
+				(size_t)((uintptr_t)colAB.data() & 63),
+				(size_t)((uintptr_t)ringInvS.data() & 63), (size_t)((uintptr_t)ringValid.data() & 63),
+				(size_t)((uintptr_t)colInv.data() & 63), (size_t)((uintptr_t)colN.data() & 63),
+				stride, stride & 63);
+		}
+	}
+#endif
 
 	const auto emitRow = [&](int rOut) {
 #if MESHOPT_PROFILE
@@ -7070,10 +8005,20 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 		// emitRow reads varBRow[i] only under the same `mask[rOut*cols+i]` test
 		// that guards the write below, for the same row, so every entry it reads
 		// was written this pass. Zeroing it was a whole cols-wide fill per row.
-		memset(rowInvS, 0, plane * sizeof(float));
-		memset(rowZovb, 0, plane * sizeof(float));
-		memset(rowMean, 0, plane * sizeof(float));
-		memset(rowValid, 0, plane * sizeof(float));
+		// [colStart, colEnd) ONLY. The borders [0,colStart) and [colEnd,cols) are
+		// zeroed by the ring's assign() at entry and NOTHING ever writes them -- the
+		// terms pass below runs [colStart, colEnd) -- so re-clearing them every row
+		// is pure waste. (The remaining redundancy is that at MASKED columns this
+		// memset is overwritten immediately by the terms pass; closing that means
+		// having SceneRefineWZNCCTermsRowAVX2 store zeros instead of taking its
+		// mask8==0 early-out, so each column is written once instead of twice --
+		// ~31% of the stores in this phase, ~0.4 s, but it touches a kernel with a
+		// formal byte-identity proof. Not done.)
+		const size_t clearCnt = (size_t)(colEnd - colStart);
+		memset(rowInvS + colStart, 0, clearCnt * sizeof(float));
+		memset(rowZovb + colStart, 0, clearCnt * sizeof(float));
+		memset(rowMean + colStart, 0, clearCnt * sizeof(float));
+		memset(rowValid + colStart, 0, clearCnt * sizeof(float));
 
 		const uint8_t* __restrict maskRow = &mask[(size_t)r * cols];
 		const uint16_t* __restrict meanARow = imageMeanA.ptr<uint16_t>(r);
@@ -7182,8 +8127,6 @@ float MeshRefine::ComputeLocalZNCCFusedWindowed(
 
 #if 1
 
-#define FMA(a,b,c) _mm_add_ps(_mm_mul_ps(a,b),c)
-
 void MeshRefine::ComputePhotometricGradient(
 	const View& viewA,
 	const CameraRenderData& rd,
@@ -7197,7 +8140,7 @@ void MeshRefine::ComputePhotometricGradient(
 	std::vector<uint32_t>& threadNorm,
 	Real RegularizationScale,
 	uint64_t setupEpoch,
-	std::vector<float>& tileEnergyLocal,
+	std::vector<float>& tileEnergyView,
 	size_t rowBegin,
 	size_t rowEnd,
 	size_t dznccRowOffset,
@@ -7311,8 +8254,12 @@ void MeshRefine::ComputePhotometricGradient(
 	const int maxX = static_cast<int>(viewB.width) - 2;
   	const int maxY = static_cast<int>(viewB.height) - 2;
   	const int wB = static_cast<int>(viewB.width); // planar gradient row stride
+#if MESHOPT_GRAD_INTERLEAVED
+	const GradStoreT* __restrict gradXYB = viewB.gradXY; // interleaved (gx,gy) pairs
+#else
 	const GradStoreT* __restrict gradXB = viewB.gradX;
 	const GradStoreT* __restrict gradYB = viewB.gradY;
+#endif
 
 #if MESHOPT_PG_AVX2
 	static const bool usePGAVX2 = [] {
@@ -7321,12 +8268,16 @@ void MeshRefine::ComputePhotometricGradient(
 			enabled = enabled && String(szSimd) != _T("0");
 		if (const char* szBaseline = std::getenv("OPENMVS_REFINE_BASELINE"))
 			enabled = enabled && String(szBaseline) == _T("0");
-		REFINE_DIAG(_T("Mesh refinement photometric-gradient SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
+		REFINE_MODE_DIAG(_T("Mesh refinement photometric-gradient SIMD: %s"), enabled ? _T("AVX2") : _T("scalar"));
 		return enabled;
 	}();
 	PGPairCtxAVX2 pgCtx;
+#if MESHOPT_GRAD_INTERLEAVED
+	pgCtx.gradXYB = gradXYB;
+#else
 	pgCtx.gradXB = gradXB;
 	pgCtx.gradYB = gradYB;
+#endif
 	pgCtx.rA00 = rA00; pgCtx.rA01 = rA01; pgCtx.rA02 = rA02;
 	pgCtx.rA20 = rA20; pgCtx.rA21 = rA21; pgCtx.rA22 = rA22;
 	pgCtx.cxA = cxA; pgCtx.invFxA = invFxA;
@@ -7341,12 +8292,55 @@ void MeshRefine::ComputePhotometricGradient(
 #endif
 
 #if MESHOPT_PG_FACECACHE
-	constexpr uint32_t FACE_SETUP_CACHE_SIZE = 128;
+	// MEASURED WORSE 2026-09-17 -- do not re-propose "one entry per local face".
+	//
+	// The 9.36% miss rate here IS roughly one miss per face encounter, so replacing
+	// this 128-entry direct-mapped cache with a fully-associative per-local-face array
+	// plus a generation stamp did exactly what it promised: misses 3.348e9 -> 7.993e8,
+	// a 4.19x cut, because a FaceSetup is a pure function of (localFace, rd) and a
+	// reference view rescans the same faceMap for each of its 4-8 pairs.
+	//
+	// It was still 24% SLOWER overall, for two separate reasons:
+	//   * ZNCC:grad itself rose 8.5% DESPITE the 4.19x fewer fills. The probe became a
+	//     random access into a 51-150 MB per-thread array instead of an L1-resident
+	//     9.7 KB one. THIS CACHE IS FAST BECAUSE IT IS TINY; associativity is not the
+	//     binding constraint, probe locality is.
+	//   * ~1.6-5 GB of new per-thread scratch shrank streamBudgetBytes enough to tip
+	//     the scene out of SINGLE-BATCH residency: StreamResident 25 -> 30 calls,
+	//     InitImage(thr-sum) +85% from reloading evicted views, StreamResident +53%.
+	//
+	// A middle ground was NOT tried: a few-thousand-entry set-associative cache that
+	// still fits L2 (e.g. 4096 x 76 B = 311 KB, 4-way). That would cut misses somewhat
+	// while keeping probes off DRAM -- but note every tail change here has measured
+	// zero or worse, so measure before building.
+	// Must stay a POWER OF TWO -- the index is `& (FACE_SETUP_CACHE_SIZE - 1)`.
+	// 128 = 9.7 KB, 256 = 19.0 KB (both inside a 32 KB L1), 512 = 38.9 KB (spills to
+	// L2, which is what makes the probe expensive -- see the note above).
+	//
+	// MEASURED 2026-09-17: 128 -> 256 moved the miss rate only 9.36% -> 9.11%, i.e. it
+	// recovered 2.6% of misses. THE MISSES ARE COMPULSORY: 9.36% is one miss per 10.7
+	// probes and a face covers ~10-15 masked pixels, so the cache was already getting
+	// full reuse within a face's pixel run and there were no conflicts to recover at
+	// 128. Enlarging further cannot help either -- the next reuse available is across
+	// a band boundary (~760 faces, 58 KB) and then across the view's pairs (~91k faces,
+	// 6.9 MB), and both of those spill out of L1, which costs more on every probe than
+	// it saves on the rare miss (the fully-associative version measured 24% WORSE).
+	// Kept at 256 only because it is free and more robust if faces ever get smaller.
+	constexpr uint32_t FACE_SETUP_CACHE_SIZE = 256;
 	struct FaceSetup {
 		FIndex key;
+
 		uint32_t g0, g1, g2;   // global vertex indices, pre-resolved
 		float nx, ny, nz;      // face normal, pre-resolved
-		float su0, sv0, su1, sv1, su2, sv2;
+		// Screen-space vertex positions, and the four EDGE DIFFERENCES the per-pixel
+		// barycentric evaluation used to recompute at every pixel. They depend only
+		// on the face, so hoisting them here is bit-identical -- same operands, same
+		// subtraction, done once instead of once per covered pixel.
+		// su0/sv0 are deliberately absent: after this hoist they are read only by
+		// invArea and by e02u/e02v, both at fill time, so they stay fill-time locals.
+		float su1, sv1, su2, sv2;
+		float e21u, e21v;      // su2-su1, sv2-sv1
+		float e02u, e02v;      // su0-su2, sv0-sv2
 		float invZ0, invZ1, invZ2, invArea;
 	};
 	static thread_local FaceSetup faceSetupCache[FACE_SETUP_CACHE_SIZE];
@@ -7382,7 +8376,7 @@ void MeshRefine::ComputePhotometricGradient(
 
 			const size_t xEnd = std::min(tx + TILEX, ColsEnd);
 
-			constexpr int LOCAL_CAP = TILEX * TILEY * 4;  // enough for most 32x32 tiles
+			constexpr int LOCAL_CAP = TILEX * TILEY * 4;  // 4 slots/px = 75% worst-case load; see TILEX
 			struct TGrad { float v[3]; };
 			alignas(64) TGrad tileGrad[LOCAL_CAP];
 
@@ -7396,11 +8390,38 @@ void MeshRefine::ComputePhotometricGradient(
 				initialized = true;
 			}
 
-			alignas(64) uint32_t usedIdx[LOCAL_CAP];
+			// usedIdx holds SLOT indices into the two tables above -- it only ever spans
+			// [0, LOCAL_CAP), never a vertex id, so uint32_t was 4x wider than needed.
+			// The width is DERIVED from LOCAL_CAP rather than hardcoded, because
+			// LOCAL_CAP is TILEX*TILEY*4 and therefore moves whenever the tile is
+			// retuned: a fixed uint8_t fits exactly at today's 8x8 (256) and would
+			// SILENTLY TRUNCATE at 8x16 (512), making the flush read the wrong slot and
+			// corrupt the gradient with no error and no assertion. The static_assert
+			// turns that into a build failure instead.
+			typedef std::conditional<(LOCAL_CAP <= 256), uint8_t,
+				std::conditional<(LOCAL_CAP <= 65536), uint16_t, uint32_t>::type>::type SlotIdx;
+			static_assert((size_t)(LOCAL_CAP - 1) <= (size_t)std::numeric_limits<SlotIdx>::max(),
+				"usedIdx element type is too narrow for LOCAL_CAP");
+			alignas(64) SlotIdx usedIdx[LOCAL_CAP];
 			size_t usedCount = 0;
 
 			// hoisted to tile scope so the AVX2 group path and the scalar path
 			// share the identical open-addressed tile-slot accumulation
+			// hoisted to tile scope so the AVX2 group path and the scalar path
+			// share the identical open-addressed tile-slot accumulation.
+			//
+			// MEASURED ZERO 2026-09-17 -- do not re-propose. Three packings were tried
+			// together here: caching the three vertex->slot probes per FACE (consecutive
+			// pixels share a face, so they are the same for a whole run), padding TGrad
+			// to 16 B so the three-float update is one aligned SSE load/add/store, and
+			// hoisting Ng into an __m128. Result: pair loop 112.35 -> 113.14 s, i.e.
+			// slightly WORSE, with the subdivide phases flat as a control. That is the
+			// FOURTH tail optimisation here to measure nothing (after 8-wide math at
+			// +6.5%, removing 64 B/px of struct copies, and removing 4 ops/px) -- this
+			// loop stalls on the B-side bilinear gather at ~210 cycles per masked pixel
+			// against ~30-40 arithmetic ops, and everything L1-resident hides behind
+			// that. Stop optimising the tail; only a restructure that shrinks the
+			// per-thread working set can move it.
 			auto accum = [&](uint32_t vi, const Grad& g)
 			{
 				uint32_t slot = (vi * 0x9E3779B1u) & (LOCAL_CAP - 1);
@@ -7425,7 +8446,7 @@ void MeshRefine::ComputePhotometricGradient(
 						t.v[0] = g.x;
 						t.v[1] = g.y;
 						t.v[2] = g.z;
-						usedIdx[usedCount++] = slot;
+						usedIdx[usedCount++] = (SlotIdx)slot; // width checked against LOCAL_CAP above
 						return;
 					}
 
@@ -7459,6 +8480,14 @@ void MeshRefine::ComputePhotometricGradient(
 						const size_t c = cScalar;
 						uint64_t m8;
 						memcpy(&m8, maskRow + c, sizeof(m8));
+#if MESHOPT_PROFILE
+						// mask bytes are 0 or 1, so popcount of the 8-byte word IS the
+						// number of masked pixels in the group -- one instruction
+						++MeshProf::tlPG[0];
+						MeshProf::tlPG[2] += (unsigned long long)__popcnt64(m8);
+						if (m8 == 0)
+							++MeshProf::tlPG[1];
+#endif
 						if (m8 == 0)
 							continue;
 						// scalar prepass in pixel order: face-setup cache fetch/fill
@@ -7472,6 +8501,18 @@ void MeshRefine::ComputePhotometricGradient(
 						// here instead corrupted ~5% of groups (wrong triangle's
 						// barycentrics AND wrong vertices) -- caught as a +0.9%
 						// iteration-1 gradient-norm shift on Niwot.
+						// scalar prepass in pixel order: face-setup cache fetch/fill
+						// (same fills the scalar path would do; the cache is a pure
+						// cache, so fill order only affects hit rate, never values).
+						// setups are copied BY VALUE at fetch time: the cache is
+						// direct-mapped, so a LATER lane's fill can overwrite an
+						// EARLIER lane's slot (two faces hashing together within one
+						// group); the scalar path fetches at the pixel, and the copy
+						// freezes exactly what it would have seen. Holding pointers
+						// here instead corrupted ~5% of groups -- caught as a +0.9%
+						// iteration-1 gradient-norm shift on Niwot. (Making the cache
+						// fully associative removes that hazard and lets pointers work,
+						// but see the note on the declaration: it measured 24% worse.)
 						FaceSetup setupsLocal[8];
 						uint32_t laneHasSetup = 0;
 						alignas(32) float nxl[8], nyl[8], nzl[8];
@@ -7483,6 +8524,10 @@ void MeshRefine::ComputePhotometricGradient(
 							const FIndex fA = faceRowA[c + (size_t)k];
 							FaceSetup& setup = faceSetupCache[
 								((uint32_t)fA * 0x9E3779B1u) & (FACE_SETUP_CACHE_SIZE - 1)];
+#if MESHOPT_PROFILE
+							++MeshProf::tlPG[7];
+							if (setup.key != fA) ++MeshProf::tlPG[8];
+#endif
 							if (setup.key != fA) {
 								setup.key = fA;
 								const Face& faceA = rd.faces[fA];
@@ -7495,12 +8540,18 @@ void MeshRefine::ComputePhotometricGradient(
 								const Grad& N = faceNormals[rd.globalFace[fA]];
 								setup.nx = N.x; setup.ny = N.y; setup.nz = N.z;
 								setup.invZ0 = cv0.invZ; setup.invZ1 = cv1.invZ; setup.invZ2 = cv2.invZ;
-								setup.su0 = cv0.x * setup.invZ0; setup.sv0 = cv0.y * setup.invZ0;
+								const float su0 = cv0.x * setup.invZ0, sv0 = cv0.y * setup.invZ0;
 								setup.su1 = cv1.x * setup.invZ1; setup.sv1 = cv1.y * setup.invZ1;
 								setup.su2 = cv2.x * setup.invZ2; setup.sv2 = cv2.y * setup.invZ2;
+								setup.e21u = setup.su2 - setup.su1; setup.e21v = setup.sv2 - setup.sv1;
+								// NOT -(su2-su0) reusing invArea's operands below: negating a
+								// difference flips the sign of zero when the two are equal, and
+								// that is a different bit pattern. Subtract directly; it is free
+								// here and it keeps the hoist exact.
+								setup.e02u = su0 - setup.su2; setup.e02v = sv0 - setup.sv2;
 								setup.invArea = 1.f / (
-									(setup.su1 - setup.su0) * (setup.sv2 - setup.sv0) -
-									(setup.sv1 - setup.sv0) * (setup.su2 - setup.su0));
+									(setup.su1 - su0) * (setup.sv2 - sv0) -
+									(setup.sv1 - sv0) * (setup.su2 - su0));
 							}
 							setupsLocal[k] = setup;
 							laneHasSetup |= 1u << k;
@@ -7526,8 +8577,22 @@ void MeshRefine::ComputePhotometricGradient(
 #endif
 							const FaceSetup& setup = setupsLocal[k];
 							const float bpx = (float)(int)(c + (size_t)k), bpy = rowF;
-							const float bw0 = ((setup.su2 - setup.su1) * (bpy - setup.sv1) - (setup.sv2 - setup.sv1) * (bpx - setup.su1)) * setup.invArea;
-							const float bw1 = ((setup.su0 - setup.su2) * (bpy - setup.sv2) - (setup.sv0 - setup.sv2) * (bpx - setup.su2)) * setup.invArea;
+							const float bw0 = (setup.e21u * (bpy - setup.sv1) - setup.e21v * (bpx - setup.su1)) * setup.invArea;
+							const float bw1 = (setup.e02u * (bpy - setup.sv2) - setup.e02v * (bpx - setup.su2)) * setup.invArea;
+// MEASURED WORSE 2026-09-17 -- do not re-propose. sum(bw_i * invZ_i) IS
+							// exactly 1/z (screen-affine barycentrics, 1/z affine in screen space;
+							// verified to 3.5e-15 over 200k triangles), so bDen could be read straight
+							// from the depth this loop already loads, dropping a divide, 3 muls, 2 adds
+							// and bw2. Measured pair loop 112.35 -> 117.00 s, +4.1% SLOWER, subdivide
+							// flat as a control.
+							//
+							// Why: the DIVIDER IS IDLE -- nothing else in this loop uses it -- so a
+							// divide is nearly free here, while the replacement is a LOAD, and the load
+							// ports are the busy resource (four gathers plus the mask/faceMap/depth/dZNCC
+							// streams). This is the fifth tail change to measure zero or worse; the one
+							// before it (slot cache + SSE accumulate) was also neutral-to-negative.
+							// Together with the SMT test (a second thread per core buys only 11.3%) the
+							// picture is LOAD-PORT bound, not divider-bound and not stall-bound.
 							const float bw2 = 1.f - bw0 - bw1;
 							const float bDen = 1.f / (bw0 * setup.invZ0 + bw1 * setup.invZ1 + bw2 * setup.invZ2);
 							const float bx = (bw0 * setup.invZ0) * bDen;
@@ -7576,6 +8641,10 @@ void MeshRefine::ComputePhotometricGradient(
 					// globalFace->faceNormals and 3x globalVert gathers with one struct
 					FaceSetup& setup = faceSetupCache[
 						((uint32_t)fA * 0x9E3779B1u) & (FACE_SETUP_CACHE_SIZE - 1)];
+#if MESHOPT_PROFILE
+					++MeshProf::tlPG[7];
+					if (setup.key != fA) ++MeshProf::tlPG[8];
+#endif
 					if (setup.key != fA) {
 						setup.key = fA;
 						const Face& faceA = rd.faces[fA];
@@ -7588,12 +8657,14 @@ void MeshRefine::ComputePhotometricGradient(
 						const Grad& N = faceNormals[rd.globalFace[fA]];
 						setup.nx = N.x; setup.ny = N.y; setup.nz = N.z;
 						setup.invZ0 = cv0.invZ; setup.invZ1 = cv1.invZ; setup.invZ2 = cv2.invZ;
-						setup.su0 = cv0.x * setup.invZ0; setup.sv0 = cv0.y * setup.invZ0;
+						const float su0 = cv0.x * setup.invZ0, sv0 = cv0.y * setup.invZ0;
 						setup.su1 = cv1.x * setup.invZ1; setup.sv1 = cv1.y * setup.invZ1;
 						setup.su2 = cv2.x * setup.invZ2; setup.sv2 = cv2.y * setup.invZ2;
+						setup.e21u = setup.su2 - setup.su1; setup.e21v = setup.sv2 - setup.sv1;
+						setup.e02u = su0 - setup.su2; setup.e02v = sv0 - setup.sv2;
 						setup.invArea = 1.f / (
-							(setup.su1 - setup.su0) * (setup.sv2 - setup.sv0) -
-							(setup.sv1 - setup.sv0) * (setup.su2 - setup.su0));
+							(setup.su1 - su0) * (setup.sv2 - sv0) -
+							(setup.sv1 - sv0) * (setup.su2 - su0));
 					}
 					const float Nx = setup.nx, Ny = setup.ny, Nz = setup.nz;
 #else
@@ -7669,6 +8740,17 @@ void MeshRefine::ComputePhotometricGradient(
 					const size_t off = static_cast<size_t>(yi) * wB + xi;
 #if MESHOPT_GRAD_F32
 					// scalar 2x2 lerp on the float planes (SIMD gather paths are int16-only)
+#if MESHOPT_GRAD_INTERLEAVED
+					// interleaved: a pixel's (gx,gy) are adjacent, row stride is 2*wB
+					const float* __restrict g0 = gradXYB + 2 * off;
+					const size_t sB = 2 * (size_t)wB;
+					const float gxTop = g0[0] + fx * (g0[2] - g0[0]);
+					const float gxBot = g0[sB] + fx * (g0[sB + 2] - g0[sB]);
+					const float gBx = gxTop + fy * (gxBot - gxTop);
+					const float gyTop = g0[1] + fx * (g0[3] - g0[1]);
+					const float gyBot = g0[sB + 1] + fx * (g0[sB + 3] - g0[sB + 1]);
+					const float gBy = gyTop + fy * (gyBot - gyTop);
+#else
 					const float* __restrict gx0 = gradXB + off;
 					const float* __restrict gy0 = gradYB + off;
 					const float gxTop = gx0[0] + fx * (gx0[1] - gx0[0]);
@@ -7677,21 +8759,38 @@ void MeshRefine::ComputePhotometricGradient(
 					const float gyTop = gy0[0] + fx * (gy0[1] - gy0[0]);
 					const float gyBot = gy0[wB] + fx * (gy0[wB + 1] - gy0[wB]);
 					const float gBy = gyTop + fy * (gyBot - gyTop);
+#endif
+#else
+#if MESHOPT_GRAD_INTERLEAVED
+					// one 8-byte load per row yields {gx,gy,gx,gy} for both taps
+					const int16_t* __restrict g0 = gradXYB + 2 * off;
+					const size_t sB = 2 * (size_t)wB;
 #else
 					const int16_t* __restrict gx0 = gradXB + off;
 					const int16_t* __restrict gy0 = gradYB + off;
+#endif
 
 					const __m128 fxv = _mm_set1_ps(fx);
 					const __m128 fyv = _mm_set1_ps(fy);
 #if MESHOPT_PG_BILERP_MERGE
 					// Pack {gx00,gx01,gy00,gy01} and the matching bottom row,
 					// then interpolate both channels in the same SIMD lanes.
+#if MESHOPT_GRAD_INTERLEAVED
+					// memory holds {gx00,gy00,gx01,gy01}; shufflelo reorders it to the
+					// {gx00,gx01,gy00,gy01} the lerp below expects -- pure data movement,
+					// identical values in identical lanes, one load instead of two
+					const __m128i top16 = _mm_shufflelo_epi16(
+						_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g0)), _MM_SHUFFLE(3, 1, 2, 0));
+					const __m128i bot16 = _mm_shufflelo_epi16(
+						_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g0 + sB)), _MM_SHUFFLE(3, 1, 2, 0));
+#else
 					const __m128i top16 = _mm_unpacklo_epi32(
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gx0)),
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gy0)));
 					const __m128i bot16 = _mm_unpacklo_epi32(
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gx0 + wB)),
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gy0 + wB)));
+#endif
 
 					__m128 topv = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi16_epi32(top16)), invScale);
 					__m128 botv = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi16_epi32(bot16)), invScale);
@@ -7704,12 +8803,23 @@ void MeshRefine::ComputePhotometricGradient(
 #else
 					// gather 2x2 bilinear block from two adjacent planar rows
 					// each row holds gx00,gx01 (resp. gy) contiguously; combine with yi+1
+#if MESHOPT_GRAD_INTERLEAVED
+					// interleaved: one load per row gives {gx,gy,gx,gy}; shufflelo splits it
+					// into {gx0*,gy0*} halves, then unpacklo_epi32 pairs the two rows
+					const __m128i t = _mm_shufflelo_epi16(
+						_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g0)), _MM_SHUFFLE(3, 1, 2, 0));
+					const __m128i bt = _mm_shufflelo_epi16(
+						_mm_loadl_epi64(reinterpret_cast<const __m128i*>(g0 + sB)), _MM_SHUFFLE(3, 1, 2, 0));
+					const __m128i gx16 = _mm_unpacklo_epi32(t, bt);                        // gx00,gx01,gx10,gx11
+					const __m128i gy16 = _mm_unpacklo_epi32(_mm_srli_si128(t, 4), _mm_srli_si128(bt, 4)); // gy...
+#else
 					const __m128i gx16 = _mm_unpacklo_epi32(
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gx0)),       // gx00,gx01
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gx0 + wB))); // gx10,gx11
 					const __m128i gy16 = _mm_unpacklo_epi32(
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gy0)),       // gy00,gy01
 						_mm_cvtsi32_si128(*reinterpret_cast<const int*>(gy0 + wB))); // gy10,gy11
+#endif
 
 					__m128 gxv = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(gx16));
 					__m128 gyv = _mm_cvtepi32_ps(_mm_cvtepi16_epi32(gy16));
@@ -7777,8 +8887,8 @@ void MeshRefine::ComputePhotometricGradient(
 #if MESHOPT_PG_FACECACHE
 					// setup was fetched/filled at the top of the pixel
 					const float bpx = (float)(int)c, bpy = rowF;
-					const float bw0 = ((setup.su2 - setup.su1) * (bpy - setup.sv1) - (setup.sv2 - setup.sv1) * (bpx - setup.su1)) * setup.invArea;
-					const float bw1 = ((setup.su0 - setup.su2) * (bpy - setup.sv2) - (setup.sv0 - setup.sv2) * (bpx - setup.su2)) * setup.invArea;
+					const float bw0 = (setup.e21u * (bpy - setup.sv1) - setup.e21v * (bpx - setup.su1)) * setup.invArea;
+					const float bw1 = (setup.e02u * (bpy - setup.sv2) - setup.e02v * (bpx - setup.su2)) * setup.invArea;
 					const float bw2 = 1.f - bw0 - bw1;
 					const float bDen = 1.f / (bw0 * setup.invZ0 + bw1 * setup.invZ1 + bw2 * setup.invZ2);
 					const float bx = (bw0 * setup.invZ0) * bDen;
@@ -7844,7 +8954,7 @@ void MeshRefine::ComputePhotometricGradient(
 			}
 			usedCount = 0;
 #if MESHOPT_NEEDS_TILE_ENERGY
-			tileEnergyLocal[tileIndex] += tileEnergy;
+			tileEnergyView[tileIndex] += tileEnergy;
 #endif
 		} // end tx
 	} // end ty
@@ -7924,7 +9034,7 @@ float MeshRefine::ComputeSmoothnessGradient1(
 	GradArr& smoothGrad1, VIndex idxStart, VIndex idxEnd)
 {
 	ASSERT(!vertices.IsEmpty() && vertices.GetSize() == vertexVertices.GetSize() && vertices.GetSize() == smoothGrad1.GetSize());
-#ifdef MESHOPT_CERES
+#if MESHOPT_SCORE_SMOOTH
 	float score(0);
 #endif
 	for (VIndex idxV = idxStart; idxV < idxEnd; ++idxV) {
@@ -7940,13 +9050,13 @@ float MeshRefine::ComputeSmoothnessGradient1(
 		FOREACH(v, verts)
 			grad += Cast<Real>(vertices[verts[v]]);
 		grad = grad / (Real)verts.GetSize() - Cast<Real>(vertices[idxV]);
-#ifdef MESHOPT_CERES
+#if MESHOPT_SCORE_SMOOTH
 		const float regularityScore((float)norm(grad));
 		ASSERT(ISFINITE(regularityScore));
 		score += regularityScore;
 #endif
 	}
-#ifdef MESHOPT_CERES
+#if MESHOPT_SCORE_SMOOTH
 	return score;
 #else
 	return 0.0f;
@@ -8033,11 +9143,17 @@ void MeshRefine::ThSelectNeighbors(uint32_t idxImage, std::unordered_set<uint64_
 	}
 }
 
-void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma)
+void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma, bool gradients)
 {
 	Image& imageData = images[idxImage];
 	if (!imageData.IsValid())
 		return;
+#if MESHOPT_PROFILE
+	struct InitUsScope {
+		MeshProf::Timer t;
+		~InitUsScope() { MeshProf::gInitUs.fetch_add((uint64_t)(t.ms() * 1000.0), std::memory_order_relaxed); }
+	} _initUs; // scoped: ThInitImage has several early returns below
+#endif
 	// load and init image
 	unsigned level(resolutionLevelOverride != unsigned(-1) ? resolutionLevelOverride : nResolutionLevel);
 	const unsigned imageSize(imageData.RecomputeMaxResolution(level, nMinResolution));
@@ -8083,121 +9199,229 @@ void MeshRefine::ThInitImage(uint32_t idxImage, Real scale, Real sigma)
 		ComputeLocalVariance(img, std::vector<uint8_t>(img.cols * img.rows, 0xFF), view.imageMean, view.imageVar);
 #endif
 	}
-	// compute image gradient
-	typedef View::Grad::Type GradType;
-	static thread_local TImage<GradType> grad[2];
-#if MESHOPT_GRAD_KERNEL3X5
-	{
-		const TMatrix<GradType, 3, 5> kernel(CreateDerivativeKernel3x5());
-		cv::filter2D(img, grad[0], cv::DataType<GradType>::type, kernel);
-		cv::filter2D(img, grad[1], cv::DataType<GradType>::type, kernel.t());
-	}
-#else
-	grad[0].create(img.rows, img.cols);
-	grad[1].create(img.rows, img.cols);
+	// Dimensions come from `img` (post-blur, post-resize), NOT from grad[0]. The two
+	// are identical -- filter2D's output is always the size of its input -- but these
+	// must be set even when the gradient build below is skipped, because they ARE the
+	// point of the geometry-only pass.
+	view.width  = img.cols;
+	view.height = img.rows;
 
-	for (int y = 0; y < img.rows; ++y) {
-		const GradType* __restrict src = img.ptr<GradType>(y);
-		const GradType* __restrict next = img.ptr<GradType>(MINF(y + 1, img.rows - 1));
-		GradType* __restrict gradX = grad[0].ptr<GradType>(y);
-		GradType* __restrict gradY = grad[1].ptr<GradType>(y);
-		for (int x = 0; x < img.cols; ++x) {
-			gradX[x] = img.ptr<GradType>(y)[MINF(x + 1, img.cols - 1)] - src[x];
-			gradY[x] = next[x] - src[x];
+	// gradients == false (PrepareViewGeometryChunked): build ONLY this function's side
+	// effects -- UpdateCamera above, and view.width/height just set.
+	//
+	// That pass never sets viewResident, so the first EnsureViewsResident of the scale
+	// puts every view in `toLoad` and re-runs the whole of ThInitImage regardless: the
+	// gradient planes built here were PlaneFree'd and rebuilt without ever being read.
+	// Measured on RichmondHistoric (368 views, res-level 1): at scales 2 and 3 the prep
+	// and residency passes do identical work over the same 368 views, so the prep pass
+	// is exactly half of InitImage(thr-sum) -- 26.9 s and 53.8 s of thread time -- and
+	// the Sobel + plane half of that is waste. ~6.8 GB of peak commit and ~27 GB of
+	// page-faulting go with it.
+	//
+	// view.image CANNOT be skipped the same way: ProjectMesh's texture-flatness prune
+	// reads it, and ListFaceAreas calls ProjectMesh directly between this pass and the
+	// residency round. The gradient planes are read in exactly ONE place --
+	// ComputePhotometricGradient, i.e. the pair loop -- which runs only after that
+	// residency round has rebuilt them. That asymmetry is what makes this exact.
+	if (gradients) {
+		// compute image gradient
+		typedef View::Grad::Type GradType;
+		static thread_local TImage<GradType> grad[2];
+#if MESHOPT_GRAD_KERNEL3X5
+		{
+			const TMatrix<GradType, 3, 5> kernel(CreateDerivativeKernel3x5());
+			cv::filter2D(img, grad[0], cv::DataType<GradType>::type, kernel);
+			cv::filter2D(img, grad[1], cv::DataType<GradType>::type, kernel.t());
 		}
-	}
+#else
+		grad[0].create(img.rows, img.cols);
+		grad[1].create(img.rows, img.cols);
+
+		for (int y = 0; y < img.rows; ++y) {
+			const GradType* __restrict src = img.ptr<GradType>(y);
+			const GradType* __restrict next = img.ptr<GradType>(MINF(y + 1, img.rows - 1));
+			GradType* __restrict gradX = grad[0].ptr<GradType>(y);
+			GradType* __restrict gradY = grad[1].ptr<GradType>(y);
+			for (int x = 0; x < img.cols; ++x) {
+				gradX[x] = img.ptr<GradType>(y)[MINF(x + 1, img.cols - 1)] - src[x];
+				gradY[x] = next[x] - src[x];
+			}
+		}
 #endif
 #ifdef VALIDATE_GRADIENT
-	cv::merge(grad, 2, view.imageGrad);
+		cv::merge(grad, 2, view.imageGrad);
 #endif
 
-	// ------------------------------------------------------------------
-	// Build packed 2x2 gradient blocks (int16 quantized)
-	// ------------------------------------------------------------------
-	const int width = view.width = grad[0].cols;
-	const int height = view.height = grad[0].rows;
-	// Store gradients as two planar int16 planes (gx, gy) at full resolution.
-	// The 2x2 bilinear block consumed by ComputePhotometricGradient is gathered
-	// on the fly from two adjacent rows. This is 4x smaller than pre-expanding
-	// the redundant 2x2 blocks (16 -> 4 bytes/pixel) and more cache-friendly.
-	const size_t numPx = static_cast<size_t>(height) * width;
+		// ------------------------------------------------------------------
+		// Build packed 2x2 gradient blocks (int16 quantized)
+		// ------------------------------------------------------------------
+		const int width = view.width;
+		const int height = view.height;
+		// Store gradients as two planar int16 planes (gx, gy) at full resolution.
+		// The 2x2 bilinear block consumed by ComputePhotometricGradient is gathered
+		// on the fly from two adjacent rows. This is 4x smaller than pre-expanding
+		// the redundant 2x2 blocks (16 -> 4 bytes/pixel) and more cache-friendly.
+		const size_t numPx = static_cast<size_t>(height) * width;
 
-	PlaneFree(view.gradX); // Will leak on exit.
-	PlaneFree(view.gradY);
-	view.gradX = (GradStoreT*)PlaneAlloc(numPx * sizeof(GradStoreT));
-	view.gradY = (GradStoreT*)PlaneAlloc(numPx * sizeof(GradStoreT));
+#if MESHOPT_GRAD_INTERLEAVED
+		PlaneFree(view.gradXY); // Will leak on exit.
+		view.gradXY = (GradStoreT*)PlaneAlloc(2 * numPx * sizeof(GradStoreT));
+#else
+		PlaneFree(view.gradX); // Will leak on exit.
+		PlaneFree(view.gradY);
+		view.gradX = (GradStoreT*)PlaneAlloc(numPx * sizeof(GradStoreT));
+		view.gradY = (GradStoreT*)PlaneAlloc(numPx * sizeof(GradStoreT));
+#endif
 
 #if MESHOPT_GRAD_F32
-	// float planes: copy the filter output rows verbatim (no quantization)
-	for (int y = 0; y < height; ++y) {
-		memcpy(view.gradX + (size_t)y * width, grad[0].ptr<GradType>(y), sizeof(float) * width);
-		memcpy(view.gradY + (size_t)y * width, grad[1].ptr<GradType>(y), sizeof(float) * width);
-	}
+		// float planes: copy the filter output rows verbatim (no quantization)
+		for (int y = 0; y < height; ++y) {
+#if MESHOPT_GRAD_INTERLEAVED
+			const GradType* __restrict gx = grad[0].ptr<GradType>(y);
+			const GradType* __restrict gy = grad[1].ptr<GradType>(y);
+			GradStoreT* __restrict out = view.gradXY + 2 * (size_t)y * width;
+			for (int x = 0; x < width; ++x) { out[2 * x] = gx[x]; out[2 * x + 1] = gy[x]; }
 #else
-	auto quant = [](float f) -> int16_t {
-		float scaled = f * kScale;
-		if (scaled > 32767.f)  scaled = 32767.f;
-		if (scaled < -32767.f) scaled = -32767.f;
-		return static_cast<int16_t>(scaled);
-	};
-
-	// SSE2 quantize: (f*kScale) clamped to +/-32767, truncated to int16. The
-	// clamp is done in float (min/max), cvtt truncates toward zero (== the
-	// static_cast above) and packs saturates (never triggered post-clamp), so
-	// the 8-wide path is bit-identical to the scalar quant. Processes 8 grads
-	// per store; a scalar tail handles widths not divisible by 8.
-	const __m128 vScale = _mm_set1_ps(kScale);
-	const __m128 vHi = _mm_set1_ps(32767.f);
-	const __m128 vLo = _mm_set1_ps(-32767.f);
-	auto quant8 = [&](const GradType* __restrict src, int16_t* __restrict dst, int x) {
-		__m128 a = _mm_mul_ps(_mm_loadu_ps(src + x), vScale);
-		__m128 b = _mm_mul_ps(_mm_loadu_ps(src + x + 4), vScale);
-		a = _mm_min_ps(_mm_max_ps(a, vLo), vHi);
-		b = _mm_min_ps(_mm_max_ps(b, vLo), vHi);
-		const __m128i packed = _mm_packs_epi32(_mm_cvttps_epi32(a), _mm_cvttps_epi32(b));
-		_mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), packed);
-	};
-
-	for (int y = 0; y < height; ++y) {
-		const GradType* __restrict gxRow = grad[0].ptr<GradType>(y);
-		const GradType* __restrict gyRow = grad[1].ptr<GradType>(y);
-		int16_t* __restrict gxOut = view.gradX + static_cast<size_t>(y) * width;
-		int16_t* __restrict gyOut = view.gradY + static_cast<size_t>(y) * width;
-		int x = 0;
-		for (; x + 8 <= width; x += 8) {
-			quant8(gxRow, gxOut, x);
-			quant8(gyRow, gyOut, x);
+			memcpy(view.gradX + (size_t)y * width, grad[0].ptr<GradType>(y), sizeof(float) * width);
+			memcpy(view.gradY + (size_t)y * width, grad[1].ptr<GradType>(y), sizeof(float) * width);
+#endif
 		}
-		for (; x < width; ++x) {
-			gxOut[x] = quant(gxRow[x]);
-			gyOut[x] = quant(gyRow[x]);
+#else
+		auto quant = [](float f) -> int16_t {
+			float scaled = f * kScale;
+			if (scaled > 32767.f)  scaled = 32767.f;
+			if (scaled < -32767.f) scaled = -32767.f;
+			return static_cast<int16_t>(scaled);
+		};
+
+		// SSE2 quantize: (f*kScale) clamped to +/-32767, truncated to int16. The
+		// clamp is done in float (min/max), cvtt truncates toward zero (== the
+		// static_cast above) and packs saturates (never triggered post-clamp), so
+		// the 8-wide path is bit-identical to the scalar quant. Processes 8 grads
+		// per store; a scalar tail handles widths not divisible by 8.
+		const __m128 vScale = _mm_set1_ps(kScale);
+		const __m128 vHi = _mm_set1_ps(32767.f);
+		const __m128 vLo = _mm_set1_ps(-32767.f);
+		// quantize 8 grads into one packed int16 vector, exactly as before
+		auto quant8 = [&](const GradType* __restrict src, int x) -> __m128i {
+			__m128 a = _mm_mul_ps(_mm_loadu_ps(src + x), vScale);
+			__m128 b = _mm_mul_ps(_mm_loadu_ps(src + x + 4), vScale);
+			a = _mm_min_ps(_mm_max_ps(a, vLo), vHi);
+			b = _mm_min_ps(_mm_max_ps(b, vLo), vHi);
+			return _mm_packs_epi32(_mm_cvttps_epi32(a), _mm_cvttps_epi32(b));
+		};
+
+		// ...then INTERLEAVE the two channels on the way out: unpacklo/hi_epi16 turns
+		// {gx0..gx7} and {gy0..gy7} into {gx0,gy0,gx1,gy1,...}. The quantized values are
+		// identical to the two-plane build; only their addresses change.
+		for (int y = 0; y < height; ++y) {
+			const GradType* __restrict gxRow = grad[0].ptr<GradType>(y);
+			const GradType* __restrict gyRow = grad[1].ptr<GradType>(y);
+#if MESHOPT_GRAD_INTERLEAVED
+			int16_t* __restrict out = view.gradXY + 2 * static_cast<size_t>(y) * width;
+			int x = 0;
+			for (; x + 8 <= width; x += 8) {
+				const __m128i gx = quant8(gxRow, x);
+				const __m128i gy = quant8(gyRow, x);
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x), _mm_unpacklo_epi16(gx, gy));
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(out + 2 * x + 8), _mm_unpackhi_epi16(gx, gy));
+			}
+			for (; x < width; ++x) {
+				out[2 * x] = quant(gxRow[x]);
+				out[2 * x + 1] = quant(gyRow[x]);
+			}
+#else
+			int16_t* __restrict gxOut = view.gradX + static_cast<size_t>(y) * width;
+			int16_t* __restrict gyOut = view.gradY + static_cast<size_t>(y) * width;
+			int x = 0;
+			for (; x + 8 <= width; x += 8) {
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(gxOut + x), quant8(gxRow, x));
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(gyOut + x), quant8(gyRow, x));
+			}
+			for (; x < width; ++x) {
+				gxOut[x] = quant(gxRow[x]);
+				gyOut[x] = quant(gyRow[x]);
+			}
+#endif
 		}
-	}
 #endif // MESHOPT_GRAD_F32
+		// The Sobel float scratch (grad[0]/grad[1]) is static thread_local, so it
+		// otherwise stays resident for the ENTIRE refinement (2*4 B/px per thread,
+		// ~1.2 GB across 32 threads at res-level 1) even though it is only needed
+		// here to build the int16 gradX/gradY planes. Release it now.
+		//
+		// CORRECTION 2026-09-17: this used to claim the recreate is "once per scale =
+		// negligible". It is not -- ThInitImage runs once per VIEW, so grad[0], grad[1]
+		// and the local `img` are allocated, first-touched and freed once per view per
+		// scale. The geometry-only path above removes both Sobel planes AND both
+		// gradX/gradY planes from the 368 prep calls per scale, which is ~27 GB of the
+		// ~63 GB of page-faulting per run; `img` still churns on every call and is the
+		// remainder. If that ever needs fixing: release the scratch once at the END of
+		// the pass rather than per view -- sized at ~4-8% of this function, never measured.
+		grad[0].release();
+		grad[1].release();
+	} // if (gradients)
 
 #if MESHOPT_IMAGE_U16
 	// Quantize the float grayscale [0,1] into the resident uint16 store (0..65535).
 	// Halves view.image from 4 to 2 B/px; the 8-bit JPEG source makes this
 	// near-lossless and below the ZNCC variance floor / flatness-prune thresholds.
+	//
+	// SSE2, bit-identical to the scalar form it replaces (kept below as both the
+	// reference and the width-%8 tail):
+	//   * the clamp is done in float, in the SAME order as the scalar (max against
+	//     0 first, then min against 1). MAXPS/MINPS return their SECOND operand when
+	//     either input is NaN, so a NaN lands on 0 here; the scalar leaves it NaN and
+	//     the cast then yields 0 on x86. Moot in practice -- a decoded 8-bit JPEG run
+	//     through toGray/blur/resize cannot produce one -- but the two agree anyway.
+	//   * mul and add stay separate intrinsics and are never contracted into an FMA,
+	//     so `v * 65535 + 0.5` rounds exactly as the scalar expression does.
+	//   * cvtt truncates toward zero, which is what the C cast to uint16_t does.
+	//     Post-clamp the operand is [0.5, 65535.5], so the result is [0, 65535] and
+	//     nothing can wrap.
+	//   * SSE2 has no unsigned 32->16 pack (_mm_packus_epi32 is SSE4.1), so the lanes
+	//     are biased into signed range, packed with the saturating SIGNED pack --
+	//     which cannot actually saturate, the range is exactly [-32768, 32767] -- and
+	//     unbiased with an xor. Exact for every input, not merely for typical ones.
+	//
+	// Deliberately NOT widened to AVX2: this pass reads 4 B/px and writes 2 B/px over
+	// the whole frame, so it is memory-bound well before eight lanes are the limit.
+	// The win here is deleting the per-pixel branches and the scalar cvt, not width.
 	view.image.create(img.rows, img.cols);
-	for (int y = 0; y < img.rows; ++y) {
-		const float* __restrict s = img.ptr<float>(y);
-		uint16_t* __restrict d = view.image.ptr<uint16_t>(y);
-		for (int x = 0; x < img.cols; ++x) {
-			float v = s[x];
-			if (v < 0.f) v = 0.f; else if (v > 1.f) v = 1.f;
-			d[x] = (uint16_t)(v * 65535.f + 0.5f);
+	{
+		const __m128 vZero = _mm_setzero_ps();
+		const __m128 vOne = _mm_set1_ps(1.f);
+		const __m128 vMax = _mm_set1_ps(65535.f);
+		const __m128 vHalf = _mm_set1_ps(0.5f);
+		const __m128i vBias = _mm_set1_epi32(32768);
+		const __m128i vFlip = _mm_set1_epi16((short)-32768); // 0x8000
+		auto quantU16x8 = [&](const float* __restrict s, int x) -> __m128i {
+			__m128 a = _mm_loadu_ps(s + x);
+			__m128 b = _mm_loadu_ps(s + x + 4);
+			a = _mm_min_ps(_mm_max_ps(a, vZero), vOne);
+			b = _mm_min_ps(_mm_max_ps(b, vZero), vOne);
+			a = _mm_add_ps(_mm_mul_ps(a, vMax), vHalf);
+			b = _mm_add_ps(_mm_mul_ps(b, vMax), vHalf);
+			const __m128i ia = _mm_sub_epi32(_mm_cvttps_epi32(a), vBias);
+			const __m128i ib = _mm_sub_epi32(_mm_cvttps_epi32(b), vBias);
+			return _mm_xor_si128(_mm_packs_epi32(ia, ib), vFlip);
+		};
+		const int cols = img.cols;
+		for (int y = 0; y < img.rows; ++y) {
+			const float* __restrict s = img.ptr<float>(y);
+			uint16_t* __restrict d = view.image.ptr<uint16_t>(y);
+			int x = 0;
+			for (; x + 8 <= cols; x += 8)
+				_mm_storeu_si128(reinterpret_cast<__m128i*>(d + x), quantU16x8(s, x));
+			for (; x < cols; ++x) {
+				float v = s[x];
+				if (v < 0.f) v = 0.f; else if (v > 1.f) v = 1.f;
+				d[x] = (uint16_t)(v * 65535.f + 0.5f);
+			}
 		}
 	}
 #endif
 
-	// The Sobel float scratch (grad[0]/grad[1]) is static thread_local, so it
-	// otherwise stays resident for the ENTIRE refinement (2*4 B/px per thread,
-	// ~1.2 GB across 32 threads at res-level 1) even though it is only needed
-	// here in InitImage to build the int16 gradX/gradY planes. Release it now;
-	// it is recreated on the next scale's InitImage (once per scale = negligible).
-	grad[0].release();
-	grad[1].release();
 }
 
 void MeshRefine::ThProjectMesh(uint32_t idxImage, const Mesh::FaceIdxArr& cameraFaces, const CameraRenderData& rd)
@@ -8212,12 +9436,22 @@ void MeshRefine::ThProjectMesh(uint32_t idxImage, const Mesh::FaceIdxArr& camera
 #endif
 	// project mesh to the given camera plane
 	View& view = views[idxImage];
+#if MESHOPT_PROFILE
+	MeshProf::Timer _tPM;
+#endif
 	ProjectMesh(view, imageData.camera, rd);
+#if MESHOPT_PROFILE
+	{
+		const double _pmMs = _tPM.ms();
+		MeshProf::gProjUs.fetch_add((uint64_t)(_pmMs * 1000.0), std::memory_order_relaxed);
+		MeshProf::PMRoundAddView(_pmMs);
+	}
+#endif
 
 	view.tilesX = (view.width + TILEX - 1) / TILEX;
 	view.tilesY = (view.height + TILEY - 1) / TILEY;
 }
-void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& threadGrad, std::vector<uint32_t>& threadNorm, std::vector<std::vector<float>>& tileEnergyLocal,
+void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& threadGrad, std::vector<uint32_t>& threadNorm,
 	const TImage<uint16_t>& imageMeanA, const TImage<Real>& imageVarA)
 {
 	// fetch view A data
@@ -8228,6 +9462,11 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 	const DepthMap& depthMapA = viewA.depthMap;
 	const ImageStore& imageA = viewA.image;
 	const Camera& cameraA = imageDataA.camera;
+	// Tile energy is accumulated at the REFERENCE view, and the pair loop's
+	// omp-for is over reference views, so this thread is the only writer of
+	// views[idxImageA] for the whole evaluation -- no per-thread buffer and no
+	// reduction (see ScoreMesh). The array was zeroed before the pair loop.
+	std::vector<float>& tileEnergyA = views[idxImageA].tileEnergyAccum;
 	// fetch view B data
 	const Image& imageDataB = images[idxImageB];
 	ASSERT(imageDataB.IsValid());
@@ -8247,6 +9486,36 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 	MeshProf::Timer _tWarp;
 #endif
 	ImageMeshWarp(viewA, depthMapA, cameraA, depthMapB, cameraB, imageB, imageAB, mask);
+#if MESHOPT_PROFILE
+	{
+		// Mask geometry, once per pair. Diagnostic only -- this is the record of why
+		// the mask-column gating of the ZNCC was tried and then REVERTED: coverage is
+		// contiguous (48.4% of 8-pixel groups fully empty against 0.36% if it were
+		// random at 50.5% density), but the frame-GLOBAL column span is 78.2% of the
+		// width, not the 68.1% per-row mean, and the two per-pixel passes already skip
+		// empty columns 8 at a time. Gating the remaining mask-blind work measured
+		// 0.5%. Do not re-propose it; see the note on the early-out in the gradient.
+		const int nRows = imageA.rows, nCols = imageA.cols;
+		uint64_t rowsCovered = 0, spanSum = 0;
+		for (int r = 0; r < nRows; ++r) {
+			const uint8_t* __restrict m = &mask[(size_t)r * (size_t)nCols];
+			int lo = -1, c = 0;
+			for (; c + 8 <= nCols; c += 8) { uint64_t w; memcpy(&w, m + c, 8); if (w) break; }
+			for (; c < nCols; ++c) if (m[c]) { lo = c; break; }
+			if (lo < 0)
+				continue;
+			int e = nCols, hi = lo;
+			for (; e - 8 >= lo + 8; e -= 8) { uint64_t w; memcpy(&w, m + e - 8, 8); if (w) break; }
+			for (; e > lo; --e) if (m[e - 1]) { hi = e - 1; break; }
+			++rowsCovered;
+			spanSum += (uint64_t)(hi - lo + 1);
+		}
+		MeshProf::tlPG[3] += rowsCovered;
+		MeshProf::tlPG[4] += (uint64_t)nRows;
+		MeshProf::tlPG[5] += spanSum;
+		MeshProf::tlPG[6] += rowsCovered * (uint64_t)nCols;
+	}
+#endif
 #if MESHOPT_PROFILE
 	MeshProf::AddTL(MeshProf::P_Warp, _tWarp.ms());
 #endif
@@ -8332,7 +9601,7 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 		ComputePhotometricGradient(
 			viewA, g_cameraData[idxImageA], faceNormals, cameraA, cameraB, viewB,
 			band, mask, threadGrad, threadNorm, RegularizationScale, faceSetupEpoch,
-			tileEnergyLocal[idxImageA], rowBegin, rowEnd, rowBegin, finalizePair);
+			tileEnergyA, rowBegin, rowEnd, rowBegin, finalizePair);
 #if MESHOPT_PROFILE
 		MeshProf::AddTL(MeshProf::P_PhotoGrad, _tPG.ms());
 #endif
@@ -8371,7 +9640,7 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 #if MESHOPT_PROFILE
 	MeshProf::Timer _tPG;
 #endif
-	ComputePhotometricGradient(viewA, g_cameraData[idxImageA], faceNormals, cameraA, cameraB, viewB, imageDZNCC, mask, threadGrad, threadNorm, RegularizationScale, faceSetupEpoch, tileEnergyLocal[idxImageA]);
+	ComputePhotometricGradient(viewA, g_cameraData[idxImageA], faceNormals, cameraA, cameraB, viewB, imageDZNCC, mask, threadGrad, threadNorm, RegularizationScale, faceSetupEpoch, tileEnergyA);
 #if MESHOPT_PROFILE
 	MeshProf::AddTL(MeshProf::P_PhotoGrad, _tPG.ms());
 #endif
@@ -8409,7 +9678,7 @@ void MeshRefine::ThProcessPair(uint32_t idxImageA, uint32_t idxImageB, GradArr& 
 }
 void MeshRefine::ThSmoothVertices1(VIndex idxStart, VIndex idxEnd)
 {
-#ifdef MESHOPT_CERES
+#if MESHOPT_SCORE_SMOOTH
 	const float score(ComputeSmoothnessGradient1(vertices, vertexVertices, vertexBoundary, smoothGrad1, idxStart, idxEnd));
 	Lock l(cs);
 	scoreSmooth += score;
@@ -8909,7 +10178,7 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 	// period, halo) and two environment overrides -- refiner mechanism, so it rides
 	// REFINE_DIAG like the rest. The per-scale [TILE-SKIP] line, also gated, then
 	// says what it actually retired.
-	REFINE_DIAG("Mesh refinement tile-skip: %s (warmup %d, full refresh every %d iterations, halo %d tile%s; OPENMVS_REFINE_TILE_SKIP=0/1 overrides, OPENMVS_REFINE_BASELINE=1 disables all refine optimizations)",
+	REFINE_MODE_DIAG("Mesh refinement tile-skip: %s (warmup %d, full refresh every %d iterations, halo %d tile%s; OPENMVS_REFINE_TILE_SKIP=0/1 overrides, OPENMVS_REFINE_BASELINE=1 disables all refine optimizations)",
 		refine.tileSkipEnabled ? "enabled" : "disabled (default: costs ~3%% final gradient norm)",
 		MESHOPT_TILE_SKIP_WARMUP, MESHOPT_TILE_SKIP_REFRESH,
 		MESHOPT_TILE_SKIP_HALO, MESHOPT_TILE_SKIP_HALO == 1 ? "" : "s");
@@ -8919,6 +10188,9 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #endif
 
 	// run the mesh optimization on multiple scales (coarse to fine)
+#if MESHOPT_SCALE_CONTRIB
+	unsigned scPrevFaces = 0; // previous scale's face count -> subdivision growth
+#endif
 	for (unsigned nScale = 0; nScale < nScales; ++nScale) {
 #if MESHOPT_MEM_DIAG
 		{
@@ -9058,7 +10330,22 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				const int baseIters = FLOOR2INT(fGradientStep);
 				iters = MAXF(baseIters / (int)(nScale + 1), 8);
 				gstep = (fGradientStep - (float)baseIters) * 10.0;
+#if MESHOPT_ITER_REBALANCE
+				// ONLY the middle scale is raised -- it was measured running out at 22/22
+				// while still improving. Cutting the finest scale's budget to 9
+				// was a REGRESSION: Niwot ran 9/9 there while still improving photo -1.32%
+				// and smooth -54.6%. The five scenes that justified the cut all converged
+				// at 5-6 iterations because they had no geometric headroom; a scene with
+				// headroom uses the budget. Leave it at baseIters/(nScale+1).
+				if (nScales >= 3 && nScale == nScales - 2)
+					iters = MAXF((baseIters * 3) / 4, 8);        // 33 at baseIters 45
+#endif
 			}
+#if MESHOPT_STEP_PER_SCALE
+			// after BOTH paths above, so it applies to the default 1.5 as well as to
+			// a caller-supplied step -- see MESHOPT_STEP_PER_SCALE
+			gstep /= (double)(nScale + 1);
+#endif
 #if MESHOPT_REFINE_HIRES_FINAL
 			// Option A: the final scale runs at ~4x the pixels, so cut its
 			// iterations to keep the pass roughly compute-neutral.
@@ -9069,6 +10356,10 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #if MESHOPT_CONVERGED_EXIT
 			double cvPrevEnergy[2] = { 0.0, 0.0 }; // photoEnergy history per pair-direction parity
 			int cvHits = 0;
+			int cvBackoffs = 0;         // times the step was cut for overshoot, this scale
+#if MESHOPT_SCORE_SMOOTH
+			double cvPrevSmooth = -1.0; // regularity energy of the PREVIOUS iteration
+#endif
 #endif
 
 			Eigen::Matrix<float, Eigen::Dynamic, 3, Eigen::RowMajor> gradients;
@@ -9083,6 +10374,28 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 			// other use for; the summary reports it as unavailable when it is closed.
 			const auto scaleT0 = std::chrono::steady_clock::now();
 			int itersRun = 0;
+#if MESHOPT_SCALE_CONTRIB
+			const unsigned scFacesIn = mesh.faces.GetSize();
+#endif
+#if MESHOPT_SKIP_BARREN_FINE_SCALE && MESHOPT_SCALE_CONTRIB
+			// see MESHOPT_SKIP_BARREN_FINE_SCALE
+			const bool scBarren = (nScale + 1 == nScales) && scPrevFaces > 0
+				&& (double)(scFacesIn - scPrevFaces)
+					< MESHOPT_SKIP_BARREN_FRACTION * (double)scPrevFaces;
+			if (scBarren) {
+				VERBOSE("[SCALE] %u/%u SKIPPED: subdivision added %u faces (%.2f%% of %u), "
+					"no geometric headroom -- the finest scale cannot improve photo-consistency "
+					"without finer faces (see MESHOPT_SKIP_BARREN_FINE_SCALE)",
+					nScale + 1, nScales, scFacesIn - scPrevFaces,
+					100.0 * (double)(scFacesIn - scPrevFaces) / (double)scPrevFaces, scPrevFaces);
+				iters = 0;
+			}
+#endif
+#if MESHOPT_SCALE_CONTRIB
+
+			double scFirstE[2] = { -1.0, -1.0 }, scLastE[2] = { -1.0, -1.0 };
+			double scFirstSm = -1.0, scLastSm = -1.0;
+#endif
 			double lastCost = 0.0, lastGradNorm = -1.0;
 
 			for (int iter = 0; iter < iters; ++iter)
@@ -9091,6 +10404,10 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				// fast-forwards the index, so iter+1 would claim the skipped
 				// iterations ran
 				++itersRun;
+#if MESHOPT_CONV_TRACE
+				const int cvIterEntry = iter; // the exit below fast-forwards `iter`
+				const auto cvT0 = std::chrono::steady_clock::now();
+#endif
 #if MESHOPT_MEM_DIAG
 				{
 					const Util::MemoryInfo mi = Util::GetMemoryInfo();
@@ -9121,11 +10438,11 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				bool rebuildOctree = true;
 
 #if MESHOPT_PROFILE
-						MeshProf::Timer _tSM;
+				MeshProf::Timer _tSM;
 #endif
-						double cost = refine.ScoreMesh(gradients.data(), rebuildOctree);
+				double cost = refine.ScoreMesh(gradients.data(), rebuildOctree);
 #if MESHOPT_PROFILE
-						MeshProf::Add(MeshProf::P_ScoreMesh, _tSM.ms());
+				MeshProf::Add(MeshProf::P_ScoreMesh, _tSM.ms());
 #endif
 #if MESHOPT_ITER_DIAGNOSTICS && TD_VERBOSE != TD_VERBOSE_OFF
 				// start-of-scale support: geometry not yet displaced at this scale
@@ -9188,10 +10505,42 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 				// consumer, so it is computed once, inside the gate, rather than the
 				// twice this line used to ask for unconditionally.
 				lastCost = cost;
-				if (REFINE_DIAG_ENABLED()) {
+#if MESHOPT_SCALE_CONTRIB
+				{
+					const int scPar = iter & 1;
+					const double scE = refine.photoEnergyLast;
+					// The scheduled FINAL iteration runs BOTH pair directions, so its
+					// energy is ~2x a single-direction one -- observed as a bogus +78%
+					// on the parity it happened to land on. Record single-direction
+					// iterations only; the first/last comparison then compares like
+					// with like.
+					if (iter + 1 < iters) {
+						if (scFirstE[scPar] < 0.0) scFirstE[scPar] = scE;
+						scLastE[scPar] = scE;
+						// smooth is excluded on the same iterations as photo, so the two
+						// cover the SAME range and can be read against each other. It
+						// does not alternate with pair direction, so this is purely for
+						// consistency -- it costs the final iteration's contribution to
+						// both metrics, which is the price of comparing like with like.
+						const double scSm = (double)refine.scoreSmooth;
+						if (scFirstSm < 0.0) scFirstSm = scSm;
+						scLastSm = scSm;
+					}
+				}
+#endif
+				// The [CONV] trace wants the norm too. It is an O(vertices) reduction --
+				// a few ms against a 1.7-13 s iteration -- so compute it for either
+				// consumer, but leave the REFINE_DIAG line's content exactly as it was.
+#if MESHOPT_CONV_TRACE
+				constexpr bool cvWantNorm = true;
+#else
+				constexpr bool cvWantNorm = false;
+#endif
+				if (cvWantNorm || REFINE_DIAG_ENABLED()) {
 					lastGradNorm = gradients.norm();
-					REFINE_DIAG("\t%2d. f: %.5f (%.4e)\tg: %.5f (%.4e)\ts: %.3f", iter + 1,
-						cost, cost / (double)nVerts, lastGradNorm, lastGradNorm / (double)nVerts, gstep);
+					if (REFINE_DIAG_ENABLED())
+						REFINE_DIAG("\t%2d. f: %.5f (%.4e)\tg: %.5f (%.4e)\ts: %.3f", iter + 1,
+							cost, cost / (double)nVerts, lastGradNorm, lastGradNorm / (double)nVerts, gstep);
 				}
 				// Gradient update
 				// -------------------------------------------------------------
@@ -9473,22 +10822,112 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 #endif
 
 #if MESHOPT_CONVERGED_EXIT
+#if MESHOPT_CONV_TRACE
+				// captured, not recomputed: these must be the values the test below
+				// actually saw, so a trace can never disagree with the decision
+				const double cvCur = refine.photoEnergyLast;
+				double cvPrevSeen = -1.0;  // -1 == the test did not run this iteration
+				bool cvFired = false;
+				bool cvBackedOff = false;
+				double cvRelSmooth = 0.0;
+				const bool cvTested = (iter + 2 < iters);
+#endif
 				// same-parity photo-energy plateau => the photometric term is done;
 				// jump so the next iteration is the scheduled final both-directions one
 				if (iter + 2 < iters) {
 					const int par = iter & 1;
 					const double prev = cvPrevEnergy[par];
+#if MESHOPT_CONV_TRACE
+					cvPrevSeen = prev;
+#endif
 					cvPrevEnergy[par] = refine.photoEnergyLast;
-					if (prev > 0.0 && prev - refine.photoEnergyLast < prev * MESHOPT_CONVERGED_EXIT_RTOL) {
+					// BOTH TERMS, not just the photometric one. Judging this on photo
+					// alone cannot distinguish the only two cases that matter:
+					//   photo UP, smooth DOWN -> legitimate trade, the regularity term is
+					//       winning, which is what weightRegularity exists to do. MUST NOT
+					//       back off and MUST NOT count as converged.
+					//   photo UP, smooth UP   -> both halves worse at once, which no
+					//       weighting can excuse. Overshoot.
+					// Measured both in the field: one scene smoothed a rough mesh at scale 3
+					// (smooth -65.0% against photo +0.08%) while another genuinely diverged
+					// (photo +0.29%, smooth 36,997 -> 37,463). A photo-only rule backed the
+					// first one off 9 times and collapsed its step by 679x, freezing the mesh
+					// at roughly iteration 6.
+					//
+					// smooth is a pure function of vertex positions, so unlike photoEnergy it
+					// does NOT alternate with pair direction -- compare it against the
+					// immediately preceding iteration, not the same-parity one.
+					const double relPhoto = (prev > 0.0)
+						? (prev - refine.photoEnergyLast) / prev : 1.0;
+#if MESHOPT_SCORE_SMOOTH
+					const double curSmooth = (double)refine.scoreSmooth;
+					const double relSmooth = (cvPrevSmooth > 0.0)
+						? (cvPrevSmooth - curSmooth) / cvPrevSmooth : 1.0;
+					cvPrevSmooth = curSmooth;
+#else
+					// no regularity energy available: "improving", so bothWorse can never
+					// be true and the backoff is inert. TWOTERM implies SCORE_SMOOTH, so
+					// the exit criterion below never reaches this value.
+					const double relSmooth = 1.0;
+#endif
+#if MESHOPT_CONV_TRACE
+					cvRelSmooth = relSmooth;
+#endif
+					// MAGNITUDE FLOOR, not just sign. Near a converged minimum both terms
+					// jitter on floating-point noise, and a sign-only test fires on that:
+					// measured at scale 1, where relSmooth ran -1.7e-3, -9.0e-4, -1.3e-3,
+					// -6.2e-4, -1.1e-3, -4.2e-4, -9.0e-4, +1.4e-4, -4.6e-4, +8.9e-6 -- noise
+					// around a minimum -- and one -4.2e-4 wobble triggered a backoff whose
+					// cvHits reset then stopped the scale exiting at all (45 iterations
+					// against 41 for the same scene unmodified). Cheap there at 0.45 s an
+					// iteration; at scale 3's 5-11 s it would not be.
+					//
+					// Requiring BOTH to worsen by more than RTOL separates the two cases
+					// cleanly on the evidence in hand: that scale-1 wobble (|relSmooth|
+					// 4.2e-4 < RTOL) stops firing, while genuine divergence still does
+					// (RichmondHistoric scale 3 iter 3: relPhoto -3.66e-3, relSmooth
+					// -7.32e-3, both comfortably past the floor).
+					const bool bothWorse = (relPhoto < -(double)MESHOPT_CONVERGED_EXIT_RTOL)
+						&& (relSmooth < -(double)MESHOPT_CONVERGED_EXIT_RTOL);
+#if MESHOPT_CONVERGED_EXIT_TWOTERM
+					const bool neitherImproving = (relPhoto < MESHOPT_CONVERGED_EXIT_RTOL)
+						&& (relSmooth < MESHOPT_CONVERGED_EXIT_RTOL);
+#else
+					// original: photometric term only, and note it has no lower bound --
+					// a RISING energy satisfies it, so divergence reads as convergence
+					const bool neitherImproving = (relPhoto < MESHOPT_CONVERGED_EXIT_RTOL);
+#endif
+					if (MESHOPT_STEP_BACKOFF_PCT > 0 && prev > 0.0 && bothWorse) {
+						gstep *= MESHOPT_STEP_BACKOFF;
+						cvHits = 0;
+						++cvBackoffs;
+#if MESHOPT_CONV_TRACE
+						cvBackedOff = true;
+#endif
+					} else if (prev > 0.0 && neitherImproving) {
 						if (++cvHits >= MESHOPT_CONVERGED_EXIT_HITS) {
 							REFINE_DIAG("Photo-consistency converged at iteration %d/%d; skipping to the final iteration", iter + 1, iters);
 							for (int k = iter; k < iters - 2; ++k)
 								gstep *= decay; // fast-forward the scheduled step decay
 							iter = iters - 2;
+#if MESHOPT_CONV_TRACE
+							cvFired = true;
+#endif
 						}
 					} else
 						cvHits = 0;
 				}
+#if MESHOPT_CONV_TRACE
+				VERBOSE("[CONV] scale %u/%u iter %2d/%d par %d tested %d E %.12g prevE %.12g "
+					"rel %+.6e relSm %+.6e rtol %g hits %d fired %d back %d/%d smooth %.10g g %.8g step %.6g ms %.1f",
+					nScale + 1, nScales, cvIterEntry, iters, cvIterEntry & 1, (int)cvTested,
+					cvCur, cvPrevSeen,
+					cvPrevSeen > 0.0 ? (cvPrevSeen - cvCur) / cvPrevSeen : 0.0, cvRelSmooth,
+					(double)MESHOPT_CONVERGED_EXIT_RTOL, cvHits, (int)cvFired,
+					(int)cvBackedOff, cvBackoffs,
+					(double)refine.scoreSmooth, lastGradNorm, gstep,
+					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cvT0).count());
+#endif
 #endif
 				gstep *= decay;
 				progress.display(iter);
@@ -9503,6 +10942,27 @@ bool Scene::RefineMesh(unsigned nResolutionLevel, unsigned nMinResolution, unsig
 			// long it took. Gated with the rest: the coarse-to-fine schedule, the
 			// iteration budget and the convergence values are all internal, and
 			// RefineMesh's caller already prints the finished mesh's size and runtime.
+#if MESHOPT_SCALE_CONTRIB
+			// What this scale CONTRIBUTED. Energies are only comparable WITHIN a scale
+			// (the image resolution is fixed there), and photo alternates with pair
+			// direction, so each parity is reported first-vs-last on its own.
+			// A scale that worsens BOTH terms has provably bought nothing, and its
+			// wall time is the prize. Compare face counts across lines for the
+			// subdivision growth -- the candidate predictor.
+			if (itersRun > 0) {
+				auto pct = [](double a, double b) { return a > 0.0 ? 100.0 * (b - a) / a : 0.0; };
+				VERBOSE("[SCALE] %u/%u  %u verts %u faces (subdiv %+.2f%%)  photo p0 %.10g->%.10g (%+.3f%%) "
+					"p1 %.10g->%.10g (%+.3f%%)  smooth %.10g->%.10g (%+.3f%%)  iters %d/%d  %.1f s",
+					nScale + 1, nScales, mesh.vertices.GetSize(), scFacesIn,
+					scPrevFaces > 0 ? 100.0 * ((double)scFacesIn - (double)scPrevFaces) / (double)scPrevFaces : 0.0,
+					scFirstE[0], scLastE[0], pct(scFirstE[0], scLastE[0]),
+					scFirstE[1], scLastE[1], pct(scFirstE[1], scLastE[1]),
+					scFirstSm, scLastSm, pct(scFirstSm, scLastSm),
+					itersRun, iters,
+					std::chrono::duration<double>(std::chrono::steady_clock::now() - scaleT0).count());
+				scPrevFaces = scFacesIn;
+			}
+#endif
 			REFINE_DIAG("Refined scale %u/%u at %.2f image scale: %u vertices, %u faces, "
 				"%d/%d iterations%s (%.1fs)",
 				nScale + 1, nScales, (double)scale, mesh.vertices.GetSize(), mesh.faces.GetSize(),

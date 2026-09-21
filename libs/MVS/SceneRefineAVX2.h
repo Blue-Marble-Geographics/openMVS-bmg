@@ -2,6 +2,38 @@
 
 #include <cstdint>
 
+// MESHOPT_GRAD_INTERLEAVED: store view B's x/y image gradients as ONE plane of
+// (gx,gy) int16 pairs instead of two separate planar arrays. Same total bytes;
+// what changes is that the two channels of a bilinear tap share a cache line and
+// a TLB entry instead of living in two planes megabytes apart. The gradient is
+// transaction-bound, not bandwidth-bound (~12 GB/s effective against ~75 GB/s
+// peak), so this is the layout that matters.
+//
+// Defined HERE, not in SceneRefine.cpp, because that file includes this header
+// before its own MESHOPT block and both translation units must agree.
+//
+// MEASURED 2026-09-17 and DEFAULTED OFF: this buys NOTHING. grad/Warp came out
+// 3.1404 interleaved against 3.1373 and 3.0742 for two runs of the identical
+// two-plane gradient code -- inside a 2.1% run-to-run spread on that ratio, so the
+// A/B cannot resolve a difference this small. The mechanism (halving cache lines and
+// TLB entries per bilinear tap) is sound on paper; it is simply not what this loop is
+// waiting on. An earlier "2.6%" claim came from a single PROFILE=0 wall comparison and
+// was wrong. Kept behind the switch because it is PROVEN exact and the A/B is one
+// build away if the plane sizes ever change.
+//
+// 1 selects the interleaved layout. The two are BIT-IDENTICAL -- same
+// quantized int16 values, same sign-extend, same bilerp operand order, only the
+// addresses differ -- so the A/B is: build each, run
+//   --max-threads 1 --resolution-level 3 --output-file <name>.mvs
+// (single thread => deterministic pair order; ~9m20s, silent for the first ~6m45s
+// because ListFaceAreas is mesh-bound at one thread) and hash the outputs.
+// NOTE the reference must come from a build with the SAME TILEX/TILEY -- tile
+// geometry re-groups the per-tile gradient partial sums and is not bit-identical
+// across sizes, so a hash from a different tile config can never match.
+#ifndef MESHOPT_GRAD_INTERLEAVED
+#define MESHOPT_GRAD_INTERLEAVED 0
+#endif
+
 namespace MVS {
 
 int SceneRefineZNCCRowAVX2(
@@ -115,8 +147,17 @@ void SceneRefineWZNCCEmitRowAVX2(
 // order, so the accumulation order -- and therefore the result -- is
 // byte-identical to the scalar path.
 struct PGPairCtxAVX2 {
+#if MESHOPT_GRAD_INTERLEAVED
+	// INTERLEAVED int16 (gx,gy) pairs for view B: elements 2*i / 2*i+1 of pixel i.
+	// A 32-bit gather at SCALE 4 therefore lands one lane on the (gx,gy) pair of a
+	// single pixel, so the 2x2 bilinear block costs 4 gathers over ONE plane instead
+	// of 4 over two planes 9.5 MB apart -- same gather count, half the cache lines
+	// and half the TLB entries, which is what this loop is actually short of.
+	const int16_t* gradXYB;
+#else
 	const int16_t* gradXB;   // planar int16 gradient planes of view B
 	const int16_t* gradYB;
+#endif
 	float rA00, rA01, rA02;  // camera A rotation rows (ray reconstruction)
 	float rA20, rA21, rA22;
 	float cxA, invFxA;

@@ -72,6 +72,15 @@ public:
 	virtual HRESULT		ReadHeader();
 	virtual HRESULT		ReadData(void*, PIXELFORMAT, Size nStride, Size lineWidth);
 
+	// Ask the decoder to emit a REDUCED image directly, if it can do so more cheaply
+	// than decoding at full size and resampling afterwards (JPEG can: scaling in the
+	// DCT domain shrinks the IDCT and the colour conversion).
+	// Called AFTER ReadHeader and BEFORE ReadData. An implementation MUST update
+	// m_width/m_height/m_lineWidth to what ReadData will actually emit, because the
+	// caller sizes its buffer from GetWidth()/GetHeight().
+	// Default: do nothing -- decode at full size, as every format did before.
+	virtual void		SetDecodeScale(Size /*nMaxResolution*/) {}
+
 	virtual HRESULT		WriteHeader(PIXELFORMAT, Size width, Size height, BYTE numLevels);
 	virtual HRESULT		WriteData(void*, PIXELFORMAT, Size nStride, Size lineWidth);
 

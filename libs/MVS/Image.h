@@ -92,6 +92,10 @@ public:
 	static IMAGEPTR OpenImage(const String& fileName);
 	static IMAGEPTR ReadImageHeader(const String& fileName);
 	static IMAGEPTR ReadImage(const String& fileName, Image8U3& image);
+	// as ReadImage, but lets the decoder emit a reduced image directly; reports the
+	// FULL-resolution size so the caller can fold the decode factor into `scale`
+	static IMAGEPTR ReadImageScaled(const String& fileName, Image8U3& image,
+		unsigned nMaxResolution, unsigned& fullWidth, unsigned& fullHeight);
 	static IMAGEPTR ReadImageRaw(const String& fileName, Image8U3& image);
 	static bool ReadImage(IMAGEPTR pImage, Image8U3& image);
 	static bool ReadImageRaw(IMAGEPTR pImage, Image8U3& image);

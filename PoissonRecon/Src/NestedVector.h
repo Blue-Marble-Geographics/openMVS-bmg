@@ -92,8 +92,14 @@ namespace PoissonRecon
 		{
 			if( sz>_MaxSize ) MK_THROW( "Resize size exceeds max size, considering increasing nesting: " , sz , " > " , _MaxSize );
 
-			// Quick check to see if anything needs doing
-			if( sz<_size ) return size();
+			// Quick check to see if anything needs doing.
+			//
+			// <=, not <. At sz==_size there is nothing to do -- the grow loop below runs
+			// zero times and the assignment is a no-op -- yet the strict < sent that case
+			// through to the mutex. SparseNodeData::at() calls resize( nodeIndex+1 ) on
+			// EVERY lookup, so once the container is sized to the node count, the
+			// highest-indexed node hit the lock on every one of its touches.
+			if( sz<=_size ) return size();
 
 			// Otherwise lock it down and get to work
 			std::lock_guard lock( _mutex );

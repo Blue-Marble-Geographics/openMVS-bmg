@@ -152,7 +152,27 @@ bool RegularTreeNode< Dim , NodeData , DepthAndOffsetType >::_initChildren_s( Al
 		_children[idx]._depth = _depth+1;
 		for( int d=0 ; d<Dim ; d++ ) _children[idx]._offset[d] = (_offset[d]<<1) | ( (idx>>d) & 1 );
 		// [WARNING] We are assuming that it's OK to initialize nodes that may not be used.
-		for( int idx=0 ; idx<(1<<Dim) ; idx++ ) initializer( _children[idx] );
+		//
+		// The initializer call USED TO BE A NESTED LOOP over a SHADOWED `idx`:
+		//     for( int idx=0 ; idx<(1<<Dim) ; idx++ ) initializer( _children[idx] );
+		// sitting inside this one, so it ran 8x8 = 64 times per child block instead of 8,
+		// initializing every child eight times over. The non-thread-safe twin,
+		// _initChildren above, has always called it once per child inside the single loop
+		// -- this is the _s variant having drifted.
+		//
+		// NOT MERELY WASTEFUL: FEMTree's _NodeInitializer is
+		//     node.nodeData.nodeIndex = femTree._nodeCount++;
+		// which is stateful. 64 calls advanced _nodeCount by 64 where 8 were due, so the
+		// tree's node counter ran ~8x ahead of the real node count for every node created
+		// on this path -- and this path is the one the normal-field splat takes
+		// (_splatPointData< CreateNodes=true , ThreadSafe=true >). Anything sized from
+		// nodeCount() was sized ~8x too large.
+		//
+		// Child ORDER is unaffected either way: the old inner loop assigned children 0..7
+		// consecutively on each of its eight passes, so the surviving indices were still
+		// consecutive and in order, just displaced by 56. Removing the redundancy closes
+		// the gap without reordering anything.
+		initializer( _children[idx] );
 	}
 
 	// If we are the first to set the child, initialize

@@ -51,6 +51,19 @@
 //                           reorder loads. Pure annotation, zero runtime
 //                           cost when off.
 //
+// PMCUDA_OPT_FAST_DIV     : how the ZNCC texel loop performs its projective
+//                           division. THE ONLY TOGGLE HERE THAT CAN CHANGE
+//                           RESULTS -- see the note at PMHNormalized below.
+//                           0 = exact (upstream): Eigen's hnormalized(), two
+//                               full IEEE fp32 divisions per texel.
+//                           1 = one correctly-rounded reciprocal (__frcp_rn)
+//                               plus two multiplies. Halves the divide count;
+//                               <=1 ulp from exact.
+//                           2 = one approximate reciprocal (a single MUFU.RCP)
+//                               plus two multiplies. ~2 ulp; the fast setting.
+//                           Default 2. Drop to 1 for a conservative half-step,
+//                           to 0 to A/B against upstream arithmetic.
+//
 // PMCUDA_TDR_MAX_PIXEL_VIEWS :
 //                           cap on (pixels x views) processed by a single
 //                           checkerboard kernel launch. Windows' WDDM driver
@@ -72,6 +85,8 @@
 #ifndef PMCUDA_OPT_RESTRICT
 #define PMCUDA_OPT_RESTRICT 1
 #endif
+// PMCUDA_OPT_FAST_DIV comes from PatchMatchCUDA.inl -- it lives there, like the
+// block geometry, because the host side reports the value it was built with
 #ifndef PMCUDA_TDR_MAX_PIXEL_VIEWS
 #define PMCUDA_TDR_MAX_PIXEL_VIEWS (4<<20)
 #endif
@@ -387,6 +402,59 @@ __device__ inline Matrix3 ComputeHomography(const PatchMatch::PairConstants& pai
 	return H;
 }
 
+// ---------------------------------------------------------------------
+// Projective division for the ZNCC texel loop (PMCUDA_OPT_FAST_DIV).
+//
+// This is the hottest arithmetic in the estimator. ScorePlane walks 25 texels,
+// and ProcessPixel evaluates 13 hypotheses (8 checkerboard neighbors + the
+// current plane + up to 4 refinements) against nNumViews targets -- so at the
+// default 8 views this runs ~2600 times per pixel per iteration, and it is the
+// only place a per-texel division appears.
+//
+// Eigen's hnormalized() is `head<2>() / coeff(2)`, which expands to
+// scalar_quotient_op, i.e. TWO separate divisions. nvcc defaults to
+// -prec-div=true, so each is a full IEEE fp32 divide -- a MUFU.RCP plus
+// Newton-Raphson refinement plus the denormal/overflow fixup, on the order of a
+// dozen instructions. That is roughly 5200 divisions per pixel per iteration,
+// enough to put the kernel's ALU cost in the same range as its texture cost.
+//
+// Both fast settings compute the reciprocal ONCE and multiply twice:
+//   1: __frcp_rn  -- correctly-rounded reciprocal; x*(1/z) differs from x/z by
+//                    <=1 ulp. Halves the divide count and keeps IEEE rounding
+//                    on the reciprocal itself.
+//   2: __fdividef(1,z) -- nvcc emits a bare MUFU.RCP for the unit numerator, so
+//                    the whole division becomes 3 instructions. ~2 ulp.
+//
+// THIS CHANGES RESULTS, unlike every other toggle in this file. The effect is a
+// sub-ulp shift in where the patch is sampled in the target image; with bilinear
+// filtering over fp16 textures whose quantization step (~5e-4) is already three
+// orders of magnitude coarser than the perturbation, the sampled value is almost
+// always bit-identical anyway, and PatchMatch re-scores every hypothesis each
+// iteration so nothing accumulates. It is the same class of change as the
+// __expf/__sinf already taken under PMCUDA_OPT_FAST_INTRIN -- and considerably
+// smaller, since those intrinsics carry far more error than 2 ulp.
+//
+// NOT used for the bounds test at the top of ScorePlane. That one is per
+// hypothesis-view rather than per texel (1/25th of the traffic, so no measurable
+// gain) and it is the only site where a ulp decides a BRANCH -- whether a patch
+// centre lands inside the target image at all -- rather than nudging a sample
+// coordinate. Keeping it exact costs nothing and keeps the failure mode of this
+// lever purely photometric.
+// ---------------------------------------------------------------------
+__device__ inline Point2 PMHNormalized(const Point3& X)
+{
+#if PMCUDA_OPT_FAST_DIV == 0
+	return X.hnormalized();
+#else
+  #if PMCUDA_OPT_FAST_DIV == 1
+	const float inv = __frcp_rn(X.z());
+  #else
+	const float inv = __fdividef(1.f, X.z());
+  #endif
+	return Point2(X.x() * inv, X.y() * inv);
+#endif
+}
+
 // weight a neighbor texel based on color similarity and distance to the center texel
 __device__ inline float ComputeBilateralWeight(int xDist, int yDist, float pix, float centerPix)
 {
@@ -484,6 +552,8 @@ __device__ float ScorePlane(const CUDA::Camera& refCamera, const ImagePixels trg
 		return maxCost;
 
 	Matrix3 H = ComputeHomography(pair, refCamera.model, p.cast<float>(), plane);
+	// exact division here on purpose: this feeds a branch, not a sample position
+	// (see the note at PMHNormalized)
 	const Point2 pt = (H * p.cast<float>().homogeneous()).hnormalized();
 	if (pt.x() >= trgCamera.size.x() || pt.x() < 0.f || pt.y() >= trgCamera.size.y() || pt.y() < 0.f)
 		return maxCost;
@@ -501,7 +571,7 @@ __device__ float ScorePlane(const CUDA::Camera& refCamera, const ImagePixels trg
 	for (int i = -nSizeHalfWindow; i <= nSizeHalfWindow; i += nSizeStep) {
 		#pragma unroll
 		for (int j = -nSizeHalfWindow; j <= nSizeHalfWindow; j += nSizeStep, ++k) {
-			const Point2 trgPt = X.hnormalized();
+			const Point2 trgPt = PMHNormalized(X);
 			const float trgPix = tex2D<float>(trgImage, trgPt.x() + 0.5f, trgPt.y() + 0.5f);
 			const float weightTrgPix = rp.weight[k] * trgPix;
 			sumTrg += weightTrgPix;

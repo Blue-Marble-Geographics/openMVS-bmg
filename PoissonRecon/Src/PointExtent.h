@@ -58,7 +58,7 @@ namespace PoissonRecon
 			const std::pair< Real , Real > &operator[]( unsigned int d ) const { return extents[d]; }
 
 			Extent( void );
-			void add( Point< Real , Dim > p );
+			void add( const Point< Real , Dim > &p );
 			Extent operator + ( const Extent &e ) const;
 		protected:
 			static const PointExtent::Frame< Real , Dim , ExtendedAxes > _Frame;

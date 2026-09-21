@@ -91,6 +91,25 @@ option(OpenMVS_CUDA_PTXAS_VERBOSE "Report CUDA register usage and local-memory s
 if(_USE_CUDA AND OpenMVS_CUDA_PTXAS_VERBOSE)
 	target_compile_options(MVS PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()
+
+# How the CUDA ZNCC texel loop performs its projective division -- the hottest
+# arithmetic in the depth-map estimator (~2600 evaluations per pixel per
+# iteration at the default 8 views). See PMHNormalized in PatchMatchCUDA.cu.
+#   2 (default) one approximate reciprocal + two multiplies, ~2 ulp -- fastest
+#   1           one correctly-rounded reciprocal + two multiplies, <=1 ulp
+#   0           Eigen hnormalized(), two full IEEE divisions -- upstream exactly
+# This is the one CUDA PatchMatch knob that changes results, so it is spelled out
+# at configure time rather than buried in a header: a timing comparison is only
+# meaningful if both builds report the same value here.
+set(OpenMVS_CUDA_FAST_DIV "2" CACHE STRING "CUDA PatchMatch projective divide: 2=approx rcp (fast), 1=exact rcp, 0=IEEE divide")
+set_property(CACHE OpenMVS_CUDA_FAST_DIV PROPERTY STRINGS 0 1 2)
+if(_USE_CUDA)
+	target_compile_definitions(MVS PRIVATE PMCUDA_OPT_FAST_DIV=${OpenMVS_CUDA_FAST_DIV})
+	# the legacy estimator predates this knob and ignores it -- do not imply otherwise
+	if(NOT OpenMVS_PATCHMATCH_CUDA_LEGACY)
+		message(STATUS "MVS: CUDA PatchMatch projective divide = ${OpenMVS_CUDA_FAST_DIV} (2=approx rcp, 1=exact rcp, 0=IEEE divide)")
+	endif()
+endif()
 if(_USE_CUDA AND OpenMVS_PATCHMATCH_CUDA_LEGACY)
 	target_compile_definitions(MVS PUBLIC PATCHMATCH_CUDA_LEGACY=1)
 	message(STATUS "MVS: CUDA PatchMatch estimator = LEGACY (original, 235b9712)")

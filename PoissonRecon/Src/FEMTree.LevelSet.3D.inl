@@ -60,6 +60,10 @@ public:
 
 	using Key = LevelSetExtraction::Key< Dim >;
 	using IsoEdge = LevelSetExtraction::IsoEdge< Dim >;
+	// Heap-free stand-in for std::vector< IsoEdge > in the per-face scratch. A face yields
+	// at most MarchingSquares::MAX_EDGES == 2 edges, so every one of those vectors was a
+	// heap allocation for 48 bytes of payload. See LevelSetExtraction::IsoEdgeSet.
+	using IsoEdgeSet = LevelSetExtraction::IsoEdgeSet< Dim >;
 	template< unsigned int D , unsigned int ... Ks >
 	using HyperCubeTables = LevelSetExtraction::HyperCubeTables< D , Ks ... >;
 
@@ -111,7 +115,7 @@ public:
 	{
 		struct Scratch
 		{
-			using FKeyValues = std::vector< std::vector< std::pair< Key , std::vector< IsoEdge > > > >;
+			using FKeyValues = std::vector< std::vector< std::pair< Key , IsoEdgeSet > > >;
 			using EKeyValues = std::vector< std::vector< std::pair< Key , std::pair< node_index_type , Vertex > > > >;
 			using VKeyValues = std::vector< std::vector< std::pair< Key , Key > > >;
 
@@ -381,7 +385,7 @@ public:
 	{
 		struct Scratch
 		{
-			using FKeyValues = std::vector< std::vector< std::pair< Key , std::vector< IsoEdge > > > >;
+			using FKeyValues = std::vector< std::vector< std::pair< Key , IsoEdgeSet > > >;
 			using EKeyValues = std::vector< std::vector< std::pair< Key , std::pair< node_index_type , Vertex > > > >;
 			using VKeyValues = std::vector< std::vector< std::pair< Key , Key > > >;
 
@@ -867,24 +871,32 @@ public:
 	}
 
 	template< unsigned int ... FEMSigs >
-	static void SetSliceCornerValuesAndMCIndices( const FEMTree< Dim , Real >& tree , ConstPointer( Real ) coefficients , ConstPointer( Real ) coarseCoefficients , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice ,         std::vector< SlabValues >& slabValues , const _Evaluator< UIntPack< FEMSigs ... > , 1 >& evaluator )
+	static void SetSliceCornerValuesAndMCIndices( const FEMTree< Dim , Real >& tree , ConstPointer( Real ) coefficients , ConstPointer( Real ) coarseCoefficients , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice ,         std::vector< SlabValues >& slabValues , const _Evaluator< UIntPack< FEMSigs ... > , 1 >& evaluator  , std::vector< ConstPointSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > &neighborKeys , std::vector< ConstCornerSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > &bNeighborKeys )
 	{
-		if( slice>0          ) SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients , coarseCoefficients , isoValue , depth , fullDepth , slice , HyperCube::FRONT , slabValues , evaluator );
-		if( slice<(1<<depth) ) SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients , coarseCoefficients , isoValue , depth , fullDepth , slice , HyperCube::BACK  , slabValues , evaluator );
+		if( slice>0          ) SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients , coarseCoefficients , isoValue , depth , fullDepth , slice , HyperCube::FRONT , slabValues , evaluator , neighborKeys , bNeighborKeys );
+		if( slice<(1<<depth) ) SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients , coarseCoefficients , isoValue , depth , fullDepth , slice , HyperCube::BACK  , slabValues , evaluator , neighborKeys , bNeighborKeys );
 	}
 
 	template< unsigned int ... FEMSigs >
-	static void SetSliceCornerValuesAndMCIndices( const FEMTree< Dim , Real >& tree , ConstPointer( Real ) coefficients , ConstPointer( Real ) coarseCoefficients , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , HyperCube::Direction zDir , std::vector< SlabValues >& slabValues , const _Evaluator< UIntPack< FEMSigs ... > , 1 >& evaluator )
+	static void SetSliceCornerValuesAndMCIndices( const FEMTree< Dim , Real >& tree , ConstPointer( Real ) coefficients , ConstPointer( Real ) coarseCoefficients , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , HyperCube::Direction zDir , std::vector< SlabValues >& slabValues , const _Evaluator< UIntPack< FEMSigs ... > , 1 >& evaluator  , std::vector< ConstPointSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > &neighborKeys , std::vector< ConstCornerSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > &bNeighborKeys )
 	{
 		static const unsigned int FEMDegrees[] = { FEMSignature< FEMSigs >::Degree ... };
 		SliceValues& sValues = slabValues[depth].sliceValues( slice );
 		typename SliceValues::Scratch &sScratch = slabValues[depth].sliceScratch( slice );
 		bool useBoundaryEvaluation = false;
 		for( int d=0 ; d<Dim ; d++ ) if( FEMDegrees[d]==0 || ( FEMDegrees[d]==1 && sValues.cornerGradients ) ) useBoundaryEvaluation = true;
-		std::vector< ConstPointSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > neighborKeys( ThreadPool::NumThreads() );
-		std::vector< ConstCornerSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > bNeighborKeys( ThreadPool::NumThreads() );
-		if( useBoundaryEvaluation ) for( size_t i=0 ; i<neighborKeys.size() ; i++ ) bNeighborKeys[i].set( tree._localToGlobal( depth ) );
-		else                        for( size_t i=0 ; i<neighborKeys.size() ; i++ )  neighborKeys[i].set( tree._localToGlobal( depth ) );
+		// Neighbour keys are CALLER-OWNED -- see Extract, where they are allocated once at
+		// tree._maxDepth. They used to be built here: two vectors of ThreadPool::NumThreads()
+		// keys per call, and NeighborKey::set() is `new NeighborType[depth+1]`, value-
+		// initialised. This runs once per slice per depth -- the slab loop reports 8135
+		// iterations -- so at 32 threads it was a quarter of a million allocations plus the
+		// zeroing, inside what is now the largest phase in the stage.
+		//
+		// Allocating at _maxDepth and querying shallower nodes is correct: _depth is only the
+		// bound of the array and of getNeighbors' clear loop
+		//     for( d=node->depth()+1 ; d<=_depth && ... ) neighbors[d]...=NULL;
+		// so any node with depth()<=_depth is handled exactly as before. The per-call set()
+		// at `depth` is therefore redundant, not merely expensive.
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth,slice-(zDir==HyperCube::BACK ? 0 : 1)) , tree._sNodesEnd(depth,slice-(zDir==HyperCube::BACK ? 0 : 1)) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
@@ -999,14 +1011,14 @@ public:
 	}
 
 	template< unsigned int WeightDegree , unsigned int DataSig , typename VertexStream >
-	static void SetSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData )
+	static void SetSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData  , std::vector< ConstOneRingNeighborKey > &neighborKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > &weightKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , FEMSignature< DataSig >::Degree > > > &dataKeys )
 	{
-		if( slice>0          ) SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , depth , fullDepth , slice , HyperCube::FRONT , vertexStream , slabValues , zeroData );
-		if( slice<(1<<depth) ) SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , depth , fullDepth , slice , HyperCube::BACK  , vertexStream , slabValues , zeroData );
+		if( slice>0          ) SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , depth , fullDepth , slice , HyperCube::FRONT , vertexStream , slabValues , zeroData , neighborKeys , weightKeys , dataKeys );
+		if( slice<(1<<depth) ) SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , depth , fullDepth , slice , HyperCube::BACK  , vertexStream , slabValues , zeroData , neighborKeys , weightKeys , dataKeys );
 	}
 
 	template< unsigned int WeightDegree , unsigned int DataSig , typename VertexStream >
-	static void SetSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , HyperCube::Direction zDir , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData )
+	static void SetSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slice , HyperCube::Direction zDir , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData  , std::vector< ConstOneRingNeighborKey > &neighborKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > &weightKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , FEMSignature< DataSig >::Degree > > > &dataKeys )
 	{
 		auto _EdgeIndex = [&]( const TreeNode *node , typename HyperCube::Cube< Dim >::template Element< 1 > e )
 		{
@@ -1019,10 +1031,7 @@ public:
 		SliceValues &sValues = slabValues[depth].sliceValues( slice );
 		typename SliceValues::Scratch &sScratch = slabValues[depth].sliceScratch( slice );
 		// [WARNING] In the case Degree=2, these two keys are the same, so we don't have to maintain them separately.
-		std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > weightKeys( ThreadPool::NumThreads() );
-		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , DataDegree > > > dataKeys( ThreadPool::NumThreads() );
-		for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( tree._localToGlobal( depth ) ) , weightKeys[i].set( tree._localToGlobal( depth ) ) , dataKeys[i].set( tree._localToGlobal( depth ) );
+		// Keys are caller-owned; see Extract. Allocated once at _maxDepth.
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth,slice-(zDir==HyperCube::BACK ? 0 : 1)) , tree._sNodesEnd(depth,slice-(zDir==HyperCube::BACK ? 0 : 1)) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
@@ -1141,7 +1150,7 @@ public:
 	// Iso-Extraction //
 	////////////////////
 	template< unsigned int WeightDegree , unsigned int DataSig , typename VertexStream >
-	static void SetXSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim >  &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slab , Real bCoordinate , Real fCoordinate , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData )
+	static void SetXSliceIsoVertices( const LevelSetExtraction::KeyGenerator< Dim >  &keyGenerator , const FEMTree< Dim , Real >& tree , bool nonLinearFit , bool gradientNormals , typename FEMIntegrator::template PointEvaluator< IsotropicUIntPack< Dim , DataSig > , ZeroUIntPack< Dim > >* pointEvaluator , const DensityEstimator< WeightDegree >* densityWeights , const SparseNodeData< ProjectiveData< Data , Real > , IsotropicUIntPack< Dim , DataSig > >* data , Real isoValue , LocalDepth depth , LocalDepth fullDepth , int slab , Real bCoordinate , Real fCoordinate , VertexStream &vertexStream , std::vector< SlabValues >& slabValues , const Data &zeroData  , std::vector< ConstOneRingNeighborKey > &neighborKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > &weightKeys , std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , FEMSignature< DataSig >::Degree > > > &dataKeys )
 	{
 		auto _EdgeIndex = [&]( const TreeNode *node , typename HyperCube::Cube< Dim >::template Element< 1 > e )
 		{
@@ -1159,10 +1168,7 @@ public:
 		typename XSliceValues::Scratch &xScratch = slabValues[depth].xSliceScratch( slab   );
 
 		// [WARNING] In the case Degree=2, these two keys are the same, so we don't have to maintain them separately.
-		std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > weightKeys( ThreadPool::NumThreads() );
-		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , DataDegree > > > dataKeys( ThreadPool::NumThreads() );
-		for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( tree._localToGlobal( depth ) ) , weightKeys[i].set( tree._localToGlobal( depth ) ) , dataKeys[i].set( tree._localToGlobal( depth ) );
+		// Keys are caller-owned; see Extract. Allocated once at _maxDepth.
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth,slab) , tree._sNodesEnd(depth,slab) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
@@ -1411,13 +1417,13 @@ public:
 		);
 	}
 
-	static void SetSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slice , std::vector< SlabValues >& slabValues )
+	static void SetSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slice , std::vector< SlabValues >& slabValues  , std::vector< ConstOneRingNeighborKey > &neighborKeys )
 	{
-		if( slice>0          ) SetSliceIsoEdges( keyGenerator , tree , depth , slice , HyperCube::FRONT , slabValues );
-		if( slice<(1<<depth) ) SetSliceIsoEdges( keyGenerator , tree , depth , slice , HyperCube::BACK  , slabValues );
+		if( slice>0          ) SetSliceIsoEdges( keyGenerator , tree , depth , slice , HyperCube::FRONT , slabValues , neighborKeys );
+		if( slice<(1<<depth) ) SetSliceIsoEdges( keyGenerator , tree , depth , slice , HyperCube::BACK  , slabValues , neighborKeys );
 	}
 
-	static void SetSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slice , HyperCube::Direction zDir , std::vector< SlabValues >& slabValues )
+	static void SetSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slice , HyperCube::Direction zDir , std::vector< SlabValues >& slabValues  , std::vector< ConstOneRingNeighborKey > &neighborKeys )
 	{
 		auto _FaceIndex = [&]( const TreeNode *node , typename HyperCube::Cube< Dim >::template Element< 2 > f )
 		{
@@ -1428,8 +1434,7 @@ public:
 
 		SliceValues& sValues = slabValues[depth].sliceValues( slice );
 		typename SliceValues::Scratch &sScratch = slabValues[depth].sliceScratch( slice );
-		std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-		for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( tree._localToGlobal( depth ) );
+		// Keys are caller-owned; see Extract. Allocated once at _maxDepth.
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth, slice-(zDir==HyperCube::BACK ? 0 : 1)) , tree._sNodesEnd(depth,slice-(zDir==HyperCube::BACK ? 0 : 1)) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
@@ -1463,7 +1468,8 @@ public:
 							LocalDepth _depth = depth;
 							int _slice = slice;
 							typename HyperCube::Cube< Dim >::template Element< Dim-1 > f( zDir , 0 );
-							std::vector< IsoEdge > edges;
+							// Inline storage now, so no allocation and no scratch to hoist.
+							IsoEdgeSet edges;
 							edges.resize( fe.count );
 							for( int j=0 ; j<fe.count ; j++ ) edges[j] = fe.edges[j];
 							while( tree._isValidSpaceNode( node->parent ) && HyperCubeTables< Dim , 2 , 0 >::Overlap[f.index][(unsigned int)(node-node->parent->children) ] )
@@ -1473,7 +1479,7 @@ public:
 								Key key = _FaceIndex( node , f );
 								SliceValues& _sValues = slabValues[_depth].sliceValues( _slice );
 								typename SliceValues::Scratch &_sScratch = slabValues[_depth].sliceScratch( _slice );
-								_sScratch.fKeyValues[ thread ].push_back( std::pair< Key , std::vector< IsoEdge > >( key , edges ) );
+								_sScratch.fKeyValues[ thread ].push_back( std::pair< Key , IsoEdgeSet >( key , edges ) );
 							}
 						}
 					}
@@ -1483,7 +1489,7 @@ public:
 		);
 	}
 
-	static void SetXSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slab , std::vector< SlabValues >& slabValues )
+	static void SetXSliceIsoEdges( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , const FEMTree< Dim , Real >& tree , LocalDepth depth , int slab , std::vector< SlabValues >& slabValues  , std::vector< ConstOneRingNeighborKey > &neighborKeys )
 	{
 		auto _FaceIndex = [&]( const TreeNode *node , typename HyperCube::Cube< Dim >::template Element< 2 > f )
 		{
@@ -1499,8 +1505,7 @@ public:
 		typename  SliceValues::Scratch &fScratch = slabValues[depth]. sliceScratch( slab+1 );
 		typename XSliceValues::Scratch &xScratch = slabValues[depth].xSliceScratch( slab   );
 
-		std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-		for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( tree._localToGlobal( depth ) );
+		// Keys are caller-owned; see Extract. Allocated once at _maxDepth.
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth,slab) , tree._sNodesEnd(depth,slab) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
@@ -1556,7 +1561,7 @@ public:
 								TreeNode* node = leaf;
 								LocalDepth _depth = depth;
 								int _slab = slab;
-								std::vector< IsoEdge > edges;
+								IsoEdgeSet edges;
 								edges.resize( fe.count );
 								for( int j=0 ; j<fe.count ; j++ ) edges[j] = fe.edges[j];
 								while( tree._isValidSpaceNode( node->parent ) && HyperCubeTables< Dim , 2 , 0 >::Overlap[f.index][(unsigned int)(node-node->parent->children) ] )
@@ -1566,7 +1571,7 @@ public:
 									Key key = _FaceIndex( node , f );
 									XSliceValues& _xValues = slabValues[_depth].xSliceValues( _slab );
 									typename XSliceValues::Scratch &_xScratch = slabValues[_depth].xSliceScratch( _slab );
-									_xScratch.fKeyValues[ thread ].push_back( std::pair< Key , std::vector< IsoEdge > >( key , edges ) );
+									_xScratch.fKeyValues[ thread ].push_back( std::pair< Key , IsoEdgeSet >( key , edges ) );
 								}
 							}
 						}
@@ -1576,16 +1581,59 @@ public:
 		} );
 	}
 
+	// Per-thread scratch for SetLevelSet / AddIsoPolygons.
+	//
+	// Stock, every surface cell allocated: the loop-of-loops (the outer vector, plus one
+	// inner vector per loop grown one push_back at a time), one value-initialized polygon
+	// vector per loop, and -- inside AddIsoPolygons -- a fresh 3-element std::vector per
+	// triangle handed to polygonStream.write(). That is half a dozen malloc/free pairs per
+	// triangle, from 32 threads, against a heap that serializes them; the write() sink is
+	// lock-free and does nothing with the vector but memcpy 12 bytes back out of it.
+	//
+	// These buffers grow to a high-water mark and are never shrunk, so after the first few
+	// cells the allocations are gone. loops and polygon carry their live counts separately
+	// from vector::size() precisely so that reusing them never re-initializes entries the
+	// caller is about to overwrite. alignas(64) keeps one thread's buffer headers off
+	// another thread's cache line.
+	struct alignas(64) LevelSetScratch
+	{
+		std::vector< IsoEdge > edges;
+		std::vector< std::vector< Key > > loops;						// loops[0,loopCount) are live
+		size_t loopCount;
+		std::vector< std::pair< node_index_type , Vertex > > polygon;	// [0,n) live, see polygonBuffer
+		std::vector< node_index_type > face;							// reused polygonStream.write() argument
+		std::vector< Point< Real , Dim > > triVertices;					// MinimalAreaTriangulation input
+
+		LevelSetScratch( void ) : loopCount(0) {}
+
+		void resetLoops( void ){ loopCount = 0; }
+		// The returned reference stays valid until the next newLoop() call.
+		std::vector< Key > &newLoop( void )
+		{
+			if( loopCount==loops.size() ) loops.resize( loopCount+1 );
+			std::vector< Key > &loop = loops[ loopCount++ ];
+			loop.clear();	// clear(), not a fresh vector: the capacity survives into the next cell
+			return loop;
+		}
+		// Grow-only, so a cell whose polygon is no larger than the largest seen so far does
+		// no allocating and no initializing at all.
+		std::pair< node_index_type , Vertex > *polygonBuffer( size_t n )
+		{
+			if( polygon.size()<n ) polygon.resize( n );
+			return polygon.data();
+		}
+	};
+
 	template< typename VertexStream , typename FaceIndexFunctor /* = std::function< LevelSetExtraction::Key< Dim > ( const TreeNode * , typename HyperCube::Cube< Dim >::template Element< 2 > ) */ >
 	static void SetLevelSet( const LevelSetExtraction::KeyGenerator< Dim > &keyGenerator , FaceIndexFunctor faceIndexFunctor , const FEMTree< Dim , Real >& tree , LocalDepth depth , int offset , const SliceValues& bValues , const SliceValues& fValues , const XSliceValues& xValues , const typename SliceValues::Scratch &bScratch , const typename SliceValues::Scratch &fScratch , const typename XSliceValues::Scratch &xScratch , VertexStream &vertexStream , OutputDataStream< std::vector< node_index_type > > &polygonStream , bool polygonMesh , bool addBarycenter , bool flipOrientation )
 	{
-		std::vector< std::pair< node_index_type , Vertex > > polygon;
-		std::vector< std::vector< IsoEdge > > edgess( ThreadPool::NumThreads() );
+		std::vector< LevelSetScratch > scratches( ThreadPool::NumThreads() );
 		ThreadPool::ParallelFor( tree._sNodesBegin(depth,offset) , tree._sNodesEnd(depth,offset) , [&]( unsigned int thread , size_t i )
 		{
 			if( tree._isValidSpaceNode( tree._sNodes.treeNodes[i] ) )
 			{
-				std::vector< IsoEdge >& edges = edgess[ thread ];
+				LevelSetScratch &scratch = scratches[ thread ];
+				std::vector< IsoEdge >& edges = scratch.edges;
 				TreeNode* leaf = tree._sNodes.treeNodes[i];
 				int res = 1<<depth;
 				LocalDepth d ; LocalOffset off;
@@ -1626,10 +1674,10 @@ public:
 							}
 						}
 						// Get the edge loops
-						std::vector< std::vector< Key > > loops;
+						scratch.resetLoops();
 						while( edges.size() )
 						{
-							loops.resize( loops.size()+1 );
+							std::vector< Key > &loop = scratch.newLoop();
 							IsoEdge edge = edges.back();
 							edges.pop_back();
 							Key start = edge[0] , current = edge[1];
@@ -1641,35 +1689,38 @@ public:
 								{
 									typename LevelSetExtraction::KeyMap< Dim , Key >::const_iterator iter;
 									Key pair;
-									if     ( bValues.setVertexPair(current,pair) ) loops.back().push_back( current ) , current = pair;
-									else if( fValues.setVertexPair(current,pair) ) loops.back().push_back( current ) , current = pair;
-									else if( (iter=xValues.vertexPairMap.find(current))!=xValues.vertexPairMap.end() ) loops.back().push_back( current ) , current = iter->second;
+									if     ( bValues.setVertexPair(current,pair) ) loop.push_back( current ) , current = pair;
+									else if( fValues.setVertexPair(current,pair) ) loop.push_back( current ) , current = pair;
+									else if( (iter=xValues.vertexPairMap.find(current))!=xValues.vertexPairMap.end() ) loop.push_back( current ) , current = iter->second;
 									else MK_THROW( "Failed to close loop for node[" , i , "]: [" , off[0] , " " , off[1] , " " , off[2] , " @ " , d , "] | " , keyGenerator.to_string( current ) , " -- " , keyGenerator.to_string( start ) , " | " , current.to_string() , " -- " , start.to_string() );
 								}
 								else
 								{
-									loops.back().push_back( current );
+									loop.push_back( current );
 									current = edges[idx][1];
 									edges[idx] = edges.back() , edges.pop_back();
 								}
 							}
-							loops.back().push_back( start );
+							loop.push_back( start );
 						}
 						// Add the loops to the mesh
-						for( size_t j=0 ; j<loops.size() ; j++ )
+						for( size_t j=0 ; j<scratch.loopCount ; j++ )
 						{
-							std::vector< std::pair< node_index_type , Vertex > > polygon( loops[j].size() );
-							for( size_t k=0 ; k<loops[j].size() ; k++ )
+							const std::vector< Key > &loop = scratch.loops[j];
+							const size_t polygonSize = loop.size();
+							// Re-taken each j: polygonBuffer() may have had to grow the buffer.
+							std::pair< node_index_type , Vertex > *polygon = scratch.polygonBuffer( polygonSize );
+							for( size_t k=0 ; k<polygonSize ; k++ )
 							{
-								Key key = loops[j][k];
+								Key key = loop[k];
 								typename LevelSetExtraction::KeyMap< Dim , std::pair< node_index_type , Vertex > >::const_iterator iter;
-								size_t kk = flipOrientation ? loops[j].size()-1-k : k;
+								size_t kk = flipOrientation ? polygonSize-1-k : k;
 								if     ( bValues.setEdgeVertex( key , polygon[kk] ) );
 								else if( fValues.setEdgeVertex( key , polygon[kk] ) );
 								else if( ( iter=xValues.edgeVertexMap.find( key ) )!=xValues.edgeVertexMap.end() ) polygon[kk] = iter->second;
 								else MK_THROW( "Couldn't find vertex in edge map: " , off[0] , " , " , off[1] , " , " , off[2] , " @ " , depth , " : " , keyGenerator.to_string( key ) , " | " , key.to_string() );
 							}
-							AddIsoPolygons( thread , vertexStream , polygonStream , polygon , polygonMesh , addBarycenter );
+							AddIsoPolygons( thread , vertexStream , polygonStream , polygon , polygonSize , scratch , polygonMesh , addBarycenter );
 						}
 					}
 				}
@@ -1902,79 +1953,101 @@ public:
 		return true;
 	}
 
+	// polygon is the first polygonSize entries of scratch.polygonBuffer(); the face handed
+	// to polygonStream.write() is scratch.face, reused across every call, because write()
+	// only ever reads it. See LevelSetScratch.
 	template< typename VertexStream >
-	static unsigned int AddIsoPolygons( unsigned int thread , VertexStream &vertexStream , OutputDataStream< std::vector< node_index_type > > &polygonStream , std::vector< std::pair< node_index_type , Vertex > >& polygon , bool polygonMesh , bool addBarycenter )
+	static unsigned int AddIsoPolygons( unsigned int thread , VertexStream &vertexStream , OutputDataStream< std::vector< node_index_type > > &polygonStream , const std::pair< node_index_type , Vertex > *polygon , size_t polygonSize , LevelSetScratch &scratch , bool polygonMesh , bool addBarycenter )
 	{
+		std::vector< node_index_type > &face = scratch.face;
+
 		if( polygonMesh )
 		{
-			std::vector< node_index_type > vertices( polygon.size() );
-			for( unsigned int i=0 ; i<polygon.size() ; i++ ) vertices[i] = polygon[polygon.size()-1-i].first;
-			polygonStream.write( thread , vertices );
+			face.resize( polygonSize );
+			for( size_t i=0 ; i<polygonSize ; i++ ) face[i] = polygon[polygonSize-1-i].first;
+			polygonStream.write( thread , face );
 			return 1;
 		}
-		if( polygon.size()>3 )
+		if( polygonSize>3 )
 		{
 			bool isCoplanar = false;
-			std::vector< node_index_type > triangle( 3 );
 
 			if( addBarycenter )
-				for( unsigned int i=0 ; i<polygon.size() ; i++ ) for( unsigned int j=0 ; j<i ; j++ )
-					if( (i+1)%polygon.size()!=j && (j+1)%polygon.size()!=i )
+				for( size_t i=0 ; i<polygonSize ; i++ ) for( size_t j=0 ; j<i ; j++ )
+					if( (i+1)%polygonSize!=j && (j+1)%polygonSize!=i )
 					{
 						Vertex v1 = polygon[i].second , v2 = polygon[j].second;
 						for( int k=0 ; k<3 ; k++ ) if( v1.template get<0>()[k]==v2.template get<0>()[k] ) isCoplanar = true;
 					}
+			face.resize( 3 );
 			if( isCoplanar )
 			{
 				Vertex c;
 				c *= 0;
-				for( unsigned int i=0 ; i<polygon.size() ; i++ ) c += polygon[i].second;
-				c /= ( typename Vertex::Real )polygon.size();
+				for( size_t i=0 ; i<polygonSize ; i++ ) c += polygon[i].second;
+				c /= ( typename Vertex::Real )polygonSize;
 
 				node_index_type cIdx = (node_index_type)vertexStream.write( thread , c );
 
-				for( unsigned i=0 ; i<polygon.size() ; i++ )
+				for( size_t i=0 ; i<polygonSize ; i++ )
 				{
-					triangle[0] = polygon[ i                  ].first;
-					triangle[1] = cIdx;
-					triangle[2] = polygon[(i+1)%polygon.size()].first;
-					polygonStream.write( thread , triangle );
+					face[0] = polygon[ i                 ].first;
+					face[1] = cIdx;
+					face[2] = polygon[(i+1)%polygonSize ].first;
+					polygonStream.write( thread , face );
 				}
-				return (unsigned int)polygon.size();
+				return (unsigned int)polygonSize;
 			}
 			else
 			{
-				std::vector< Point< Real , Dim > > vertices( polygon.size() );
-				for( unsigned int i=0 ; i<polygon.size() ; i++ ) vertices[i] = polygon[i].second.template get<0>();
+				std::vector< Point< Real , Dim > > &vertices = scratch.triVertices;
+				vertices.resize( polygonSize );
+				for( size_t i=0 ; i<polygonSize ; i++ ) vertices[i] = polygon[i].second.template get<0>();
 				std::vector< TriangleIndex< node_index_type > > triangles = MinimalAreaTriangulation< node_index_type , Real , Dim >( ( ConstPointer( Point< Real , Dim > ) )GetPointer( vertices ) , (node_index_type)vertices.size() );
-				if( triangles.size()!=polygon.size()-2 ) MK_THROW( "Minimal area triangulation failed:" , triangles.size() , " != " , polygon.size()-2 );
-				for( unsigned int i=0 ; i<triangles.size() ; i++ )
+				if( triangles.size()!=polygonSize-2 ) MK_THROW( "Minimal area triangulation failed:" , triangles.size() , " != " , polygonSize-2 );
+				for( size_t i=0 ; i<triangles.size() ; i++ )
 				{
-					for( int j=0 ; j<3 ; j++ ) triangle[2-j] = polygon[ triangles[i].idx[j] ].first;
-					polygonStream.write( thread , triangle );
+					for( int j=0 ; j<3 ; j++ ) face[2-j] = polygon[ triangles[i].idx[j] ].first;
+					polygonStream.write( thread , face );
 				}
 			}
 		}
-		else if( polygon.size()==3 )
+		else if( polygonSize==3 )
 		{
-			std::vector< node_index_type > vertices( 3 );
-			for( int i=0 ; i<3 ; i++ ) vertices[2-i] = polygon[i].first;
-			polygonStream.write( thread , vertices );
+			face.resize( 3 );
+			for( int i=0 ; i<3 ; i++ ) face[2-i] = polygon[i].first;
+			polygonStream.write( thread , face );
 		}
-		return (unsigned int)polygon.size()-2;
+		return (unsigned int)polygonSize-2;
 	}
 
 	struct Stats
 	{
 		double cornersTime , verticesTime , edgesTime , surfaceTime;
 		double setTableTime;
-		Stats( void ) : cornersTime(0) , verticesTime(0) , edgesTime(0) , surfaceTime(0) , setTableTime(0) {;}
+		// The reset() pair in InitSlice/InitSlab: clearing the three KeyMaps and
+		// re-zeroing the corner/edge/face arrays for the incoming slice. It was the only
+		// work left in the slab loop with no timer once Finalize got one, and it is where
+		// the ~1.2 s that the named sub-timers did not account for has to be.
+		double resetTime;
+		// FinalizeSlice + FinalizeSlab were the only helpers in the slab loop with no timer,
+		// which is why the named sub-timers summed to 6.2 s of an 8.7 s 'Got Faces'. They
+		// build the vertex/edge/face KeyMaps from the per-thread scratch arrays, serially
+		// per map (3-way via ParallelSections, not 32-way), and ParallelSections spawns
+		// threads rather than using the pool -- hence sectionCount alongside the time.
+		double finalizeTime;
+		size_t sectionCount;
+		Stats( void ) : cornersTime(0) , verticesTime(0) , edgesTime(0) , surfaceTime(0) , setTableTime(0) , resetTime(0) , finalizeTime(0) , sectionCount(0) {;}
 		std::string toString( void ) const
 		{
 			std::stringstream stream;
-			stream << "Corners / Vertices / Edges / Surface / Set Table: ";
-			stream << std::fixed << std::setprecision(1) << cornersTime << " / " << verticesTime << " / " << edgesTime << " / " << surfaceTime << " / " << setTableTime;
-			stream << " (s)";
+			stream << "Corners / Vertices / Edges / Surface / Set Table / Reset / Finalize: ";
+			stream << std::fixed << std::setprecision(1) << cornersTime << " / " << verticesTime << " / " << edgesTime << " / " << surfaceTime << " / " << setTableTime << " / " << resetTime << " / " << finalizeTime;
+			stream << " (s), ParallelSections calls: " << sectionCount;
+			// Measured on this box: the 2 std::async spawns per ParallelSections call cost
+			// ~9 us, so a whole Marco-sized run's 8135 calls floor at ~74 ms. If Finalize is
+			// seconds, it is the KeyMap inserts, not the fork/join -- do not chase the spawns.
+			stream << "\n\t" << LevelSetExtraction::SetTableStats::ToString();
 			return stream.str();
 		}
 	};
@@ -2112,9 +2185,10 @@ public:
 					slabValues[d].sliceValues(slice).cellIndices.set( tree._sNodes , tree._localToGlobal( d ) , slice + tree._localInset( d ) );
 					stats.setTableTime += Time()-t;
 
+					t = Time();
 					slabValues[d].sliceValues(slice).reset( slice , nonLinearFit || gradientNormals );
-
 					slabValues[d].sliceScratch(slice).reset( slabValues[d].sliceValues(slice).cellIndices );
+					stats.resetTime += Time()-t;
 				}
 			}
 		};
@@ -2130,9 +2204,10 @@ public:
 					slabValues[d].xSliceValues(slab).cellIndices.set( tree._sNodes , tree._localToGlobal( d ) , slab + tree._localInset( d ) );
 					stats.setTableTime += Time()-t;
 
+					t = Time();
 					slabValues[d].xSliceValues(slab).reset(slab);
-
 					slabValues[d].xSliceScratch(slab).reset( slabValues[d].xSliceValues(slab).cellIndices );
+					stats.resetTime += Time()-t;
 				}
 				if( (slab&1) && !first ) break;
 			}
@@ -2180,6 +2255,59 @@ public:
 			}
 		};
 
+		// Corner/MC neighbour keys for the WHOLE extraction, allocated once.
+		//
+		// SetSliceCornerValuesAndMCIndices used to build these per call -- once per slice per
+		// depth, 8135 slab iterations by the log's own count -- and NeighborKey::set() is a
+		// value-initialised `new NeighborType[depth+1]`. At 32 threads that is a quarter of a
+		// million allocations and their zeroing, in the phase that is now the largest in the
+		// stage. Same pattern, same fix, as the per-block keys in
+		// _getSliceMatrixAndProlongationConstraints.
+		//
+		// Sized at _maxDepth and reused at every shallower depth: _depth only bounds the
+		// array and getNeighbors' clear loop, so a node at any depth <= _depth behaves
+		// exactly as it did when the key was sized to that node's own depth.
+		//
+		// The four Set* lambdas below capture by [&], so nothing between here and the call
+		// site needed a signature change -- only the two SetSliceCornerValuesAndMCIndices
+		// overloads take them explicitly.
+		// One set of neighbour keys per Set* function, for the whole extraction.
+		//
+		// Each of these used to be built inside its function -- once per slice per depth,
+		// 8135 slab iterations by the log's own count -- and NeighborKey::set() is a
+		// value-initialised `new NeighborType[depth+1]`, ~2.6 KB at depth 11. At 32 threads
+		// that is hundreds of thousands of allocations and their zeroing per site. Hoisting
+		// the corner pair alone moved "Corners" 1.1 -> 0.9 s, which is what justified doing
+		// the rest.
+		//
+		// SEPARATE per function rather than shared, deliberately. The four Set* lambdas run
+		// sequentially in the slab loop today, so one shared set would be safe -- but that
+		// is a property of the caller, not of these functions, and a future reordering into
+		// ParallelSections would turn sharing into a silent data race. The cost of keeping
+		// them apart is a few hundred KB, once.
+		//
+		// All sized at _maxDepth and reused at every shallower depth: _depth only bounds the
+		// array and getNeighbors' clear loop, so a node at any depth <= _depth behaves
+		// exactly as when the key was sized to its own depth.
+		std::vector< ConstOneRingNeighborKey > isoVertKeys( ThreadPool::NumThreads() ) , xIsoVertKeys( ThreadPool::NumThreads() );
+		std::vector< ConstOneRingNeighborKey > isoEdgeKeys( ThreadPool::NumThreads() ) , xIsoEdgeKeys( ThreadPool::NumThreads() );
+		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , WeightDegree > > > isoWeightKeys( ThreadPool::NumThreads() ) , xIsoWeightKeys( ThreadPool::NumThreads() );
+		std::vector< ConstPointSupportKey< IsotropicUIntPack< Dim , DataDegree > > > isoDataKeys( ThreadPool::NumThreads() ) , xIsoDataKeys( ThreadPool::NumThreads() );
+		for( size_t i=0 ; i<(size_t)ThreadPool::NumThreads() ; i++ )
+		{
+			isoVertKeys[i].set( tree._localToGlobal( tree._maxDepth ) ) , xIsoVertKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+			isoEdgeKeys[i].set( tree._localToGlobal( tree._maxDepth ) ) , xIsoEdgeKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+			isoWeightKeys[i].set( tree._localToGlobal( tree._maxDepth ) ) , xIsoWeightKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+			isoDataKeys[i].set( tree._localToGlobal( tree._maxDepth ) ) , xIsoDataKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+		}
+		std::vector< ConstPointSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > cornerNeighborKeys( ThreadPool::NumThreads() );
+		std::vector< ConstCornerSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > > > cornerBNeighborKeys( ThreadPool::NumThreads() );
+		for( size_t i=0 ; i<cornerNeighborKeys.size() ; i++ )
+		{
+			cornerNeighborKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+			cornerBNeighborKeys[i].set( tree._localToGlobal( tree._maxDepth ) );
+		}
+
 		auto SetSliceValues = [&]( unsigned int sliceAtMaxDepth )
 		{
 
@@ -2219,7 +2347,7 @@ public:
 								SetMCIndices( tree , isoValue , d , fullDepth , o , slabValues );
 							}
 						}
-						else SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients() , coarseCoefficients() , isoValue , d , fullDepth , o , slabValues , evaluators[d] );				
+						else SetSliceCornerValuesAndMCIndices< FEMSigs ... >( tree , coefficients() , coarseCoefficients() , isoValue , d , fullDepth , o , slabValues , evaluators[d] , cornerNeighborKeys , cornerBNeighborKeys );				
 					}
 					if( o&1 ) break;
 				}
@@ -2262,7 +2390,7 @@ public:
 				{
 					if( d<=tree._maxDepth )
 					{
-						SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , d , fullDepth , o , vertexStream , slabValues , zeroData );
+						SetSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , d , fullDepth , o , vertexStream , slabValues , zeroData , isoVertKeys , isoWeightKeys , isoDataKeys );
 					}
 					if( o&1 ) break;
 				}
@@ -2275,7 +2403,7 @@ public:
 					if( d<=tree._maxDepth )
 					{
 						if( d<tree._maxDepth ) CopyFinerSliceIsoEdgeKeys( tree , d , fullDepth , o , slabValues );
-						SetSliceIsoEdges( keyGenerator , tree , d , o , slabValues );
+						SetSliceIsoEdges( keyGenerator , tree , d , o , slabValues , isoEdgeKeys );
 					}
 					if( o&1 ) break;
 				}
@@ -2301,7 +2429,7 @@ public:
 						// Set the iso-vertices
 						Real bCoordinate , fCoordinate;
 						SetSlabBounds( d , o , bCoordinate , fCoordinate );
-						SetXSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , d , std::max< unsigned int >( slabDepth , fullDepth ) , o , bCoordinate , fCoordinate , vertexStream , slabValues , zeroData );
+						SetXSliceIsoVertices< WeightDegree , DataSig >( keyGenerator , tree , nonLinearFit , gradientNormals , pointEvaluator , densityWeights , data , isoValue , d , std::max< unsigned int >( slabDepth , fullDepth ) , o , bCoordinate , fCoordinate , vertexStream , slabValues , zeroData , xIsoVertKeys , xIsoWeightKeys , xIsoDataKeys );
 					}
 				}
 
@@ -2329,7 +2457,7 @@ public:
 						{
 							CopyFinerXSliceIsoEdgeKeys( tree , d , fullDepth , o , slabValues );
 						}
-						SetXSliceIsoEdges( keyGenerator , tree , d , o , slabValues );
+						SetXSliceIsoEdges( keyGenerator , tree , d , o , slabValues , xIsoEdgeKeys );
 					}
 
 				}
@@ -2366,11 +2494,13 @@ public:
 			stats.surfaceTime += Time()-t;
 		};
 
+		const size_t _sectionCount0 = ThreadPool::SectionCount.load( std::memory_order_relaxed );
+		LevelSetExtraction::SetTableStats::Reset();
 		InitSlice( slabStartAtMaxDepth );
 		InitSlab( slabStartAtMaxDepth , true );	// This needs to be done in case the slice wants to push iso-vertices down to the slab
 		SetSliceValues( slabStartAtMaxDepth );
 		SetSliceIso( slabStartAtMaxDepth );
-		FinalizeSlice( slabStartAtMaxDepth );
+		{ double _tf = Time(); FinalizeSlice( slabStartAtMaxDepth ); stats.finalizeTime += Time()-_tf; }
 
 		// Iterate over the slabs at the finest level
 		for( unsigned int slab=slabStartAtMaxDepth ; slab<slabEndAtMaxDepth ; slab++)
@@ -2389,12 +2519,12 @@ public:
 			// Now compute the iso-edges
 			SetSlabIsoEdges( slab );
 
-			FinalizeSlice( slab+1 );
-			FinalizeSlab( slab );
+			{ double _tf = Time(); FinalizeSlice( slab+1 ); FinalizeSlab( slab ); stats.finalizeTime += Time()-_tf; }
 
 			IsoSurface( slab );
 		}
 
+		stats.sectionCount = ThreadPool::SectionCount.load( std::memory_order_relaxed ) - _sectionCount0;
 		if( pointEvaluator ) delete pointEvaluator;
 		size_t badRootCount = _BadRootCount;
 		if( badRootCount!=0 ) MK_WARN( "bad average roots: " , badRootCount );

@@ -52,6 +52,43 @@ namespace PoissonReconLib
 		// coarse as it needed. Padding the cube instead lets depth D land the cell
 		// exactly on the floor. See POISSON_CUBE_PAD_MAX in SceneReconstruct.cpp.
 		float scale          = 1.1f;   // --scale
+
+		// Worker threads for the solve. 0 = inherit the process-wide OpenMP setting
+		// (omp_get_max_threads(), which ReconstructMesh's --max-threads already sets),
+		// which is what a caller normally wants.
+		//
+		// This exists because PoissonRecon keeps its OWN thread pool, entirely separate
+		// from OpenMVS's: ThreadPool::Init is never called anywhere in the tree and
+		// ThreadPool::_NumThreads defaults to std::thread::hardware_concurrency(), while
+		// ParallelFor passes num_threads(_NumThreads) explicitly -- which also overrides
+		// the OMP_NUM_THREADS environment variable. So before this field the solve
+		// ignored --max-threads completely and always ran on every core; measured on
+		// RichmondHistoric, --max-threads 1 left every Poisson phase unchanged (normal
+		// field 17.8s -> 17.5s) while OpenMVS's own stages duly slowed down.
+		//
+		// The env var OPENMVS_POISSON_THREADS overrides this field when set, so the
+		// thread count can be swept without a rebuild.
+		unsigned int threads = 0;
+
+		// Sink for the solver's OWN per-phase trace -- "# Read input into tree",
+		// "#   Got kernel density", "#     Got normal field", "#       Finalized tree",
+		// "# Linear system solved", "#            Got Faces", the node/memory tallies.
+		// Each line carries that phase's elapsed time, so together they are the only
+		// account of where the solve's wall clock actually goes.
+		//
+		// PoissonRecon writes them to std::cout, and the OpenMVS logger reads nothing
+		// from std::cout: LogConsole swaps in a streambuf only when AllocConsole()
+		// SUCCEEDED (i.e. the process had no console), and that streambuf fputc's to
+		// stdout rather than raising a log record. So on a normal run the trace was
+		// generated in full and then dropped on the floor, leaving the single most
+		// expensive stage in the mesh pipeline as one unexplained interval in the log.
+		//
+		// When this is set, Reconstruct() swaps std::cout's streambuf for the duration
+		// of the solve and hands each COMPLETE line here instead. Only takes effect
+		// when `verbose` is also set; NULL leaves std::cout exactly where it pointed.
+		// Not reentrant -- it mutates process-global std::cout -- so do not run two
+		// Reconstruct() calls concurrently with a sink installed.
+		void (*logSink)( const char* line ) = nullptr;
 	};
 
 	// Parameters for the surface trimmer (SurfaceTrimmer.exe equivalents).
@@ -61,6 +98,13 @@ namespace PoissonReconLib
 		float aRatio        = 0.002f;  // --aRatio (island area ratio)
 		bool  removeIslands = true;    // --removeIslands
 		bool  verbose       = false;
+
+		// Sink for the trimmer's per-phase trace, same contract as ReconParams::logSink.
+		// Trim does NOT install the std::cout redirect that Reconstruct does, so without
+		// this the [TRIM-PROFILE] line goes to stdout and never reaches the log -- trim is
+		// the largest single item in POST-SOLVE (3.7-3.9 s) and was completely unattributed
+		// because of exactly that.
+		void (*logSink)( const char* line ) = nullptr;
 	};
 
 	// Screened-Poisson surface reconstruction, in memory.

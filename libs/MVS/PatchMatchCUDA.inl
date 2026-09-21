@@ -76,6 +76,20 @@
 #define PMCUDA_OPT_FP16_TEX 1
 #endif
 
+// How the ZNCC texel loop performs its projective division: 2 = one approximate
+// reciprocal plus two multiplies (~2 ulp, fastest), 1 = one correctly-rounded
+// reciprocal plus two multiplies (<=1 ulp), 0 = Eigen hnormalized(), two full
+// IEEE divisions (upstream arithmetic). Set from CMake via
+// OpenMVS_CUDA_FAST_DIV; the rationale and the accuracy argument are at
+// PMHNormalized in PatchMatchCUDA.cu. This is the ONE CUDA PatchMatch toggle
+// that changes results, so it is declared here rather than in the .cu: the host
+// side reports the compiled-in value once per run, because two builds differing
+// only in this are otherwise indistinguishable in a log -- the same trap the
+// estimator banner exists to close.
+#ifndef PMCUDA_OPT_FAST_DIV
+#define PMCUDA_OPT_FAST_DIV 2
+#endif
+
 
 // S T R U C T S ///////////////////////////////////////////////////
 

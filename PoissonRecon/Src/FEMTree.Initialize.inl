@@ -52,22 +52,31 @@ size_t FEMTreeInitializer< Dim , Real >::_Initialize( FEMTreeNode &node , int ma
 
 template< unsigned int Dim , class Real >
 template< typename IsValidFunctor /*=std::function< bool ( const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ... AuxData >
-size_t FEMTreeInitializer< Dim , Real >::Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... d , int maxDepth ,                                                                  Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process )
+size_t FEMTreeInitializer< Dim , Real >::Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... d , int maxDepth ,                                                                  Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process  , std::vector< Allocator< FEMTreeNode > * > *threadAllocators )
 {
-	return Initialize< IsValidFunctor , ProcessFunctor , AuxData ... >( root , pointStream , d... , maxDepth , [&]( Point< Real , Dim > ){ return maxDepth; } , nodeAllocator , NodeInitializer , IsValid , Process );
+	return Initialize< IsValidFunctor , ProcessFunctor , AuxData ... >( root , pointStream , d... , maxDepth , [maxDepth]( Point< Real , Dim > ){ return maxDepth; } , nodeAllocator , NodeInitializer , IsValid , Process  , threadAllocators );
 }
 
 template< unsigned int Dim , class Real >
-template< typename IsValidFunctor/*=std::function< bool ( const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ... AuxData >
-size_t FEMTreeInitializer< Dim , Real >::Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... d , int maxDepth , std::function< int ( Point< Real , Dim > ) > pointDepthFunctor , Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process )
+template< typename IsValidFunctor/*=std::function< bool ( const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , const AuxData &... ) >*/ , typename ... AuxData , typename PointDepthFunctor >
+size_t FEMTreeInitializer< Dim , Real >::Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... d , int maxDepth , PointDepthFunctor pointDepthFunctor , Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process  , std::vector< Allocator< FEMTreeNode > * > *threadAllocators )
 {
 	typename FEMTreeNode::SubTreeExtractor subtreeExtractor( root );
-	auto Leaf = [&]( FEMTreeNode& root , Point< Real , Dim > p , unsigned int maxDepth )
+	// Leaf takes its allocator EXPLICITLY and is generic on a thread-safety tag, because
+	// the parallel path below must hand each worker its own Allocator: Allocator::
+	// newElements mutates _state and push_back()s to _memory with no synchronisation, so
+	// one shared allocator across threads is memory corruption, not just contention. This
+	// is the same reason setInterpolatedDataField indexes nodeAllocators[thread].
+	auto Leaf = [&]( auto threadSafeTag , FEMTreeNode& root , Point< Real , Dim > p , unsigned int maxDepth , Allocator< FEMTreeNode > *alloc )
 		{
+			constexpr bool _ThreadSafe = decltype( threadSafeTag )::value;
 			for( int d=0 ; d<Dim ; d++ ) if( p[d]<0 || p[d]>1 ) return (FEMTreeNode*)NULL;
 			Point< Real , Dim > center;
 			Real width;
 			typename FEMTree< Dim , Real >::LocalDepth depth;
+			// `offset` is filled by depthAndOffset and then never read -- Leaf returns only
+			// the node. It used to be re-derived every level of every descent (Dim shifts +
+			// ors x 11 levels x 53.3M points); the per-level maintenance is gone below.
 			typename FEMTree< Dim , Real >::LocalOffset offset;
 			root.centerAndWidth( center , width );
 			root.depthAndOffset( depth , offset );
@@ -76,33 +85,112 @@ size_t FEMTreeInitializer< Dim , Real >::Initialize( FEMTreeNode &root , InputDa
 
 			while( depth<(int)maxDepth )
 			{
-				if( !node->children ) node->template initChildren< false >( nodeAllocator , NodeInitializer );
+				// _ThreadSafe selects _initChildren_s -- an optimistic build-then-CAS-install;
+				// a thread that loses the race abandons its 8 children into its own allocator.
+				if( !node->children ) node->template initChildren< _ThreadSafe >( alloc , NodeInitializer );
 				int cIndex = FEMTreeNode::ChildIndex( center , p );
 				node = node->children + cIndex;
 				width /= 2;
 
 				depth++;
 				for( int dd=0 ; dd<Dim ; dd++ )
-					if( (cIndex>>dd) & 1 ) center[dd] += width/2 , offset[dd] = (offset[dd]<<1) | 1;
-					else                   center[dd] -= width/2 , offset[dd] = (offset[dd]<<1) | 0;
+					if( (cIndex>>dd) & 1 ) center[dd] += width/2;
+					else                   center[dd] -= width/2;
 			}
 			return node;
 		};
 
-	// Add the point data
+	// Add the point data -- CHUNKED, DESCENT IN PARALLEL, PROCESS IN ORDER.
+	//
+	// This was a single serial loop: read a point, descend the octree to its leaf, hand the
+	// leaf to Process. On the larger measured scene that is 53.1M points each walking 11
+	// levels, on one core of 32, and it is most of the "Read input into tree" phase.
+	//
+	// The descent is what costs, and it parallelises. Process does not -- it assigns each
+	// new node a sample slot with `idx = samples->size()`, so SAMPLE INDICES FOLLOW THE
+	// ORDER POINTS ARRIVE, and the density estimator, the normal splat and the
+	// interpolation info all index off that. Threading Process would reorder every float
+	// accumulation downstream.
+	//
+	// So the two are split. Per chunk: descend every point in parallel, storing only the
+	// leaf pointer; then walk the chunk IN ORDER calling Process with the stored leaf.
+	// Process sees points in exactly the sequence it saw before, so sample indices, and
+	// everything derived from them, are unchanged. This is bit-identical, not equivalent.
+	//
+	// IsValid is evaluated in phase 1 and its result carried across, because it GATES the
+	// descent -- an invalid point must not create nodes, and calling Leaf for it would
+	// change the tree.
+	//
+	// Chunked rather than one pass over all points so the leaf array stays ~8 MB instead of
+	// 8 bytes x 53.1M = 425 MB.
+	//
+	// Node creation switches to the thread-safe variant (see Leaf above). Losers of its
+	// atomic install abandon 8 nodes into the allocator, and the ORDER node indices are
+	// handed out becomes nondeterministic -- neither matters here: the SET of nodes created
+	// is the union of every point's root-to-leaf path and does not depend on order, and
+	// SortedTreeNodes renumbers every node (treeNodes[i]->nodeData.nodeIndex = i) before
+	// anything reads those values.
 	size_t outOfBoundPoints = 0 , badDataCount = 0 , pointCount = 0;
-	Point< Real , Dim > p;
-	while( pointStream.read( p , d... ) )
+	if( !threadAllocators || threadAllocators->size()<(size_t)ThreadPool::NumThreads() )
 	{
-		// Check if the data is good
-		if( !IsValid( p , d... ) ){ badDataCount++ ; continue; }
+		// Original serial path, byte for byte. Taken whenever the caller has not supplied
+		// one Allocator per worker -- without those the descent CANNOT be threaded, because
+		// Allocator::newElements is unsynchronised.
+		Point< Real , Dim > p;
+		while( pointStream.read( p , d... ) )
+		{
+			if( !IsValid( p , d... ) ){ badDataCount++ ; continue; }
+			FEMTreeNode *leaf = Leaf( std::false_type{} , root , p , pointDepthFunctor(p) , nodeAllocator );
+			if( !leaf ){ outOfBoundPoints++ ; continue; }
+			if( Process( *leaf , p , d ... ) ) pointCount++;
+		}
+	}
+	else
+	{
+		static const size_t ChunkSize = 1<<20;
+		using PointRecord = std::tuple< Point< Real , Dim > , AuxData ... >;
+		std::vector< PointRecord > chunk;
+		std::vector< FEMTreeNode * > leaves( ChunkSize , (FEMTreeNode *)NULL );
+		std::vector< char > bad( ChunkSize , 0 );
+		chunk.reserve( ChunkSize );
 
-		// Check that the position is in-range
-		FEMTreeNode *leaf = Leaf( root , p , pointDepthFunctor(p) );
-		if( !leaf ){ outOfBoundPoints++ ; continue; }
+		Point< Real , Dim > p;
+		bool more = true;
+		while( more )
+		{
+			chunk.clear();
+			while( chunk.size()<ChunkSize )
+			{
+				if( !pointStream.read( p , d... ) ){ more = false ; break; }
+				chunk.push_back( PointRecord( p , d... ) );
+			}
+			if( chunk.empty() ) break;
 
-		// Process the data
-		if( Process( *leaf , p , d ... ) ) pointCount++;
+			// Phase 1: validity test and octree descent, in parallel. Writes only leaves[i]
+			// and bad[i], both disjoint per i, and allocates only from this worker's own
+			// Allocator.
+			ThreadPool::ParallelFor( 0 , chunk.size() , [&]( unsigned int thread , size_t i )
+				{
+					PointRecord &rec = chunk[i];
+					// Non-const refs, deliberately. The IsValid at line ~225 of this file takes
+					// `AuxData &`, so const references cannot bind to it; non-const ones bind
+					// to that, to `const AuxData &`, and to by-value parameters alike. `rec` is
+					// a non-const element of the chunk, so std::apply yields lvalues.
+					const bool ok = std::apply( [&]( Point< Real , Dim > &_p , AuxData & ... _d ){ return IsValid( _p , _d... ); } , rec );
+					bad[i] = ok ? 0 : 1;
+					leaves[i] = ok ? Leaf( std::true_type{} , root , std::get< 0 >( rec ) , pointDepthFunctor( std::get< 0 >( rec ) ) , (*threadAllocators)[thread] ) : (FEMTreeNode *)NULL;
+				} );
+
+			// Phase 2: in stream order, exactly as the serial loop above runs.
+			for( size_t i=0 ; i<chunk.size() ; i++ )
+			{
+				if( bad[i] ){ badDataCount++ ; continue; }
+				if( !leaves[i] ){ outOfBoundPoints++ ; continue; }
+				FEMTreeNode &leaf = *leaves[i];
+				const bool counted = std::apply( [&]( Point< Real , Dim > &_p , AuxData & ... _d ){ return Process( leaf , _p , _d... ); } , chunk[i] );
+				if( counted ) pointCount++;
+			}
+		}
 	}
 	pointStream.reset();
 	return pointCount;

@@ -31,6 +31,11 @@
 
 #include "Common.h"
 #include "Mesh.h"
+
+#include <memory>   // std::unique_ptr -- ComputeMedianEdgeLength
+#include <cstdlib>  // std::getenv -- OPENMVS_MESH_REORDER
+#include <tbb/parallel_sort.h>
+#include <cstring>  // std::memmove -- ComputeMedianEdgeLength
 // fix non-manifold vertices
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/filtered_graph.hpp>
@@ -528,6 +533,94 @@ using namespace MVS;
 static constexpr size_t BLOCK_SIZE = 8 * 1024 * 1024;  // objects per block
 std::vector<void*> g_qBlocks;
 size_t g_qOffset = BLOCK_SIZE;
+
+// Decimation setup sub-phase timings; declared in vcg/complex/algorithms/local_optimization.h
+// and filled from inside vcglib's Init. See the [DECI-PROFILE] line below.
+DeciSetupTimes g_deciSetup = {};
+
+// OPENMVS_MESH_DECI_AUDIT=1 turns on the per-collapse invariant checks in
+// LocalOptimization::DoOptimization. Read once: this is on the pop path.
+bool g_deciAudit = [](){ const char* e = std::getenv("OPENMVS_MESH_DECI_AUDIT");
+                         return e && std::atoi(e) > 0; }();
+
+// Lazy revalidation: UpdateHeap stops re-adding the ~50% of candidates whose priority
+// provably cannot have changed (neither endpoint is the survivor), and their existing
+// entries are revalidated at pop instead. DEFAULT ON; OPENMVS_MESH_DECI_LAZY=0 reverts.
+//
+// It trades away the invariant that collapse legality is guaranteed by bump-and-re-add --
+// which in this configuration is the ONLY thing guaranteeing it, since IsFeasible is
+// commented out at the pop site AND returns true unconditionally when PreserveTopology is
+// false, which runDecimate sets. In its place IsUpToDate asks the real question directly
+// (do the endpoints still share a face?) and a second per-vertex mark, QHelper::Gm,
+// separates "this vertex's geometry changed" from "the local topology was touched".
+//
+// VALIDATED on two scenes with OPENMVS_MESH_DECI_AUDIT=1, both non-edge 0 / priority
+// stale 0 / max rel 0.000e+00:
+//   RichmondHistoric 4,640,580 collapses   loop 12.979 -> 11.678 s, calls -51.5%
+//   Marco            7,811,596 collapses   loop -9.5%/collapse,     calls -50.1%
+// ~34M pool allocations avoided per run (~1.2 GB) on RichmondHistoric alone.
+//
+// The audit is cheap (~15-27 ns per extra ComputePriority -- the pop site already
+// prefetches both quadrics) and it has already caught one real bug here, a mark
+// off-by-one that produced NO visible symptom: no crash, no non-manifold output, face
+// count in band. Re-run it after ANY change to the staleness logic.
+bool g_deciLazy = [](){ const char* e = std::getenv("OPENMVS_MESH_DECI_LAZY");
+                        return !(e && std::atoi(e) == 0); }();
+
+// OPENMVS_MESH_QUADRIC_FP32_PROBE=1 measures whether float quadric storage would be
+// viable, WITHOUT changing the storage. See FP32-PROBE in local_optimization.h.
+bool g_deciFp32Probe = [](){ const char* e = std::getenv("OPENMVS_MESH_QUADRIC_FP32_PROBE");
+                             return e && std::atoi(e) > 0; }();
+
+// OPENMVS_MESH_QUADRIC_RECENTRED=1 switches decimation to 40-byte recentred float
+// quadrics (see CLEAN::RQuadric). DEFAULT OFF until validated end to end: the numerics
+// are already proven by FP32-PROBE on two scenes, but the IMPLEMENTATION -- three frame
+// translations, in InitQuadric, ComputePosition and Execute -- is not. A sign or frame
+// error there would be invisible in the face count, which decimation drives to ~4.06M
+// regardless. Validate with OPENMVS_MESH_DECI_AUDIT=1.
+bool g_deciRecentred = [](){ const char* e = std::getenv("OPENMVS_MESH_QUADRIC_RECENTRED");
+                             return e && std::atoi(e) > 0; }();
+
+// OPENMVS_MESH_DECI_LOOPPROF=1 splits the collapse loop into pop / stale / Execute /
+// UpdateHeap / other. Do NOT combine with the audit or fp32 probe: both call
+// ComputePriority on the pop path and their cost would land inside tscExec.
+bool g_deciLoopProf = [](){ const char* e = std::getenv("OPENMVS_MESH_DECI_LOOPPROF");
+                            return e && std::atoi(e) > 0; }();
+
+// [EXEC-PROFILE] counters. Declared at global scope in vcg/simplex/face/topology.h (and
+// mirrored in local_optimization.h, which carries the explanation). Exact counts, not
+// timings -- Execute's parts are at the scale where this file's own rdtsc splits are
+// documented as unreliable.
+unsigned long long g_execCollapses = 0;
+unsigned long long g_execRingV0 = 0;
+unsigned long long g_execAv01 = 0;
+unsigned long long g_execAv0 = 0;
+unsigned long long g_vfDetachCalls = 0;
+unsigned long long g_vfDetachHead = 0;
+unsigned long long g_vfDetachSteps = 0;
+
+// FULL LAZY was implemented here and REVERTED. UpdateHeap pushed nothing at all; stale
+// entries were left in the heap and repaired at pop time by resolving both endpoints
+// through a per-vertex collapse-forwarding chain, recomputing the priority there and
+// re-keying. Correct -- it ran clean and hit the same face target -- but MEASURED on
+// RichmondHistoric it LOSES badly:
+//     loop 11.97 -> 20.76 s | pops 9.19M -> 27.37M | priority calls 31.87M -> 24.68M
+// The surfacing count (re-keys) came out at 20.0M against a ~9M breakeven.
+//
+// WHY, because the reasoning is the reusable part: eager pushes the edge's TRUE priority,
+// so the edge sinks deep in the heap and only its cheap garbage copy surfaces. Lazy has no
+// fresh entry -- the low-keyed record IS the edge -- so every invalidation eventually
+// forces a surfacing. Re-keys therefore track the INVALIDATION count (eager's 31.87M
+// pushes), not the garbage-surfacing count (4.54M). Pops tripled to save 23% of the
+// priority calls.
+//
+// It also measured the hole in the monotonicity argument: 805,972 pops (2.94%) had a key
+// ABOVE the recomputed priority, by up to a factor of two, because ComputePosition falls
+// back to the edge midpoint on singular systems. That is not a lower bound.
+//
+// Do not retry without a different data structure. The 71%-of-entries-never-popped waste
+// is real, but eliminating it needs one entry per edge (an indexed heap with decrease-key,
+// hence an edge -> slot map), not laziness.
 
 // S T R U C T S ///////////////////////////////////////////////////
 
@@ -1721,6 +1814,40 @@ namespace CLEAN {
 	// decimation helper classes
 	typedef	vcg::SimpleTempData< Mesh::VertContainer, vcg::math::Quadric<double> > QuadricTemp;
 
+	// Per-vertex GEOMETRY mark for the lazy-revalidation scheme (OPENMVS_MESH_DECI_LAZY).
+	// Holds the GlobalMark value at which this vertex last SURVIVED a collapse, i.e. the
+	// last time its quadric and position changed. A heap entry's stored priority is still
+	// correct iff its creation mark is >= this for both endpoints -- which lets the
+	// topology mark (IMark) and the priority validity stop being the same test.
+	typedef	vcg::SimpleTempData< Mesh::VertContainer, int > GMarkTemp;
+
+	// RECENTRED FLOAT QUADRIC -- 40 bytes instead of Quadric<double>'s 80.
+	//
+	// Stored RELATIVE TO ITS OWN VERTEX. A quadric translation is exact -- for y = x - r,
+	// A' = A, b' = b + 2Ar, c' = Q(r) -- and since r lies on the surface, b' becomes
+	// O(displacement) and c' O(displacement^2) instead of O(d) and O(d^2), where
+	// d = n.p is the distance from the WORLD ORIGIN to the plane.
+	//
+	// That distinction is the whole reason this works. MEASURED with
+	// OPENMVS_MESH_QUADRIC_FP32_PROBE=1, rounding every coefficient to float and
+	// re-running the real ComputePriority:
+	//                      world-frame float        recentred float
+	//   RichmondHistoric   61.66% of collapses      0.00%  (123 of 4.64M)
+	//   Marco              86.08% reorder           0.00%  (6 of 7.81M)
+	//   coefficient range  3.5e4 / 3.3e5            1.3e-7 / 3.7e-4
+	// World-frame float was never viable on any scene; recentred passes on both.
+	//
+	// WHY IT PAYS: the decimate loop does two random loads out of this array per
+	// ComputePriority (390 ns/call, 21.6 s of an 86 s Marco run). 40 bytes fits in ONE
+	// cache line where 80 spans two, and the array drops 779 -> 390 MB on Marco.
+	struct RQuadric {
+		float a[6];   // A: a11 a12 a13 a22 a23 a33 -- translation-INVARIANT
+		float b[3];   // b' = b + 2Ar
+		float c;      // c' = Q(r)
+		inline void SetZero() { a[0]=a[1]=a[2]=a[3]=a[4]=a[5]=0.f; b[0]=b[1]=b[2]=0.f; c=0.f; }
+	};
+	typedef	vcg::SimpleTempData< Mesh::VertContainer, RQuadric > RQuadricTemp;
+
 	class QHelper
 	{
 	public:
@@ -1728,6 +1855,14 @@ namespace CLEAN {
 		static void Init() {}
 		static vcg::math::Quadric<double>& Qd(const Vertex& v) { return TD()[v]; }
 		static vcg::math::Quadric<double>& Qd(const Vertex* v) { return TD()[*v]; }
+		static GMarkTemp*& GMp() { static GMarkTemp* gm; return gm; }
+		static GMarkTemp& GM() { return *GMp(); }
+		static int& Gm(const Vertex& v) { return GM()[v]; }
+		static int& Gm(const Vertex* v) { return GM()[*v]; }
+		static RQuadricTemp*& RQp() { static RQuadricTemp* rq; return rq; }
+		static RQuadricTemp& RQ() { return *RQp(); }
+		static RQuadric& Rq(const Vertex& v) { return RQ()[v]; }
+		static RQuadric& Rq(const Vertex* v) { return RQ()[*v]; }
 		static Vertex::ScalarType W(Vertex* /*v*/) { return 1.0; }
 		static Vertex::ScalarType W(Vertex& /*v*/) { return 1.0; }
 		static void Merge(Vertex& /*v_dest*/, Vertex const& /*v_del*/) {}
@@ -1766,7 +1901,14 @@ namespace CLEAN {
 				::operator delete(block, std::nothrow);
 			}
 			g_qBlocks.clear();
-			g_qOffset = 0;
+			// MUST be BLOCK_SIZE, not 0. operator new only allocates a fresh block when
+			// g_qOffset == BLOCK_SIZE; leaving it at 0 with g_qBlocks now empty means the
+			// next allocation skips the block creation and calls g_qBlocks.back() on an
+			// empty vector. The static initialiser gets this right (g_qOffset = BLOCK_SIZE),
+			// which is why the first pass works; Release did not. The non-manifold fallback
+			// runDecimate below is a second pass after a Finalize -> Release, so it lands
+			// exactly there.
+			g_qOffset = BLOCK_SIZE;
 		}
 	};
 };
@@ -1934,6 +2076,60 @@ struct CleanStats
 	int removedNonManifoldFaces = 0;
 };
 
+// [CLEAN-PROFILE] -- per-pass wall clock for Mesh::Clean.
+//
+// Clean is the largest block left in ReconstructMesh -- ~6.5 s of a ~21 s run on
+// MechanicFalls -- and the only one with no cost breakdown. Every DIAG line it emits
+// reports what a pass REMOVED, never what the pass TOOK, and the one self-timing pass
+// is decimation ("Decimating ... 1s946ms"). That left ~4.5 s attributed to "everything
+// else", which is not a basis for optimising anything. The Poisson solve had exactly
+// this problem until its own trace was routed into the log, and the breakdown is what
+// made the wins there findable at all.
+//
+// MARKS, NOT SCOPED TIMERS. The phases here are delimited by top-level statements, not
+// by blocks, so a Mark() between two statements needs no restructuring and cannot
+// silently mis-attribute by landing on the wrong brace. Every Mark() sits at function
+// scope AND outside every #if: a mark inside a disabled block would vanish and fold its
+// interval into a neighbouring phase without saying so, which is the failure mode that
+// makes a profile lie rather than merely be coarse.
+//
+// A phase name labels the interval that just ENDED, not the one about to begin.
+//
+// Rides MESH_DIAG, and the gate is checked in Mark() as well as Report(): the gate is a
+// compile-time constant, so a build without it folds the whole thing away rather than
+// carrying thirteen clock reads and a heap-allocating vector.
+struct CleanProfile
+{
+	typedef std::chrono::steady_clock Clock;
+
+	CleanProfile() : t0(Clock::now()), last(t0) {}
+
+	void Mark(const char* name) {
+		if (!MESH_DIAG_ENABLED())
+			return;
+		const Clock::time_point now = Clock::now();
+		phases.emplace_back(name, std::chrono::duration<double>(now - last).count());
+		last = now;
+	}
+
+	void Report() const {
+		if (!MESH_DIAG_ENABLED() || phases.empty())
+			return;
+		std::string s;
+		char buf[64];
+		for (const std::pair<const char*, double>& ph : phases) {
+			snprintf(buf, sizeof(buf), "%s=%.3f ", ph.first, ph.second);
+			s += buf;
+		}
+		MESH_DIAG("[CLEAN-PROFILE] %stotal=%.3f (seconds)", s.c_str(),
+			std::chrono::duration<double>(Clock::now() - t0).count());
+	}
+
+private:
+	Clock::time_point t0, last;
+	std::vector<std::pair<const char*, double>> phases;
+};
+
 static void KillEdges(CLEAN::Mesh& mesh) {
 	for (auto& e : mesh.edge)
 		vcg::tri::Allocator<CLEAN::Mesh>::DeleteEdge(mesh, e);
@@ -2085,32 +2281,243 @@ static inline void FastClean(CLEAN::Mesh& m, CleanStats& clean)
 	}
 }
 
-float ComputeMedianEdgeLength(const CLEAN::Mesh& mesh)
+// ---- Spatial vertex reorder (EXPERIMENTAL -- default OFF, OPENMVS_MESH_REORDER=1) --
+//
+// Why: MEASURED, twice. ComputePriority costs 117 ns/call during the heap build but
+// 205 ns/call inside the collapse loop -- the SAME function, 1.75x slower, reproducible
+// (202.5/116.9 then 205.2/117.4). The heap build walks vertices in index order; the loop
+// walks scattered collapse neighbourhoods. Each call loads two Quadric<double> (80 B) out
+// of a 533 MB per-vertex array, so that 1.75x is a locality penalty and nothing else.
+// Renumbering vertices along a Morton curve makes topological neighbours into memory
+// neighbours, which is what the quadric array, the VF rings and the heap loads all key on.
+//
+// NOT bit-identical. The heap is enumerated in vertex order, so ties break differently and
+// the collapse sequence shifts. The face-count floor is a TARGET, so the output face count
+// is unchanged, but the geometry differs microscopically -- the same class of
+// nondeterminism the Poisson normal-field splat already has. That is why this defaults OFF
+// rather than being switched on unmeasured.
+//
+// Returns false (and changes nothing) if it cannot run.
+static inline uint64_t _Part1By2_21(uint32_t x)
 {
-	std::vector<float> edgeLens2;
-	edgeLens2.reserve(mesh.fn * 3);
+	uint64_t v = x & 0x1FFFFFull;
+	v = (v | (v << 32)) & 0x1F00000000FFFFull;
+	v = (v | (v << 16)) & 0x1F0000FF0000FFull;
+	v = (v | (v <<  8)) & 0x100F00F00F00F00Full;
+	v = (v | (v <<  4)) & 0x10C30C30C30C30C3ull;
+	v = (v | (v <<  2)) & 0x1249249249249249ull;
+	return v;
+}
 
-	for (const auto& f : mesh.face) {
-		if (f.IsD()) continue;
+static bool SpatiallyReorderVertices(CLEAN::Mesh& mesh)
+{
+	// Compacted mesh only. The permutation is a scatter, so any deleted element would
+	// need index-space bookkeeping this deliberately does not do -- bail instead.
+	if (mesh.vert.size() != (size_t)mesh.vn || mesh.face.size() != (size_t)mesh.fn)
+		return false;
+	const size_t nV = mesh.vert.size();
+	if (nV < 2)
+		return false;
 
-		for (int i = 0; i < 3; ++i) {
-			const auto* v0 = f.V(i);
-			const auto* v1 = f.V((i + 1) % 3);
-			const float d2 = (v1->cP() - v0->cP()).SquaredNorm();
-			if (d2 > 0) // skip degenerate edges
-				edgeLens2.push_back(d2);
-		}
+	vcg::tri::UpdateBounding<CLEAN::Mesh>::Box(mesh);
+	const float bx = mesh.bbox.min[0], by = mesh.bbox.min[1], bz = mesh.bbox.min[2];
+	const float ex = mesh.bbox.max[0]-bx, ey = mesh.bbox.max[1]-by, ez = mesh.bbox.max[2]-bz;
+	constexpr float kQMax = 2097151.f;  // 2^21 - 1
+	const float sx = ex > 0 ? kQMax/ex : 0.f, sy = ey > 0 ? kQMax/ey : 0.f, sz = ez > 0 ? kQMax/ez : 0.f;
+
+	// DEFAULT-initialised, not value-initialised: every slot is written unconditionally
+	// by the loop below, so the zero-fill a std::vector would do (~107 MB at 6.67M verts)
+	// is a pure extra pass over memory that is about to be overwritten. std::pair cannot
+	// express this -- its default constructor value-initialises its members, so even
+	// `new std::pair[n]` zeroes. A POD aggregate can.
+	struct MortonKey { uint64_t code; uint32_t idx; };
+	std::unique_ptr<MortonKey[]> keys(new MortonKey[nV]);
+#pragma omp parallel for schedule(static)
+	for (int i = 0; i < (int)nV; ++i) {
+		const auto& p = mesh.vert[i].cP();
+		const uint32_t qx = (uint32_t)std::min(kQMax, std::max(0.f, (p[0]-bx)*sx));
+		const uint32_t qy = (uint32_t)std::min(kQMax, std::max(0.f, (p[1]-by)*sy));
+		const uint32_t qz = (uint32_t)std::min(kQMax, std::max(0.f, (p[2]-bz)*sz));
+		keys[i].code = _Part1By2_21(qx) | (_Part1By2_21(qy)<<1) | (_Part1By2_21(qz)<<2);
+		keys[i].idx  = (uint32_t)i;
+	}
+	// Tie-break on idx, exactly as the std::pair ordering did. parallel_sort is NOT
+	// stable, so comparing on code alone would leave vertices that quantise into the same
+	// 21-bit cell in an arbitrary order -- a different permutation every run, and hence a
+	// different collapse sequence every run. Keeping the tie-break keeps the reorder
+	// deterministic for a given input.
+	tbb::parallel_sort(keys.get(), keys.get() + nV,
+		[](const MortonKey& a, const MortonKey& b) {
+			return a.code != b.code ? a.code < b.code : a.idx < b.idx;
+		});
+
+	// Same reasoning: fully overwritten below, so skip the fill (~27 MB).
+	std::unique_ptr<uint32_t[]> newIdx(new uint32_t[nV]);   // old index -> new index
+#pragma omp parallel for schedule(static)
+	for (int n = 0; n < (int)nV; ++n)
+		newIdx[keys[(size_t)n].idx] = (uint32_t)n;
+
+	// Scatter through a temp buffer. In-place is NOT an option: vcg's own
+	// PermutateVertexVector writes forward (m.vert[remap[i]] = m.vert[i]) and is therefore
+	// only valid for COMPACTION, where remap[i] <= i. An arbitrary permutation would
+	// clobber records it has not read yet.
+	{
+		// NOTE this one is NOT the redundant-fill case that keys/newIdx were. CLEAN::Vertex
+		// is not trivially default-constructible -- vcg::vertex::BitFlags and VFAdj both have
+		// user-provided default ctors (_flags=0, _fp=0, _zp=-1) -- so `new Vertex[n]` would
+		// run exactly the same constructors a sized vector does. Eliding them needs raw
+		// storage plus placement copy-construction, which buys ~20 ms of a ~400 ms reorder
+		// and costs alignment/UB care. Left alone deliberately.
+		std::vector<CLEAN::Vertex> tmp(nV);
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < (int)nV; ++i) tmp[newIdx[(size_t)i]] = mesh.vert[i];
+#pragma omp parallel for schedule(static)
+		for (int i = 0; i < (int)nV; ++i) mesh.vert[i] = tmp[(size_t)i];
 	}
 
-	if (edgeLens2.empty())
+	// Face corner pointers. The vertex ARRAY did not move, only its contents, so
+	// (f.V(j) - base) still yields the OLD index of that corner.
+	CLEAN::Vertex* const base = &mesh.vert[0];
+	const int nF = (int)mesh.face.size();
+#pragma omp parallel for schedule(static)
+	for (int fi = 0; fi < nF; ++fi) {
+		auto& f = mesh.face[fi];
+		if (f.IsD()) continue;
+		for (int j = 0; j < 3; ++j)
+			f.V(j) = base + newIdx[(size_t)(f.V(j) - base)];
+	}
+	// VF adjacency is rebuilt by TriEdgeCollapseQuadric::Init, so it is not fixed here.
+
+	return true;
+}
+
+
+// Median edge length, EXACT -- same multiset, same nth_element, same answer as the
+// serial original. Do NOT switch this to a sampled estimate: the result feeds errorDev
+// for decimation and the span gates for hole-closing and sealing, which are tuned
+// scale-relative thresholds. A sampled median is a different number into tuned knobs,
+// and stride sampling over face order biases wherever edge length correlates with
+// region.
+//
+// Called 3x per Clean (sail-peel and deflate are compiled out): once pre-decimation at
+// 13.3M faces = 40M edges -- ~1.7s, the gap between CLEAN-PROFILE decimate= and
+// DECI-PROFILE -- and twice post-decimation at 4.07M faces, inside holes= and seal=.
+//
+// The cost is the GATHER, not the selection: 3 vertex-pointer dereferences per face
+// into a 6.67M-vertex array is ~40M scattered 12-byte reads, i.e. memory-latency
+// bound. Threads buy memory-level parallelism here, which is the whole point; the
+// push_back capacity check was never the problem. Each thread fills its own vector and
+// they are concatenated; nth_element does not care about order, so the multiset -- and
+// therefore the median -- is identical to the serial version.
+//
+// NOTE each interior edge is counted TWICE, once per incident face. That is the
+// original behaviour and the downstream thresholds are tuned against it; preserved.
+float ComputeMedianEdgeLength(const CLEAN::Mesh& mesh)
+{
+	const int nFaces = (int)mesh.face.size();
+	if (nFaces <= 0)
 		return 0.0f;
 
-	const size_t mid = edgeLens2.size() / 2;
-	std::nth_element(edgeLens2.begin(),
-		edgeLens2.begin() + mid,
-		edgeLens2.end());
+	// ONE buffer of 3*nFaces, not per-thread vectors plus a concatenation: this stage is
+	// memory-governed (see the MESH-MEM line) and the two-buffer version would peak at
+	// ~320 MB on a 13.3M-face mesh instead of ~160 MB. Default-initialised, so no
+	// zero-fill of 160 MB that is about to be overwritten.
+	//
+	// Thread t owns faces [lo,hi) and writes into [3*lo, 3*hi), which is exactly big
+	// enough because a face contributes at most 3 edges. Deleted and degenerate edges
+	// leave gaps, so the segments are compacted afterwards. nth_element does not care
+	// about order -- the multiset is identical to the serial original.
+	const size_t cap = (size_t)nFaces * 3;
+	std::unique_ptr<float[]> buf(new float[cap]);
+	const int nThreads = std::max(1, omp_get_max_threads());
+	std::vector<size_t> segLo((size_t)nThreads), segCnt((size_t)nThreads, 0);
+#pragma omp parallel for schedule(static)
+	for (int t = 0; t < nThreads; ++t) {
+		const int lo = (int)((int64_t)nFaces * t / nThreads);
+		const int hi = (int)((int64_t)nFaces * (t + 1) / nThreads);
+		float* __restrict dst = buf.get() + (size_t)lo * 3;
+		float* __restrict p = dst;
+		for (int fi = lo; fi < hi; ++fi) {
+			const auto& f = mesh.face[fi];
+			if (f.IsD()) continue;
+			for (int i = 0; i < 3; ++i) {
+				const auto* v0 = f.V(i);
+				const auto* v1 = f.V((i + 1) % 3);
+				const float d2 = (v1->cP() - v0->cP()).SquaredNorm();
+				if (d2 > 0) // skip degenerate edges
+					*p++ = d2;
+			}
+		}
+		segLo[(size_t)t] = (size_t)lo * 3;
+		segCnt[(size_t)t] = (size_t)(p - dst);
+	}
 
-	return std::sqrt(edgeLens2[mid]);
+	// Close the gaps left by deleted/degenerate edges, in thread order.
+	size_t n = segCnt[0];
+	for (int t = 1; t < nThreads; ++t) {
+		if (segCnt[(size_t)t] && segLo[(size_t)t] != n)
+			std::memmove(buf.get() + n, buf.get() + segLo[(size_t)t], segCnt[(size_t)t] * sizeof(float));
+		n += segCnt[(size_t)t];
+	}
+
+	if (n == 0)
+		return 0.0f;
+
+	const size_t mid = n / 2;
+
+	// PARALLEL SELECTION, and EXACT -- the same element std::nth_element would pick.
+	//
+	// The gather above is threaded but the selection was not, and it runs over ~40M
+	// squared lengths (160 MB) on the pre-decimation mesh: introselect makes several
+	// passes over all of it on one core, which is most of the gap between
+	// CLEAN-PROFILE decimate= and the DECI-PROFILE phases.
+	//
+	// buf holds SQUARED lengths, so every value is >= 0, and for non-negative IEEE
+	// floats the 32-bit pattern orders identically to the value. Bucketing on the top
+	// 16 bits of the pattern is therefore a MONOTONE partition: every element of bucket
+	// b is <= every element of bucket b+1. Count the buckets in parallel, walk the
+	// cumulative counts to find the one containing rank `mid`, and run the ordinary
+	// nth_element on just that bucket. Same answer, because the element of rank `mid`
+	// overall is the element of rank (mid - cumulative-before) within its bucket.
+	//
+	// 16 bits = sign + exponent + 7 mantissa bits, i.e. 128 buckets per octave, so even
+	// a tightly clustered edge-length distribution spreads over enough buckets to keep
+	// the final exact pass small.
+	{
+		constexpr int kBits = 16;
+		constexpr int kNB = 1 << kBits;
+		const int nT = std::max(1, omp_get_max_threads());
+		std::unique_ptr<uint32_t[]> hist(new uint32_t[(size_t)kNB * nT]);
+		std::memset(hist.get(), 0, (size_t)kNB * nT * sizeof(uint32_t));
+		const uint32_t* __restrict bits = reinterpret_cast<const uint32_t*>(buf.get());
+#pragma omp parallel for schedule(static)
+		for (int t = 0; t < nT; ++t) {
+			uint32_t* __restrict h = hist.get() + (size_t)t * kNB;
+			const size_t lo = n * (size_t)t / (size_t)nT;
+			const size_t hi = n * (size_t)(t + 1) / (size_t)nT;
+			for (size_t i = lo; i < hi; ++i) ++h[bits[i] >> (32 - kBits)];
+		}
+		size_t cum = 0; int target = -1;
+		for (int b = 0; b < kNB && target < 0; ++b) {
+			size_t c = 0;
+			for (int t = 0; t < nT; ++t) c += hist[(size_t)t * kNB + b];
+			if (cum + c > mid) target = b; else cum += c;
+		}
+		if (target >= 0) {
+			std::vector<float> sub;
+			sub.reserve(4096);
+			const uint32_t tb = (uint32_t)target;
+			for (size_t i = 0; i < n; ++i) if ((bits[i] >> (32 - kBits)) == tb) sub.push_back(buf[i]);
+			const size_t k = mid - cum;
+			if (k < sub.size()) {
+				std::nth_element(sub.begin(), sub.begin() + k, sub.end());
+				return std::sqrt(sub[k]);
+			}
+		}
+		// Unreachable for finite input; fall through to the exact serial path.
+	}
+	std::nth_element(buf.get(), buf.get() + mid, buf.get() + n);
+	return std::sqrt(buf[mid]);
 }
 
 static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
@@ -2122,10 +2529,23 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 		return;
 	}
 
+	// [SPIKE-PROFILE] -- RemoveSpikes had no threading at all (0 omp pragmas in 117
+	// lines) and shows up as ~3.1 s of Clean, but it is four different things and only
+	// some of them can be threaded. Split so the next change targets the right one:
+	//   csr      building the incident-face adjacency (2 passes over every face, and an
+	//            incFacesFlat of ~40M FacePointers = ~320 MB on a 13.3M-face mesh)
+	//   seed     scanning for valence-1 vertices
+	//   cascade  the pruning worklist -- SEQUENTIAL by nature, and it removes ~235
+	//            vertices of 6.67M on these scenes, so it should be nearly free
+	//   rebuild  RemoveUnreferencedVertex + KillEdges + both Compact* + FaceFace +
+	//            VertexFace -- full mesh rebuilds, run regardless of how little changed
+	const Clock::time_point tSpike0 = Clock::now();
+
 	const int numVerts = (int)mesh.vert.size();
 	std::vector<int> valence(numVerts, 0);
 	std::vector<uint8_t> alive(numVerts, 0);
 
+#pragma omp parallel for schedule(static)
 	for (int i = 0; i < numVerts; ++i)
 		alive[i] = mesh.vert[i].IsD() ? 0u : 1u;
 
@@ -2133,24 +2553,28 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 		return int(vp - &mesh.vert[0]);
 		};
 
-	// Pass 1: count valence
-	size_t numFaceRefs = 0;
-	for (auto& f : mesh.face) {
+	// Pass 1: count valence.
+	// Parallel with interlocked increments -- counting is order-independent, so the
+	// result is identical to the serial version. Same pattern already used for the
+	// degree histogram earlier in this file. numFaceRefs is gone: it was just
+	// sum(valence), which the prefix sum below already produces as `run`.
+	const int numFacesAll = (int)mesh.face.size();
+#pragma omp parallel for schedule(static)
+	for (int fi = 0; fi < numFacesAll; ++fi) {
+		auto& f = mesh.face[fi];
 		if (f.IsD()) continue;
-		auto* v0 = f.V(0);
-		auto* v1 = f.V(1);
-		auto* v2 = f.V(2);
-		const int i0 = vpIndex(v0);
-		const int i1 = vpIndex(v1);
-		const int i2 = vpIndex(v2);
+		const int i0 = vpIndex(f.V(0));
+		const int i1 = vpIndex(f.V(1));
+		const int i2 = vpIndex(f.V(2));
 
 		if (!(alive[i0] & alive[i1] & alive[i2])) continue;
 
-		valence[i0]++; valence[i1]++; valence[i2]++;
-		numFaceRefs += 3;
+		_InterlockedIncrement(reinterpret_cast<long*>(&valence[i0]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&valence[i1]));
+		_InterlockedIncrement(reinterpret_cast<long*>(&valence[i2]));
 	}
 
-	// CSR offsets
+	// CSR offsets (serial prefix sum)
 	std::vector<uint32_t> incOffsets(numVerts + 1);
 	uint64_t run = 0;
 	for (int i = 0; i < numVerts; ++i) {
@@ -2159,8 +2583,11 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 	}
 	incOffsets[numVerts] = (uint32_t)run;
 
-	// Pass 2: fill flat incident-face array
-	std::vector<CLEAN::Mesh::FacePointer> incFacesFlat(numFaceRefs);
+	// Pass 2: fill flat incident-face array.
+	// Deliberately left SERIAL. The cursor bump would need to be atomic, and the order
+	// of faces within a vertex's range would then be nondeterministic -- which changes
+	// the order the cascade deletes faces in, and so can change the output mesh.
+	std::vector<CLEAN::Mesh::FacePointer> incFacesFlat((size_t)run);
 	std::vector<uint32_t> cursor = incOffsets;
 	for (auto& f : mesh.face) {
 		if (f.IsD()) continue;
@@ -2176,6 +2603,9 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 		incFacesFlat[cursor[i2]++] = &f;
 	}
 
+	const double tCsr = std::chrono::duration<double>(Clock::now() - tSpike0).count();
+	const Clock::time_point tSeed0 = Clock::now();
+
 	auto facesBegin = [&](int vi) { return incFacesFlat.data() + incOffsets[vi]; };
 	auto facesEnd = [&](int vi) { return incFacesFlat.data() + incOffsets[vi + 1]; };
 
@@ -2185,6 +2615,9 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 	for (int i = 0; i < numVerts; ++i)
 		if (alive[i] && valence[i] == 1)
 			q.push_back(i);
+
+	const double tSeed = std::chrono::duration<double>(Clock::now() - tSeed0).count();
+	const Clock::time_point tCasc0 = Clock::now();
 
 	// Spike pruning (with cascading)
 	size_t head = 0;
@@ -2220,14 +2653,41 @@ static void RemoveSpikes(CLEAN::Mesh& mesh, CleanStats& stats)
 		++nTotalSpikes;
 	}
 
+	const double tCasc = std::chrono::duration<double>(Clock::now() - tCasc0).count();
+	const Clock::time_point tReb0 = Clock::now();
+
 	int removedUnref = vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 	stats.removedVerts += removedUnref;
 
 	KillEdges(mesh);
+	// The compaction STAYS: DeleteFace/DeleteVertex above leave holes, and the Morton
+	// vertex reorder before decimation bails unless vert.size()==vn.
 	vcg::tri::Allocator<CLEAN::Mesh>::CompactVertexVector(mesh);
 	vcg::tri::Allocator<CLEAN::Mesh>::CompactFaceVector(mesh);
-	vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-	vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+
+	// FaceFace + VertexFace used to be rebuilt here -- two full topology passes over a
+	// 13-19M-face mesh to reflect the ~250-400 vertices this function actually removed.
+	// Measured as the bulk of [SPIKE-PROFILE] rebuild= (1.69 s RichmondHistoric, 2.59 s
+	// Marco) against csr=0.36/0.49 and cascade=0.000.
+	//
+	// Nothing downstream needs them, and the proof is structural rather than an audit:
+	// this whole function only runs when bRemoveSpikes is true, so anything between here
+	// and decimation that required the topology it builds would already be broken on the
+	// bRemoveSpikes==false path. Concretely:
+	//   * VF -- TriEdgeCollapseQuadric::Init rebuilds VertexFace + FaceBorderFromVF
+	//     itself at the top of decimation (that duplicate is what cost 1.9 s until it was
+	//     removed from runDecimate).
+	//   * FF -- the only consumer before decimation is the boundary-tooth peel, which is
+	//     #if MESH_TOOTH_PEEL_ENABLED (0, compiled out) AND calls FaceFace as the first
+	//     statement of its own loop, so it does not depend on ours even when enabled.
+	//   * ValidateMesh reads flags and geometry only, never FFp/VFp.
+	// Decimation then invalidates both anyway.
+
+	const double tReb = std::chrono::duration<double>(Clock::now() - tReb0).count();
+	MESH_DIAG("[SPIKE-PROFILE] csr=%.3f seed=%.3f cascade=%.3f rebuild=%.3f (seconds)"
+		" | %d spikes of %d verts, %llu incident-face refs (%.0f MB)",
+		tCsr, tSeed, tCasc, tReb, nTotalSpikes, numVerts,
+		(unsigned long long)run, (double)run * sizeof(CLEAN::Mesh::FacePointer) / (1024.0*1024.0));
 
   stats.removedSpikes = nTotalSpikes;
 }
@@ -2247,6 +2707,7 @@ void Mesh::Clean(
 	const FIndex numFacesIn = faces.GetSize();
 
 	TD_TIMER_STARTD();
+	CleanProfile prof;
 
 	CLEAN::Mesh mesh;
 	{
@@ -2301,6 +2762,7 @@ void Mesh::Clean(
 		faces.Release();
 	}
 
+	prof.Mark("to-vcg");
 	constexpr CLEAN::Mesh::ScalarType eps = 1e-12;
 
 	// Compact-only helper: removes unreferenced verts and (if any were removed)
@@ -2359,6 +2821,7 @@ void Mesh::Clean(
 	//     scraps -- and why no `DIAG component sizes` line ever appeared on that
 	//     path to diagnose them with.
 	// None of that has anything to do with long edges; it was incidental nesting.
+	prof.Mark("prep");
 	{
 		if (fSpurious > 0) {
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::AllocateEdge(mesh);
@@ -2398,6 +2861,7 @@ void Mesh::Clean(
 			MESH_DIAG("DIAG after long-edge removal: %d vn, %d fn (removed %d)",
 				mesh.vn, mesh.fn, removed);
 		}
+		prof.Mark("r-longedge");
 
 		// Pass 2: Fix normal orientation globally.
 		// The mesh from reconstruction should be predominantly correctly oriented.
@@ -2443,6 +2907,7 @@ void Mesh::Clean(
 				MESH_DIAG("DIAG mesh is non-orientable; deferring cleanup to component removal");
 			}
 		}
+		prof.Mark("r-orient");
 
 #if 1
 		// Pass 3: Remove faces whose normals disagree with neighbors (catches
@@ -2454,34 +2919,60 @@ void Mesh::Clean(
 			// Single-pass collection: mark faces for removal without iteration.
 			// This prevents cascading where removing one face exposes neighbors
 			// to subsequent removal, punching growing holes in the surface.
+			// THREADED. The scan is READ-ONLY -- it touches N(), FFp() and IsD() and
+			// writes nothing back -- so the only shared state is the output list, which
+			// each thread accumulates privately and which is then concatenated in CHUNK
+			// ORDER. With schedule(static) each thread owns one contiguous face range, so
+			// the concatenation reproduces ascending face order exactly: toDelete is
+			// byte-identical to what the serial loop produced, and so is the removal count.
+			//
+			// This was the only serial pass left in the bracket -- PerFaceNormalized and
+			// FaceFace above are both already threaded (FAST_NORMALIZE_PER_FACE is defined
+			// at the top of vcg's normal.h) -- over 13.3M faces of FF pointer chasing.
 			std::vector<CLEAN::Mesh::FacePointer> toDelete;
-			for (auto fi = mesh.face.begin(); fi != mesh.face.end(); ++fi) {
-				if (fi->IsD()) continue;
+			{
+				const int nF = (int)mesh.face.size();
+				const int nT = omp_get_max_threads();
+				std::vector<std::vector<CLEAN::Mesh::FacePointer>> tDel((size_t)nT);
+#pragma omp parallel num_threads(nT)
+				{
+					const int tid = omp_get_thread_num();
+					std::vector<CLEAN::Mesh::FacePointer>& out = tDel[(size_t)tid];
+#pragma omp for schedule(static)
+					for (int fi = 0; fi < nF; ++fi) {
+						auto& f = mesh.face[fi];
+						if (f.IsD()) continue;
 
-				const auto& fNormal = fi->N();
-				const float fNormSq = fNormal.SquaredNorm();
-				if (fNormSq < 1e-12f) {
-					toDelete.push_back(&*fi);
-					continue;
-				}
+						const auto& fNormal = f.N();
+						const float fNormSq = fNormal.SquaredNorm();
+						if (fNormSq < 1e-12f) {
+							out.push_back(&f);
+							continue;
+						}
 
-				int nAgree = 0, nDisagree = 0;
-				for (int e = 0; e < 3; ++e) {
-					auto* adj = fi->FFp(e);
-					if (adj == &*fi || adj->IsD())
-						continue;
-					const float dot = fNormal * adj->N();
-					if (dot > 0) ++nAgree;
-					else ++nDisagree;
-				}
+						int nAgree = 0, nDisagree = 0;
+						for (int e = 0; e < 3; ++e) {
+							auto* adj = f.FFp(e);
+							if (adj == &f || adj->IsD())
+								continue;
+							const float dot = fNormal * adj->N();
+							if (dot > 0) ++nAgree;
+							else ++nDisagree;
+						}
 
-				// Remove only if ALL neighbors disagree AND we have all 3
-				// valid neighbors. This ensures we only catch faces that are
-				// fully surrounded by opposing normals (interior of an
-				// inverted sheet), never faces on boundaries or creases.
-				if (nDisagree == 3 && nAgree == 0) {
-					toDelete.push_back(&*fi);
+						// Remove only if ALL neighbors disagree AND we have all 3
+						// valid neighbors. This ensures we only catch faces that are
+						// fully surrounded by opposing normals (interior of an
+						// inverted sheet), never faces on boundaries or creases.
+						if (nDisagree == 3 && nAgree == 0)
+							out.push_back(&f);
+					}
 				}
+				size_t nDel = 0;
+				for (int t = 0; t < nT; ++t) nDel += tDel[(size_t)t].size();
+				toDelete.reserve(nDel);
+				for (int t = 0; t < nT; ++t)
+					toDelete.insert(toDelete.end(), tDel[(size_t)t].begin(), tDel[(size_t)t].end());
 			}
 
 			for (auto* fp : toDelete)
@@ -2547,18 +3038,104 @@ void Mesh::Clean(
 			}
 		}
 #endif
+		prof.Mark("r-flipped");
 
 		// Small connected component removal (RELATIVE-TO-LARGEST face count).
 		// Keep components with >= MESH_KEEP_COMPONENT_PCT_X1000/1000 percent of the
 		// largest component's face count; delete the rest. The main body is always
 		// the largest, so this drops floating junk on any scene without an absolute
 		// size. Only disconnected components are affected.
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		// [RCOMPS-PROFILE] -- this bracket is 3.50 s of a 28.7 s Clean and had never been
+		// split. FF build, the flood, the gap rescue and the compaction want different
+		// fixes, and the flood is the only one that is inherently serial.
+		// OPENMVS_MESH_RCOMPS_SKIP_FF=1 -- DEFAULT OFF, and unlike the other rebuild
+		// removals in this file this one rests on a SEMANTIC argument rather than on the
+		// work being immediately redone, so it is opt-in until a run confirms it.
+		//
+		// The claim: FF is already valid here. The flipped-normal pass above builds it and
+		// then only DELETES faces -- vcg's DeleteFace sets a flag, it does not move faces
+		// or rewire links -- so every live-to-live FF link is still correct, and a link to
+		// a deleted face is exactly what the flood below already skips:
+		//     if (nb == nullptr || nb == fp || nb->IsD()) continue;
+		// So the rebuild recomputes information that consumer does not need. Nothing
+		// compacts between the two (that WOULD move faces and invalidate it).
+		//
+		// The residual risk is a consumer that needs FFp to be BORDER-correct -- self-
+		// pointing on an open edge rather than pointing at a dead face. The flood does not
+		// care, and the gap rescue works off cid/csz plus centroids, but vcg's
+		// RemoveSmallConnectedComponentsSize fallback is only reached when the rescue found
+		// nothing, so it stays behind the flag too.
+		//
+		// VALIDATE by diffing the component line against a run with the flag off:
+		// "of N components", "largest=M" and the removed-face count must all match.
+		// Note OPENMVS_MESH_RCOMPS_CHECK is NOT a valid check here -- vcg's
+		// ConnectedComponents reads the same FF, so it would agree with a stale one.
+		bool rcSkipFF = false;
+		if (const char* _sf = std::getenv("OPENMVS_MESH_RCOMPS_SKIP_FF"))
+			rcSkipFF = std::atoi(_sf) > 0;
+		const Clock::time_point tRc0 = Clock::now();
+		if (!rcSkipFF)
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+		const double tRcFF = std::chrono::duration<double>(Clock::now() - tRc0).count();
+		double tRcFlood = 0.0, tRcRescue = 0.0;
 		{
-			std::vector<std::pair<int, CLEAN::Mesh::FacePointer>> CCV;
-			vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
+			// ONE connected-component flood, used by everything below.
+			//
+			// This phase used to traverse the whole mesh three to four times for a single
+			// partition: ConnectedComponents here (for `largest` and the diag), an identical
+			// per-face flood inside the gap-rescue block, and then
+			// RemoveSmallConnectedComponentsSize, which calls ConnectedComponents AGAIN and
+			// then walks each small component with ConnectedComponentIterator. On Marco that
+			// is 19.7M faces of FF pointer-chasing, repeated, inside a 5.9 s phase.
+			//
+			// The flood below produces strictly more than ConnectedComponents did: csz gives
+			// the sizes (so `largest` and the component count fall out of it) AND cid gives
+			// the per-face labels the gap rescue needs. Same adjacency, same skip rules
+			// (null / self / deleted), so the same partition.
+			//
+			// OPENMVS_MESH_RCOMPS_CHECK=1 verifies that against vcg's own ConnectedComponents
+			// -- worth running once per corpus, because if the two ever disagreed `largest`
+			// would shift, moving sizeThreshold and changing which components are removed.
+			const Clock::time_point tFl0 = Clock::now();
+			const size_t nF = mesh.face.size();
+			std::vector<int> cid(nF, -1);
+			std::vector<int> csz;
+			{
+				std::vector<CLEAN::Mesh::FacePointer> stack;
+				for (size_t i = 0; i < nF; ++i) {
+					if (mesh.face[i].IsD() || cid[i] >= 0) continue;
+					const int id = (int)csz.size();
+					int cnt = 0;
+					stack.push_back(&mesh.face[i]);
+					cid[i] = id;
+					while (!stack.empty()) {
+						CLEAN::Mesh::FacePointer fp = stack.back(); stack.pop_back();
+						++cnt;
+						for (int e = 0; e < 3; ++e) {
+							CLEAN::Mesh::FacePointer nb = fp->FFp(e);
+							if (nb == nullptr || nb == fp || nb->IsD()) continue;
+							const size_t ni = (size_t)vcg::tri::Index(mesh, nb);
+							if (cid[ni] >= 0) continue;
+							cid[ni] = id;
+							stack.push_back(nb);
+						}
+					}
+					csz.push_back(cnt);
+				}
+			}
+			tRcFlood = std::chrono::duration<double>(Clock::now() - tFl0).count();
 			int largest = 0;
-			for (auto& cc : CCV) largest = std::max(largest, cc.first);
+			for (int c : csz) largest = std::max(largest, c);
+			const size_t nComp = csz.size();
+			if (const char* _rc = std::getenv("OPENMVS_MESH_RCOMPS_CHECK")) if (std::atoi(_rc) > 0) {
+				std::vector<std::pair<int, CLEAN::Mesh::FacePointer>> CCV;
+				vcg::tri::Clean<CLEAN::Mesh>::ConnectedComponents(mesh, CCV);
+				int refLargest = 0;
+				for (auto& cc : CCV) refLargest = std::max(refLargest, cc.first);
+				MESH_DIAG("[RCOMPS-CHECK] flood: %zu components, largest %d | vcg: %zu, largest %d"
+					" -- both pairs must match, or sizeThreshold moves and different components die",
+					nComp, largest, CCV.size(), refLargest);
+			}
 
 			// DIAG: component face-count distribution (top 12). If the 2nd-
 			// largest is itself big, leftover junk is a LARGE component -> raise
@@ -2568,17 +3145,16 @@ void Mesh::Clean(
 			//
 			// The sort exists only to order the line, so it goes behind the gate too.
 			if (MESH_DIAG_ENABLED()) {
-				std::vector<int> sz; sz.reserve(CCV.size());
-				for (auto& cc : CCV) sz.push_back(cc.first);
+				std::vector<int> sz(csz);
 				std::sort(sz.begin(), sz.end(), std::greater<int>());
 				char buf[256]; int off = 0;
 				for (size_t i = 0; i < sz.size() && i < 12 && off < 230; ++i)
 					off += snprintf(buf + off, sizeof(buf) - off, "%d ", sz[i]);
-				MESH_DIAG("DIAG component sizes (top of %zu): %s", CCV.size(), buf);
+				MESH_DIAG("DIAG component sizes (top of %zu): %s", nComp, buf);
 			}
 
 			const int fnBefore = mesh.fn;
-			if (largest > 0 && CCV.size() > 1) {
+			if (largest > 0 && nComp > 1) {
 				const double frac = double(MESH_KEEP_COMPONENT_PCT_X1000) / 100000.0; // (pct/1000)/100
 				const int sizeThreshold = std::max(1, (int)(frac * (double)largest));
 				// GAP RESCUE -- mirrors the identical test in the Poisson small-component
@@ -2599,33 +3175,11 @@ void Mesh::Clean(
 				// not already covered by a component that IS above the bar.
 				std::vector<CLEAN::Mesh::FacePointer> smallFaces;
 				size_t nRescued = 0, nRescuedFaces = 0;
+				const Clock::time_point tRs0 = Clock::now();
 #if MESH_COMPONENT_GAP_RESCUE
 				{
-					// Per-face component id by flood over the FF adjacency built above.
-					const size_t nF = mesh.face.size();
-					std::vector<int> cid(nF, -1);
-					std::vector<int> csz;
-					std::vector<CLEAN::Mesh::FacePointer> stack;
-					for (size_t i = 0; i < nF; ++i) {
-						if (mesh.face[i].IsD() || cid[i] >= 0) continue;
-						const int id = (int)csz.size();
-						int cnt = 0;
-						stack.push_back(&mesh.face[i]);
-						cid[i] = id;
-						while (!stack.empty()) {
-							CLEAN::Mesh::FacePointer fp = stack.back(); stack.pop_back();
-							++cnt;
-							for (int e = 0; e < 3; ++e) {
-								CLEAN::Mesh::FacePointer nb = fp->FFp(e);
-								if (nb == nullptr || nb == fp || nb->IsD()) continue;
-								const size_t ni = (size_t)vcg::tri::Index(mesh, nb);
-								if (cid[ni] >= 0) continue;
-								cid[ni] = id;
-								stack.push_back(nb);
-							}
-						}
-						csz.push_back(cnt);
-					}
+					// cid / csz come from the single flood above -- this block used to
+					// recompute the identical partition over every face a second time.
 					// Ground covered by the components that clear the size bar.
 					float bx0 = FLT_MAX, by0 = FLT_MAX, bx1 = -FLT_MAX, by1 = -FLT_MAX;
 					for (size_t v = 0; v < mesh.vert.size(); ++v) {
@@ -2687,12 +3241,13 @@ void Mesh::Clean(
 					}
 				}
 #endif
+				tRcRescue = std::chrono::duration<double>(Clock::now() - tRs0).count();
 				if (smallFaces.empty() && nRescued == 0)
 					vcg::tri::Clean<CLEAN::Mesh>::RemoveSmallConnectedComponentsSize(mesh, sizeThreshold);
 				stats.removedComponents += (fnBefore - mesh.fn);
 				if (fnBefore != mesh.fn)
 					MESH_DIAG("Removed %d faces in small components (kept >= %.3g%% of largest=%d faces -> threshold %d faces, of %zu components)",
-						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, sizeThreshold, CCV.size());
+						fnBefore - mesh.fn, float(MESH_KEEP_COMPONENT_PCT_X1000) / 1000.f, largest, sizeThreshold, nComp);
 				if (nRescued > 0)
 					MESH_DIAG("DIAG gap rescue (Clean): kept %zu components / %zu faces whose ground"
 						" the kept mesh does not already cover (overlap < %.2f)",
@@ -2700,7 +3255,53 @@ void Mesh::Clean(
 			}
 		}
 
-		CompactAndRefresh();
+		const Clock::time_point tCp0 = Clock::now();
+		// Compact WITHOUT rebuilding the adjacencies. This used to be CompactAndRefresh(),
+		// i.e. Compact + FaceFace + VertexFace, to reflect deletions that on this scene
+		// amount to 685 faces out of 13,346,717 -- and compaction cost does not scale with
+		// how little was removed.
+		//
+		// MEASURED: [RCOMPS-PROFILE] compact= fell 1.608 -> 0.645 s and the bracket
+		// 3.434 -> 2.428 s, with the output mesh unchanged.
+		//
+		// Compact() itself STAYS: it is what invalidates every pointer, and the Morton
+		// vertex reorder before decimation bails unless vert.size() == vn.
+		//
+		// The rebuild is skipped entirely on the bRemoveSpikes path, because RemoveSpikes
+		// reads no vcg adjacency (it builds its own CSR) and finishes by compacting, which
+		// would invalidate a rebuild anyway -- see the note at its call site. Nothing
+		// between here and decimation reads FF or VF: decimation's Init rebuilds
+		// VertexFace itself, FF's only consumer is compiled out, and ValidateMesh reads
+		// flags and geometry only, never FFp/VFp.
+		//
+		// ...and the COMPACTION goes too, on that same path. RemoveSpikes ends with exactly
+		// the sequence Compact() is -- RemoveUnreferencedVertex, KillEdges,
+		// CompactVertexVector, CompactFaceVector -- and runs it unconditionally, so it
+		// already cleans up the faces deleted here. Doing it twice moves 13.3M faces and
+		// 6.7M vertices for nothing.
+		//
+		// MEASURED: [RCOMPS-PROFILE] compact=0.646 s to retire 685 deleted faces of
+		// 13,346,717.
+		//
+		// Nothing in between requires a compacted mesh: the diagnostic prints vn/fn, which
+		// are counts and stay correct with holes present, and ValidateMesh skips IsD faces
+		// and only checks that LIVE faces reference live vertices. RemoveSpikes itself
+		// tolerates holes by construction -- its CSR build skips IsD faces. The Morton
+		// vertex reorder does require vert.size()==vn, but it runs after RemoveSpikes has
+		// compacted. stats.removedVerts is unaffected: the same unreferenced vertices are
+		// counted once by RemoveSpikes instead of split across two calls.
+		//
+		// The !bRemoveSpikes branch keeps the original behaviour for a path this corpus
+		// does not exercise, rather than extending the proof to cover it unmeasured.
+		if (!bRemoveSpikes) {
+			Compact();
+			LightRefresh();
+		}
+		MESH_DIAG("[RCOMPS-PROFILE] faceFace=%.3f flood=%.3f rescue=%.3f compact=%.3f (seconds)"
+			" -- faceFace sorts 3x nFaces edges (24 B each) and wires them in parallel; the"
+			" flood is SERIAL FF pointer-chasing and is the one that cannot simply be threaded",
+			tRcFF, tRcFlood, tRcRescue,
+			std::chrono::duration<double>(Clock::now() - tCp0).count());
 
 		MESH_DIAG("DIAG after topology repair: %d vn, %d fn (long-edge pass %s)",
 			mesh.vn, mesh.fn,
@@ -2711,8 +3312,22 @@ void Mesh::Clean(
 	// =============================================================
 	// Phase 3: Spike removal
 	// =============================================================
+	prof.Mark("r-comps");
 	if (bRemoveSpikes) {
-		LightRefresh();
+		// NO LightRefresh here. RemoveSpikes reads NO vcg adjacency -- it builds its own
+		// CSR of incident faces (SPIKE-PROFILE csr=) and works from that, and KillEdges
+		// inside it is equally adjacency-free. FaceFace + VertexFace over a 13.3M-face mesh
+		// was being built purely to be thrown away.
+		//
+		// MEASURED: the spikes bracket is 2.013 s but SPIKE-PROFILE accounts only
+		// 0.352 + 0.002 + 0.707 = 1.061 of it. The ~0.95 s difference was this call.
+		//
+		// Safe for the same structural reason the trailing rebuild was removed from the end
+		// of RemoveSpikes (see the note there): that function finishes by compacting, which
+		// invalidates FF and VF anyway, and nothing between here and decimation reads
+		// either -- decimation's TriEdgeCollapseQuadric::Init rebuilds VertexFace itself,
+		// FF's only consumer is compiled out, and ValidateMesh touches neither. If invalid
+		// AFTER is fine, invalid BEFORE is fine too, given RemoveSpikes never reads them.
 		RemoveSpikes(mesh, stats);
 
 		MESH_DIAG("DIAG after spikes: %d vn, %d fn", mesh.vn, mesh.fn);
@@ -2736,6 +3351,7 @@ void Mesh::Clean(
 	// first solid (2D) ring and cannot recede the real silhouette or punch
 	// holes. Few iterations, tiny face counts, self-terminating.
 	// Compile-time gated by MESH_TOOTH_PEEL_ENABLED (default 0 = off).
+	prof.Mark("spikes");
 #if MESH_TOOTH_PEEL_ENABLED
 	{
 		constexpr int  TOOTH_MAX_ITERS    = 4;
@@ -2972,6 +3588,7 @@ void Mesh::Clean(
 	// edges, building outlines) that would otherwise be lost while the
 	// collapser "fixes" artifacts.
 	// =============================================================
+	prof.Mark("pre-deci");
 	if ((fDecimate > 0 && fDecimate < 1.0f) || fDecimateError > 0.f) {
 		const int removedArea = vcg::tri::Clean<CLEAN::Mesh>::RemoveFaceOutOfRangeArea(mesh, eps);
 		const int removedDup = vcg::tri::Clean<CLEAN::Mesh>::RemoveDuplicateFace(mesh);
@@ -3041,9 +3658,54 @@ void Mesh::Clean(
 				pp.ScaleIndependent = true;
 			}
 
-			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
-			vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromVF(mesh);
+			vcg::math::Quadric<double> QZero; QZero.SetZero();
+			double diagForLog = 0.0; // bbox diagonal, kept so the stop diagnostic can invert
+			                         // vcg's ScaleIndependent metric back into world units
+			// Allocate + fill the per-vertex quadric array: 6.67M verts x sizeof(Quadric<double>)
+			// (10 doubles = 80 B) = ~533 MB on a HIGH run. Timed because CLEAN-PROFILE's
+			// decimate exceeded init+loop+finalize by 1.74 s and this is the only substantial
+			// thing in that window. 1.74 s is ~30x too slow for a 533 MB memset at memory
+			// bandwidth, so the suspicion is first-touch page faults (~133k fresh 4K pages),
+			// not the fill. This number settles it. NOTE the array is then zeroed a SECOND
+			// time by InitQuadric, which re-SetZero()s every live writable vertex.
+			const Clock::time_point tAlloc0 = Clock::now();
+			// TD is allocated ONLY for the double path. Holding it alongside the recentred
+			// array made the footprint 800 MB instead of 533 -- larger, not smaller -- which
+			// left the memory-pressure half of the recentred thesis untested.
+			std::unique_ptr<CLEAN::QuadricTemp> TD;
+			if (!g_deciRecentred)
+				TD.reset(new CLEAN::QuadricTemp(mesh.vert, QZero));
+			CLEAN::GMarkTemp GM(mesh.vert, 0);   // see GMarkTemp; 0 = never survived
+			// Allocated only when the flag is on, and exclusive with nothing else:
+			// holding this alongside TD costs MORE than the double array alone, so once
+			// the recentred path is validated TD should go away rather than coexist.
+			CLEAN::RQuadric RZero; RZero.SetZero();
+			std::unique_ptr<CLEAN::RQuadricTemp> RQ;
+			if (g_deciRecentred) {
+				RQ.reset(new CLEAN::RQuadricTemp(mesh.vert, RZero));
+				CLEAN::QHelper::RQp() = RQ.get();
+			}
+			const double tdAlloc = std::chrono::duration<double>(Clock::now() - tAlloc0).count();
+			CLEAN::QHelper::TDp() = TD.get();   // null on the recentred path; never read there
+			CLEAN::QHelper::GMp() = &GM;
 
+			vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
+			g_deciSetup.Clear();
+			const Clock::time_point tInit0 = Clock::now();
+			deci.Init<CLEAN::TriEdgeCollapse>();
+			const double tInit = std::chrono::duration<double>(Clock::now() - tInit0).count();
+			// Counter values at the setup/loop boundary, so the two phases can be attributed
+			// separately -- the counters themselves are cumulative across both.
+			const unsigned long long nPrioSetup = g_deciSetup.nPriority;
+			const unsigned long long nAddSetup  = g_deciSetup.nAddCollapse;
+
+			const Clock::time_point tDiag0 = Clock::now();
+			// Border diagnostic sits HERE, after Init, deliberately. Init already ran
+			// VertexFace + FaceBorderFromVF (tri_edge_collapse_quadric.h, top of Init), so
+			// reading the flags it produced costs nothing; doing this scan BEFORE Init
+			// meant building VF adjacency and border flags over all 13.3M faces twice.
+			// Init's boundary handling only clears vertex W flags -- it does not touch the
+			// B flags, IsD, or mesh.fn -- so the numbers are the same either way.
 			// Diagnostic (read-only): how much of the mesh is border? Every
 			// border vertex is locked by PreserveBoundary, so if this is near
 			// 100% the heap comes up empty and decimation is a silent no-op.
@@ -3073,14 +3735,8 @@ void Mesh::Clean(
 					(unsigned)borderEdges, mesh.fn, targetFaces);
 			}
 
-			vcg::math::Quadric<double> QZero; QZero.SetZero();
-			double diagForLog = 0.0; // bbox diagonal, kept so the stop diagnostic can invert
-			                         // vcg's ScaleIndependent metric back into world units
-			CLEAN::QuadricTemp TD(mesh.vert, QZero);
-			CLEAN::QHelper::TDp() = &TD;
+			const double tdDiag = std::chrono::duration<double>(Clock::now() - tDiag0).count();
 
-			vcg::LocalOptimization<CLEAN::Mesh> deci(mesh, &pp);
-			deci.Init<CLEAN::TriEdgeCollapse>();
 			deci.SetTargetSimplices(targetFaces);
 			if (kEff > 0) {
 				// Express the deviation tolerance in the collapse-priority's units. Init just
@@ -3098,10 +3754,153 @@ void Mesh::Clean(
 
 			const int faceBefore = mesh.fn;
 			Util::Progress progress(_T("Decimating"), faceBefore - targetFaces);
+			const Clock::time_point tLoop0 = Clock::now();
 			while (mesh.fn > targetFaces && deci.DoOptimization(mesh.vert.size()))
 				progress.display(faceBefore - mesh.fn);
+			const double tLoop = std::chrono::duration<double>(Clock::now() - tLoop0).count();
+			const Clock::time_point tFin0 = Clock::now();
 			deci.Finalize<CLEAN::TriEdgeCollapse>();
+			const double tFin = std::chrono::duration<double>(Clock::now() - tFin0).count();
 			progress.close();
+
+			// [DECI-PROFILE] -- decimation is the single most expensive routine in
+			// ReconstructMesh (22.2 s of an 82 s run) and it is strictly single-threaded:
+			// measured 22.097 s at --max-threads 1 vs 22.099 s at 32. Everything up to
+			// 'loop' below is SETUP and is serial; only the loop has any threading in it
+			// (HeapThreadPool compacts stale heap entries in parallel). This line exists to
+			// say how the 22 s actually splits before anyone tries to parallelise a phase.
+			// topo/boundary/quadric/heapBuild/heapify are filled from inside vcglib.
+			MESH_DIAG("[DECI-PROFILE] topo=%.3f boundary=%.3f quadric=%.3f heapBuild=%.3f"
+				" heapify=%.3f | quadricAlloc=%.3f diagScan=%.3f init=%.3f loop=%.3f finalize=%.3f"
+				" | setup=%.1f%% of %.3f accounted (seconds; compare CLEAN-PROFILE decimate=)",
+				g_deciSetup.topo, g_deciSetup.boundary, g_deciSetup.quadric,
+				g_deciSetup.heapBuild, g_deciSetup.heapify, tdAlloc, tdDiag, tInit, tLoop, tFin,
+				(tInit + tLoop + tFin) > 0.0 ? 100.0 * tInit / (tInit + tLoop + tFin) : 0.0,
+				tdAlloc + tdDiag + tInit + tLoop + tFin);
+
+			// Where the loop's time actually goes. The hypothesis under test: the collapse
+			// loop is dominated not by heap mechanics or the collapses themselves but by
+			// UpdateHeap re-deriving neighbourhood priorities -- ~12 AddCollapseToHeap per
+			// collapse, each a ComputePriority (two 80-byte quadric loads out of a 533 MB
+			// array, then a 3x3 Cholesky). ns/prio is the number that says whether this is
+			// memory-latency bound; if it tracks the ~118 ns/candidate the heap build shows,
+			// the loop is that same cost repeated and quadric locality is the lever.
+			{
+				const unsigned long long nPrioLoop = g_deciSetup.nPriority    - nPrioSetup;
+				const unsigned long long nAddLoop  = g_deciSetup.nAddCollapse - nAddSetup;
+				const int collapsed = faceBefore - mesh.fn;
+				MESH_DIAG("[DECI-PROFILE] priority calls: setup=%llu loop=%llu | addCollapse:"
+					" setup=%llu loop=%llu | %.1f addCollapse per collapse (%d collapses)"
+					" | setup %.1f ns/prio, loop %.1f ns/prio",
+					nPrioSetup, nPrioLoop, nAddSetup, nAddLoop,
+					collapsed > 0 ? (double)nAddLoop / (double)collapsed : 0.0, collapsed,
+					nPrioSetup ? 1e9 * g_deciSetup.heapBuild / (double)nPrioSetup : 0.0,
+					nPrioLoop  ? 1e9 * tLoop / (double)nPrioLoop : 0.0);
+
+				// Call-site split. nAddOpposite pairs cannot have changed priority -- neither
+				// endpoint is the surviving vertex -- so that share of the loop's
+				// ComputePriority work is recomputing what the heap already holds. Multiply by
+				// the loop ns/prio above for what skipping it could be worth. The stale-pop
+				// ratio says how much of the heap those duplicates turn into garbage.
+				const unsigned long long nSurv = g_deciSetup.nAddSurvivor;
+				const unsigned long long nOpp  = g_deciSetup.nAddOpposite;
+				const unsigned long long nBoth = nSurv + nOpp;
+				const double nsPrio = nPrioLoop ? 1e9 * tLoop / (double)nPrioLoop : 0.0;
+				if (g_deciLoopProf) {
+					const double tot = (double)(g_deciSetup.tscPop + g_deciSetup.tscStale
+						+ g_deciSetup.tscExec + g_deciSetup.tscUpd + g_deciSetup.tscOther);
+					const double sc = (tot > 0.0) ? 100.0 / tot : 0.0;
+					MESH_DIAG("[LOOP-PROFILE] pop=%.1f%% stale=%.1f%% execute=%.1f%% updateHeap=%.1f%%"
+						" other=%.1f%% of loop=%.3f s -- pop is the heap sift-down; updateHeap is the"
+						" VF walks plus AddCollapseToHeap (ComputePriority + pool alloc + push)",
+						g_deciSetup.tscPop*sc, g_deciSetup.tscStale*sc, g_deciSetup.tscExec*sc,
+						g_deciSetup.tscUpd*sc, g_deciSetup.tscOther*sc, tLoop);
+
+					// DO NOT TRUST THE SPLIT BELOW FOR ATTRIBUTION. __rdtsc is NOT serializing,
+					// so out-of-order execution migrates work across the read boundaries, and
+					// the parts being timed are 8-70 ns. MEASURED contradiction: removing the
+					// redundant second VF ring walk and the discarded Apply() moved this to
+					// prio 2.218 -> 0.984 s while walk went 1.596 -> 2.157 s -- walk ROSE
+					// after a whole ring traversal was deleted. updateHeap's own total moved
+					// 4.471 -> 4.297, which is the only number in it that means anything.
+					// Phase-level [LOOP-PROFILE] above is fine (each phase is 1-4 s); this
+					// line is only good for "is one part an order of magnitude bigger".
+					//
+					// Breakdown of updateHeap's AddCollapseToHeap. Shares are of updateHeap's
+					// OWN ticks, not the loop's, so they answer "which third of the 131 ns".
+					// The three do not sum to 100%: the remainder is the VF ring walk and the
+					// visited-flag bookkeeping in UpdateHeap itself, which is outside
+					// AddCollapseToHeap -- that residual is reported as walk=.
+					const double up = (double)g_deciSetup.tscUpd;
+					const double su = (up > 0.0) ? 100.0 / up : 0.0;
+					const double acc = (double)(g_deciSetup.tscAlloc + g_deciSetup.tscPrio
+						+ g_deciSetup.tscPush);
+					MESH_DIAG("[LOOP-PROFILE] updateHeap breakdown: alloc=%.1f%% prio=%.1f%%"
+						" push=%.1f%% walk=%.1f%% of updateHeap=%.3f s -- prio is the quadric"
+						" sum + Cholesky, and only FEWER CALLS can shrink it; alloc is the"
+						" block pool; walk is the VF ring outside AddCollapseToHeap."
+						" 4 rdtsc reads on a ~131 ns call inflate updateHeap itself by ~10%%,"
+						" so read the ratio, not the share",
+						g_deciSetup.tscAlloc*su, g_deciSetup.tscPrio*su, g_deciSetup.tscPush*su,
+						(up - acc)*su, (tot > 0.0) ? tLoop * (up / tot) : 0.0);
+
+					// Execute's structure, by exact count. tscExec says HOW LONG Execute takes;
+					// this says WHAT IT DOES, which is what a fix has to change. scan/detach is
+					// the average number of VF list nodes walked per unlink -- VFDetach is O(1)
+					// only when the face is already at its vertex's list head, and O(valence)
+					// otherwise. steps x ~a few ns per dependent load is the size of the prize;
+					// if that is well under tscExec then the cost is the face/vertex deletion
+					// and the relink, not the scan.
+					const unsigned long long nCol = g_execCollapses;
+					const double perCol = nCol ? 1.0 / (double)nCol : 0.0;
+					const unsigned long long nDet = g_vfDetachCalls;
+					const double tExec = (tot > 0.0) ? tLoop * ((double)g_deciSetup.tscExec / tot) : 0.0;
+					MESH_DIAG("[EXEC-PROFILE] %llu collapses of execute=%.3f s (%.0f ns each) |"
+						" per collapse: ringV0=%.2f av01=%.2f av0=%.2f detach=%.2f |"
+						" VFDetach %llu calls, %llu head-hits (%.1f%%), %llu scan steps"
+						" (%.2f per call, %.2f per collapse)",
+						nCol, tExec, nCol ? 1e9 * tExec * perCol : 0.0,
+						g_execRingV0 * perCol, g_execAv01 * perCol, g_execAv0 * perCol,
+						nDet * perCol,
+						nDet, g_vfDetachHead, nDet ? 100.0 * (double)g_vfDetachHead / (double)nDet : 0.0,
+						g_vfDetachSteps,
+						nDet ? (double)g_vfDetachSteps / (double)nDet : 0.0,
+						g_vfDetachSteps * perCol);
+				}
+				if (g_deciFp32Probe)
+					MESH_DIAG("[FP32-PROBE] %llu collapses | max rel error %.3e | %llu over 1e-3 (%.2f%%)"
+						" | coefficient range: max|d^2|=%.4g vs max|a^2|=%.4g (ratio %.3g)"
+						" -- float keeps ~7 digits, so a ratio near 1e6 leaves nothing after the"
+						" cancellation in Apply(); over 1e-3 means collapse ORDER would move",
+						g_deciSetup.nFp32Probed, g_deciSetup.fp32MaxRel, g_deciSetup.nFp32Bad,
+						g_deciSetup.nFp32Probed ? 100.0 * (double)g_deciSetup.nFp32Bad / (double)g_deciSetup.nFp32Probed : 0.0,
+						g_deciSetup.fp32MaxAbsA9, g_deciSetup.fp32MaxAbsA0,
+						g_deciSetup.fp32MaxAbsA0 > 0.0 ? g_deciSetup.fp32MaxAbsA9 / g_deciSetup.fp32MaxAbsA0 : 0.0);
+				if (g_deciFp32Probe)
+					MESH_DIAG("[FP32-PROBE] RECENTRED on each vertex: max rel error %.3e | %llu over 1e-3"
+						" (%.2f%%) | max|c'|=%.4g vs max|a^2|=%.4g (ratio %.3g) -- compare against the"
+						" world-frame line above; recentring is an EXACT transform, so any improvement"
+						" is pure conditioning",
+						g_deciSetup.rcMaxRel, g_deciSetup.nRcBad,
+						g_deciSetup.nFp32Probed ? 100.0 * (double)g_deciSetup.nRcBad / (double)g_deciSetup.nFp32Probed : 0.0,
+						g_deciSetup.rcMaxAbsC, g_deciSetup.fp32MaxAbsA0,
+						g_deciSetup.fp32MaxAbsA0 > 0.0 ? g_deciSetup.rcMaxAbsC / g_deciSetup.fp32MaxAbsA0 : 0.0);
+				if (g_deciAudit)
+					MESH_DIAG("[DECI-AUDIT] %llu collapses checked | non-edge %llu | priority stale %llu"
+						" (max rel %.3e) -- BOTH counts must be 0 on the current code; a non-zero"
+						" non-edge count means a collapse merged two vertices that no longer share"
+						" a face, which nothing else in this configuration would catch",
+						g_deciSetup.nAudited, g_deciSetup.nAuditNonEdge,
+						g_deciSetup.nAuditPriStale, g_deciSetup.auditMaxPriRel);
+				MESH_DIAG("[DECI-PROFILE] addCollapse split: survivor=%llu (%.1f%%)"
+					" opposite=%llu (%.1f%%) | opposite is ~%.2f s at %.1f ns/prio"
+					" | heap pops=%llu stale=%llu (%.1f%%)",
+					nSurv, nBoth ? 100.0 * (double)nSurv / (double)nBoth : 0.0,
+					nOpp,  nBoth ? 100.0 * (double)nOpp  / (double)nBoth : 0.0,
+					1e-9 * (double)nOpp * nsPrio, nsPrio,
+					g_deciSetup.nHeapPop, g_deciSetup.nHeapStale,
+					g_deciSetup.nHeapPop ? 100.0 * (double)g_deciSetup.nHeapStale / (double)g_deciSetup.nHeapPop : 0.0);
+			}
 			if (logDiag && kEff > 0) {
 				const bool hitFloor = (mesh.fn <= targetFaces);
 				const bool hitMetric = (deci.currMetric > deci.targetMetric);
@@ -3143,6 +3942,47 @@ void Mesh::Clean(
 		// than being passed unconditionally.
 		const bool bDecimateDiag = MESH_DIAG_ENABLED();
 		int totalCollapsed = 0;
+
+		// Morton vertex reorder. DEFAULT ON, measured on RichmondHistoric HIGH:
+		//   decimate 19.997 -> 18.576 s, Clean 34.358 -> 32.621, run 79 -> 77 s,
+		//   for a 0.236 s reorder cost.
+		// It pays out of SETUP, not the loop, which is the opposite of why it was tried:
+		//   setup 117.4 -> 86.0 ns/prio (-27%)   loop 205.2 -> 200.8 ns/prio (-2%)
+		// The heap build walks vertices in index order, so spatial coherence in that order
+		// helps it enormously. The collapse loop pops in PRIORITY order, which no vertex
+		// numbering can make local -- and it already prefetches quadrics explicitly.
+		// Set OPENMVS_MESH_REORDER=0 to disable (it is not bit-identical: the heap is
+		// enumerated in vertex order, so ties break differently and the collapse sequence
+		// shifts; the face-count floor is a target so the output count is unchanged).
+		{
+			const char* e = std::getenv("OPENMVS_MESH_REORDER");
+			if (!e || std::atoi(e) != 0) {
+				const Clock::time_point tRe0 = Clock::now();
+				const bool ok = SpatiallyReorderVertices(mesh);
+				const double tRe = std::chrono::duration<double>(Clock::now() - tRe0).count();
+				MESH_DIAG("[DECI-PROFILE] vertex reorder %s in %.3f s (%u verts, %u faces)"
+					" -- repaid out of init= (heap build), NOT loop=; not bit-identical",
+					ok ? "done" : "SKIPPED (mesh not compacted)", tRe,
+					(unsigned)mesh.vert.size(), (unsigned)mesh.face.size());
+
+				// DO NOT reorder FACES here as well. It was implemented and MEASURED
+				// (RichmondHistoric HIGH, sort by min corner index, in-place cycle
+				// permutation) and it LOSES:
+				//   cost  1.389 s -- serial, ~120 B x 13.3M faces of random move traffic;
+				//                    cycles cannot be found without a scan, so it cannot
+				//                    be threaded, and parallelising them lands at break-even
+				//   gain  loop 12.076 -> 11.742 s, i.e. 0.33 s  =>  NET -1.06 s
+				// The informative part is WHICH phase moved: execute 3.297 -> 3.029, but
+				// updateHeap 4.202 -> 4.192, i.e. nothing. updateHeap is the VF ring walk
+				// plus AddCollapseToHeap, so making the walk's memory pattern strictly
+				// better and gaining zero means the 4.2 s is NOT the walk. That is the third
+				// locality lever to come back null on this loop, after "the heap is cached"
+				// (294 ns/pop over ~24 levels) and recentred 40-byte quadrics (array halved,
+				// speed unchanged). The loop is not memory-bound; look at ComputePriority
+				// CALL COUNT instead, which is what the lazy-revalidation change moved.
+			}
+		}
+
 		if (mesh.fn > targetFaces)
 			totalCollapsed += runDecimate(bDecimateDiag);
 		MESH_DIAG("Decimation pass 1 (PreserveBoundary=true): %d collapsed, fn=%d", totalCollapsed, mesh.fn);
@@ -3196,6 +4036,7 @@ void Mesh::Clean(
 	// ear-cutting never fans a sheet across them. SelfIntersectionEar remains
 	// the per-ear backstop.
 	// =============================================================
+	prof.Mark("decimate");
 	if (nCloseHoles > 0) {
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
@@ -3290,6 +4131,7 @@ void Mesh::Clean(
 	// =============================================================
 	// Phase 5: Smoothing
 	// =============================================================
+	prof.Mark("holes");
 	if (nSmooth > 0) {
 		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
 		vcg::tri::Smooth<CLEAN::Mesh>::VertexCoordLaplacian(mesh, nSmooth, false, false);
@@ -3341,9 +4183,11 @@ void Mesh::Clean(
 	// Then fill with intersection-aware ears for larger holes, and
 	// trivial ears for the tiny 3-6 edge gaps that remain.
 	// =============================================================
+	prof.Mark("smooth");
 	if (nCloseHoles > 0) {
 		// Fix non-manifold topology left by earlier face deletions so
 		// that border half-edge loops are valid for hole detection.
+		bool preSealRepaired = false;
 		{
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
 			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
@@ -3355,11 +4199,23 @@ void Mesh::Clean(
 				vcg::tri::Clean<CLEAN::Mesh>::RemoveUnreferencedVertex(mesh);
 				KillEdges(mesh);
 				vcg::tri::Allocator<CLEAN::Mesh>::CompactEveryVector(mesh);
+				preSealRepaired = true;
 			}
 		}
 
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
-		vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		// Rebuild ONLY if the repair above actually changed the mesh. RemoveNonManifoldFace
+		// and SplitNonManifoldVertex are no-ops when they return 0, and the compaction that
+		// would invalidate FF/VF sits inside the same guard -- so with nothing repaired the
+		// topology built at the top of the block is still valid and this pair was rebuilding
+		// it for nothing, over a 4.06M-face mesh.
+		//
+		// MEASURED: "pre-seal fix" does not appear in ANY run of this corpus, so the repair
+		// never fires here and this was always a duplicate. Kept conditional rather than
+		// deleted because a scene that does need the repair still needs the rebuild.
+		if (preSealRepaired) {
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::FaceFace(mesh);
+			vcg::tri::UpdateTopology<CLEAN::Mesh>::VertexFace(mesh);
+		}
 		vcg::tri::UpdateFlags<CLEAN::Mesh>::FaceBorderFromFF(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerFaceNormalized(mesh);
 		vcg::tri::UpdateNormal<CLEAN::Mesh>::PerVertexAngleWeighted(mesh);
@@ -3516,6 +4372,7 @@ void Mesh::Clean(
 		ValidateMesh(mesh, "after final seal", true);
 	}
 
+	prof.Mark("seal");
 #if MESH_RIM_ERODE_RINGS > 0
 	// =============================================================
 	// Phase 8.5: Aggressive uniform rim erosion (perimeter straightening)
@@ -4014,6 +4871,7 @@ void Mesh::Clean(
 	// =============================================================
 	// Export
 	// =============================================================
+	prof.Mark("post");
 	ASSERT(vertices.IsEmpty() && faces.IsEmpty());
 	vertices.Reserve(mesh.VN());
 	vcg::SimpleTempData<CLEAN::Mesh::VertContainer, VIndex> indices(mesh.vert);
@@ -4045,6 +4903,8 @@ void Mesh::Clean(
 	// The counts describe the RESULT and stay; the breakdown names the individual
 	// passes (long-edge, spike, component, hole-fill), which is a description of the
 	// method, so it rides the gate with everything else those passes emit.
+	prof.Mark("to-mvs");
+	prof.Report();
 	DEBUG("Final cleaned mesh: %u vertices, %u faces (was %u/%u) (%s)",
 		vertices.GetSize(), faces.GetSize(), numVertsIn, numFacesIn,
 		TD_TIMER_GET_FMT().c_str());

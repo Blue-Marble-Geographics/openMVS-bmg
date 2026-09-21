@@ -31,6 +31,7 @@ public:
 
 	HRESULT		ReadHeader();
 	HRESULT		ReadData(void*, PIXELFORMAT, Size nStride, Size lineWidth);
+	void		SetDecodeScale(Size nMaxResolution) override;
 	HRESULT		WriteHeader(PIXELFORMAT, Size width, Size height, BYTE numLevels);
 	HRESULT		WriteData(void*, PIXELFORMAT, Size nStride, Size lineWidth);
 

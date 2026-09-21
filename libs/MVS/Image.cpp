@@ -63,6 +63,26 @@ IMAGEPTR Image::ReadImageHeader(const String& fileName)
 } // ReadImageHeader
 /*----------------------------------------------------------------*/
 
+// MVS_JPEG_SCALED_DECODE: let the JPEG decoder produce the reduced image directly
+// (DCT-domain scaling) instead of decoding at full resolution and then resampling.
+//
+// WHY: at --resolution-level 1 the pipeline immediately halves each dimension, so
+// three quarters of every decoded pixel was being computed and thrown away. On a
+// 322-image / 11.44 MPixel scene the first-pass decode is ~2.5 s of the run
+// (StreamPrepChunked at scale 1), and a 1/2 DCT decode is worth roughly 2x of it.
+//
+// WHY IT IS OFF BY DEFAULT: a DCT-domain reduction is a DIFFERENT low-pass than a
+// full decode followed by INTER_AREA, so the decoded pixels change. Every energy,
+// gradient and reference hash downstream moves with them -- this will NOT match the
+// E89CC3B8 reference family. Quality is expected to be neutral-or-better (the DCT
+// reduction is better conditioned than a box filter over full-res pixels) but that
+// is an expectation, not a measurement.
+//
+// 1 = scaled decode, 0 = the original decode-then-resize path.
+#ifndef MVS_JPEG_SCALED_DECODE
+#define MVS_JPEG_SCALED_DECODE 1
+#endif
+
 IMAGEPTR Image::ReadImage(const String& fileName, Image8U3& image)
 {
 	IMAGEPTR pImage(OpenImage(fileName));
@@ -70,6 +90,35 @@ IMAGEPTR Image::ReadImage(const String& fileName, Image8U3& image)
 		pImage.Release();
 	return pImage;
 } // ReadImage
+/*----------------------------------------------------------------*/
+
+// As ReadImage, but asks the decoder for a reduced image up front. fullWidth/
+// fullHeight come back as the file's TRUE dimensions -- the caller needs them to
+// fold the decode factor into Image::scale, since ResizeImage() can only report a
+// ratio against whatever it was handed.
+IMAGEPTR Image::ReadImageScaled(const String& fileName, Image8U3& image,
+	unsigned nMaxResolution, unsigned& fullWidth, unsigned& fullHeight)
+{
+	fullWidth = fullHeight = 0;
+	IMAGEPTR pImage(OpenImage(fileName));
+	if (pImage == NULL)
+		return pImage;
+	if (FAILED(pImage->ReadHeader())) {
+		LOG("error: failed loading image header");
+		pImage.Release();
+		return pImage;
+	}
+	fullWidth = (unsigned)pImage->GetWidth();
+	fullHeight = (unsigned)pImage->GetHeight();
+	// no-op for every format except JPEG; may shrink GetWidth()/GetHeight()
+	pImage->SetDecodeScale((CImage::Size)nMaxResolution);
+	image.create(pImage->GetHeight(), pImage->GetWidth());
+	if (FAILED(pImage->ReadData(image.data, PF_R8G8B8, 3, (CImage::Size)image.step))) {
+		LOG("error: failed loading image data");
+		pImage.Release();
+	}
+	return pImage;
+} // ReadImageScaled
 /*----------------------------------------------------------------*/
 
 IMAGEPTR Image::ReadImageRaw(const String& fileName, Image8U3& image)
@@ -134,7 +183,14 @@ bool Image::LoadImage(const String& fileName, unsigned nMaxResolution)
 // open the stored image file name and read again the image data
 bool Image::ReloadImage(unsigned nMaxResolution, bool bLoadPixels)
 {
+#if MVS_JPEG_SCALED_DECODE
+	unsigned fullWidth = 0, fullHeight = 0;
+	IMAGEPTR pImage(bLoadPixels
+		? ReadImageScaled(name, image, nMaxResolution, fullWidth, fullHeight)
+		: ReadImageHeader(name));
+#else
 	IMAGEPTR pImage(bLoadPixels ? ReadImage(name, image) : ReadImageHeader(name));
+#endif
 	if (pImage == NULL) {
 		LOG("error: failed reloading image '%s'", name.c_str());
 		return false;
@@ -144,8 +200,20 @@ bool Image::ReloadImage(unsigned nMaxResolution, bool bLoadPixels)
 		width = pImage->GetWidth();
 		height = pImage->GetHeight();
 	}
+#if MVS_JPEG_SCALED_DECODE
+	// ResizeImage reports a ratio against the image IT was handed, so if the decoder
+	// already reduced by fullWidth/decodedWidth that factor is invisible to it and
+	// `scale` would come back too large -- UpdateCamera would then scale K by the
+	// wrong amount and every projection in the run would be off. Capture the decoded
+	// width first and multiply the two factors.
+	const unsigned decodedWidth = image.empty() ? 0u : (unsigned)image.width();
+	scale = ResizeImage(nMaxResolution);
+	if (decodedWidth != 0u && fullWidth != 0u && decodedWidth != fullWidth)
+		scale *= (float)decodedWidth / (float)fullWidth;
+#else
 	// resize image if needed
 	scale = ResizeImage(nMaxResolution);
+#endif
 	return true;
 } // ReloadImage
 /*----------------------------------------------------------------*/

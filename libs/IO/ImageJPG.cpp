@@ -181,6 +181,62 @@ HRESULT CImageJPG::ReadHeader()
 } // ReadHeader
 /*----------------------------------------------------------------*/
 
+// Scale in the DCT domain instead of decoding full-size and resampling afterwards.
+// libjpeg emits ceil(dim * scale_num / scale_denom); at 1/2 the IDCT drops from 8x8
+// to 4x4 and upsampling plus colour conversion run on a quarter of the pixels, so
+// this is worth roughly 2x -- not 4x, because Huffman decoding is unchanged.
+//
+// Restricted to 1/8, 1/4, 1/2: denom 8 with a power-of-two num is supported by plain
+// libjpeg 6b as well as libjpeg-turbo. turbo also accepts any num in 1..16, but the
+// extra granularity is not worth depending on which flavour is linked.
+//
+// Picks the SMALLEST output that still covers nMaxResolution, so the caller's
+// subsequent ResizeImage only ever downsamples -- never upsamples, which would throw
+// away real resolution.
+//
+// NOT equivalent to a full decode followed by INTER_AREA: a DCT-domain reduction is a
+// different low-pass than a box filter over full-resolution pixels. Pixel values
+// differ, so the caller gates this off by default.
+void CImageJPG::SetDecodeScale(Size nMaxResolution)
+{
+	JpegState* state = (JpegState*)m_state;
+	if (state == NULL || nMaxResolution == 0 || m_width == 0 || m_height == 0)
+		return;
+	jpeg_decompress_struct* cinfo = &state->cinfo;
+	const Size full = (m_width > m_height ? m_width : m_height);
+	if (full <= nMaxResolution)
+		return; // already at or below the target; nothing to gain
+	// EXACT DIVISIBILITY IS REQUIRED, not just convenient. libjpeg emits
+	// ceil(dim * num / 8), and the caller then resizes by nMaxResolution/decodedWidth.
+	// If ceil() rounded either dimension up, that second ratio differs from the one
+	// the full-resolution path would have used and the FINAL size can land one pixel
+	// off -- which changes every plane dimension, the tile grid, and the decode-cache
+	// key (`MAXF(cache.width, cache.height) != imageSize`) downstream. Requiring both
+	// dimensions to divide exactly makes ceil() a no-op, so the final size is
+	// bit-for-bit the size the old path produced. Camera JPEGs are almost always even,
+	// so this rejects very little in practice and costs nothing when it does.
+	const unsigned kNums[3] = { 1u, 2u, 4u }; // over 8 -> 1/8, 1/4, 1/2
+	unsigned num = 8u;
+	for (int i = 0; i < 3; ++i) {
+		const unsigned den = 8u / kNums[i]; // 8, 4, 2
+		if ((m_width % den) != 0 || (m_height % den) != 0)
+			continue; // ceil() would round; skip this ratio
+		const Size outMax = (full * kNums[i]) / 8;
+		if (outMax >= nMaxResolution) { num = kNums[i]; break; }
+	}
+	if (num >= 8u)
+		return; // no exact ratio both covers the target and divides evenly
+	cinfo->scale_num = num;
+	cinfo->scale_denom = 8;
+	jpeg_calc_output_dimensions(cinfo);
+	// ReadData loops m_height times and the caller allocated GetWidth() x GetHeight(),
+	// so BOTH must become the post-scale size here or the decode walks off the buffer.
+	m_dataWidth = m_width = cinfo->output_width;
+	m_dataHeight = m_height = cinfo->output_height;
+	m_lineWidth = m_width * m_stride;
+} // SetDecodeScale
+/*----------------------------------------------------------------*/
+
 HRESULT CImageJPG::ReadData(void* pData, PIXELFORMAT dataFormat, Size nStride, Size lineWidth)
 {
 	JpegState* state = (JpegState*)m_state;

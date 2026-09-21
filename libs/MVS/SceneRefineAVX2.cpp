@@ -843,15 +843,28 @@ uint32_t SceneRefinePGGroupAVX2(
 
 	const __m256 fx = _mm256_sub_ps(gsx, _mm256_cvtepi32_ps(xi));
 	const __m256 fy = _mm256_sub_ps(gsy, _mm256_cvtepi32_ps(yi));
-	// int16-plane element offsets; a 32-bit gather at scale 2 reads the tap
-	// pair {off, off+1}, exactly like the scalar *(const int*)(plane + off)
 	__m256i off = _mm256_add_epi32(_mm256_mullo_epi32(yi, _mm256_set1_epi32(ctx.wB)), xi);
 	off = _mm256_and_si256(off, keepI); // clamp dead lanes to 0 (their gather is masked anyway)
 	const __m256i offBot = _mm256_add_epi32(off, _mm256_set1_epi32(ctx.wB));
+#if MESHOPT_GRAD_INTERLEAVED
+	// PIXEL indices, not int16-element offsets: the plane holds one (gx,gy) int16
+	// pair per pixel, so a 32-bit gather at SCALE 4 reads pixel `off`'s pair into one
+	// lane -- {gx,gy} of one pixel, where the two-plane version reads {gx00,gx01} of
+	// one channel. Four taps, four gathers either way; the difference is that a row's
+	// two taps now sit 4 bytes apart in ONE plane.
+	const __m256i one32 = _mm256_set1_epi32(1);
+	const __m256i g00 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXYB, off, keepI, 4);
+	const __m256i g01 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXYB, _mm256_add_epi32(off, one32), keepI, 4);
+	const __m256i g10 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXYB, offBot, keepI, 4);
+	const __m256i g11 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXYB, _mm256_add_epi32(offBot, one32), keepI, 4);
+#else
+	// int16-plane element offsets; a 32-bit gather at scale 2 reads the tap
+	// pair {off, off+1}, exactly like the scalar *(const int*)(plane + off)
 	const __m256i gxTop16 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXB, off, keepI, 2);
 	const __m256i gxBot16 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradXB, offBot, keepI, 2);
 	const __m256i gyTop16 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradYB, off, keepI, 2);
 	const __m256i gyBot16 = _mm256_mask_i32gather_epi32(zeroI, (const int*)ctx.gradYB, offBot, keepI, 2);
+#endif
 
 	// dequantize the two int16 taps of each gather: low tap via shift-up/down
 	// sign extension, high tap via arithmetic shift -- then * invScale, exactly
@@ -870,8 +883,16 @@ uint32_t SceneRefinePGGroupAVX2(
 		const __m256 b = _mm256_add_ps(v01, _mm256_mul_ps(fy, _mm256_sub_ps(v11, v01)));
 		return _mm256_add_ps(a, _mm256_mul_ps(fx, _mm256_sub_ps(b, a)));
 	};
+#if MESHOPT_GRAD_INTERLEAVED
+	// lowTap of a lane is that pixel's x-gradient, highTap its y-gradient. Same int16
+	// values, same sign-extend + invScale, same bilerp operand order as the two-plane
+	// form below -- which is the whole bit-identity claim.
+	const __m256 gBx = bilerp(lowTap(g00), lowTap(g01), lowTap(g10), lowTap(g11));
+	const __m256 gBy = bilerp(highTap(g00), highTap(g01), highTap(g10), highTap(g11));
+#else
 	const __m256 gBx = bilerp(lowTap(gxTop16), highTap(gxTop16), lowTap(gxBot16), highTap(gxBot16));
 	const __m256 gBy = bilerp(lowTap(gyTop16), highTap(gyTop16), lowTap(gyBot16), highTap(gyBot16));
+#endif
 
 	// scalar: dot0 = t0 - xB*tW; dot1 = t1 - yB*tW;
 	//         sg = ((((gBx*dot0 + gBy*dot1) * invW) * invNd) * Reg) * dZNCC

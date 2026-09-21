@@ -141,6 +141,7 @@ private:
 
     // Local stack (optional): avoids calling push_back if counts are known
     for (VFIterator x = VFIterator(v0); !x.End(); ++x) {
+      if (g_deciLoopProf) ++g_execRingV0;
       FaceType* __restrict f = x.F();
       const int z = x.I();
       VertexType* const * __restrict verts = f->VRaw(); // assume VRaw returns VertexType*[3]
@@ -488,6 +489,12 @@ static int Do(TriMeshType &m, VertexPair & c, const Point3<ScalarType> &p, const
     static EdgeSet es(m.vert.size());
 
     FindSets(c,es);
+
+    if (g_deciLoopProf) {
+      ++g_execCollapses;
+      g_execAv01 += es.av01Faces.size();
+      g_execAv0  += es.av0Faces.size();
+    }
 
     for (int i = 0, cnt = es.av01Faces.size(); i < cnt; ++i) {
       FaceType& f = *es.av01Faces[i];

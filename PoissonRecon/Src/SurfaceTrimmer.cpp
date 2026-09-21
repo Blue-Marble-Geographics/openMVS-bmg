@@ -52,8 +52,17 @@ using namespace PoissonRecon;
 // triangulate / cleanup). Prints unconditionally (no --verbose needed). Set to 0
 // to silence once the hot phase is identified.
 #ifndef PR_TRIM_PROFILE
-#define PR_TRIM_PROFILE 0
+#define PR_TRIM_PROFILE 1
 #endif // PR_TRIM_PROFILE
+
+// The phase times are accumulated here and emitted as ONE line through
+// TrimParams::logSink, rather than the eight std::cout lines this used to print.
+// Trim installs no cout redirect, so those went to stdout and never reached the log.
+namespace { struct TrimProf {
+	double split = 0, connComp = 0, copyArea = 0, bndEdges = 0,
+	       compEdges = 0, islandMerge = 0, triangulate = 0;
+	size_t nVerts = 0, nPolys = 0;
+}; TrimProf g_trimProf; }
 
 // [DENSITY-BAND FILTER] Targeted removal of the low-confidence, down-facing
 // Poisson "underside/skirt" faces that appear only when --trim is lowered to keep
@@ -445,6 +454,18 @@ void SetConnectedComponents( const std::vector< std::vector< Index > >& polygons
 		Index lo , hi , poly;
 		bool operator < ( const EdgeRec &e ) const { return lo<e.lo || ( lo==e.lo && hi<e.hi ); }
 	};
+	// DO NOT replace this std::sort with a counting sort. It was tried (bucket by `lo`,
+	// then a threaded per-bucket insertion sort) and it is a WASH: trim 3.921 -> 3.848 s,
+	// inside the 3.704-3.921 run-to-run band, while costing +110 MB for the offset and
+	// cursor arrays in a stage with no memory governor.
+	//
+	// The reason is visible in the OpenMVS-side component pass, which has the identical
+	// structure and is now instrumented: comp-csr=0.810 s for the count + prefix + scatter
+	// over the same ~41M edge instances, against comp-sort=0.022 s for the sort itself.
+	// The scatter costs what the comparison sort cost -- both are memory-bound on the same
+	// ~495 MB -- so bucketing only moves the time, it does not remove it.
+	//
+	// Threading the sort is likewise pointless here: it is not where the time is.
 	size_t edgeCount = 0;
 	for( size_t i=0 ; i<nPolys ; i++ ) edgeCount += polygons[i].size();
 	std::vector< EdgeRec > edges;
@@ -468,6 +489,7 @@ void SetConnectedComponents( const std::vector< std::vector< Index > >& polygons
 		for( size_t k=s+1 ; k<e ; k++ ) Union( edges[s].poly , edges[k].poly );
 		s = e;
 	}
+	std::vector< EdgeRec >().swap( edges );   // ~495 MB, dead from here on
 
 	// Flatten to roots, number components by their (smallest-index) representative,
 	// and group polygons in ascending order. A dense root->component vector avoids
@@ -502,12 +524,14 @@ void TrimMeshInMemory
 
 #if PR_TRIM_PROFILE
 	double _tp = Time();
-	std::cout << "[TRIM-PROFILE] input: verts=" << vertices.size() << " polys=" << polygons.size() << std::endl;
+	g_trimProf = TrimProf();
+	g_trimProf.nVerts = vertices.size();
+	g_trimProf.nPolys = polygons.size();
 #endif // PR_TRIM_PROFILE
 	vertexTable.reserve( polygons.size() );
 	for( size_t i=0 ; i<polygons.size() ; i++ ) SplitPolygon( polygons[i] , vertices , &ltPolygons , &gtPolygons , &ltFlags , &gtFlags , vertexTable , trimValue );
 #if PR_TRIM_PROFILE
-	std::cout << "[TRIM-PROFILE] SplitPolygon: " << Time()-_tp << " (s)" << std::endl; _tp = Time();
+	g_trimProf.split = Time()-_tp; _tp = Time();
 #endif // PR_TRIM_PROFILE
 
 	if( islandAreaRatio>0 )
@@ -519,7 +543,7 @@ void TrimMeshInMemory
 			SetConnectedComponents( ltPolygons , ltComponents );
 			SetConnectedComponents( gtPolygons , gtComponents );
 #if PR_TRIM_PROFILE
-			std::cout << "[TRIM-PROFILE]   .. SetConnComp x2: " << Time()-_tp << " (s)" << std::endl; _tp = Time();
+			g_trimProf.connComp = Time()-_tp; _tp = Time();
 #endif // PR_TRIM_PROFILE
 			gtComponentStart = ltComponents.size();
 			for( unsigned int i=0 ; i<gtComponents.size() ; i++ ) for( unsigned int j=0 ; j<gtComponents[i].size() ; j++ ) gtComponents[i][j] += (Index)ltPolygons.size();
@@ -539,7 +563,7 @@ void TrimMeshInMemory
 			nodes[i].polygonIndices.push_back( _components[i] );
 		}
 #if PR_TRIM_PROFILE
-		std::cout << "[TRIM-PROFILE]   .. Copy+Area: " << Time()-_tp << " (s)" << std::endl; _tp = Time();
+		g_trimProf.copyArea = Time()-_tp; _tp = Time();
 #endif // PR_TRIM_PROFILE
 
 		struct _HalfEdge
@@ -567,7 +591,7 @@ void TrimMeshInMemory
 		}
 		std::sort( halfEdges.begin() , halfEdges.end() );
 #if PR_TRIM_PROFILE
-		std::cout << "[TRIM-PROFILE]   .. BoundaryHalfEdges: " << Time()-_tp << " (s)" << std::endl; _tp = Time();
+		g_trimProf.bndEdges = Time()-_tp; _tp = Time();
 #endif // PR_TRIM_PROFILE
 
 		std::unordered_set< EdgeKey< Index > , typename EdgeKey< Index >::Hasher > componentEdges;
@@ -592,7 +616,7 @@ void TrimMeshInMemory
 		double area = 0;
 		for( unsigned int i=0 ; i<nodes.size() ; i++ ) area += nodes[i].area;
 #if PR_TRIM_PROFILE
-		std::cout << "[TRIM-PROFILE] ComponentEdges+area: " << Time()-_tp << " (s) , components=" << nodes.size() << std::endl; _tp = Time();
+		g_trimProf.compEdges = Time()-_tp; _tp = Time();
 		size_t _nMerges = 0;
 #endif // PR_TRIM_PROFILE
 
@@ -613,7 +637,7 @@ void TrimMeshInMemory
 			}
 		}
 #if PR_TRIM_PROFILE
-		std::cout << "[TRIM-PROFILE] IslandMerge loop: " << Time()-_tp << " (s) , merges=" << _nMerges << std::endl; _tp = Time();
+		g_trimProf.islandMerge = Time()-_tp; _tp = Time();
 #endif // PR_TRIM_PROFILE
 
 		ltPolygons.clear() , gtPolygons.clear();
@@ -640,7 +664,7 @@ void TrimMeshInMemory
 
 	RemoveHangingVertices( vertices , gtPolygons );
 #if PR_TRIM_PROFILE
-	std::cout << "[TRIM-PROFILE] Triangulate+RemoveHanging: " << Time()-_tp << " (s)" << std::endl;
+	g_trimProf.triangulate = Time()-_tp;
 #endif // PR_TRIM_PROFILE
 	outPolygons = std::move( gtPolygons );
 }
@@ -659,20 +683,31 @@ namespace PoissonReconLib
 		const size_t nv = in.VertexCount() , nt = in.TriangleCount();
 		if( nv==0 || nt==0 ) return false;
 
-		std::vector< Vertex > vertices( nv );
+		// reserve+emplace, NOT vector(nv): the sized ctor value-initializes every
+		// element (Point's default ctor memsets the 3 coords; the density float is
+		// left indeterminate anyway, so there is no defined-state argument for it),
+		// and every one of those bytes is overwritten by the loop below -- a
+		// redundant full pass over 16*nv bytes that the optimizer does not fuse
+		// with the fill.
+		std::vector< Vertex > vertices;
+		vertices.reserve( nv );
 		for( size_t i=0 ; i<nv ; i++ )
 		{
 			const float *v = &in.vertices[ i*4 ];
-			vertices[i].template get<0>()[0] = (Real)v[0];
-			vertices[i].template get<0>()[1] = (Real)v[1];
-			vertices[i].template get<0>()[2] = (Real)v[2];
-			vertices[i].template get<1>()    = (Real)v[3]; // density -> value
+			Vertex &vt = vertices.emplace_back();
+			vt.template get<0>()[0] = (Real)v[0];
+			vt.template get<0>()[1] = (Real)v[1];
+			vt.template get<0>()[2] = (Real)v[2];
+			vt.template get<1>()    = (Real)v[3]; // density -> value
 		}
-		std::vector< std::vector< Index > > polygons( nt );
+		// Same reasoning. The inner vectors still cost one heap block per triangle;
+		// that is inherent to the vector<vector<Index>> the trimmer interior takes.
+		std::vector< std::vector< Index > > polygons;
+		polygons.reserve( nt );
 		for( size_t i=0 ; i<nt ; i++ )
 		{
 			const uint32_t *tr = &in.triangles[ i*3 ];
-			polygons[i] = { (Index)tr[0] , (Index)tr[1] , (Index)tr[2] };
+			polygons.push_back( { (Index)tr[0] , (Index)tr[1] , (Index)tr[2] } );
 		}
 
 		Real effectiveTrim = (Real)params.trim;
@@ -838,6 +873,25 @@ namespace PoissonReconLib
 			out.Clear();
 			return false;
 		}
+
+#if PR_TRIM_PROFILE
+		// ONE line through the sink -- Trim installs no std::cout redirect, so printing
+		// here would not reach the log. trim= is the largest single item in [POST-SOLVE]
+		// (3.7-3.9 s) and had never been attributed; these are its parts.
+		if( params.logSink )
+		{
+			char _b[512];
+			const TrimProf &p = g_trimProf;
+			snprintf( _b , sizeof(_b) ,
+				"[TRIM-PROFILE] split=%.3f connComp=%.3f copyArea=%.3f bndEdges=%.3f"
+				" compEdges=%.3f islandMerge=%.3f triangulate=%.3f (seconds)"
+				" | in %zu verts / %zu polys -- connComp is the two SetConnectedComponents"
+				" calls (edge gather + sort + union-find)" ,
+				p.split , p.connComp , p.copyArea , p.bndEdges ,
+				p.compEdges , p.islandMerge , p.triangulate , p.nVerts , p.nPolys );
+			params.logSink( _b );
+		}
+#endif // PR_TRIM_PROFILE
 
 		out.vertices.resize( vertices.size()*4 );
 		for( size_t i=0 ; i<vertices.size() ; i++ )

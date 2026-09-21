@@ -586,6 +586,21 @@ namespace MVS {
 								(int)PMCUDA_BLOCK_H, g_pmcudaEffectiveBlockH);
 					}
 				}
+				// PMCUDA_OPT_FAST_DIV is the one estimator toggle that changes results, so
+				// say which setting produced this run -- a timing or quality comparison
+				// between two builds is worthless if it turns out they disagreed here.
+				// VERBOSE, not DENSIFY_DIAG: the Global Mapper pipeline spawns the exe with
+				// a fixed command line, so the diag gate is always shut there.
+				{
+					static bool sReportedFastDiv = false;
+					if (!sReportedFastDiv) {
+						sReportedFastDiv = true;
+						VERBOSE("CUDA: PatchMatch projective divide = %d (%s)", (int)PMCUDA_OPT_FAST_DIV,
+							PMCUDA_OPT_FAST_DIV == 2 ? "approximate reciprocal, ~2 ulp" :
+							PMCUDA_OPT_FAST_DIV == 1 ? "correctly-rounded reciprocal, <=1 ulp" :
+							"IEEE division, exact");
+					}
+				}
 
 				// split the results back into maps on-device, then download through
 				// pinned staging; the confidence conversion and the views bit-mask ->

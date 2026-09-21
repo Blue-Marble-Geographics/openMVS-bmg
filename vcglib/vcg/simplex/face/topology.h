@@ -28,6 +28,21 @@
 
 #include <vcg/complex/allocate.h>
 
+// [EXEC-PROFILE] counters for the collapse hot path. GLOBAL scope on purpose: the matching
+// declarations in vcg/complex/algorithms/local_optimization.h are global too, and both this
+// header and edge_collapse.h sit below it, so they cannot pull its types in without a
+// cycle. Defined in libs/MVS/Mesh.cpp beside g_deciSetup. Everything is gated on
+// g_deciLoopProf (OPENMVS_MESH_DECI_LOOPPROF=1) so the default path pays one
+// perfectly-predicted branch.
+extern bool g_deciLoopProf;
+extern unsigned long long g_execCollapses;
+extern unsigned long long g_execRingV0;
+extern unsigned long long g_execAv01;
+extern unsigned long long g_execAv0;
+extern unsigned long long g_vfDetachCalls;
+extern unsigned long long g_vfDetachHead;
+extern unsigned long long g_vfDetachSteps;
+
 namespace vcg {
 namespace face {
 /** \addtogroup face */
@@ -864,8 +879,10 @@ void VFDetach(FaceType & f)
 template <class FaceType>
 void VFDetach(FaceType & f, int z)
 {
+    if( g_deciLoopProf ) ++g_vfDetachCalls;
     if(f.V(z)->VFp()==&f )  //if it is the first face detach from the begin
     {
+        if( g_deciLoopProf ) ++g_vfDetachHead;
         int fz = f.V(z)->VFi();
         f.V(z)->VFp() = f.VFp(fz);
         f.V(z)->VFi() = f.VFi(fz);
@@ -877,6 +894,7 @@ void VFDetach(FaceType & f, int z)
 
         for(;;)
         {
+            if( g_deciLoopProf ) ++g_vfDetachSteps;
             y = x;
             ++x;
             assert(x.f!=0);

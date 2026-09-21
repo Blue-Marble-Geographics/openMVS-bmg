@@ -45,6 +45,20 @@ using namespace MVS;
 // uncomment to enable multi-threading based on OpenMP
 #ifdef _USE_OPENMP
 #define RECMESH_USE_OPENMP
+
+// ============================================================================
+// A/B SWITCH -- flip this and rebuild; no environment variable needed, so the
+// setting reaches the whole Global Mapper pipeline and not just a shell.
+//
+//   1 = deliverable follows the ATLAS FACE BUDGET  (current default)
+//   0 = deliverable follows --decimate             (previous behaviour)
+//
+// See the note at the decision site. OPENMVS_MESH_FILL_ATLAS still overrides at
+// runtime if it happens to be set, but the define is what ships.
+// ============================================================================
+#ifndef MESH_FILL_ATLAS
+#define MESH_FILL_ATLAS 1
+#endif
 #endif
 
 
@@ -520,6 +534,11 @@ int main(int argc, LPCTSTR* argv)
 		// which meant a small-scene size preference silently removed the protection the
 		// large scenes depend on.
 		double capRatio = 1.0;
+		// The ratio that would FILL the face budget exactly. capRatio above is only ever a
+		// CAP -- it is set solely when the budget is smaller than the mesh -- so when the
+		// budget is LARGER, --decimate decides alone and the atlas is left under-filled.
+		// See OPENMVS_MESH_FILL_ATLAS at the decision below.
+		double fillRatio = 0.0;
 		if (OPT::nTargetFaceNum == 0 && !scene.mesh.faces.empty()) {
 			size_t nViews = 0;
 			for (size_t i = 0; i < (size_t)scene.images.GetSize(); ++i)
@@ -582,8 +601,17 @@ int main(int argc, LPCTSTR* argv)
 				const char* which = (budgetAtlas < budgetMem) ? "ATLAS" : "RAM";
 				// WHY this dimension, in one clause. Precedence is env pin > host probe >
 				// built-in fallback, so the source also says what the alternative was.
+				// A pin ABOVE the hardware is clamped away by ResolveAtlasMaxDimEx, so it
+				// did not decide anything and must not be named as though it had -- the
+				// hardware did. Naming the pin there would have this line claim the
+				// operator chose 16384 when what actually happened is that their 65536
+				// was refused.
+				const bool pinDecided = (atlasEnvPin > 0 &&
+					(atlasHostLimit <= 0 || atlasEnvPin <= atlasHostLimit));
 				const char* srcAtlas =
-					(atlasEnvPin > 0)     ? "pinned by OPENMVS_ATLAS_MAX_DIM" :
+					pinDecided            ? "pinned by OPENMVS_ATLAS_MAX_DIM" :
+					(atlasEnvPin > 0)     ? "host GPU limit; OPENMVS_ATLAS_MAX_DIM pinned"
+					                        " higher and was clamped away" :
 					(atlasHostLimit > 0)  ? "host GPU limit" :
 					                        "fallback, no GPU reachable";
 				// The largest dimension this host would have allowed. An env pin BELOW the
@@ -654,6 +682,7 @@ int main(int argc, LPCTSTR* argv)
 					(unsigned)nViews, budgetMem * 1e-6);
 				if (budget < nFaces) {
 					capRatio = budget / nFaces;
+					fillRatio = capRatio;
 					// This CHANGES the deliverable -- it forces decimation the caller did
 					// not ask for -- so it stays visible at normal verbosity.
 					VERBOSE("[ATLAS] %s-bound: reducing %u faces to %.1fM (x%.3f)",
@@ -679,6 +708,26 @@ int main(int argc, LPCTSTR* argv)
 				} else {
 					// nothing was changed, so this is a statement about the budget
 					// rather than about the deliverable -- it rides the gate
+					// The mesh already fits the budget, so the atlas is not what binds.
+					// Normally leave --decimate alone: RefineMesh fills the headroom, and
+					// it fills it BETTER, because its subdivision is projected-area-uniform
+					// and labels into far fewer patches than Poisson's heterogeneous faces.
+					//
+					// ...but only if RefineMesh is actually going to run. If the policy
+					// chose SKIP, nothing downstream fills the budget, so fill it here.
+					extern int PoissonMeshRefineWillRun();
+					if (PoissonMeshRefineWillRun() == 0)
+						fillRatio = budget / nFaces;
+					// MEASURED on SchnellTests (mesh 3.25M against a 4.1M budget, refine RUN),
+					// full chain both ways:
+					//            ReconstructMesh   RefineMesh   atlas patches
+					//   leave     1,285,559        3,245,890      12,542
+					//   fill      3,229,385        3,832,382      19,003   (+52%)
+					// Filling bought 18% more faces for 52% more patches. Patch count is
+					// what drives per-chart bbox slack, so it costs usable atlas area --
+					// and RefineMesh had already rebuilt the decimated mesh to the same
+					// size anyway (1.29M -> 3.25M), with UNIFORM faces that label into far
+					// fewer patches. See "Refine subdivision homogenizes".
 					MESH_DIAG("[ATLAS] %s-bound at %.1fM faces; mesh has %u -- not reduced",
 						which, budget * 1e-6, (unsigned)nFaces);
 				}
@@ -687,6 +736,56 @@ int main(int argc, LPCTSTR* argv)
 		float fDecimate(OPT::nTargetFaceNum ? static_cast<float>(OPT::nTargetFaceNum) / scene.mesh.faces.size() : OPT::fDecimateMesh);
 		if ((float)capRatio < fDecimate)
 			fDecimate = (float)capRatio;
+
+		// Keep the deliverable at the FACE BUDGET rather than at --decimate -- but ONLY
+		// when the atlas is what binds, i.e. only when the mesh EXCEEDS the budget and
+		// fillRatio was set above. DEFAULT ON; OPENMVS_MESH_FILL_ATLAS=0 restores
+		// --decimate. This DOES override an explicit --decimate, deliberately: where the
+		// atlas binds, the budget is what it can carry and shipping under it is capacity
+		// thrown away.
+		//
+		// MEASURED on RichmondHistoric, full chain, with the oversolve trim active:
+		// without this the solve's 8.93M would have decimated to 3.57M (x0.400) against a
+		// budget of 4.07M. With it, x0.456 -> 4,068,475, and RefineMesh then lands on
+		// 4,068,445 faces / 62,760 patches -- indistinguishable from the 4,068,103 /
+		// 63,185 of the untrimmed baseline, for ~25 s less across Clean+Refine+Texture.
+		//
+		// fillRatio is < 1 when the atlas binds, and > 1 in the refine-SKIP case (the mesh
+		// is smaller than the budget, so "fill" means keep it). The clamp below is a
+		// WORKING path for that second case, not just a guard -- and it must stay strictly
+		// under 1.0, because Mesh::Clean reads fDecimate >= 1 as "no keep floor".
+		//
+		// WHY IT EXISTS. --decimate is a FRACTION of whatever the solve produced, so the
+		// output tracks the raw mesh instead of the atlas. MEASURED on RichmondHistoric:
+		// the baseline solves 13.77M and the atlas caps it at 4.1M, giving x0.305 -- the
+		// atlas binds and is filled. With the oversolve trim reducing the solve to 9.29M,
+		// x0.4 became the smaller of the two and the output fell to 3.59M against an atlas
+		// that could carry 4.1M: 12% of the texture budget left unused for no reason.
+		// Same effect whenever a scene simply solves smaller than 2.5x the budget.
+		//
+		// Filling the budget is what "best quality for this atlas" means: the cap is
+		// computed at a fixed texels-per-face, so faces below it are capacity the atlas
+		// could have carried and did not.
+		if (fillRatio > (double)fDecimate) {
+			const char* fa = std::getenv("OPENMVS_MESH_FILL_ATLAS");
+			const bool fillOn = fa ? (std::atoi(fa) > 0) : (MESH_FILL_ATLAS != 0);
+			if (fillOn) {
+				const float was = fDecimate;
+				// CLAMP BELOW 1.0, NOT AT IT. fDecimate is a keep-FRACTION only while it is
+				// strictly inside (0,1): Mesh::Clean reads `fDecimate >= 1` as "no keep
+				// floor", and with --decimate-error set (Global Mapper passes 1) the error
+				// metric is then free to run to a minimal safety floor.
+				// MEASURED the hard way: x1.000 produced "target faces: 4" and a 143,310-face
+				// mesh from a 3.2M-face input.
+				fDecimate = (float)std::min(0.999, fillRatio);
+				VERBOSE("[ATLAS] FILL: raising decimate x%.3f -> x%.3f so the deliverable"
+					" matches the face budget rather than --decimate (%u faces ->"
+					" %u instead of %u)", was, fDecimate,
+					(unsigned)scene.mesh.faces.size(),
+					(unsigned)(scene.mesh.faces.size() * fDecimate),
+					(unsigned)(scene.mesh.faces.size() * was));
+			}
+		}
 		// Under --poisson, skip ONLY the graph-cut-oriented spurious (long-edge)
 		// removal -- the Poisson surface is coherently oriented, and skipping it also
 		// preserves the edge extrapolation. Hole-closing STAYS ON: SurfaceTrimmer

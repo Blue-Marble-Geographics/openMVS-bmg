@@ -46,6 +46,7 @@ DAMAGE.
 #define FEM_TREE_INCLUDED
 
 #include <atomic>
+#include <algorithm>
 #ifdef SANITIZED_PR
 #include <shared_mutex>
 #endif // SANITIZED_PR
@@ -75,6 +76,7 @@ DAMAGE.
 #include <functional>
 #include <string>
 #include <tuple>
+#include <vector>
 #include <functional>
 #include <cmath>
 #include <climits>
@@ -345,6 +347,75 @@ namespace PoissonRecon
 		Data& operator[] ( size_t idx ) { return _data[idx]; }
 
 		void reserve( size_t sz ){ if( sz>_indices.size() ) _indices.resize( sz , -1 ); }
+
+		// Undo the densification's ACCESS cost once the field is built.
+		//
+		// presizeSlots below gives every node a slot so the parallel splat never takes
+		// at()'s mutex. The price is that operator()(node) then returns a valid pointer for
+		// every node, where it used to return NULL for untouched ones -- so readers that
+		// used to skip a node now dereference into a 314 MB array and eat a cache miss.
+		// MEASURED at +0.2 s in "Set FEM constraints" on both scenes, and a value-level
+		// !_IsZero() guard did NOT recover it: the miss happens on the lookup, before any
+		// value can be tested.
+		//
+		// This walks the field once, in parallel, and points the index back at -1 wherever
+		// the slot still holds `zero`. Readers go back to seeing NULL and never touch the
+		// data array for those nodes.
+		//
+		// A slot holding `zero` is INDISTINGUISHABLE from an untouched one -- that is
+		// exactly what an untouched slot contains -- so this cannot change what any
+		// value-testing consumer sees. It does differ from the pre-densification behaviour
+		// for a node that was touched and summed to exactly zero: that used to read
+		// non-NULL. Both consumers of the normal field test the VALUE (HasNormalDataFunctor
+		// checks normal[d]!=0; _addFEMConstraints skips zeros), so they are unaffected --
+		// but a future consumer that distinguishes "present and zero" from "absent" would
+		// be, which is why this is opt-in per caller rather than folded into presizeSlots.
+		//
+		// The data array is NOT shrunk: slots stay allocated, they just stop being reachable.
+		// This buys access time, not memory.
+		template< typename IsZeroFunctor >
+		void dropZeroEntries( IsZeroFunctor isZero )
+		{
+			ThreadPool::ParallelFor( 0 , _indices.size() , [&]( unsigned int , size_t i )
+				{
+					const node_index_type idx = _indices[i];
+					if( idx>=0 && isZero( _data[idx] ) ) _indices[i] = -1;
+				} );
+		}
+
+		// Give every node index < sz its own slot UP FRONT, so at() never reaches its
+		// allocation path -- and therefore never takes _updateMutex -- during a parallel
+		// pass. Only legal on an empty field; on a non-empty one it does nothing, because
+		// re-pointing _indices at an identity mapping would orphan the existing slots.
+		//
+		// MEASURED, and this is the whole reason it exists. at() takes ONE SHARED MUTEX on
+		// the first touch of each node and holds it while _data grows by a single element.
+		// The normal-field splat first-touches millions of nodes from every thread at once.
+		// Timing the lookup separately from the atomic add, on Historic, per node-update
+		// (the instrumentation that produced this has since been removed):
+		//
+		//                 2 threads   8 threads   growth
+		//   depth/weight     28          71        2.5x     <- read-only control
+		//   atomicAdd        60         197        3.3x     <- the float CAS
+		//   sparseAt        119       3,206        27x      <- this
+		//
+		// 27x for 4x the threads is a lock convoy; nothing else scales that way. At 8
+		// threads sparseAt is 91% of splat time and the CAS is 5.6%, which is why the
+		// splat is pinned to 2 threads and why every earlier theory about the atomics
+		// was chasing the wrong 5%.
+		//
+		// The cost is density: _data is sized to the node count rather than the touched
+		// count. That is safe for this field's consumers because untouched slots hold
+		// `zero` and both readers test the VALUE, not slot presence -- HasNormalDataFunctor
+		// checks normal[d]!=0, and _addFEMConstraints iterates _sNodes.treeNodes and looks
+		// up per node rather than walking _data. Do not assume that holds for a new caller.
+		void presizeSlots( size_t sz , Data zero=Data() )
+		{
+			if( _data.size() ) return;
+			reserve( sz );
+			if( sz ) _data.resize( sz , zero );
+			ThreadPool::ParallelFor( 0 , sz , [&]( unsigned int , size_t i ){ _indices[i] = (node_index_type)i; } );
+		}
 		size_t reserved( void ) const { return _indices.size(); } 
 		Data* operator()( const RegularTreeNode< Dim , FEMTreeNodeData , depth_and_offset_type >* node ){ return ( node->nodeData.nodeIndex<0 || node->nodeData.nodeIndex>=(node_index_type)_indices.size() || _indices[ node->nodeData.nodeIndex ]==-1 ) ? NULL : &_data[ _indices[ node->nodeData.nodeIndex ] ]; }
 		const Data* operator()( const RegularTreeNode< Dim , FEMTreeNodeData , depth_and_offset_type >* node ) const { return ( node->nodeData.nodeIndex<0 || node->nodeData.nodeIndex>=(node_index_type)_indices.size() || _indices[ node->nodeData.nodeIndex ]==-1 ) ? NULL : &_data[ _indices[ node->nodeData.nodeIndex ] ]; }
@@ -352,7 +423,23 @@ namespace PoissonRecon
 		Data& operator[]( const RegularTreeNode< Dim , FEMTreeNodeData , depth_and_offset_type >* node ){ return at( node ); }
 		Data &at( const RegularTreeNode< Dim , FEMTreeNodeData , depth_and_offset_type > *node , Data zero=Data() )
 		{
-			_indices.resize( node->nodeData.nodeIndex+1 , -1 );
+			// Grow ONLY when needed, and then in chunks.
+			//
+			// This was an unconditional resize( nodeIndex+1 ) on every call -- order 1e8
+			// times during the normal-field splat, from every thread. Two costs: each call
+			// reached into NestedVector's atomic _size (a line that concurrent growth keeps
+			// dirtying, so every reader takes a coherence miss), and every node created
+			// DURING the splat -- getNeighbors< CreateNodes > makes plenty -- grew the
+			// container by one under its mutex.
+			//
+			// Growing past what this call needs is harmless: the surplus entries are -1,
+			// which is exactly "unassigned", and index() already bounds-checks against
+			// _indices.size(). So one lock acquisition now covers a chunk of new nodes
+			// instead of one each. _data is untouched and stays exactly sized.
+			{
+				const size_t _need = (size_t)node->nodeData.nodeIndex + 1;
+				if( _need>_indices.size() ) _indices.resize( std::max< size_t >( _need , _indices.size() + ( _indices.size()>>3 ) + 4096 ) , -1 );
+			}
 
 			// If the node hasn't been allocated yet
 #ifdef SANITIZED_PR
@@ -1134,6 +1221,51 @@ namespace PoissonRecon
 
 			double value   ( const int offset[] , const unsigned int derivatives[] ) const { return _value< Dim   >( offset , derivatives ); }
 			double subValue( const int offset[] , const unsigned int derivatives[] ) const { return _value< Dim-1 >( offset , derivatives ); }
+
+			// NON-VIRTUAL shadows of the base's dValues/partialDotDValues.
+			//
+			// The base declares value()/subValue() PURE VIRTUAL and then defines these two
+			// templated accessors on top of them, so every B-spline lookup in matrix
+			// assembly is an indirect call: _addPointValues calls partialDotDValues from
+			// its innermost window loop, once per supported neighbour per point per node.
+			// The call can neither inline nor vectorize, and the whole body it is hiding is
+			// a bounds check and a 2-D array index (_OneDValues::value).
+			//
+			// The virtual is not buying anything AT THESE CALL SITES. Every one of the ten
+			// callers holds a CONCRETE PointEvaluatorState by value or by derived-typed
+			// reference -- the dynamic type is a compile-time constant there. The base class
+			// exists so BaseFEMIntegrator can hold a type-erased handle; that is a different
+			// use, and it still works because these shadow rather than replace. A call
+			// through a base reference still finds the base's virtual version, unchanged.
+			//
+			// Name hiding does the selection: an unqualified peState.dValues<...>() on a
+			// derived-typed object finds these first. Bodies are the base's, verbatim, with
+			// value()/subValue() replaced by the _value<> they already forward to -- same
+			// arithmetic, same order, same rounding. Bit-identical by construction.
+			template< class Real , typename DerivativeType >
+			Point< Real , DerivativeType::Size > dValues( const int offset[] ) const
+			{
+				Point< Real , DerivativeType::Size > v;
+				unsigned int _d[Dim];
+				for( int d=0 ; d<DerivativeType::Size ; d++ )
+				{
+					DerivativeType::Factor( d , _d );
+					v[d] = (Real)_value< Dim >( offset , _d );
+				}
+				return v;
+			}
+			template< class Real , typename DerivativeType >
+			Point< Real , DerivativeType::LastDerivative+1 > partialDotDValues( Point< Real , DerivativeType::Size > v , const int offset[] ) const
+			{
+				Point< Real , DerivativeType::LastDerivative+1 > dot;
+				unsigned int _d[Dim];
+				for( int d=0 ; d<DerivativeType::Size ; d++ )
+				{
+					DerivativeType::Factor( d , _d );
+					dot[ _d[Dim-1] ] += (Real)( _value< Dim-1 >( offset , _d ) * v[d] );
+				}
+				return dot;
+			}
 			// Bypassing the "auto" keyword 
 			template< unsigned int _Dim >
 			const double (*(values)( void ) const )[ UIntPack< TDs ... >::template Get< _Dim >()+1 ] { return std::template get< _Dim >( _oneDValues ).values; }
@@ -2294,7 +2426,7 @@ namespace PoissonRecon
 		CumulativeDerivativeValues< T , Dim , PointD >   _finerFunctionValues( UIntPack< FEMSigs ... > , Point< Real , Dim > p , const ConstPointSupportKey< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& neighborKey , const FEMTreeNode* node , const PointEvaluator< UIntPack< FEMSigs ... > , UIntPack< FEMSignature< FEMSigs >::Degree ... > >& bsData , ConstPointer( T ) coefficients ) const;
 
 		template< unsigned int ... FEMSigs , typename T , typename ... InterpolationInfos >
-		int _getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... > , const BaseSystem< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& F , SystemMatrixType< FEMSigs ... > &matrix , Pointer( Real ) diagonalR , const PointEvaluator< UIntPack< FEMSigs ... > , UIntPack< FEMSignature< FEMSigs >::Degree ... > >& bsData , LocalDepth depth , node_index_type nBegin , node_index_type nEnd , ConstPointer( T ) prolongedSolution , Pointer( T ) constraints , const CCStencil < UIntPack< FEMSignature< FEMSigs >::Degree ... > >& ccStencil , const PCStencils< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& pcStencils , std::tuple< InterpolationInfos *... > interpolationInfos ) const;
+		int _getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... > , const BaseSystem< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& F , SystemMatrixType< FEMSigs ... > &matrix , Pointer( Real ) diagonalR , const PointEvaluator< UIntPack< FEMSigs ... > , UIntPack< FEMSignature< FEMSigs >::Degree ... > >& bsData , LocalDepth depth , node_index_type nBegin , node_index_type nEnd , ConstPointer( T ) prolongedSolution , Pointer( T ) constraints , const CCStencil < UIntPack< FEMSignature< FEMSigs >::Degree ... > >& ccStencil , const PCStencils< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& pcStencils , std::tuple< InterpolationInfos *... > interpolationInfos , std::vector< ConstOneRingNeighborKey > *sharedNeighborKeys=NULL ) const;
 
 		// Down samples constraints @(depth) to constraints @(depth-1)
 		template< class C , typename ArrayWrapper , unsigned ... Degrees , unsigned int ... FEMSigs > void _downSample( UIntPack< FEMSigs ... > , typename BaseFEMIntegrator::template RestrictionProlongation< UIntPack< Degrees ... > >& RP , LocalDepth highDepth , ArrayWrapper finerConstraints , Pointer( C ) coarserConstraints ) const;
@@ -2963,6 +3095,26 @@ namespace PoissonRecon
 		const FEMTreeNode& tree( void ) const { return _tree; }
 		_NodeInitializer &initializer( void ){ return _nodeInitializer; }
 		size_t leaves( void ) const { return _tree.leaves(); }
+		// All four of the tallies below are printed together on one log line, and each one
+		// separately runs _tree.processNodes -- an unpruned, single-threaded recursive
+		// descent over EVERY node in the octree. Four traversals of a tens-of-millions-of-
+		// nodes tree, for one line of output, landing in whatever stage's timer happened to
+		// be running. This gathers all four in a single walk; the individual accessors are
+		// kept for callers that genuinely want just one.
+		struct NodeTallies{ size_t all , active , ghost , dirichletElement; };
+		NodeTallies nodeTallies( void ) const
+		{
+			NodeTallies t = { 0 , 0 , 0 , 0 };
+			_tree.processNodes( [&]( const FEMTreeNode *n )
+				{
+					t.all++;
+					if( IsActiveNode< Dim >( n ) ) t.active++;
+					else                           t.ghost++;
+					if( n->nodeData.getDirichletElementFlag() ) t.dirichletElement++;
+				} );
+			return t;
+		}
+
 		size_t allNodes              ( void ) const { size_t count = 0 ; _tree.processNodes( [&]( const FEMTreeNode *  ){ count++; } ) ; return count; }
 		size_t activeNodes           ( void ) const { size_t count = 0 ; _tree.processNodes( [&]( const FEMTreeNode *n ){ if( IsActiveNode< Dim >( n ) ) count++; } ) ; return count; }
 		size_t ghostNodes            ( void ) const { size_t count = 0 ; _tree.processNodes( [&]( const FEMTreeNode *n ){ if( !IsActiveNode< Dim >( n ) ) count++; } ) ; return count; }
@@ -3095,9 +3247,14 @@ namespace PoissonRecon
 		};
 
 		template< typename IsValidFunctor/*=std::function< bool ( const Point< Real , Dim > & , AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , AuxData &... ) >*/ , typename ... AuxData >
-		static size_t Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... zeroData , int maxDepth ,                                                                  Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process );
-		template< typename IsValidFunctor/*=std::function< bool ( const Point< Real , Dim > & , AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , AuxData &... ) >*/ , typename ... AuxData >
-		static size_t Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... zeroData , int maxDepth , std::function< int ( Point< Real , Dim > ) > pointDepthFunctor , Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process );
+		static size_t Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... zeroData , int maxDepth ,                                                                  Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process , std::vector< Allocator< FEMTreeNode > * > *threadAllocators=NULL );
+		// PointDepthFunctor is a TEMPLATE parameter, not std::function, because this is
+		// called once per input point -- 53.3M times on a HIGH run. The constant-depth
+		// overload above forwards a lambda that just returns maxDepth; through
+		// std::function that was 53.3M type-erased indirect calls to return a constant.
+		// Deduced, so callers that still pass a std::function behave exactly as before.
+		template< typename IsValidFunctor/*=std::function< bool ( const Point< Real , Dim > & , AuxData &... ) >*/ , typename ProcessFunctor/*=std::function< bool ( FEMTreeNode & , const Point< Real , Dim > & , AuxData &... ) >*/ , typename ... AuxData , typename PointDepthFunctor >
+		static size_t Initialize( FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData ... > &pointStream , AuxData ... zeroData , int maxDepth , PointDepthFunctor pointDepthFunctor , Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , IsValidFunctor IsValid , ProcessFunctor Process , std::vector< Allocator< FEMTreeNode > * > *threadAllocators=NULL );
 
 		template< typename AuxData >
 		static size_t Initialize( struct StreamInitializationData &sid , FEMTreeNode &root , InputDataStream< Point< Real , Dim > , AuxData > &pointStream , AuxData zeroData , int maxDepth ,                                                                  std::vector< PointSample >& samplePoints , std::vector< AuxData > &sampleData , Allocator< FEMTreeNode >* nodeAllocator , std::function< void ( FEMTreeNode& ) > NodeInitializer , std::function< Real ( const Point< Real , Dim > & , AuxData & ) > ProcessData = []( const Point< Real , Dim > & , AuxData & ){ return (Real)1.; } );

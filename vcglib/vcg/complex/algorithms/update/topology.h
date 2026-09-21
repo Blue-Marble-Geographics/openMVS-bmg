@@ -618,25 +618,32 @@ static void FaceFace(MeshType& m)
   // Sort by canonical vertex pair
   tbb::parallel_sort(edges, edges+numEdges);
 
-  // Find run boundaries
-  std::vector<size_t> runStarts;
-  runStarts.reserve(numEdges+1);
-  runStarts.push_back(0);
-  for (uint32_t i = 1; i < numEdges; ++i)
-  {
-    if (!(edges[i] == edges[i - 1]))
-      runStarts.push_back(i);
-  }
-  runStarts.push_back(numEdges);
-
-  // Parallel wiring
-  const ptrdiff_t nRuns = (ptrdiff_t)runStarts.size() - 1;
+  // Run boundaries are NOT materialised any more. Building a runStarts vector was the one
+  // SERIAL step between two parallel ones (the parallel_sort above and the wiring below):
+  // 40M comparisons on a 13.3M-face mesh, plus a push_back per run -- and nearly every
+  // edge is shared by exactly two faces, so that is ~20M push_backs into a 160 MB vector,
+  // with the reallocation churn of growing it on top of an edge array that is already
+  // 961 MB (40M x 24 B).
+  //
+  // Instead each element decides for itself whether it STARTS a run, and if so walks its
+  // own run. Runs are 1 or 2 long except at non-manifold edges, so the extra comparison
+  // per element is trivial next to the sort, and the whole pass is parallel with ZERO
+  // allocation.
+  //
+  // Wiring is unchanged: the same [i, j) intervals linked in the same cyclic order, so
+  // the FF adjacency produced is identical.
+  const ptrdiff_t nE = (ptrdiff_t)numEdges;
 
 #pragma omp parallel for schedule(static, 10000)
-  for (ptrdiff_t r = 0; r < nRuns; ++r)
+  for (ptrdiff_t e = 0; e < nE; ++e)
   {
-    uint32_t i = runStarts[r];
-    uint32_t j = runStarts[r + 1];
+    if (e > 0 && edges[e] == edges[e - 1])
+      continue;                       // interior of a run; the run's first element does it
+
+    const uint32_t i = (uint32_t)e;
+    uint32_t j = i + 1;
+    while (j < numEdges && edges[j] == edges[i])
+      ++j;
 
     uint32_t next = i + 1;
     for (uint32_t k = i; k < j; ++k)

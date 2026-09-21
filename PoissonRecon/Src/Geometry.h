@@ -613,7 +613,7 @@ namespace PoissonRecon
 
 	template< class Real , unsigned int Dim > Point< Real , Dim > RandomBallPoint( void );
 	template< class Real , unsigned int Dim > Point< Real , Dim > RandomSpherePoint( void );
-	template< class Real , unsigned int Dim > Real Length( Point< Real , Dim > p ){ return (Real)sqrt( Point< Real , Dim >::SquareNorm( p ) ); }
+	template< class Real , unsigned int Dim > Real Length( Point< Real , Dim > p ){ return (Real)__sqrt_ss( Point< Real , Dim >::SquareNorm( p ) ); }
 	template< class Real , unsigned int Dim > Real SquareLength( Point< Real , Dim > p ){ return Point< Real , Dim >::SquareNorm( p ); }
 	template< class Real , unsigned int Dim > Real Distance( Point< Real , Dim > p1 , Point< Real , Dim > p2 ){ return Length(p1-p2); }
 	template< class Real , unsigned int Dim > Real SquareDistance( Point< Real , Dim > p1 , Point< Real , Dim > p2 ){ return SquareLength( p1-p2 ); }
@@ -630,7 +630,7 @@ namespace PoissonRecon
 		Real l1 = Point< Real , Dim >::SquareNorm( v1 ) , l2 = Point< Real , Dim >::SquareNorm( v2 );
 		return ( l1 * l2 - dot * dot ) / 4;
 	}
-	template< class Real , unsigned int Dim > Real Area( Point< Real , Dim > p1 , Point< Real , Dim > p2 , Point< Real , Dim > p3 ){ return (Real)sqrt( SquareArea( p1 , p2 , p3 ) ); }
+	template< class Real , unsigned int Dim > Real Area( Point< Real , Dim > p1 , Point< Real , Dim > p2 , Point< Real , Dim > p3 ){ return (Real)__sqrt_ss( SquareArea( p1 , p2 , p3 ) ); }
 
 	template< unsigned int K > struct Factorial{ static const unsigned long long Value = Factorial< K-1 >::Value * K; };
 	template<> struct Factorial< 0 >{ static const unsigned long long Value = 1; };
@@ -642,7 +642,7 @@ namespace PoissonRecon
 		Simplex( void ){ static_assert( K<=Dim , "[ERROR] Bad simplex dimension" ); }
 		Point< Real , Dim >& operator[]( unsigned int k ){ return p[k]; }
 		const Point< Real , Dim >& operator[]( unsigned int k ) const { return p[k]; }
-		Real measure( void ) const { return (Real)sqrt( squareMeasure() ); }
+		Real measure( void ) const { return (Real)__sqrt_ss( squareMeasure() ); }
 		Real squareMeasure( void ) const
 		{
 			XForm< Real , K > mass;
@@ -711,7 +711,7 @@ namespace PoissonRecon
 			Ray< Real , Dim > ray( p , simplices[idx].center() - p );
 			Real l = (Real)Point< Real , Dim >::SquareNorm( ray.direction );
 			if( !l ) MK_THROW( "point is on simplex" );
-			l = (Real)sqrt(l);
+			l = (Real)__sqrt_ss(l);
 			ray.direction /= l;
 
 			// Make the assessment based on which side of the simplex the point p is
@@ -772,7 +772,7 @@ namespace PoissonRecon
 			Ray< Real , Dim > ray( p , simplices[idx].center() - p );
 			Real l = (Real)Point< Real , Dim >::SquareNorm( ray.direction );
 			if( !l ) MK_THROW( "point is on simplex" );
-			l = (Real)sqrt(l);
+			l = (Real)__sqrt_ss(l);
 			ray.direction /= l;
 
 			// Make the assessment based on which side of the simplex the point p is
@@ -825,7 +825,7 @@ namespace PoissonRecon
 			Ray< Real , Dim > ray( p , simplices[0].center() - p );
 			Real l = (Real)Point< Real , Dim >::SquareNorm( ray.direction );
 			if( !l ) MK_THROW( "point is on simplex" );
-			l = (Real)sqrt(l);
+			l = (Real)__sqrt_ss(l);
 			ray.direction /= l;
 
 			// Make the assessment based on which side of the simplex the point p is

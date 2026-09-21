@@ -29,6 +29,60 @@ DAMAGE.
 // Level-set extraction data
 namespace LevelSetExtraction
 {
+	// Sub-timers for CellIndexData::set(), which the extractor's Stats line reports as a
+	// single "Set Table" figure -- 1.9 s of an 8.7 s "Got Faces" on Marco, the largest
+	// named slice, with no breakdown.
+	//
+	// Two overhead theories for this stage were MEASURED AND REFUTED on this box before
+	// adding these, so do not re-chase either from the call shapes alone:
+	//   * rebuilding NumThreads() ConstOneRingNeighborKeys per set() call -- 8000 calls x
+	//     32 keys at depth 11 is 10 ms total, not the ~0.3 s it looks like;
+	//   * ParallelSections' std::async spawns -- MSVC routes launch::async through the
+	//     Windows thread pool at ~6.4 us, so a whole run's 8135 calls floor at ~74 ms.
+	// Whatever is in here is real work, so find out WHICH work before rewriting any of it.
+	//
+	// Nanoseconds in relaxed atomics: set() runs from the serial part of the slab loop, so
+	// there is no contention, and four clock reads against a call averaging hundreds of
+	// microseconds is noise.
+	struct SetTableStats
+	{
+		static std::atomic< unsigned long long > keysNS , processNS , countsNS , tablesNS , allocNS , calls , nodes;
+		static void Reset( void )
+		{
+			keysNS = 0 , processNS = 0 , countsNS = 0 , tablesNS = 0 , allocNS = 0 , calls = 0 , nodes = 0;
+		}
+		static std::string ToString( void )
+		{
+			auto s = []( const std::atomic< unsigned long long > &v ){ return (double)v.load( std::memory_order_relaxed ) * 1e-9; };
+			std::stringstream stream;
+			stream << std::fixed << std::setprecision(2);
+			stream << "Set Table -- alloc / keys / process / counts / tables: ";
+			stream << s(allocNS) << " / " << s(keysNS) << " / " << s(processNS) << " / " << s(countsNS) << " / " << s(tablesNS) << " (s)";
+			stream << ", calls: " << calls.load( std::memory_order_relaxed );
+			stream << ", nodes: " << nodes.load( std::memory_order_relaxed );
+			return stream.str();
+		}
+	};
+	inline std::atomic< unsigned long long > SetTableStats::keysNS{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::processNS{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::countsNS{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::tablesNS{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::allocNS{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::calls{ 0 };
+	inline std::atomic< unsigned long long > SetTableStats::nodes{ 0 };
+
+	// Accumulate into one of the counters; _SetTableTimer( x ) reads the clock on scope exit.
+	struct _SetTableTimer
+	{
+		std::atomic< unsigned long long > &_acc;
+		std::chrono::high_resolution_clock::time_point _t0;
+		_SetTableTimer( std::atomic< unsigned long long > &acc ) : _acc(acc) , _t0( std::chrono::high_resolution_clock::now() ) {}
+		~_SetTableTimer( void )
+		{
+			_acc.fetch_add( (unsigned long long)std::chrono::duration_cast< std::chrono::nanoseconds >( std::chrono::high_resolution_clock::now()-_t0 ).count() , std::memory_order_relaxed );
+		}
+	};
+
 	/////////
 	// Key //
 	/////////
@@ -117,6 +171,56 @@ namespace LevelSetExtraction
 		}
 	};
 
+	////////////////////
+	// IsoEdgeSet     //
+	////////////////////
+	// Fixed-capacity, heap-free replacement for std::vector< IsoEdge > in the per-face
+	// scratch that feeds Scratch::FKeyValues.
+	//
+	// A face contributes at most MarchingSquares::MAX_EDGES == 2 iso-edges, and IsoEdge is
+	// Key<3>[2] = 24 bytes, so the entire payload is 48 bytes -- yet every one of those
+	// was a std::vector, i.e. a heap allocation for two elements. They are not rare: one
+	// per face on construction, plus one more for each std::pair copied onto fKeyValues as
+	// the code walks up the ancestors, and fKeyValues holds millions of those pairs, each
+	// owning its own 2-element block. Inline storage removes the allocation AND makes the
+	// pair trivially copyable, so growing the outer vector stops chasing pointers.
+	//
+	// Capacity 2, matching MarchingSquares::MAX_EDGES exactly, with a 4-byte length: 52
+	// bytes total. The first cut used capacity 4 and a size_t -- 104 bytes to hold 48 that
+	// are never exceeded -- which quadrupled every element of fKeyValues. That vector holds
+	// millions of pairs, so it traded heap allocations for memory traffic and came out
+	// even: Got Faces 5.9 -> 5.8 s (inside its 5.8-6.2 noise band) for +14 MB. Slack in an
+	// inline buffer is not free when the container is huge.
+	//
+	// Overflow throws rather than truncating, so if MAX_EDGES ever grows this fails loudly
+	// at the first face instead of silently dropping edges.
+	//
+	// NOT a general small_vector -- it implements exactly the operations the scratch path
+	// uses (resize / operator[] / begin / end / size). Boost's container library would do
+	// this properly, but PoissonRecon links no Boost outside Socket.h and this box already
+	// has Boost version drift; 30 lines beats a new dependency in a vendored library.
+	template< unsigned int Dim , unsigned int Capacity=2 >
+	struct IsoEdgeSet
+	{
+		IsoEdgeSet( void ) : _size(0) {}
+		size_t size( void ) const { return _size; }
+		void resize( size_t sz )
+		{
+			if( sz>Capacity ) MK_THROW( "IsoEdgeSet capacity exceeded: " , sz , " > " , Capacity );
+			_size = (unsigned int)sz;
+		}
+		IsoEdge< Dim > &operator[]( size_t i ){ return _data[i]; }
+		const IsoEdge< Dim > &operator[]( size_t i ) const { return _data[i]; }
+		IsoEdge< Dim > *begin( void ){ return _data; }
+		IsoEdge< Dim > *end  ( void ){ return _data + _size; }
+		const IsoEdge< Dim > *begin( void ) const { return _data; }
+		const IsoEdge< Dim > *end  ( void ) const { return _data + _size; }
+	protected:
+		IsoEdge< Dim > _data[Capacity];
+		unsigned int _size;
+	};
+
+
 	/////////////////////
 	// HyperCubeTables //
 	/////////////////////
@@ -196,6 +300,65 @@ namespace LevelSetExtraction
 			SetHyperCubeTables< D-1 , D-1 , D-1 >();
 		}
 		else HyperCubeTables< D , K1 , K2 >::SetTables();
+	}
+
+	// Renumber a 0/1 ownership map in place: every non-zero entry is replaced by its rank
+	// in index order, and the total is returned. Bit-identical to the serial scan it
+	// replaces -- `for i: if( map[i] ) map[i] = count++` -- which three copies of
+	// _setCounts each ran, once per cell dimension, once per slice, per depth.
+	//
+	// MEASURED: 0.49 s of a 2.2 s "Set Table" on a 13.8M-face depth-11 run, and it was the
+	// only fully serial loop left in a stage that otherwise runs 32-wide.
+	//
+	// Two passes: count the non-zeros in each chunk, exclusive-scan the chunk totals, then
+	// renumber inside each chunk starting from its offset. Pass 2 re-tests the ORIGINAL
+	// values because pass 1 never writes, and within a chunk each index is tested and then
+	// written once in increasing order -- no entry is ever read after being renumbered. A
+	// renumbered entry may legitimately become 0 (the first non-zero gets rank 0); that is
+	// true of the serial scan too, and _setTables reads the map as a lookup table rather
+	// than re-testing it as a flag.
+	//
+	// nChunks is deliberately pushed ABOVE ThreadPool::SerialCutoff. ParallelFor runs any
+	// range shorter than that cutoff on the calling thread, so the natural choice of a few
+	// chunks per core would have been silently serialized straight back to where it started.
+	inline node_index_type _CompactRenumber( Pointer( node_index_type ) map , size_t n )
+	{
+		// Below this the two passes and their fork/join cost more than one plain scan; the
+		// coarse depths hit it constantly, since a coarse slice holds very few nodes.
+		static const size_t _ParallelFloor = 1<<15;
+		if( n<_ParallelFloor || ThreadPool::NumThreads()<2 )
+		{
+			node_index_type count = 0;
+			for( size_t i=0 ; i<n ; i++ ) if( map[i] ) map[i] = count++;
+			return count;
+		}
+
+		size_t nChunks = (size_t)ThreadPool::NumThreads() * 8;
+		if( nChunks<=ThreadPool::SerialCutoff ) nChunks = ThreadPool::SerialCutoff + 1;
+		const size_t chunk = ( n + nChunks - 1 ) / nChunks;
+		std::vector< node_index_type > offsets( nChunks );
+
+		ThreadPool::ParallelFor( 0 , nChunks , [&]( unsigned int , size_t c )
+			{
+				const size_t b = c*chunk;
+				const size_t e = ( n<b+chunk ) ? n : b+chunk;
+				node_index_type k = 0;
+				for( size_t i=b ; i<e ; i++ ) if( map[i] ) k++;
+				offsets[c] = k;
+			} );
+
+		node_index_type total = 0;
+		for( size_t c=0 ; c<nChunks ; c++ ){ node_index_type k = offsets[c] ; offsets[c] = total ; total += k; }
+
+		ThreadPool::ParallelFor( 0 , nChunks , [&]( unsigned int , size_t c )
+			{
+				const size_t b = c*chunk;
+				const size_t e = ( n<b+chunk ) ? n : b+chunk;
+				node_index_type k = offsets[c];
+				for( size_t i=b ; i<e ; i++ ) if( map[i] ) map[i] = k++;
+			} );
+
+		return total;
 	}
 
 	// A helper class for storing a static array
@@ -298,7 +461,7 @@ namespace LevelSetExtraction
 				_capacity = sz;
 			}
 			else for( unsigned int d=0 ; d<=MaxCellDim ; d++ ) counts[d] = 0;
-			_size = sz;
+			_size = (unsigned int)sz;
 		}
 		size_t size( void ) const { return _size; }
 
@@ -406,24 +569,39 @@ namespace LevelSetExtraction
 		{
 			std::pair< node_index_type , node_index_type > span( sNodes.begin( depth ) , sNodes.end( depth ) );
 			nodeOffset = (size_t)span.first;
-			resize( (size_t)( span.second-span.first ) );
-			_scratch.resize( size() );
+			SetTableStats::calls.fetch_add( 1 , std::memory_order_relaxed );
+			{
+				_SetTableTimer _t( SetTableStats::allocNS );
+				resize( (size_t)( span.second-span.first ) );
+				_scratch.resize( size() );
+			}
+			SetTableStats::nodes.fetch_add( (unsigned long long)size() , std::memory_order_relaxed );
 
-			std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-			for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			std::vector< ConstOneRingNeighborKey > neighborKeys;
+			{
+				_SetTableTimer _t( SetTableStats::keysNS );
+				neighborKeys.resize( ThreadPool::NumThreads() );
+				for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			}
 
 			// Try and get at the nodes outside of the slab through the neighbor key
-			ThreadPool::ParallelFor( sNodes.begin(depth) , sNodes.end(depth) , [&]( unsigned int thread , size_t i )
-				{
-					ConstOneRingNeighborKey& neighborKey = neighborKeys[ thread ];
-					const TreeNode *node = sNodes.treeNodes[i];
-					ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
-					_setProcess<0>( neighbors , _scratch.maps );
-				}
-			);
+			{
+				_SetTableTimer _t( SetTableStats::processNS );
+				ThreadPool::ParallelFor( sNodes.begin(depth) , sNodes.end(depth) , [&]( unsigned int thread , size_t i )
+					{
+						ConstOneRingNeighborKey& neighborKey = neighborKeys[ thread ];
+						const TreeNode *node = sNodes.treeNodes[i];
+						ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
+						_setProcess<0>( neighbors , _scratch.maps );
+					}
+				);
+			}
 
-			_setCounts<0>( _scratch.maps );
-			ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			{ _SetTableTimer _t( SetTableStats::countsNS ); _setCounts<0>( _scratch.maps ); }
+			{
+				_SetTableTimer _t( SetTableStats::tablesNS );
+				ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			}
 		}
 
 		// Maps from tree nodes (and their associated indices) to the associated indices for the cell indices
@@ -478,10 +656,7 @@ namespace LevelSetExtraction
 		template< unsigned int CellDim >
 		void _setCounts( Pointer( node_index_type ) maps[MaxCellDim+1] )
 		{
-			node_index_type count = 0;
-			for( node_index_type i=0 ; i<(node_index_type)size() * (node_index_type)HyperCube::Cube< Dim >::template ElementNum< CellDim >() ; i++ )
-				if( maps[CellDim][i] ) maps[CellDim][i] = count++;
-			counts[ CellDim ] = count;
+			counts[ CellDim ] = _CompactRenumber( maps[CellDim] , size() * HyperCube::Cube< Dim >::template ElementNum< CellDim >() );
 
 			if constexpr( CellDim==MaxCellDim ) return;
 			else _setCounts< CellDim+1 >( maps );
@@ -536,24 +711,39 @@ namespace LevelSetExtraction
 		{
 			std::pair< node_index_type , node_index_type > span( sNodes.begin( depth , slice-1 ) , sNodes.end( depth , slice ) );
 			nodeOffset = (size_t)span.first;
-			resize( (size_t)( span.second - span.first ) );
-			_scratch.resize( size() );
+			SetTableStats::calls.fetch_add( 1 , std::memory_order_relaxed );
+			{
+				_SetTableTimer _t( SetTableStats::allocNS );
+				resize( (size_t)( span.second - span.first ) );
+				_scratch.resize( size() );
+			}
+			SetTableStats::nodes.fetch_add( (unsigned long long)size() , std::memory_order_relaxed );
 
-			std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-			for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			std::vector< ConstOneRingNeighborKey > neighborKeys;
+			{
+				_SetTableTimer _t( SetTableStats::keysNS );
+				neighborKeys.resize( ThreadPool::NumThreads() );
+				for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			}
 
 			// Try and get at the nodes outside of the slab through the neighbor key
-			ThreadPool::ParallelFor( sNodes.begin( depth , slice-1 ) , sNodes.end( depth , slice ) , [&]( unsigned int thread , size_t i )
-				{
-					ConstOneRingNeighborKey &neighborKey = neighborKeys[ thread ];
-					const TreeNode *node = sNodes.treeNodes[i];
-					ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
-					_setProcess<0>( neighbors , i<(size_t)sNodes.end( depth , slice-1 ) , _scratch.maps );
-				}
-			);
+			{
+				_SetTableTimer _t( SetTableStats::processNS );
+				ThreadPool::ParallelFor( sNodes.begin( depth , slice-1 ) , sNodes.end( depth , slice ) , [&]( unsigned int thread , size_t i )
+					{
+						ConstOneRingNeighborKey &neighborKey = neighborKeys[ thread ];
+						const TreeNode *node = sNodes.treeNodes[i];
+						ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
+						_setProcess<0>( neighbors , i<(size_t)sNodes.end( depth , slice-1 ) , _scratch.maps );
+					}
+				);
+			}
 
-			_setCounts<0>( _scratch.maps );
-			ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			{ _SetTableTimer _t( SetTableStats::countsNS ); _setCounts<0>( _scratch.maps ); }
+			{
+				_SetTableTimer _t( SetTableStats::tablesNS );
+				ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			}
 		}
 
 		// Maps from tree nodes (and their associated indices) to the associated indices for the cell indices
@@ -612,10 +802,7 @@ namespace LevelSetExtraction
 		template< unsigned int CellDim >
 		void _setCounts( Pointer( node_index_type ) maps[MaxCellDim+1] )
 		{
-			node_index_type count = 0;
-			for( node_index_type i=0 ; i<(node_index_type)size() * (node_index_type)HyperCube::Cube< _Dim >::template ElementNum< CellDim >() ; i++ )
-				if( maps[CellDim][i] ) maps[CellDim][i] = count++;
-			counts[ CellDim ] = count;
+			counts[ CellDim ] = _CompactRenumber( maps[CellDim] , size() * HyperCube::Cube< _Dim >::template ElementNum< CellDim >() );
 
 			if constexpr( CellDim==MaxCellDim ) return;
 			else _setCounts< CellDim+1 >( maps );
@@ -670,24 +857,39 @@ namespace LevelSetExtraction
 		{
 			std::pair< node_index_type , node_index_type > span( sNodes.begin( depth , slab ) , sNodes.end( depth , slab ) );
 			nodeOffset = (size_t)span.first;
-			resize( (size_t)( span.second - span.first ) );
-			_scratch.resize( size() );
+			SetTableStats::calls.fetch_add( 1 , std::memory_order_relaxed );
+			{
+				_SetTableTimer _t( SetTableStats::allocNS );
+				resize( (size_t)( span.second - span.first ) );
+				_scratch.resize( size() );
+			}
+			SetTableStats::nodes.fetch_add( (unsigned long long)size() , std::memory_order_relaxed );
 
-			std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-			for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			std::vector< ConstOneRingNeighborKey > neighborKeys;
+			{
+				_SetTableTimer _t( SetTableStats::keysNS );
+				neighborKeys.resize( ThreadPool::NumThreads() );
+				for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( depth );
+			}
 
 			// Try and get at the nodes outside of the slab through the neighbor key
-			ThreadPool::ParallelFor( sNodes.begin( depth , slab ) , sNodes.end( depth , slab ) , [&]( unsigned int thread , size_t i )
-				{
-					ConstOneRingNeighborKey &neighborKey = neighborKeys[ thread ];
-					const TreeNode *node = sNodes.treeNodes[i];
-					ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
-					_setProcess<0>( neighbors , _scratch.maps );
-				}
-			);
+			{
+				_SetTableTimer _t( SetTableStats::processNS );
+				ThreadPool::ParallelFor( sNodes.begin( depth , slab ) , sNodes.end( depth , slab ) , [&]( unsigned int thread , size_t i )
+					{
+						ConstOneRingNeighborKey &neighborKey = neighborKeys[ thread ];
+						const TreeNode *node = sNodes.treeNodes[i];
+						ConstNeighbors &neighbors = neighborKey.getNeighbors( node );
+						_setProcess<0>( neighbors , _scratch.maps );
+					}
+				);
+			}
 
-			_setCounts<0>( _scratch.maps );
-			ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			{ _SetTableTimer _t( SetTableStats::countsNS ); _setCounts<0>( _scratch.maps ); }
+			{
+				_SetTableTimer _t( SetTableStats::tablesNS );
+				ThreadPool::ParallelFor( 0 , size() , [&]( unsigned int , size_t i ){ _setTables<0>( (unsigned int)i , _scratch.maps ); } );
+			}
 		}
 
 		// Maps from tree nodes (and their associated indices) to the associated indices for the cell indices
@@ -747,10 +949,7 @@ namespace LevelSetExtraction
 		template< unsigned int _CellDim >
 		void _setCounts( Pointer( node_index_type ) maps[_MaxCellDim+1] )
 		{
-			node_index_type count = 0;
-			for( node_index_type i=0 ; i<(node_index_type)size() * (node_index_type)HyperCube::Cube< _Dim >::template ElementNum< _CellDim >() ; i++ )
-				if( maps[_CellDim][i] ) maps[_CellDim][i] = count++;
-			counts[ _CellDim ] = count;
+			counts[ _CellDim ] = _CompactRenumber( maps[_CellDim] , size() * HyperCube::Cube< _Dim >::template ElementNum< _CellDim >() );
 
 			if constexpr( _CellDim==_MaxCellDim ) return;
 			else _setCounts< _CellDim+1 >( maps );

@@ -7551,6 +7551,13 @@ int GetOpenGLMaxTextureSize()
 	if (cached != 0)
 		return cached;
 	int result = 16384; // GL guaranteed minimum; safe fallback
+	// WHICH branch produced `result` is not inferable from the value: 16384 is both the
+	// fallback AND a legitimate answer (AMD GCN and Intel report exactly that). NVIDIA
+	// has reported 32768 since Maxwell, so on an NVIDIA host a 16384 here almost
+	// certainly means this probe FAILED -- and that silently quarters the atlas face cap,
+	// which sets the decimation target, which is 35-45 percent of ReconstructMesh.
+	// It also clamps away any OPENMVS_ATLAS_MAX_DIM pin. Report the branch taken.
+	const char* how = "fallback: no _WIN32";
 #ifdef _WIN32
 	WNDCLASSA wc = {};
 	wc.lpfnWndProc = DefWindowProcA;
@@ -7559,6 +7566,7 @@ int GetOpenGLMaxTextureSize()
 	RegisterClassA(&wc);
 	if (HWND hWnd = CreateWindowA(wc.lpszClassName, "", WS_OVERLAPPEDWINDOW, 0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr)) {
 		if (HDC hDC = GetDC(hWnd)) {
+				how = "fallback: GetDC failed";   // overwritten if we get further
 			PIXELFORMATDESCRIPTOR pfd = {};
 			pfd.nSize = sizeof(pfd);
 			pfd.nVersion = 1;
@@ -7570,11 +7578,15 @@ int GetOpenGLMaxTextureSize()
 			const int pf = ChoosePixelFormat(hDC, &pfd);
 			if (pf && SetPixelFormat(hDC, pf, &pfd)) {
 				if (HGLRC hRC = wglCreateContext(hDC)) {
+				how = "fallback: wglCreateContext failed";   // overwritten if we get further
 					if (wglMakeCurrent(hDC, hRC)) {
 						GLint maxTex = 0;
 						glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
-						if (maxTex >= 1024)
+						if (maxTex >= 1024) {
 							result = (int)maxTex;
+							how = "queried GL_MAX_TEXTURE_SIZE";
+						} else
+							how = "fallback: GL returned a value below 1024";
 						wglMakeCurrent(nullptr, nullptr);
 					}
 					wglDeleteContext(hRC);
@@ -7587,6 +7599,10 @@ int GetOpenGLMaxTextureSize()
 	UnregisterClassA(wc.lpszClassName, wc.hInstance);
 #endif
 	cached = result;
+	// No percent signs here: VERBOSE double-formats, and a literal one gets re-parsed as
+	// a conversion on the second pass.
+	VERBOSE("GPU texture ceiling: %d px (%s). 16384 from a fallback is NOT a GPU limit --"
+		" it quarters the atlas face cap and with it the decimation target.", result, how);
 	return cached;
 }
 
@@ -7942,36 +7958,47 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 	// disagreeing by 4x in face capacity -- is the one already called out at the
 	// GetOpenGLMaxTextureSize definition above and at ResolveAtlasMaxDimEx.)
 	int atlasHostLimit = 0, atlasEnvPin = 0;
+	// What policy settles on with nothing explicit passed: pin or probe, CLAMPED TO THE
+	// HARDWARE. Needed in both branches -- one to use it, the other to check against it.
+	const int atlasResolved = ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
 	if (nMaxTextureSize < 0) {
-		nMaxTextureSize = ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
+		nMaxTextureSize = atlasResolved;
 		TEXTURE_DIAG("Texture max size < 0 -> atlas %d px (%s; host GL_MAX_TEXTURE_SIZE %d)",
 			nMaxTextureSize,
 			(atlasEnvPin > 0)    ? "pinned by OPENMVS_ATLAS_MAX_DIM" :
 			(atlasHostLimit > 0) ? "host GPU limit" :
 			                       "fallback, no GPU reachable",
 			atlasHostLimit);
-	} else {
-		// An explicit (or explicitly-unbounded) --max-texture-size is an operator
-		// decision and still wins -- same precedence ResolveAtlasMaxDimEx documents.
-		// Probe anyway, purely to CHECK it against the pin below. The probe caches, so
-		// asking here costs nothing.
-		ResolveAtlasMaxDimEx(0, &atlasHostLimit, &atlasEnvPin);
+	} else if (nMaxTextureSize > 0 && atlasHostLimit > 0 && nMaxTextureSize > atlasHostLimit) {
+		// An explicit --max-texture-size is an operator decision, but NOT above the
+		// hardware: an atlas the GPU cannot sample is not a choice, it is a broken
+		// deliverable. Same rule ResolveAtlasMaxDimEx applies to the env pin, applied
+		// here because this branch uses the caller's value without going through it.
+		VERBOSE("[ATLAS] warning: --max-texture-size %d exceeds this GPU's"
+			" GL_MAX_TEXTURE_SIZE (%d px) -- clamping to the hardware limit",
+			nMaxTextureSize, atlasHostLimit);
+		nMaxTextureSize = atlasHostLimit;
 	}
 	// Any disagreement means the mesh was sized for a DIFFERENT atlas than the one about
 	// to be packed, by (ratio)^2 in face capacity. Reported at normal verbosity, not on
 	// TEXTURE_DIAG: this is a silently wrong deliverable, not a mechanism.
-	if (atlasEnvPin > 0 && nMaxTextureSize > 0 && nMaxTextureSize != atlasEnvPin)
-		VERBOSE("[ATLAS] warning: packing into %d px but OPENMVS_ATLAS_MAX_DIM pins %d px"
-			" -- the mesh face cap was sized for the PINNED atlas, so this mesh carries"
+	//
+	// Compared against the RESOLVED dimension, not the raw env pin. The pin is clamped to
+	// the hardware now and every stage clamps it identically, so a pin above
+	// GL_MAX_TEXTURE_SIZE is no longer a disagreement -- comparing to the raw pin would
+	// report a 16x face mismatch on a run where all three stages agree exactly.
+	if (atlasResolved > 0 && nMaxTextureSize > 0 && nMaxTextureSize != atlasResolved)
+		VERBOSE("[ATLAS] warning: packing into %d px but the shared policy resolves to"
+			" %d px -- the mesh face cap was sized for the latter, so this mesh carries"
 			" %.2fx the faces this atlas can texture; pass --max-texture-size %d to agree",
-			nMaxTextureSize, atlasEnvPin,
-			((double)atlasEnvPin * atlasEnvPin) / ((double)nMaxTextureSize * nMaxTextureSize),
-			atlasEnvPin);
-	else if (atlasEnvPin > 0 && nMaxTextureSize == 0)
-		VERBOSE("[ATLAS] warning: --max-texture-size 0 (unbounded) but"
-			" OPENMVS_ATLAS_MAX_DIM pins %d px -- the mesh face cap was sized for the"
-			" pinned atlas while this atlas is bounded only by RAM; the two will not agree",
-			atlasEnvPin);
+			nMaxTextureSize, atlasResolved,
+			((double)atlasResolved * atlasResolved) / ((double)nMaxTextureSize * nMaxTextureSize),
+			atlasResolved);
+	else if (atlasResolved > 0 && nMaxTextureSize == 0)
+		VERBOSE("[ATLAS] warning: --max-texture-size 0 (unbounded) but the shared policy"
+			" resolves to %d px -- the mesh face cap was sized for that, while this atlas"
+			" is bounded only by RAM and may exceed what this GPU can sample (%d px)",
+			atlasResolved, atlasHostLimit);
 	// The pin exceeding the host is the more dangerous direction and must not pass
 	// silently: the atlas is built, then cannot be sampled by an OpenGL viewer.
 	if (atlasHostLimit > 0 && nMaxTextureSize > atlasHostLimit)

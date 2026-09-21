@@ -196,6 +196,24 @@
 #define OPENMVS_DENSIFY_DIAG OPENMVS_DIAG
 #endif
 #ifndef OPENMVS_MESH_DIAG
+// REVERTED to OPENMVS_DIAG now the ReconstructMesh timing work is done -- it had been
+// pinned to 1 for that, against 050fa8e8 which set OPENMVS_DIAG to 0 for release.
+//
+// This is the whole mesh trace: [MESH-*], [CLEAN-PROFILE], [DECI-PROFILE], and the
+// per-phase [POISSON-SOLVE] breakdown, which reaches the log through ReconParams::logSink
+// and rides this gate with the rest. Mesh only, deliberately -- densify/texture/refine
+// stay release-quiet.
+//
+// TO TURN IT BACK ON for a measurement run, without editing this file: configure with
+// -DOpenMVS_ENABLE_MESH_DIAG=ON (or -DOpenMVS_ENABLE_DIAG=ON), which the #ifndef above
+// respects.
+//
+// Off is not merely quiet. The gate also compiles out the instrumentation's WORK: ~86M
+// counter increments per run in decimation (DECI_COUNT, one per ComputePriority and per
+// AddCollapseToHeap) plus the DeciPhaseTimer clocks -- see DECI_PROFILE in
+// vcg/complex/algorithms/local_optimization.h -- and, in the Poisson solver, a full
+// octree walk per solve to count FEM nodes for the "Nodes:" column (measured at 0.22 s
+// on a 26M-node tree; it rides solverInfo.verbose, which rides this gate).
 #define OPENMVS_MESH_DIAG OPENMVS_DIAG
 #endif
 #ifndef OPENMVS_TEXTURE_DIAG

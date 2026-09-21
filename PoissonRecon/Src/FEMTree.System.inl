@@ -423,6 +423,14 @@ int FEMTree< Dim , Real >::_solveSlicedSystemGS( UIntPack< FEMSigs ... > , const
 		// The number of in-core blocks over which we either solve or compute residuals
 		int matrixBlocks = std::max< int >( 1 , std::min< int >( solveBlocks+2*residualOffset , blockEnd-blockBegin ) );
 		// The list of matrices for each in-memory block
+		// Neighbour keys for the whole sweep, built ONCE here rather than once per block
+		// inside _getSliceMatrixAndProlongationConstraints. depth is fixed for this call, so
+		// one set serves every block; see the note at that function for why reuse is
+		// bit-identical. This is the per-block fixed cost that made the sliced solver look
+		// bad on scenes with small slices -- 32 allocations plus ~83 KB of zeroing, 2^depth
+		// times per depth, empty slices included.
+		std::vector< ConstOneRingNeighborKey > sweepNeighborKeys( ThreadPool::NumThreads() );
+		for( size_t i=0 ; i<sweepNeighborKeys.size() ; i++ ) sweepNeighborKeys[i].set( _localToGlobal( depth ) );
 		Pointer( SystemMatrixType< FEMSigs ... > ) _M = NewPointer< SystemMatrixType< FEMSigs ... > >( matrixBlocks );
 		Pointer( Pointer( Real ) ) _D = AllocPointer< Pointer( Real ) >( matrixBlocks );
 		std::vector< Pointer( T ) > _constraints( matrixBlocks );
@@ -459,7 +467,7 @@ int FEMTree< Dim , Real >::_solveSlicedSystemGS( UIntPack< FEMSigs ... > , const
 					int b = residualBlock , _b = PR_MODULO( b , matrixBlocks );
 
 					t = Time();
-					_getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... >() , F , _M[_b] , _D[_b] , bsData , depth , _sNodesBegin( depth , BlockFirst( b ) ) , _sNodesEnd( depth , BlockLast( b ) ) , prolongedSolution , _constraints[_b] , ccStencil , pcStencils , interpolationInfos );
+					_getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... >() , F , _M[_b] , _D[_b] , bsData , depth , _sNodesBegin( depth , BlockFirst( b ) ) , _sNodesEnd( depth , BlockLast( b ) ) , prolongedSolution , _constraints[_b] , ccStencil , pcStencils , interpolationInfos , &sweepNeighborKeys );
 					size_t begin = _sNodesBegin( depth , BlockFirst( b ) ) , end = _sNodesEnd( depth , BlockLast( b ) );
 					ThreadPool::ParallelFor( begin , end , [&]( unsigned int , size_t i ){  _constraints[_b][ i-begin ] = constraints[i] - _constraints[_b][ i-begin ]; } );
 					{
@@ -1577,15 +1585,37 @@ CumulativeDerivativeValues< T , Dim , PointD > FEMTree< Dim , Real >::_finerFunc
 
 template< unsigned int Dim , class Real >
 template< unsigned int ... FEMSigs , typename T , typename ... InterpolationInfos >
-int FEMTree< Dim , Real >::_getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... > , const typename BaseFEMIntegrator::template System< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& F , SystemMatrixType< FEMSigs ... > &matrix , Pointer( Real ) diagonalR , const PointEvaluator< UIntPack< FEMSigs ... > , UIntPack< FEMSignature< FEMSigs >::Degree ... > >& bsData , LocalDepth depth , node_index_type nBegin , node_index_type nEnd , ConstPointer( T ) prolongedSolution , Pointer( T ) constraints , const CCStencil< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& ccStencil , const PCStencils< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& pcStencils , std::tuple< InterpolationInfos *... > interpolationInfos ) const
+int FEMTree< Dim , Real >::_getSliceMatrixAndProlongationConstraints( UIntPack< FEMSigs ... > , const typename BaseFEMIntegrator::template System< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& F , SystemMatrixType< FEMSigs ... > &matrix , Pointer( Real ) diagonalR , const PointEvaluator< UIntPack< FEMSigs ... > , UIntPack< FEMSignature< FEMSigs >::Degree ... > >& bsData , LocalDepth depth , node_index_type nBegin , node_index_type nEnd , ConstPointer( T ) prolongedSolution , Pointer( T ) constraints , const CCStencil< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& ccStencil , const PCStencils< UIntPack< FEMSignature< FEMSigs >::Degree ... > >& pcStencils , std::tuple< InterpolationInfos *... > interpolationInfos , std::vector< ConstOneRingNeighborKey > *sharedNeighborKeys ) const
 {
 	typedef UIntPack< FEMSignature< FEMSigs >::Degree ... > FEMDegrees;
 	typedef UIntPack< BSplineOverlapSizes< FEMSignature< FEMSigs >::Degree >::OverlapSize ... > OverlapSizes;
 	typedef UIntPack< ( -BSplineOverlapSizes< FEMSignature< FEMSigs >::Degree >::OverlapStart ) ... > OverlapRadii;
 	size_t range = nEnd - nBegin;
 	matrix.resize( range );
-	std::vector< ConstOneRingNeighborKey > neighborKeys( ThreadPool::NumThreads() );
-	for( size_t i=0 ; i<neighborKeys.size() ; i++ ) neighborKeys[i].set( _localToGlobal( depth ) );
+	// Neighbour keys: REUSED across calls when the caller owns them.
+	//
+	// Building them here costs one heap allocation per thread per call --
+	// ConstNeighborKey::set() does `new NeighborType[depth+1]`, value-initialised, so at
+	// depth 11 with 32 threads that is 32 allocations and ~83 KB of zeroing. The sliced
+	// solver calls this ONCE PER SLICE, 2^depth times per depth, and did so even for
+	// slices with no nodes in them. The keys depend only on the depth, which is fixed for
+	// the whole of a _solveSlicedSystemGS call, so there is nothing per-slice about them.
+	//
+	// Pure waste removal: the keys are scratch, written before they are read on every
+	// node, so reusing them changes no arithmetic and no ordering. The output is
+	// bit-identical -- which is the point, because every other thing tried on this solver
+	// traded the sweep order or the working-set size for speed and needed re-validating.
+	//
+	// sharedNeighborKeys==NULL keeps the original behaviour for the callers that enter
+	// this once per depth (_solveFullSystemGS, systemMatrix), where hoisting buys nothing.
+	std::vector< ConstOneRingNeighborKey > _localNeighborKeys;
+	if( !sharedNeighborKeys )
+	{
+		_localNeighborKeys.resize( ThreadPool::NumThreads() );
+		for( size_t i=0 ; i<_localNeighborKeys.size() ; i++ ) _localNeighborKeys[i].set( _localToGlobal( depth ) );
+		sharedNeighborKeys = &_localNeighborKeys;
+	}
+	std::vector< ConstOneRingNeighborKey > &neighborKeys = *sharedNeighborKeys;
 	ThreadPool::ParallelFor( 0 , range , [&]( unsigned int thread , size_t i )
 	{
 		if( _isValidFEM1Node( _sNodes.treeNodes[i+nBegin] ) )
@@ -2726,26 +2756,98 @@ void FEMTree< Dim , Real >::solveSystem( UIntPack< FEMSigs ... > , typename Base
 		if( depth<_maxDepth && _restrictedConstraints )
 			ThreadPool::ParallelFor( _sNodesBegin(depth) , _sNodesEnd(depth) , [&]( unsigned int , size_t i ){ _residualConstraints[i] -= _restrictedConstraints[i]; } );
 	};
+	// Node counts for the LOG LINE ONLY -- `femNodes` below is used in nothing but the
+	// printf. validUnlockedFEMNodes( ... , depth ) walks the WHOLE tree and then keeps only
+	// the nodes at `depth`: RegularTreeNode::processNodes is an unpruned, single-threaded
+	// recursive descent over every node, and a void-returning functor gives it nothing to
+	// prune on. Printing one line per depth therefore walked a tens-of-millions-of-nodes
+	// octree once PER DEPTH -- seven full traversals on a depth-11 run, against ~1.45 s that
+	// the per-depth timers could not account for in a 6.5 s "Linear system solved".
+	//
+	// One walk now, binned by depth, built on first use. The predicate is unchanged. The
+	// flags it reads (FEM-1 validity, set by _setFEM1ValidityFlags above; Dirichlet-element,
+	// set during tree finalization) are fixed before the V-cycle starts and relaxation only
+	// writes coefficient arrays, so one pass is as correct as seven.
+	//
+	// This whole cost is gated on solverInfo.verbose, which rides MESH_DIAG_ENABLED() in the
+	// OpenMVS bridge -- so it was only ever paid on diagnostic runs. That is exactly the run
+	// anyone profiles, which is why it read as solver time when it never was.
+	std::vector< size_t > _femNodeCounts;
+	double _femNodeCountTime = 0;
+	auto FEMNodeCount = [&]( LocalDepth d ) -> size_t
+	{
+		if( _femNodeCounts.empty() )
+		{
+			double _t = Time();
+			_femNodeCounts.resize( _maxDepth+2 , 0 );
+			_tree.processNodes( [&]( const FEMTreeNode *n )
+				{
+					if( isValidFEMNode( UIntPack< FEMSigs ... >() , n ) && !n->nodeData.getDirichletElementFlag() )
+					{
+						LocalDepth nd = _localDepth( n );
+						if( nd>=0 && nd<=_maxDepth ) _femNodeCounts[nd]++;
+					}
+				} );
+			_femNodeCountTime = Time()-_t;
+		}
+		return ( d>=0 && d<=_maxDepth ) ? _femNodeCounts[d] : 0;
+	};
+
+	// std::cout, NOT printf -- and that is the whole point of this function.
+	//
+	// The per-depth split below (constraintUpdateTime / systemTime / solveTime) is the
+	// only breakdown the solver produces of the interval the host logs as
+	// "# Linear system solved: 3.2 (s)". It was written with printf, so it went to the
+	// C stdout. The OpenMVS bridge intercepts this trace by swapping std::cout's
+	// streambuf (LineSinkBuf / CoutRedirect in PoissonReconLib.cpp, fed to
+	// ReconstructMesh's PoissonSolveLogLine) -- it never touches stdout, and a child
+	// process launched by the host has nowhere for stdout to go. So every "Cycle[...]"
+	// line the solver has ever printed was discarded: grep any ReconstructMesh log in
+	// the P2P directory and there is not one of them, while the sibling "#  Set FEM
+	// constraints" lines -- std::cout, same verbosity gate -- are all there.
+	//
+	// That split is what says whether the solve is matrix ASSEMBLY (systemTime, which is
+	// threaded per slice) or RELAXATION (solveTime, which is 27-colour Gauss-Seidel over
+	// one slice at a time and so runs on a single core at fine depths). Those two have
+	// opposite fixes, and without these lines there is no way to tell them apart.
+	//
+	// snprintf into a buffer, then ONE stream insertion per line: the format strings stay
+	// byte-identical to what upstream printed, and LineSinkBuf splits on '\n' into one
+	// host log record per line -- so a line assembled from several writes must still
+	// arrive as a single line. It strips trailing padding only, so the residual block's
+	// leading indent survives.
 	auto OutputSolverStats = [&] ( int cycle , int depth , const _SolverStats& sStats , bool showResidual , int actualIters )
 	{
+		char _buf[512];
 		if( solverInfo.verbose )
 		{
-			node_index_type femNodes = (node_index_type)validUnlockedFEMNodes( UIntPack< FEMSigs ... >() , depth );
+			node_index_type femNodes = (node_index_type)FEMNodeCount( depth );
+			std::string line;
 			if( maxSolveDepth<10 )
-				if( solverInfo.vCycles<10 ) printf( "Cycle[%d] Depth[%d/%d]:\t" , cycle , depth , maxSolveDepth );
-				else                        printf( "Cycle[%2d] Depth[%d/%d]:\t" , cycle , depth , maxSolveDepth );
-			else 
-				if( solverInfo.vCycles<10 ) printf( "Cycle[%d] Depth[%2d/%d]:\t" , cycle , depth , maxSolveDepth );
-				else                        printf( "Cycle[%2d] Depth[%2d/%d]:\t" , cycle , depth , maxSolveDepth );
-			printf( "Updated constraints / Got system / Solved in: %6.3f / %6.3f / %6.3f\t(%d MB)\tNodes: %llu\n" , sStats.constraintUpdateTime , sStats.systemTime , sStats.solveTime , MemoryInfo::PeakMemoryUsageMB() , (unsigned long long)femNodes );
+			{
+				if( solverInfo.vCycles<10 ) snprintf( _buf , sizeof(_buf) , "Cycle[%d] Depth[%d/%d]:\t" , cycle , depth , maxSolveDepth );
+				else                        snprintf( _buf , sizeof(_buf) , "Cycle[%2d] Depth[%d/%d]:\t" , cycle , depth , maxSolveDepth );
+			}
+			else
+			{
+				if( solverInfo.vCycles<10 ) snprintf( _buf , sizeof(_buf) , "Cycle[%d] Depth[%2d/%d]:\t" , cycle , depth , maxSolveDepth );
+				else                        snprintf( _buf , sizeof(_buf) , "Cycle[%2d] Depth[%2d/%d]:\t" , cycle , depth , maxSolveDepth );
+			}
+			line = _buf;
+			snprintf( _buf , sizeof(_buf) , "Updated constraints / Got system / Solved in: %6.3f / %6.3f / %6.3f\t(%d MB)\tNodes: %llu" , sStats.constraintUpdateTime , sStats.systemTime , sStats.solveTime , MemoryInfo::PeakMemoryUsageMB() , (unsigned long long)femNodes );
+			line += _buf;
+			std::cout << line << std::endl;
 		}
 		if( solverInfo.showResidual && showResidual )
 		{
-			for( int d=_baseDepth ; d<depth ; d++ ) printf( "  " );
-			if     ( depth==_baseDepth )         printf( "MG x %d" , solverInfo.baseVCycles );
-			else if( depth<=solverInfo.cgDepth ) printf( "    CG" );
-			else                                 printf( "    GS" );
-			printf( ": %.4e -> %.4e -> %.4e (%.1e) [%d]\n" , sqrt( sStats.bNorm2 ) , sqrt( sStats.inRNorm2 ) , sqrt( sStats.outRNorm2 ) , sqrt( sStats.outRNorm2  / sStats.inRNorm2 ) , actualIters );
+			std::string line;
+			for( int d=_baseDepth ; d<depth ; d++ ) line += "  ";
+			if     ( depth==_baseDepth )         { snprintf( _buf , sizeof(_buf) , "MG x %d" , solverInfo.baseVCycles ) ; line += _buf; }
+			else if( depth<=solverInfo.cgDepth ) line += "    CG";
+			else                                 line += "    GS";
+			snprintf( _buf , sizeof(_buf) , ": %.4e -> %.4e -> %.4e (%.1e) [%d]" , sqrt( sStats.bNorm2 ) , sqrt( sStats.inRNorm2 ) , sqrt( sStats.outRNorm2 ) , sqrt( sStats.outRNorm2  / sStats.inRNorm2 ) , actualIters );
+			line += _buf;
+			std::cout << line << std::endl;
 		}
 	};
 
@@ -2876,10 +2978,23 @@ void FEMTree< Dim , Real >::solveSystem( UIntPack< FEMSigs ... > , typename Base
 				UpdateRestriction( d );
 				rNorms[d] = sqrt( sStats.outRNorm2 / _bNorm2[d] );
 			}
-			printf( "%3d" , v+1 );
-			for( int d=_baseDepth ; d<=maxSolveDepth ; d++ ) printf( "\t%.4e" , rNorms[d] );
-			printf( "\n" );
+			// std::cout for the same reason as OutputSolverStats above -- one record per line.
+			char _buf[64];
+			std::string line;
+			snprintf( _buf , sizeof(_buf) , "%3d" , v+1 );
+			line = _buf;
+			for( int d=_baseDepth ; d<=maxSolveDepth ; d++ ){ snprintf( _buf , sizeof(_buf) , "\t%.4e" , rNorms[d] ) ; line += _buf; }
+			std::cout << line << std::endl;
 		}
+	}
+
+	// Self-reporting: this is the cost of the ONE remaining tree walk behind the "Nodes:"
+	// column. Multiply by the number of printed depths to see what it used to cost.
+	if( solverInfo.verbose && !_femNodeCounts.empty() )
+	{
+		char _buf[128];
+		snprintf( _buf , sizeof(_buf) , "Log-only node counting (1 tree walk, was 1 per printed depth): %6.3f (s)" , _femNodeCountTime );
+		std::cout << _buf << std::endl;
 	}
 
 	FreePointer( _residualConstraints );
@@ -2983,8 +3098,21 @@ void FEMTree< Dim , Real >::_addFEMConstraints( UIntPack< FEMSigs ... > , UIntPa
 					{
 						if( _isValidFEM2Node( nodes[j] ) )
 						{
+							// !_IsZero, not just non-null.
+							//
+							// The normal field is now DENSE -- SparseNodeData::presizeSlots gives
+							// every node a slot so the splat never takes at()'s mutex -- so
+							// coefficients() returns a valid pointer to `zero` where it used to
+							// return NULL, and this accumulated a zero contribution for every node
+							// the field does not actually cover. MEASURED at +0.2 s in "Set FEM
+							// constraints" on BOTH scenes (Historic 1.5->1.7, SchnellTests
+							// 0.6->0.8), i.e. systematic, not scene-specific.
+							//
+							// Adding a zero term is a no-op arithmetically, so skipping it cannot
+							// change the result -- it restores exactly the set of terms the sparse
+							// field contributed.
 							const D* _data = coefficients( nodes[j] );
-							if( _data ) constraints[i] += _StencilDot< double , T , CDim >( stencilValues[j] , *_data );
+							if( _data && !_IsZero( *_data ) ) constraints[i] += _StencilDot< double , T , CDim >( stencilValues[j] , *_data );
 						}
 					}
 				}
@@ -2996,8 +3124,12 @@ void FEMTree< Dim , Real >::_addFEMConstraints( UIntPack< FEMSigs ... > , UIntPa
 					{
 						if( _isValidFEM2Node( nodes[j] ) )
 						{
+							// See the note on the interior branch above: the field is dense now, so
+							// a non-null pointer no longer means "this node has data". Skipping the
+							// zero terms also skips the ccIntegrate they would have been multiplied
+							// by, which is the more expensive half of this branch.
 							const D* _data = coefficients( nodes[j] );
-							if( _data )
+							if( _data && !_IsZero( *_data ) )
 							{
 								LocalDepth _d ; LocalOffset _off ; _localDepthAndOffset( nodes[j] , _d , _off );
 								constraints[i] += _StencilDot< double , T , CDim >( F.ccIntegrate( off , _off ) , *_data );

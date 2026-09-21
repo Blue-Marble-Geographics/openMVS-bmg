@@ -35,6 +35,7 @@ DAMAGE.
 #include "FEMTree.h"
 #include "PointExtent.h"
 #include "Reconstructors.streams.h"
+#include <cstdlib>
 
 namespace PoissonRecon
 {
@@ -44,6 +45,93 @@ namespace PoissonRecon
 		static unsigned int ProfilerMS = 20;		// The number of ms at which to poll the performance (set to zero for no polling)
 		static const unsigned int DataDegree = 0;	// The order of the B-Spline used to splat in data for auxiliary data interpolation
 		static const unsigned int WeightDegree = 2;	// The order of the B-Spline used to splat in the weights for density estimation
+
+		// ---- Normal-field splat thread count -------------------------------------
+		//
+		// MEASURED 2026-09-12, RichmondHistoric HIGH (53.3M points -> 5.14M samples,
+		// 39.4M active nodes, depth 11). "Got normal field", same scene every run:
+		//
+		//     threads      1      2      4     32
+		//     seconds    4.7    4.3    4.6   17.8
+		//
+		// The splat is ~4x SLOWER on all 32 cores than on one. Every other phase of
+		// the solve scales normally (5-19x slower serial), so this is specific to
+		// setInterpolatedDataField: it makes ~277M calls to SparseNodeData::at()
+		// (27 neighbours x 2 depths x 5.14M samples at NormalDegree=2), and at() takes
+		// a SINGLE global mutex on first touch of each node -- ~39M acquisitions, with
+		// a second mutex nested inside via NestedVector::resize. Two cores buy 9%
+		// instead of 100%; 32 cores cost 13.5 s of pure convoy. Cache-line contention
+		// on the 12-byte Point<float,3> payloads likely compounds it.
+		//
+		// So: cap this ONE phase. 2 measured best, by a margin smaller than the gap to
+		// either neighbour -- anything in 1..4 recovers essentially all of the win, so
+		// do not re-tune this per machine without a measurement that clears ~0.4 s.
+		// Override with OPENMVS_POISSON_SPLAT_THREADS to re-sweep.
+		//
+		// The real fix is to make at() lock-free (pre-size the SparseNodeData and claim
+		// indices with fetch_add); this cap is the cheap 90% until someone does that.
+		// Worker count for the normal-field splat. 8, measured -- see the curve below.
+		//
+		// This was 2, because the splat used to get SLOWER with more threads (2.8 s at 2,
+		// 3.4 s at 8). That was never about the arithmetic: SparseNodeData::at() took a
+		// single shared mutex on the first touch of every node and held it while the data
+		// array grew by one element, and NestedVector::resize -- called unconditionally on
+		// every at() -- locked even when the requested size already matched. With those
+		// gone (SparseNodeData::presizeSlots, the sz<=_size early-out, and chunked growth
+		// in at()) the phase both got faster AND started scaling:
+		//
+		//   splat threads:      2       8      16
+		//   before:           2.8 s   3.4 s     -
+		//   after:            1.7 s   1.2 s   4.0 s
+		//
+		// Measured on Historic, 53.1M points / 26.2M nodes / depth 11, each pair checked
+		// against "Read input into tree" as a control -- that phase is serial and finishes
+		// before this count is read, so if it moves between two runs the machine was busy
+		// and the pair is void. One pair was discarded that way.
+		//
+		// WHY 8 AND NOT MORE. The cliff at 16 is not contention returning, it is the CCD
+		// boundary: this is a 16-core/2-chiplet part, and up to 8 workers the lines the
+		// splat still shares stay inside one chiplet's L3, while past 8 every one of them
+		// crosses Infinity Fabric. 8 is one chiplet. RE-MEASURE THIS ON A DIFFERENT CPU --
+		// the right number is a property of the cache topology, not of this code, and on a
+		// single-CCD or larger-CCD part it will differ.
+		//
+		// OPENMVS_POISSON_SPLAT_THREADS overrides without a rebuild.
+		inline unsigned int NormalSplatThreads( void )
+		{
+			static const unsigned int n = []( void ) -> unsigned int
+			{
+				if( const char *e = std::getenv( "OPENMVS_POISSON_SPLAT_THREADS" ) )
+				{
+					const int v = std::atoi( e );
+					if( v>0 ) return (unsigned int)v;
+				}
+				return 8;
+			}();
+			return n;
+		}
+
+		// Lower ThreadPool's worker count for a scope and always restore it, including
+		// on the exception path (Solve has one).
+		//
+		// This ONLY ever lowers, by construction. The asymmetry matters: callers size
+		// per-thread scratch from ThreadPool::NumThreads() once (FEMTree's
+		// densityKeys/dataKeys, PoissonReconLib's per-thread output buffers), so a
+		// pool that shrank mid-solve leaves those arrays merely oversized with only the
+		// low slots used -- harmless. A pool that GREW mid-solve would index past their
+		// ends. See the warning on ThreadPool::SetNumThreads.
+		struct ScopedThreadCount
+		{
+			explicit ScopedThreadCount( unsigned int n ) : _old( ThreadPool::NumThreads() )
+			{
+				if( n && n<_old ) ThreadPool::SetNumThreads( n );
+			}
+			~ScopedThreadCount( void ){ ThreadPool::SetNumThreads( _old ); }
+			ScopedThreadCount( const ScopedThreadCount & ) = delete;
+			ScopedThreadCount &operator=( const ScopedThreadCount & ) = delete;
+		private:
+			unsigned int _old;
+		};
 
 		// Declare a type for storing the solution information
 		template< typename Real , unsigned int Dim , typename FEMSigPack /* = UIntPack< FEMSigs... >*/ , typename ... AuxData > struct Implicit;
@@ -506,7 +594,27 @@ namespace PoissonRecon
 			template< typename Real , unsigned int Dim , unsigned int ... FEMSigs , typename ... AuxData >
 			struct Solver< Real , Dim , UIntPack< FEMSigs... > , AuxData... >
 			{
-				static Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > *Solve( InputOrientedSampleStream< Real , Dim , AuxData... > &pointStream , SolutionParameters< Real > params , AuxData ... zero , const EnvelopeMesh< Real , Dim > *envelopeMesh=nullptr , InputValuedSampleStream< Real , Dim > *valueInterpolationStream=nullptr );
+				// modelToUnitCube: OPTIONAL caller-supplied transform that SKIPS THE EXTENT PASS.
+				//
+				// Without it, Solve streams EVERY input point once, before the octree is
+				// touched, purely to find the bounding extent -- then resets and streams them
+				// all again to insert them. On the larger measured scene that is 53.1M points
+				// read twice inside a phase reporting 3.7 s, and the first walk is serial by
+				// construction: InputDataStream is a sequential virtual read().
+				//
+				// A caller holding the points in memory can build the IDENTICAL transform in
+				// parallel. PointExtent::Extent is min/max over a fixed direction frame, and
+				// min/max are associative, commutative and exact in floating point, so
+				// per-thread partials merged with Extent::operator+ equal the serial walk
+				// bit for bit; feed that to the same GetXForm(extent,scale,dir) this ends in
+				// and the octree cube is unchanged.
+				//
+				// It lives HERE rather than on SolutionParameters because SolutionParameters
+				// is templated on Real ALONE -- there is no Dim in that scope to spell
+				// XForm< Real , Dim+1 > with.
+				//
+				// nullptr keeps the original behaviour exactly.
+				static Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > *Solve( InputOrientedSampleStream< Real , Dim , AuxData... > &pointStream , SolutionParameters< Real > params , AuxData ... zero , const EnvelopeMesh< Real , Dim > *envelopeMesh=nullptr , InputValuedSampleStream< Real , Dim > *valueInterpolationStream=nullptr , const XForm< Real , Dim+1 > *modelToUnitCubeIn=nullptr );
 			};
 		};
 
@@ -644,7 +752,7 @@ namespace PoissonRecon
 
 		// Implementation of the derived Poisson::Implicit's constructor
 		template< typename Real , unsigned int Dim , unsigned int ... FEMSigs , typename ... AuxData >
-		Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > *Poisson::Solver< Real , Dim , UIntPack< FEMSigs... > , AuxData... >::Solve( InputOrientedSampleStream< Real , Dim , AuxData... > &pointStream , SolutionParameters< Real > params , AuxData ... zero , const EnvelopeMesh< Real , Dim > *envelopeMesh , InputValuedSampleStream< Real , Dim > *valueInterpolationStream )
+		Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > *Poisson::Solver< Real , Dim , UIntPack< FEMSigs... > , AuxData... >::Solve( InputOrientedSampleStream< Real , Dim , AuxData... > &pointStream , SolutionParameters< Real > params , AuxData ... zero , const EnvelopeMesh< Real , Dim > *envelopeMesh , InputValuedSampleStream< Real , Dim > *valueInterpolationStream , const XForm< Real , Dim+1 > *modelToUnitCubeIn )
 		{
 			Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > *implicitPtr = new Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... >( zero... );
 			Implicit< Real , Dim , UIntPack< FEMSigs... > , AuxData... > &implicit = *implicitPtr;
@@ -703,7 +811,10 @@ namespace PoissonRecon
 				profiler.reset();
 
 				pointStream.reset();
-				modelToUnitCube = params.scale>0 ? PointExtent::GetXForm< Real , Dim , true , Normal< Real , Dim > , AuxData... >( pointStream , Normal< Real , Dim >() , zero... , params.scale , params.alignDir ) * modelToUnitCube : modelToUnitCube;
+				// Caller-supplied transform skips the extent walk; the stream is then NOT
+					// consumed here, and the reset() below positions it for insertion either way.
+					if( modelToUnitCubeIn ) modelToUnitCube = (*modelToUnitCubeIn) * modelToUnitCube;
+					else modelToUnitCube = params.scale>0 ? PointExtent::GetXForm< Real , Dim , true , Normal< Real , Dim > , AuxData... >( pointStream , Normal< Real , Dim >() , zero... , params.scale , params.alignDir ) * modelToUnitCube : modelToUnitCube;
 				implicit.unitCubeToModel = modelToUnitCube.inverse();
 				pointStream.reset();
 
@@ -717,8 +828,21 @@ namespace PoissonRecon
 
 					auto IsValid = [&]( const Point< Real , Dim > &p , const Normal< Real , Dim > &n , AuxData ... d )
 						{
-							Real l = Point< Real , Dim >::SquareNorm( n );
-							return l>0 && std::isfinite(l);
+							// Two compares, no library call.
+							//
+							// This runs ONCE PER INPUT POINT -- 53.1M times on the larger
+							// measured scene -- against about five flops of real work, so a
+							// std::isfinite that MSVC declines to inline costs more than the
+							// norm it is checking.
+							//
+							// EXACTLY equivalent, not an approximation. l is a sum of squares,
+							// so the cases are: NaN fails l>0 (every comparison with NaN is
+							// false) and short-circuits; zero and negatives fail l>0; -inf
+							// cannot arise. The only non-finite value that can reach the second
+							// test is +inf, and l<infinity rejects it. Same truth table as
+							// l>0 && isfinite(l), one branch shorter.
+							const Real l = Point< Real , Dim >::SquareNorm( n );
+							return l>0 && l<std::numeric_limits< Real >::infinity();
 						};
 
 					auto Process = [&]( FEMTreeNode &node , const Point< Real , Dim > &p , Normal< Real , Dim > &n , AuxData ... d )
@@ -751,7 +875,12 @@ namespace PoissonRecon
 
 					auto F = [&]( AuxData ... zeroAuxData )
 						{
-							pointCount = FEMTreeInitializer< Dim , Real >::template Initialize< decltype(IsValid) , decltype(Process) , Normal< Real , Dim > , AuxData... >( implicit.tree.spaceRoot() , _pointStream , Normal< Real , Dim >() , zeroAuxData... , params.depth , implicit.tree.nodeAllocators.size() ? implicit.tree.nodeAllocators[0] : nullptr , implicit.tree.initializer() , IsValid , Process );
+							pointCount = FEMTreeInitializer< Dim , Real >::template Initialize< decltype(IsValid) , decltype(Process) , Normal< Real , Dim > , AuxData... >( implicit.tree.spaceRoot() , _pointStream , Normal< Real , Dim >() , zeroAuxData... , params.depth , implicit.tree.nodeAllocators.size() ? implicit.tree.nodeAllocators[0] : nullptr , implicit.tree.initializer() , IsValid , Process ,
+								// Per-thread allocators enable the parallel descent inside
+								// Initialize. Allocator::newElements is unsynchronised, so
+								// without one per worker that path must stay serial -- passing
+								// NULL here is what selects the original single-threaded loop.
+								implicit.tree.nodeAllocators.size() ? &implicit.tree.nodeAllocators : NULL );
 						};
 					implicit._zeroAuxData.process( F );
 				}
@@ -808,12 +937,43 @@ namespace PoissonRecon
 							out = n / l;
 							return true;
 						};
-					*normalInfo = implicit.tree.setInterpolatedDataField( Point< Real , Dim >() , NormalSigs() , *samples , *sampleNormalAndAuxData , implicit.density , params.baseDepth , params.depth , params.lowDepthCutOff , pointDepthAndWeight , ConversionFunction );
+					{
+						// Cap the pool for the SPLAT ONLY. It no longer scales BACKWARDS -- the
+						// mutex that caused that is gone -- but it still peaks at one CCD's
+						// worth of workers and falls off a cliff beyond it. See
+						// NormalSplatThreads for the measured curve and why 8.
+						ScopedThreadCount splatThreads( NormalSplatThreads() );
+						*normalInfo = implicit.tree.setInterpolatedDataField( Point< Real , Dim >() , NormalSigs() , *samples , *sampleNormalAndAuxData , implicit.density , params.baseDepth , params.depth , params.lowDepthCutOff , pointDepthAndWeight , ConversionFunction );
+					}
 
+					// Make untouched nodes read as ABSENT again.
+					//
+					// setInterpolatedDataField pre-assigns every node a slot so the splat can
+					// run without at()'s mutex; the side effect is that every node then looks
+					// populated to readers, costing them a cache miss into the data array
+					// where they used to see NULL and skip. That showed up as +0.2 s in
+					// "Set FEM constraints" on both measured scenes.
+					//
+					// Safe for THIS field specifically: its two readers test the value, not
+					// slot presence -- HasNormalDataFunctor checks normal[d]!=0 and
+					// _addFEMConstraints skips zero coefficients -- so a slot holding zero and
+					// an absent slot are already equivalent to both. See
+					// SparseNodeData::dropZeroEntries for the general caveat.
+					//
+					// Runs at the full pool: a flat pass over the index array, disjoint writes.
+					normalInfo->dropZeroEntries( []( const Point< Real , Dim > &n )
+						{
+							for( unsigned int d=0 ; d<Dim ; d++ ) if( n[d]!=0 ) return false;
+							return true;
+						} );
+
+					// Flat elementwise pass over an already-built array -- no shared-structure
+					// contention, so this one keeps the full pool.
 					ThreadPool::ParallelFor( 0 , normalInfo->size() , [&]( unsigned int , size_t i ){ (*normalInfo)[i] *= (Real)-1.; } );
 					if( params.verbose )
 					{
 						std::cout << "#     Got normal field: " << profiler << std::endl;
+						std::cout << "#       splat threads: " << NormalSplatThreads() << " (pool " << ThreadPool::NumThreads() << ")" << std::endl;
 						std::cout << "Point depth / Point weight / Estimated measure: " << pointDepthAndWeight.value()[0] << " / " << pointDepthAndWeight.value()[1] << " / " << pointCount*pointDepthAndWeight.value()[1] << std::endl;
 					}
 				}
@@ -1022,7 +1182,12 @@ namespace PoissonRecon
 					if( params.verbose ) std::cout << "#Set value interpolation constraints: " << profiler << std::endl;
 				}
 
-				if( params.verbose ) std::cout << "All Nodes / Active Nodes / Ghost Nodes / Dirichlet Supported Nodes: " << implicit.tree.allNodes() << " / " << implicit.tree.activeNodes() << " / " << implicit.tree.ghostNodes() << " / " << implicit.tree.dirichletElements() << std::endl;
+				if( params.verbose )
+				{
+					// One tree walk for all four, not four. See FEMTree::nodeTallies.
+					auto _t = implicit.tree.nodeTallies();
+					std::cout << "All Nodes / Active Nodes / Ghost Nodes / Dirichlet Supported Nodes: " << _t.all << " / " << _t.active << " / " << _t.ghost << " / " << _t.dirichletElement << std::endl;
+				}
 				if( params.verbose ) std::cout << "Memory Usage: " << float( MemoryInfo::Usage())/(1<<20) << " MB" << std::endl;
 
 				// Solve the linear system
@@ -1132,8 +1297,21 @@ namespace PoissonRecon
 
 					auto IsValid = [&]( const Point< Real , Dim > &p , const Normal< Real , Dim > &n , AuxData ... d )
 						{
-							Real l = Point< Real , Dim >::SquareNorm( n );
-							return l>0 && std::isfinite(l);
+							// Two compares, no library call.
+							//
+							// This runs ONCE PER INPUT POINT -- 53.1M times on the larger
+							// measured scene -- against about five flops of real work, so a
+							// std::isfinite that MSVC declines to inline costs more than the
+							// norm it is checking.
+							//
+							// EXACTLY equivalent, not an approximation. l is a sum of squares,
+							// so the cases are: NaN fails l>0 (every comparison with NaN is
+							// false) and short-circuits; zero and negatives fail l>0; -inf
+							// cannot arise. The only non-finite value that can reach the second
+							// test is +inf, and l<infinity rejects it. Same truth table as
+							// l>0 && isfinite(l), one branch shorter.
+							const Real l = Point< Real , Dim >::SquareNorm( n );
+							return l>0 && l<std::numeric_limits< Real >::infinity();
 						};
 
 					auto Process = [&]( FEMTreeNode &node , const Point< Real , Dim > &p , Normal< Real , Dim > &n , AuxData ... d )
@@ -1165,7 +1343,12 @@ namespace PoissonRecon
 						};
 					auto F = [&]( AuxData ... zeroAuxData )
 						{
-							pointCount = FEMTreeInitializer< Dim , Real >::template Initialize< decltype(IsValid) , decltype(Process) , Normal< Real , Dim > , AuxData... >( implicit.tree.spaceRoot() , _pointStream , Normal< Real , Dim >() , zeroAuxData... , params.depth , implicit.tree.nodeAllocators.size() ? implicit.tree.nodeAllocators[0] : nullptr , implicit.tree.initializer() , IsValid , Process );
+							pointCount = FEMTreeInitializer< Dim , Real >::template Initialize< decltype(IsValid) , decltype(Process) , Normal< Real , Dim > , AuxData... >( implicit.tree.spaceRoot() , _pointStream , Normal< Real , Dim >() , zeroAuxData... , params.depth , implicit.tree.nodeAllocators.size() ? implicit.tree.nodeAllocators[0] : nullptr , implicit.tree.initializer() , IsValid , Process ,
+								// Per-thread allocators enable the parallel descent inside
+								// Initialize. Allocator::newElements is unsynchronised, so
+								// without one per worker that path must stay serial -- passing
+								// NULL here is what selects the original single-threaded loop.
+								implicit.tree.nodeAllocators.size() ? &implicit.tree.nodeAllocators : NULL );
 						};
 					implicit._zeroAuxData.process( F );
 				}
@@ -1282,7 +1465,12 @@ namespace PoissonRecon
 					if( params.verbose ) std::cout << "#Set point constraints: " << profiler << std::endl;
 				}
 
-				if( params.verbose ) std::cout << "All Nodes / Active Nodes / Ghost Nodes: " << implicit.tree.allNodes() << " / " << implicit.tree.activeNodes() << " / " << implicit.tree.ghostNodes() << std::endl;
+				if( params.verbose )
+				{
+					// One tree walk for all three, not three. See FEMTree::nodeTallies.
+					auto _t = implicit.tree.nodeTallies();
+					std::cout << "All Nodes / Active Nodes / Ghost Nodes: " << _t.all << " / " << _t.active << " / " << _t.ghost << std::endl;
+				}
 				if( params.verbose ) std::cout << "Memory Usage: " << float( MemoryInfo::Usage())/(1<<20) << " MB" << std::endl;
 
 				// Solve the linear system

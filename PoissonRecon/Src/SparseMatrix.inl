@@ -616,6 +616,15 @@ void SparseMatrix< T , IndexType , MaxRowSize >::resize( size_t rowNum )
 		{
 			_rowSizes = AllocPointer< size_t >( rowNum );
 			_entries = AllocPointer< MatrixEntry< T , IndexType > >( rowNum * MaxRowSize );
+			// AllocPointer is a bare malloc in release builds (Array.h:99) with no null
+			// check, so an allocation this size failing used to surface as a write to
+			// address 0 during assembly rather than as an out-of-memory. That matters now
+			// that the full-depth solver is reachable: it asks for rowNum*MaxRowSize
+			// entries in ONE block -- measured at 1259 MB for depth 11 on a 6.1M-node tree,
+			// against ~3 MB for a single slice -- so this is the first configuration in
+			// which the request can plausibly be refused. Reconstruct() catches, so the
+			// caller gets a diagnosable failure instead of a crash.
+			if( !_rowSizes || !_entries ) MK_THROW( "Failed to allocate sparse matrix: " , rowNum , " rows x " , MaxRowSize , " entries = " , ( rowNum * MaxRowSize * sizeof( MatrixEntry< T , IndexType > ) )>>20 , " MB" );
 			_maxRows = rowNum;
 		}
 	}

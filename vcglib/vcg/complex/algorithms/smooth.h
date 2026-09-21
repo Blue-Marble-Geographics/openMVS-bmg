@@ -331,7 +331,18 @@ class Smooth
                 cb(100 * i / step, "Classic Laplacian Smoothing");
             TD.Init(lpz);
             AccumulateLaplacianInfo(m, TD, cotangentWeight);
-            for (auto vi = m.vert.begin(); vi != m.vert.end(); ++vi)
+            // THREADED. Each vertex's new position depends only on its OWN accumulated
+            // sum/cnt (filled by AccumulateLaplacianInfo above) and its own old position,
+            // so iterations are independent and the result is identical. The accumulate
+            // pass is left serial: it scatters from faces into vertices and so has real
+            // write conflicts.
+            const int64_t _nSmV = (int64_t)m.vert.size();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t _svi = 0; _svi < _nSmV; ++_svi)
+            {
+                auto vi = m.vert.begin() + _svi;
                 if (!(*vi).IsD() && TD[*vi].cnt > 0)
                 {
                   if (!SmoothSelected || (*vi).IsS())

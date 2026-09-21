@@ -28,7 +28,211 @@
 #include <time.h>
 #include <chrono>
 #include <algorithm>
+#include <intrin.h>   // __rdtsc -- [LOOP-PROFILE]
 using Clock = std::chrono::steady_clock;
+
+// Gate for the decimation profiling instrumentation.
+//
+// Mirrors MESH_DIAG_ENABLED() from libs/MVS/Common.h, which is a COMPILE-TIME constant
+// keyed off -DOPENMVS_MESH_DIAG -- and whose own comment states the gate is deliberately
+// meant to skip the COMPUTATION, not just the printing. That applies here: the counters
+// increment ~86M times per run (once per ComputePriority, once per AddCollapseToHeap)
+// and feed nothing but a log line.
+//
+// Defers to MESH_DIAG_ENABLED() itself where it is visible, so this cannot drift from
+// the real gate -- that also folds in TD_VERBOSE, which the raw flag does not. Mesh.cpp
+// includes MVS/Common.h before the vcg headers, so that is the path taken in practice.
+// The fallbacks cover this header being reached without MVS/Common.h; an undefined
+// OPENMVS_MESH_DIAG means off, matching Common.h.
+#if defined(MESH_DIAG_ENABLED)
+#define DECI_PROFILE MESH_DIAG_ENABLED()
+#elif defined(OPENMVS_MESH_DIAG) && OPENMVS_MESH_DIAG
+#define DECI_PROFILE 1
+#else
+#define DECI_PROFILE 0
+#endif
+
+// Compiles to nothing when the gate is off.
+#define DECI_COUNT(field) do { if (DECI_PROFILE) ++g_deciSetup.field; } while(0)
+
+// Per-phase wall clock for decimation SETUP, which is entirely single-threaded
+// while the DoOptimization loop that follows it is not (see HeapThreadPool below).
+// Filled by TriEdgeCollapseQuadric::Init and LocalOptimization::Init, reported by
+// the caller as [DECI-PROFILE]. Defined in libs/MVS/Mesh.cpp alongside g_qBlocks.
+// Not thread-safe and does not need to be -- everything it measures is serial.
+struct DeciSetupTimes
+{
+  double topo;       // VertexFace + FaceBorderFromVF inside Init
+  double boundary;   // the Fast/PreserveBoundary face scans
+  double quadric;    // InitQuadric: per-face quadric accumulation
+  double heapBuild;  // candidate enumeration + ComputePriority + emplace_back
+  double heapify;    // makeHeapUltraFast
+
+  // Call counts for the two functions the timing implicates. The [DECI-PROFILE]
+  // arithmetic says the collapse loop is ~12 candidates' worth of work per collapse
+  // and therefore almost entirely AddCollapseToHeap -> ComputePriority; these confirm
+  // or refute that directly instead of by inference.
+  //
+  // Plain uint64, NOT atomic. That is only safe because every DECI_COUNT site is on a
+  // SERIAL path -- which stopped being true once Init's priority sweep was threaded, and
+  // the counter promptly reported 2,520,325 of 19,996,738 (12.6%, 32 threads racing one
+  // ++). ComputePriority therefore no longer counts itself; the two serial sites
+  // (AddCollapseToHeap, and one exact add for the sweep's h_ret.size()) do. If you add a
+  // DECI_COUNT, check the caller is serial or the number silently becomes fiction.
+  unsigned long long nPriority;      // ComputePriority() calls
+  unsigned long long nAddCollapse;   // AddCollapseToHeap() calls
+
+  // Split of nAddCollapse by call site inside UpdateHeap, testing whether roughly half
+  // the loop's priority work is recomputing values that cannot have changed:
+  //   nAddSurvivor -- one endpoint is the SURVIVING vertex, whose quadric was just
+  //                   replaced by Q0+Q1. The priority genuinely changed; must recompute.
+  //   nAddOpposite -- the (a,b) pair opposite the survivor, pushed unconditionally once
+  //                   per incident face. Neither endpoint's quadric or position changed,
+  //                   so ComputePriority necessarily returns what the heap already holds.
+  unsigned long long nAddSurvivor;
+  unsigned long long nAddOpposite;
+
+  // Heap pops and how many were stale. The class's own heapPopCount/stalePopCount are
+  // RESET whenever compaction fires, so they cannot answer 'how much of the heap was
+  // garbage over the whole run'; these accumulate.
+  unsigned long long nHeapPop;
+  unsigned long long nHeapStale;
+
+  // [DECI-AUDIT] -- validates the two invariants the greedy loop rests on, at every
+  // collapse actually executed. Opt-in (OPENMVS_MESH_DECI_AUDIT=1) because it costs one
+  // extra ComputePriority plus a VF ring walk per pop.
+  //
+  //   nAuditNonEdge   collapses whose two endpoints no longer share a face. Today this
+  //                   MUST be 0: legality is guaranteed solely by the IMark bump-and-
+  //                   re-add cycle, since IsFeasible is commented out at the pop site
+  //                   AND returns true unconditionally when PreserveTopology is false,
+  //                   which is what runDecimate sets. Nothing else checks it.
+  //   nAuditPriStale  collapses whose stored heap priority no longer matches a fresh
+  //                   ComputePriority beyond 1e-6 relative. Today this MUST be 0 too:
+  //                   every entry is re-added with a fresh priority after any touch.
+  //
+  // Both are the invariants a geometry-mark split would trade away, so measure them on
+  // the CURRENT code first -- a validator that has never read zero proves nothing.
+  unsigned long long nAudited;
+  unsigned long long nAuditNonEdge;
+  unsigned long long nAuditPriStale;
+  double             auditMaxPriRel;
+
+  // [FP32-PROBE] -- would storing the quadrics as float instead of double work?
+  //
+  // The motive is cache: Quadric<double> is 10 doubles = 80 B/vertex, so the array is
+  // 533 MB on RichmondHistoric and 779 MB on Marco, and the decimate loop's cost is
+  // dominated by two random loads out of it per ComputePriority. Halving it is the
+  // obvious lever.
+  //
+  // The risk is cancellation. ByPlane stores a2..c2 at O(1), ad..cd at O(d), and d2 at
+  // O(d^2), where d = n.p -- so on a 1224-unit scene d^2 ~ 1e6, and Apply() sums terms
+  // of that size down to a squared distance of ~1e-2. Roughly 8 digits vanish. double
+  // has 16 and survives; float has 7 and may not.
+  //
+  // This measures it instead of arguing about it: at each collapse, round BOTH endpoint
+  // quadrics to float precision, re-run the real ComputePriority, and compare with the
+  // double answer. No storage change, no risk -- it exercises the actual code path.
+  // Also records the coefficient dynamic range that drives the cancellation.
+  unsigned long long nFp32Probed;
+  unsigned long long nFp32Bad;        // relative error > 1e-3: ordering would move
+  double             fp32MaxRel;
+  double             fp32MaxAbsA9;    // largest |d^2| term seen
+  double             fp32MaxAbsA0;    // largest |a^2| term seen
+
+  // Same probe, but with each quadric RECENTRED on its own vertex first. Translating a
+  // quadric is exact: for y = x - r,  A' = A,  b' = b + 2Ar,  c' = Q(r). Since r sits on
+  // the surface, b' becomes O(displacement) and c' O(displacement^2) instead of O(d) and
+  // O(d^2) -- which is the whole problem, because d = n.p is the distance from the
+  // WORLD ORIGIN to the plane and this scene sits ~3000 units off it.
+  unsigned long long nRcBad;       // recentred float error > 1e-3
+  double             rcMaxRel;
+  double             rcMaxAbsC;    // largest |c'| after recentring (was max|d^2|)
+
+  // [LOOP-PROFILE] -- where the collapse loop's ~11.8 s actually goes.
+  //
+  // Four hypotheses about this loop have now died (OptimalPlacement, quadric locality,
+  // float storage, sift-down prefetch), each costing a build. ns/prio is loop_time
+  // divided by priority calls, which attributes EVERYTHING to ComputePriority by
+  // construction and so cannot distinguish them. These split the iteration for real.
+  //
+  // __rdtsc, not chrono: ~4 ns versus ~25, against 9.2M iterations x 4 reads. Ticks are
+  // reported as percentages, so the TSC frequency never has to be known. Opt-in
+  // (OPENMVS_MESH_DECI_LOOPPROF=1) and NOT to be combined with the audit or fp32 probe --
+  // both call ComputePriority on the pop path and would land inside tscExec.
+  unsigned long long tscPop;     // selection + popHeapUltraFast (the sift-down)
+  unsigned long long tscStale;   // pops rejected by IsUpToDate
+  unsigned long long tscExec;    // Execute: EdgeCollapser::Do
+  unsigned long long tscUpd;     // UpdateHeap: VF walks + AddCollapseToHeap + pushes
+  unsigned long long tscOther;   // compaction, hBuffer bookkeeping, GoalReached
+
+  // updateHeap is 35.7% of the loop and is 31.9M AddCollapseToHeap calls at ~131 ns each
+  // (MEASURED: loop priority calls 31,878,462 vs 4,641,654 collapses = 6.87 per collapse,
+  // the survivor's valence). That 131 ns is THREE things and they want different fixes:
+  //   alloc -> the block pool is too slow / touching cold pages
+  //   prio  -> the quadric sum + Cholesky is the work; only fewer CALLS can help, and
+  //            ~70% of pushed entries are never popped (9.3M pops vs 31.9M pushes)
+  //   push  -> the hBuffer emplace + mini-heap compare
+  // Splitting them is the only way to choose. NOTE this adds 4 rdtsc reads to a call that
+  // costs ~131 ns, so it inflates updateHeap's share of the loop by roughly a tenth; read
+  // the RATIO between the three, not their absolute share.
+  unsigned long long tscAlloc;   // new MYTYPE (block pool)
+  unsigned long long tscPrio;    // ComputePriority
+  unsigned long long tscPush;    // hBuffer emplace_back + mini-heap swap
+
+  void Clear( void ){ topo = boundary = quadric = heapBuild = heapify = 0.0; nPriority = nAddCollapse = 0; nAddSurvivor = nAddOpposite = 0; nHeapPop = nHeapStale = 0;
+                     nAudited = nAuditNonEdge = nAuditPriStale = 0; auditMaxPriRel = 0.0;
+                     nFp32Probed = nFp32Bad = 0; fp32MaxRel = fp32MaxAbsA9 = fp32MaxAbsA0 = 0.0;
+                     nRcBad = 0; rcMaxRel = rcMaxAbsC = 0.0;
+                     tscPop = tscStale = tscExec = tscUpd = tscOther = 0;
+                     tscAlloc = tscPrio = tscPush = 0;
+                     }
+};
+extern DeciSetupTimes g_deciSetup;
+extern bool g_deciAudit;   // OPENMVS_MESH_DECI_AUDIT=1; see DECI-AUDIT above
+extern bool g_deciLazy;    // OPENMVS_MESH_DECI_LAZY=1; see TriEdgeCollapseQuadric
+extern bool g_deciFp32Probe;   // OPENMVS_MESH_QUADRIC_FP32_PROBE=1; see FP32-PROBE
+extern bool g_deciRecentred;   // OPENMVS_MESH_QUADRIC_RECENTRED=1; see CLEAN::RQuadric
+extern bool g_deciLoopProf;    // OPENMVS_MESH_DECI_LOOPPROF=1; see LOOP-PROFILE
+
+// [EXEC-PROFILE] -- Execute is 27.3% of the loop (~3.3 s) and, across a whole session spent
+// on this loop, was never once examined. Execute is EdgeCollapser::Do: FindSets walks v0's
+// VF ring; the av01 loop VFDetaches each shared face from its two non-v0 corners and deletes
+// it; the av0 loop re-points v0's remaining faces at v1 and prepends them to v1's VF list.
+//
+// These are EXACT COUNTS, not timings, deliberately: the rdtsc sub-splits above are
+// documented as untrustworthy below ~100 ns and Execute's parts are exactly that size,
+// whereas counts cannot be reordered by the CPU. The one that matters is g_vfDetachSteps --
+// VFDetach is a singly-linked-list unlink that, whenever the face is not already at the
+// head, SCANS the vertex's VF list for the predecessor. Size it (steps x a few ns per
+// dependent pointer chase) BEFORE writing any fix.
+//
+// Declared in vcg/simplex/face/topology.h at global scope, because edge_collapse.h and
+// topology.h both need them and sit below this header. Defined in libs/MVS/Mesh.cpp.
+extern unsigned long long g_execCollapses;    // calls to EdgeCollapser::Do
+extern unsigned long long g_execRingV0;       // VF ring length of v0 (FindSets iterations)
+extern unsigned long long g_execAv01;         // faces incident on both v0 and v1
+extern unsigned long long g_execAv0;          // faces incident on v0 only (relinked to v1)
+extern unsigned long long g_vfDetachCalls;    // VFDetach calls
+extern unsigned long long g_vfDetachHead;     // ... that hit the O(1) head case
+extern unsigned long long g_vfDetachSteps;    // ... total list nodes walked on the scan path
+
+// Scoped accumulator: adds its lifetime into the named slot.
+#if DECI_PROFILE
+struct DeciPhaseTimer
+{
+  explicit DeciPhaseTimer( double &sink ) : _sink(sink) , _t0(Clock::now()) {}
+  ~DeciPhaseTimer( void ){ _sink += std::chrono::duration<double>( Clock::now() - _t0 ).count(); }
+  DeciPhaseTimer( const DeciPhaseTimer & ) = delete;
+  DeciPhaseTimer &operator=( const DeciPhaseTimer & ) = delete;
+private:
+  double &_sink;
+  Clock::time_point _t0;
+};
+#else
+// Same name and construction so every call site stays unchanged; optimises away whole.
+struct DeciPhaseTimer { explicit DeciPhaseTimer( double & ){} };
+#endif
 
 //#pragma optimization("", off) // JPB WIP BUG
 
@@ -54,20 +258,45 @@ T* CodeToPtr(uint64_t code)
   return reinterpret_cast<T*>(base + indexInBlock * kItemSize);
 }
 
+// Encode a pooled MYTYPE* as (block index, index within block).
+//
+// This USED to assume the pointer lay in g_qBlocks.back(), the most recently allocated
+// block. That holds whenever PtrToOffset is called straight after `new MYTYPE(...)`,
+// which was the only caller -- but it is not a property of the pointer, it is a property
+// of that one call site, and nothing said so.
+//
+// OPENMVS_MESH_DECI_FULLLAZY re-inserts an EXISTING entry, allocated long before and
+// therefore usually in an earlier block. The old code then computed
+// ptr - lastBlockBase, which is negative, wrapped it through uintptr_t, and handed
+// CodeToPtr an index far outside the block -- reconstructing a wild pointer that faults
+// on the next pop. RichmondHistoric's 20M Init entries span 3 blocks at
+// BLOCK_SIZE = 8M objects, so two thirds of all re-keys were corrupt; the run died about
+// two thirds of the way in, once one of them surfaced.
+//
+// Searching from the back keeps the freshly-allocated case at one iteration, and the pool
+// is only a handful of blocks (8M objects each), so the miss case is a few compares.
 template<typename T>
 uint64_t PtrToOffset(T* ptr)
 {
-  // Assume g_qBlocks.back() is non-empty and ptr is within that last block
-  void* base = g_qBlocks.back();  // Most recent block
-  size_t blockIndex = g_qBlocks.size() - 1;
+  extern std::vector<void*> g_qBlocks;
 
-  // Avoid repeated casts, compute offset in one step
-  uintptr_t byteOffset = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(base);
+  constexpr uint64_t kBlockShift = 23;                      // must match CodeToPtr
+  constexpr size_t   kItemSize = 36;                        // sizeof(MYTYPE), hardcoded there too
+  // Mesh.cpp: BLOCK_SIZE = 8 * 1024 * 1024 objects == 1 << kBlockShift. The index field
+  // is exactly kBlockShift bits wide, so a block may hold no more than this.
+  constexpr size_t   kBlockBytes = (size_t(1) << kBlockShift) * kItemSize;
 
-  uint64_t indexInBlock = byteOffset / (36);
-
-  // Combine into 64-bit ID: bits 23.. are block ID, bits 0..6 are index
-  return (blockIndex << 23) | indexInBlock;
+  const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+  for (size_t bi = g_qBlocks.size(); bi-- > 0; ) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(g_qBlocks[bi]);
+    if (p < base)
+      continue;
+    const uintptr_t off = p - base;
+    if (off < kBlockBytes)
+      return (uint64_t(bi) << kBlockShift) | uint64_t(off / kItemSize);
+  }
+  assert(false && "PtrToOffset: pointer is not inside any pool block");
+  return 0;
 }
 
 namespace vcg{
@@ -329,6 +558,27 @@ public:
       size_t left = 2 * hole + 1;
       if (left >= limit) break;
 
+      // Prefetch the NEXT level while comparing this one.
+      //
+      // The sift-down is the loop's memory problem: ~24 levels per pop, each a random
+      // 8-byte read out of a heap that reaches 160-400 MB, 9.2M times a run. That also
+      // explains why halving the entry count (lazy revalidation) bought only ~10% -- a
+      // binary heap is log-depth, so half the entries removes ONE level of 24.
+      //
+      // It prefetches cleanly because the descent is only two-way: from `hole` we move to
+      // 2h+1 or 2h+2, whose children together occupy indices 4h+3 .. 4h+6 -- four
+      // consecutive 8-byte codes, 32 bytes, normally one cache line. So a single prefetch
+      // covers whichever branch the comparison takes, with no speculation about which.
+      {
+        const size_t gk = 4 * hole + 3;
+        if (gk < limit) {
+          _mm_prefetch((const char*)(data + gk), _MM_HINT_T0);
+          // 4h+3..4h+6 straddles a line when the base is badly aligned; +3 covers it.
+          const size_t gk2 = gk + 3;
+          if (gk2 < limit) _mm_prefetch((const char*)(data + gk2), _MM_HINT_T0);
+        }
+      }
+
       size_t right = left + 1;
       size_t child = (right < limit && data[right].code < data[left].code) ? right : left;
 
@@ -552,7 +802,11 @@ public:
           int count = 0;
           for (int j = 0; j < kBlockSize; ++j) {
             const Leaf* locMod = CodeToPtr<Leaf>(h[i + j].code);
-            if (locMod->IsUpToDate())
+            // IsUpToDateFast: const and allocation-free. The full test can walk a VF
+            // ring and refresh localMark, neither of which is safe from these
+            // workers. Conservative in the SAFE direction -- it only drops entries
+            // that are definitely dead, so nothing the pop would accept is lost.
+            if (locMod->IsUpToDateFast())
               tmp[count++] = h[i + j]; // Use address from vector directly
           }
           memcpy(dst, tmp, count * sizeof(PackedHeapElem));
@@ -565,7 +819,7 @@ public:
           for (size_t i = tailStart; i < endIdx; ++i) {
             const PackedHeapElem& el = h[i];
             const Leaf* locMod = CodeToPtr<Leaf>(el.code);
-            if (locMod->IsUpToDate())
+            if (locMod->IsUpToDateFast())
               tmp[count++] = el;
           }
 
@@ -709,7 +963,35 @@ public:
     // Faster to use all the threads and not worry about pinning. 43.213
     static HeapThreadPool pool(std::thread::hardware_concurrency() / 4);
 
+    // Drain the mini-buffer into the main heap once it is worth a partial re-heapify.
+    // HOISTED to a lambda because it is no longer reachable from one place only: the
+    // full-lazy path re-inserts a re-keyed entry and then `continue`s, skipping the rest
+    // of the iteration. Left inline, hBuffer would grow without bound and the
+    // min_element rescan done on every buffer pop would go linear.
+    auto drainBuffer = [&]() {
+      if (hBuffer.size() < 64)
+        return;
+      const size_t oldSize = h.size();
+      const size_t numNew = hBuffer.size();
+
+      h.reserve(oldSize + numNew);
+      h.insert(h.end(),
+        std::make_move_iterator(hBuffer.begin()),
+        std::make_move_iterator(hBuffer.end()));
+      hBuffer.clear();
+
+      const size_t totalSize = h.size();
+
+      // Only fix the parents of the newly added range
+      const int64_t firstParent = (oldSize - 1) >> 1;
+      const int64_t lastParent = (totalSize - 1) >> 1;
+
+      for (int64_t i = lastParent; i >= firstParent; --i)
+        siftDown(h, size_t(i), totalSize);
+    };
+
     while (!GoalReached()) {
+      unsigned long long _lpT = g_deciLoopProf ? __rdtsc() : 0ull;
       // Check top element without popping
       // Find the min
       bool minIsInBuffer;
@@ -754,10 +1036,19 @@ public:
 #if 1 // JPB WIP BUG
         _mm_prefetch((char*)v0, _MM_HINT_T1); // start loading Face* line
         _mm_prefetch((char*)v1, _MM_HINT_T1); // start loading Face* line
+        // QH::Qd(v) is (*TDp())[v] -- taking its address dereferences TDp, which is NULL
+        // on the recentred path. These must branch, not just be skipped.
+        if (g_deciRecentred) {
+          _mm_prefetch((char*)&Leaf::QH::Rq(v0), _MM_HINT_T1);          // 40 B: usually
+          _mm_prefetch(((char*)&Leaf::QH::Rq(v0)) + 39, _MM_HINT_T1);   // one line, two
+          _mm_prefetch((char*)&Leaf::QH::Rq(v1), _MM_HINT_T1);          // when it straddles
+          _mm_prefetch(((char*)&Leaf::QH::Rq(v1)) + 39, _MM_HINT_T1);
+        } else {
         _mm_prefetch((char*)&Leaf::QH::Qd(v0), _MM_HINT_T1);
         _mm_prefetch(((char*)&Leaf::QH::Qd(v0))+64, _MM_HINT_T1);
         _mm_prefetch((char*)&Leaf::QH::Qd(v1), _MM_HINT_T1);
         _mm_prefetch(((char*)&Leaf::QH::Qd(v1)) + 64, _MM_HINT_T1);
+        }
 #endif
         popHeapUltraFast(h);
         // The moment you pop the heap, it is likely a new minimum will replace it.
@@ -776,38 +1067,150 @@ public:
         uint32_t priBits = (uint32_t)(selCode >> 32);
         currMetric = (ScalarType)(float&)priBits; // priority is the float error bit-packed in hi 32b
       }
+      if (g_deciLoopProf) { const unsigned long long _t = __rdtsc(); g_deciSetup.tscPop += _t - _lpT; _lpT = _t; }
       ++heapPopCount;
+      DECI_COUNT(nHeapPop);
       if (!locMod->IsUpToDate()) {
         ++stalePopCount;
+        DECI_COUNT(nHeapStale);
+        if (g_deciLoopProf) g_deciSetup.tscStale += __rdtsc() - _lpT;
         continue;
+      }
+      if (g_deciLoopProf) { const unsigned long long _t = __rdtsc(); g_deciSetup.tscStale += _t - _lpT; _lpT = _t; }
+
+      // [DECI-AUDIT] -- see DeciSetupTimes. Runs only with OPENMVS_MESH_DECI_AUDIT=1.
+      //
+      // NOTE it calls ComputePriority, which also refreshes locMod->optimalPos. So with
+      // the audit ON a stale stored position is silently corrected before Execute uses
+      // it: the audit REPORTS staleness without letting it affect the output mesh. That
+      // isolation is deliberate, and it is also why this must not be left enabled.
+      if (DECI_PROFILE && g_deciAudit) {
+        typedef typename MeshType::FaceType   AuditFaceType;
+        typedef typename MeshType::VertexType AuditVertType;
+        AuditVertType * const av0 = locMod->pos.V(0);
+        AuditVertType * const av1 = locMod->pos.V(1);
+
+        // (a) are the endpoints still adjacent? A collapse of a non-edge merges two
+        //     unrelated vertices -- silent corruption, not a crash.
+        bool adj = false;
+        {
+          vcg::face::VFIterator<AuditFaceType> ax;
+          for (ax.F() = av0->VFp(), ax.I() = av0->VFi(); ax.F() != 0; ++ax) {
+            const AuditFaceType &af = *ax.F();
+            if (af.IsD()) continue;
+            if (af.V(0) == av1 || af.V(1) == av1 || af.V(2) == av1) { adj = true; break; }
+          }
+        }
+        if (!adj) ++g_deciSetup.nAuditNonEdge;
+
+        // (b) is the priority the heap ordered on still the right one?
+        uint32_t _spBits = (uint32_t)(selCode >> 32);
+        const float storedPri = (float&)_spBits;
+        const float freshPri  = locMod->ComputePriority();
+        const double _d = std::fabs((double)freshPri - (double)storedPri);
+        const double _s = std::fabs((double)storedPri);
+        const double _r = (_s > 0.0) ? (_d / _s) : (_d > 0.0 ? 1.0 : 0.0);
+        if (_r > g_deciSetup.auditMaxPriRel) g_deciSetup.auditMaxPriRel = _r;
+        if (_r > 1e-6) ++g_deciSetup.nAuditPriStale;
+        ++g_deciSetup.nAudited;
+      }
+
+      // [FP32-PROBE] -- see DeciSetupTimes. OPENMVS_MESH_QUADRIC_FP32_PROBE=1.
+      // Restores the double quadrics AND re-runs ComputePriority afterwards, so
+      // optimalPos is left exactly as the double path would have it: the probe measures
+      // without perturbing the collapse.
+      // !g_deciRecentred: this probe reads QH::Qd, which is not allocated there.
+      if (DECI_PROFILE && g_deciFp32Probe && !g_deciRecentred) {
+        typedef typename MeshType::VertexType ProbeVertType;
+        ProbeVertType * const pv0 = locMod->pos.V(0);
+        ProbeVertType * const pv1 = locMod->pos.V(1);
+        auto &Q0 = Leaf::QH::Qd(pv0);
+        auto &Q1 = Leaf::QH::Qd(pv1);
+
+        double save0[10], save1[10];
+        for (int k = 0; k < 10; ++k) {
+          save0[k] = Q0.array[k];
+          save1[k] = Q1.array[k];
+        }
+        const double a9 = std::fabs(save0[9]), a0 = std::fabs(save0[0]);
+        if (a9 > g_deciSetup.fp32MaxAbsA9) g_deciSetup.fp32MaxAbsA9 = a9;
+        if (a0 > g_deciSetup.fp32MaxAbsA0) g_deciSetup.fp32MaxAbsA0 = a0;
+
+        const float priD = locMod->ComputePriority();          // true, double
+        for (int k = 0; k < 10; ++k) {                          // round-trip through float
+          Q0.array[k] = (double)(float)save0[k];
+          Q1.array[k] = (double)(float)save1[k];
+        }
+        const float priF = locMod->ComputePriority();          // as float storage would give
+        for (int k = 0; k < 10; ++k) {                          // restore
+          Q0.array[k] = save0[k];
+          Q1.array[k] = save1[k];
+        }
+        locMod->ComputePriority();                              // restore optimalPos
+
+        const double dd = std::fabs((double)priF - (double)priD);
+        const double ss = std::fabs((double)priD);
+        const double rr = (ss > 0.0) ? (dd / ss) : (dd > 0.0 ? 1.0 : 0.0);
+        if (rr > g_deciSetup.fp32MaxRel) g_deciSetup.fp32MaxRel = rr;
+        if (rr > 1e-3) ++g_deciSetup.nFp32Bad;
+
+        // ---- and again, RECENTRED on each vertex before rounding -----------------
+        // Exact translation by r: A unchanged, b' = b + 2Ar, c' = Apply(r). Round the
+        // recentred form to float, translate back with -r in double, and re-run the real
+        // ComputePriority. That simulates "store recentred float, expand for the solve"
+        // and is an UPPER bound on the error: a real implementation would solve in the
+        // recentred frame and never rebuild the large world-frame terms at all.
+        {
+          double w0[10], w1[10];
+          for (int pass = 0; pass < 2; ++pass) {
+            const double *src = pass ? save1 : save0;
+            double *dst = pass ? w1 : w0;
+            const auto &P = pass ? pv1->cP() : pv0->cP();
+            const double rx = (double)P[0], ry = (double)P[1], rz = (double)P[2];
+            // A.r  (a is the packed symmetric 3x3: a11 a12 a13 a22 a23 a33)
+            const double Ar0 = src[0]*rx + src[1]*ry + src[2]*rz;
+            const double Ar1 = src[1]*rx + src[3]*ry + src[4]*rz;
+            const double Ar2 = src[2]*rx + src[4]*ry + src[5]*rz;
+            // c' = Q(r) = r.A.r + b.r + c
+            const double cR = (rx*Ar0 + ry*Ar1 + rz*Ar2)
+                            + (src[6]*rx + src[7]*ry + src[8]*rz) + src[9];
+            double q[10];
+            for (int k = 0; k < 6; ++k) q[k] = src[k];
+            q[6] = src[6] + 2.0*Ar0;
+            q[7] = src[7] + 2.0*Ar1;
+            q[8] = src[8] + 2.0*Ar2;
+            q[9] = cR;
+            const double ac = std::fabs(cR);
+            if (ac > g_deciSetup.rcMaxAbsC) g_deciSetup.rcMaxAbsC = ac;
+            for (int k = 0; k < 10; ++k) q[k] = (double)(float)q[k];   // <-- float storage
+            // translate back by -r, in double
+            const double Br0 = q[0]*rx + q[1]*ry + q[2]*rz;
+            const double Br1 = q[1]*rx + q[3]*ry + q[4]*rz;
+            const double Br2 = q[2]*rx + q[4]*ry + q[5]*rz;
+            for (int k = 0; k < 6; ++k) dst[k] = q[k];
+            dst[6] = q[6] - 2.0*Br0;
+            dst[7] = q[7] - 2.0*Br1;
+            dst[8] = q[8] - 2.0*Br2;
+            dst[9] = (rx*Br0 + ry*Br1 + rz*Br2) - (q[6]*rx + q[7]*ry + q[8]*rz) + q[9];
+          }
+          for (int k = 0; k < 10; ++k) { Q0.array[k] = w0[k]; Q1.array[k] = w1[k]; }
+          const float priR = locMod->ComputePriority();
+          const double dr = std::fabs((double)priR - (double)priD);
+          const double rrr = (ss > 0.0) ? (dr / ss) : (dr > 0.0 ? 1.0 : 0.0);
+          if (rrr > g_deciSetup.rcMaxRel) g_deciSetup.rcMaxRel = rrr;
+          if (rrr > 1e-3) ++g_deciSetup.nRcBad;
+        }
+        ++g_deciSetup.nFp32Probed;
       }
 
       // I think exeucte and updateheap share FindSets info.
+      if (g_deciLoopProf) _lpT = __rdtsc();   // exclude any audit/probe above
       locMod->Execute(m);
+      if (g_deciLoopProf) { const unsigned long long _t = __rdtsc(); g_deciSetup.tscExec += _t - _lpT; _lpT = _t; }
       locMod->UpdateHeap((void*) &h, (void*)&hBuffer, pairsScratch, toAddScratch);
+      if (g_deciLoopProf) { const unsigned long long _t = __rdtsc(); g_deciSetup.tscUpd += _t - _lpT; _lpT = _t; }
 
-      // always pushes to the buffer.
-      // Is buffer too big?
-// Is buffer too big?
-      if (hBuffer.size() >= 64) {
-        const size_t oldSize = h.size();
-        const size_t numNew = hBuffer.size();
-
-        h.reserve(oldSize + numNew);
-        h.insert(h.end(),
-          std::make_move_iterator(hBuffer.begin()),
-          std::make_move_iterator(hBuffer.end()));
-        hBuffer.clear();
-
-        const size_t totalSize = h.size();
-
-        // Only fix the parents of the newly added range
-        const int64_t firstParent = (oldSize - 1) >> 1;
-        const int64_t lastParent = (totalSize - 1) >> 1;
-
-        for (int64_t i = lastParent; i >= firstParent; --i)
-          siftDown(h, size_t(i), totalSize);
-      }
+      drainBuffer();
 
 
       // --- Periodic cleanup decision ---
@@ -838,6 +1241,9 @@ public:
           stalePopCount = 0;
        // }
       }
+
+      // Whatever is left of the iteration: compaction, hBuffer bookkeeping, GoalReached.
+      if (g_deciLoopProf) g_deciSetup.tscOther += __rdtsc() - _lpT;
     }
 
     // Stop the outer decimation loop when a HARD goal (target simplices or error
@@ -869,7 +1275,7 @@ public:
     LocalModificationType::Init(m,h,pp);
 
     //std::make_heap(h.begin(),h.end());
-    makeHeapUltraFast(h);
+    { DeciPhaseTimer _t( g_deciSetup.heapify ); makeHeapUltraFast(h); }
 
     // Unused if(!h.empty()) currMetric=h.front().pri;
 	}
