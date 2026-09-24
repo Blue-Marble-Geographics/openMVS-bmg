@@ -1052,7 +1052,7 @@ void Mesh::ListBoundaryVertices()
 // existing length guard in the codebase already handles it.
 static inline Mesh::Normal SafeNormalizeFaceNormal(const Mesh::Normal& n)
 {
-	const float len = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+	const float len = FastSqrtS(n.x*n.x + n.y*n.y + n.z*n.z);
 	// `> 0` (not `< eps` negated) so NaN, which compares false against everything,
 	// takes the fallback branch rather than sailing through it.
 	return (len > 0.f) ? Mesh::Normal(n.x/len, n.y/len, n.z/len) : Mesh::Normal(0,0,0);

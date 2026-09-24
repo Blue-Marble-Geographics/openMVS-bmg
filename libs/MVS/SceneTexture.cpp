@@ -2314,7 +2314,7 @@ static void ComputeGradientMagnitudeFused(
 //
 // Output is BIT-IDENTICAL to the untiled walk: pixels belong to exactly one tile,
 // and a tile's bin is filled in ascending face order, so each pixel still sees its
-// covering faces in the same relative order and the `d > z` first-wins tie goes the
+// covering faces in the same relative order and the `iz > d` first-wins tie goes the
 // same way. Set TEXTURE_RASTER_TILE to 0 to collapse this to a single frame-sized
 // tile (i.e. the untiled walk) for A/B.
 //
@@ -2326,7 +2326,25 @@ static void ComputeGradientMagnitudeFused(
 //  * barycentrics are evaluated once per row segment and stepped across it, instead
 //    of three edge functions at every bbox pixel including the ~half that miss;
 //  * PerspectiveCorrectBarycentricCoordinates + ComputeDepth (six products and a
-//    divide, behind a callback) collapse to z = 1 / (w0/z0 + w1/z1 + w2/z2).
+//    divide, behind a callback) collapse to z = 1 / (w0/z0 + w1/z1 + w2/z2) -- and
+//    then, since 1/z is affine in screen space, to a plane stepped one add at a
+//    time, with the barycentrics left to gate the span and nothing else.
+//
+// And the depth buffer holds that INVERSE depth, 1/z, not z. The interpolation is
+// natively in inverse space, so storing z meant a per-covered-pixel divide (~3-5
+// cycles of divider throughput) purely to convert back into the buffer's units --
+// and nothing downstream reads those units: after ListCameraFaces rasterizes, only
+// faceMap is consumed, and depthMap's remaining uses are isInsideWithBorder size
+// queries against a buffer that is recreated per view. (The stock TEXTURE_FAST_RASTER
+// = 0 path still writes true z into the same buffer; harmless for the same reason,
+// and the A/B compares faceMap-driven output, not depths.) Storing 1/z also folds the
+// empty test into the compare (cleared-to-zero == infinitely far, and invZ is
+// strictly positive), and leaves the span vectorizable: 8 pixels of invZ by FMA,
+// one compare, two masked stores, with no vdivps/rcpps in the way.
+// Caveat, if this is ever A/B'd against the stock path: comparing the raw sums is
+// NOT bit-identical to comparing their rounded reciprocals. Monotonicity makes the
+// two agree except where the reciprocals of two different sums round to the same
+// float -- i.e. within 1 ulp, z-fighting, where the winner was already arbitrary.
 //
 // Behaviour preserved from the stock path: whole-triangle reject unless all three
 // vertices are in front of the camera AND project inside the image with a 3 px
@@ -2334,7 +2352,8 @@ static void ComputeGradientMagnitudeFused(
 // through isInsideWithBorder); both windings rasterize under
 // TEXTURE_RASTER_NO_BACKFACE_CULL, positive-area winding only otherwise (note
 // EdgeFunction2 is the negation of Common's EdgeFunction, hence the flipped
-// comparison); nearest depth wins, ties keep the earlier face.
+// comparison); nearest depth wins, ties keep the earlier face (as the largest
+// inverse depth, see above).
 // One deliberate difference: exactly-zero-area triangles are dropped. The stock path
 // divided by that zero, and the resulting NaN barycentrics passed its negativity
 // rejects, letting a degenerate face scribble over its bounding box.
@@ -2528,8 +2547,19 @@ static void RasterizeCameraFacesFast(
 				const float w2_dx = (v0.y - v1.y) * invArea;
 
 				// only the reciprocals are needed: the perspective-correct depth is
-				// 1/sum(w_i/z_i), so the z_i themselves cancel out
+				// 1/sum(w_i/z_i), so the z_i themselves cancel out. Strictly positive:
+				// UpdateCameraVertsAndNormals sets invZ = 0 for zc <= 1e-6 and
+				// ProjectCameraFace drops the face, and the covered span only evaluates
+				// non-negative barycentrics, so the interpolated invZ below is > 0.
 				const float iz0 = t.c[0]->invZ, iz1 = t.c[1]->invZ, iz2 = t.c[2]->invZ;
+				// 1/z is exactly AFFINE in screen space (that is the whole reason
+				// perspective-correct interpolation works on the reciprocal), so the
+				// interpolated invZ is a PLANE: it steps by a constant per column and
+				// never has to be rebuilt from the barycentrics. Those only survive to
+				// gate the span. Per pixel that turns a 3-term dot plus w2's step into
+				// one add -- and it is strictly MORE accurate, because the value now
+				// accumulates stepping drift through one channel instead of three.
+				const float iz_dx = w0_dx * iz0 + w1_dx * iz1 + w2_dx * iz2;
 
 				for (int y = rowMin; y <= rowMax; ++y) {
 					const size_t base = (size_t)y * (size_t)width;
@@ -2547,29 +2577,35 @@ static void RasterizeCameraFacesFast(
 					const Point2f pRow((float)colMin, (float)y);
 					float w0 = EdgeFunction2(v1, v2, pRow) * invArea;
 					float w1 = EdgeFunction2(v2, v0, pRow) * invArea;
-					float w2 = EdgeFunction2(v0, v1, pRow) * invArea;
+					// w2 seeds the invZ plane exactly at the row start and is then done:
+					// the span test is (w0 >= 0, w1 >= 0, w0 + w1 <= 1), which is why the
+					// covered set below is bit-identical to stepping all three.
+					const float w2 = EdgeFunction2(v0, v1, pRow) * invArea;
+					float iz = w0 * iz0 + w1 * iz1 + w2 * iz2;
 
 					// skip the leading run of pixels outside the triangle (adds only)
 					int x = colMin;
 					while (x <= colMax && !(w0 >= 0.f && w1 >= 0.f && w0 + w1 <= 1.f)) {
 						w0 += w0_dx;
 						w1 += w1_dx;
-						w2 += w2_dx;
+						iz += iz_dx;
 						++x;
 					}
 					// the covered span is contiguous, so the segment ends when it does
 					for (; x <= colMax; ++x) {
-						// perspective-correct depth: PerspectiveCorrectBarycentric-
-						// Coordinates then ComputeDepth is exactly 1/sum(w_i/z_i)
-						const float z = 1.f / (w0 * iz0 + w1 * iz1 + w2 * iz2);
-						const Depth d = depthRow[x];
-						if (d == 0 || d > z) {
-							depthRow[x] = z;
+						// iz IS the perspective-correct depth, inverted: Perspective-
+						// CorrectBarycentricCoordinates then ComputeDepth is exactly
+						// 1/sum(w_i/z_i), and the buffer holds that sum (see the header).
+						// nearer == larger invZ, and the cleared-to-zero sentinel reads
+						// as infinitely far, so the empty test folds into the compare;
+						// `>` is strict, so an exact tie still keeps the earlier face
+						if (iz > depthRow[x]) {
+							depthRow[x] = iz;
 							faceRow[x] = (cuint32_t)fi;
 						}
 						w0 += w0_dx;
 						w1 += w1_dx;
-						w2 += w2_dx;
+						iz += iz_dx;
 						if (w0 < 0.f || w1 < 0.f || w0 + w1 > 1.f)
 							break;
 					}
@@ -5993,36 +6029,8 @@ struct Float3 {
 	float x, y, z;
 };
 
-static inline float Dot3_SSE(const Float3& a, const Float3& b)
-{
-	__m128 va = _mm_set_ps(0.f, a.z, a.y, a.x);
-	__m128 vb = _mm_set_ps(0.f, b.z, b.y, b.x);
-	__m128 m = _mm_mul_ps(va, vb);
-
-	__m128 shuf = _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 1, 0, 3));
-	__m128 sums = _mm_add_ps(m, shuf);
-	shuf = _mm_shuffle_ps(sums, sums, _MM_SHUFFLE(1, 0, 3, 2));
-	sums = _mm_add_ps(sums, shuf);
-
-	return _mm_cvtss_f32(sums);
-}
-
 #include <emmintrin.h>
 #include <vector>
-
-static inline float Dot3Sse2(const Float3& a, const Float3& b)
-{
-	__m128 va = _mm_set_ps(0.0f, a.z, a.y, a.x);
-	__m128 vb = _mm_set_ps(0.0f, b.z, b.y, b.x);
-	__m128 m = _mm_mul_ps(va, vb);
-
-	__m128 shuf = _mm_shuffle_ps(m, m, _MM_SHUFFLE(2, 1, 0, 3));
-	__m128 sums = _mm_add_ps(m, shuf);
-	shuf = _mm_shuffle_ps(sums, sums, _MM_SHUFFLE(1, 0, 3, 2));
-	sums = _mm_add_ps(sums, shuf);
-
-	return _mm_cvtss_f32(sums);
-}
 
 inline int Idx(int x, int y, int w)
 {
@@ -6036,6 +6044,7 @@ struct PoissonStencil {
 	MatIdx down;
 };
 
+#if 0
 #define MAX_ABS3_SSE2(rR, rG, rB, out) do {            \
   __m128 v = _mm_set_ps(0.0f, (rB), (rG), (rR));       \
   __m128 sign = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff)); \
@@ -6049,6 +6058,7 @@ struct PoissonStencil {
                                                         \
   (out) = _mm_cvtss_f32(v);                             \
 } while (0)
+#endif
 
 #ifdef COUNT_ITERATIONS
 std::atomic<int> calls = 0;
@@ -8179,6 +8189,13 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 		// scratch, the largest block it holds), then abort with the file named.
 		unsigned nReloadFailed(0);
 		String strFirstFailed;
+		// T-wide over the labels, and the body is almost entirely cv:: work: the
+		// ReloadImage decode, the INTER_AREA downscale to the resolution level, and
+		// the per-patch crop resize. Left to itself cv would open a full-width team
+		// inside each of those T iterations. Scoped, not hoisted to the top of
+		// GenerateTexture, because the final atlas resize + sharpen at the end of
+		// this function are serial and DO want cv's threads.
+		const ScopedCVThreads _cvSerialReload;
 #ifdef TEXOPT_USE_OPENMP
 #pragma omp parallel for schedule(dynamic) num_threads(T)
 #endif
@@ -10102,6 +10119,11 @@ bool MeshTexture::GenerateTexture(bool bGlobalSeamLeveling, bool bLocalSeamLevel
 					// (6 px) to maxTilePx (384 px), a ~4000x spread, so an 8-wide chunk can hand
 					// one thread eight large tiles while others idle. 1300-odd iterations make
 					// the finer scheduling free.
+					// The donor high-pass below is cv:: work (blur + a Mat subtract, both
+					// parallel_for_) on a 64x64 crop, once per tile. At that size the cv
+					// thread pool is pure dispatch overhead even serially, and nested
+					// inside this loop it is a second full-width team per tile.
+					const ScopedCVThreads _cvSerialFillTiles;
 #ifdef TEXOPT_USE_OPENMP
 					#pragma omp parallel for schedule(dynamic, 1)
 #endif

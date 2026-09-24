@@ -6781,6 +6781,10 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 		}
 		#endif
 
+		// Full-width over the image set, and each iteration is a JPEG decode plus
+		// Image::ResizeImage's INTER_AREA downscale -- cv:: work end to end. Without
+		// this, every one of those iterations opens its own cv team on top of ours.
+		const ScopedCVThreads _cvSerialImageLoad;
 		#ifdef DENSE_USE_OPENMP
 		bool bAbort(false);
 		#pragma omp parallel for shared(data, bAbort)
@@ -6930,6 +6934,14 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 #endif
 	if (nMaxThreads > 1) {
 		// multi-thread execution
+		// InitViews' toGray, ScaleDepthData's resizes and (on the CUDA path)
+		// PatchMatchCUDA's depth/normal resizes all run on these workers. The pool is
+		// deliberately narrow, so give cv the rest of the machine rather than
+		// serializing it: workers x this budget == nMaxThreads, so the box is neither
+		// oversubscribed nor left idle. Declared HERE, on the thread that owns the
+		// pool and before any worker starts: cv::setNumThreads is process-global.
+		// The single-thread branch needs no guard -- one worker, cv keeps all.
+		const ScopedCVThreads _cvEstWorkers((int)(nMaxThreads / MAXF(1u, (unsigned)nEstWorkers)));
 		cList<SEACAVE::Thread> threads(nEstWorkers);
 		FOREACHPTR(pThread, threads)
 			pThread->start(DenseReconstructionEstimateTmp, (void*)&data);
@@ -6979,6 +6991,8 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 #endif
 			if (nMaxThreads > 1) {
 				// multi-thread execution (see nEstWorkers above)
+				// see the photometric pass above for why a budget and not 0
+				const ScopedCVThreads _cvEstWorkers((int)(nMaxThreads / MAXF(1u, (unsigned)nEstWorkers)));
 				cList<SEACAVE::Thread> threads(nEstWorkers);
 				FOREACHPTR(pThread, threads)
 					pThread->start(DenseReconstructionEstimateTmp, (void*)&data);
@@ -7122,6 +7136,8 @@ bool Scene::ComputeDepthMaps(DenseDepthMapData& data)
 						data.progress = new Util::Progress("Optimized geometric-consistent depth-maps", data.images.GetSize());
 						GET_LOGCONSOLE().Pause();
 						if (nMaxThreads > 1) {
+							// see the photometric pass above for why a budget and not 0
+							const ScopedCVThreads _cvEstWorkers((int)(nMaxThreads / MAXF(1u, (unsigned)nOptimizeThreads)));
 							cList<SEACAVE::Thread> threads(nOptimizeThreads);
 							FOREACHPTR(pThread, threads)
 								pThread->start(DenseReconstructionEstimateTmp, (void*)&data);

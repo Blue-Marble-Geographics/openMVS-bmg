@@ -2971,6 +2971,12 @@ bool Scene::EstimateRefineMeshCUDAVRAM(unsigned nResolutionLevel, unsigned nMinR
 bool MeshRefineCUDA::InitImages(float scale, float sigma)
 {
 	views.Resize(images.GetSize());
+	// Full-width over the image set, and every iteration is cv:: work end to end:
+	// the ReloadImage decode, toGray's cvtColor, the GaussianBlur and the INTER_AREA
+	// resize. cv's own pool nested inside this one is pure oversubscription.
+	// (SceneRefine.cpp's ThInitImage is the same work under its own worker pool and
+	// is already covered by the cv::setNumThreads pair in Scene::RefineMesh.)
+	const ScopedCVThreads _cvSerialInitImages;
 	#ifdef MESHCUDAOPT_USE_OPENMP
 	bool bAbort(false);
 	#pragma omp parallel for

@@ -438,6 +438,47 @@ void Initialize(LPCTSTR appname, unsigned nMaxThreads=0, int nProcessPriority=0)
 void Finalize();
 /*----------------------------------------------------------------*/
 
+// Suppress OpenCV's own thread pool for the lifetime of the scope.
+//
+// Every heavy cv:: primitive we call (resize, cvtColor, GaussianBlur, filter2D,
+// blur, and the Mat arithmetic operators) fans out internally through
+// cv::parallel_for_. Called from inside one of our own parallel regions -- an
+// `omp parallel for` or one of the SEACAVE::Thread worker pools -- that nests a
+// second full-width team inside every one of ours, so the machine ends up with
+// O(ourThreads * cvThreads) runnable threads fighting over the same cores and
+// the same memory bandwidth. Outside a parallel region cv's threading is a win
+// and must be left alone, so this is scoped rather than set globally at startup.
+//
+// cv::setNumThreads is process-global, NOT thread-local: construct this on the
+// thread that OWNS the parallel region, before the region starts. Constructing
+// it inside a worker sets it for every other thread too and restores it while
+// they are still running.
+//
+// setNumThreads(0) means "run sequentially in the calling thread"; negative
+// means "reset to the system default". We restore the previous effective count
+// when there was one, which is what the hand-rolled save/restore pairs in
+// SceneTexture.cpp already do, and fall back to -1 when the previous value was
+// itself 0 (nested scopes: the outer scope still owns the suppression).
+//
+// The default (0) is for regions whose own parallelism already spans the whole
+// machine -- a full-width `omp parallel for` -- where any cv thread at all is
+// pure oversubscription. Pass an explicit budget instead when OUR pool is
+// NARROWER than the machine: the depth-map estimator runs only 2-4 workers, so
+// serializing cv outright would leave most of a 32-core box idle during its
+// resizes. nCVThreads = nMaxThreads / ourWorkers keeps total concurrency at
+// exactly nMaxThreads with neither oversubscription nor idle cores.
+struct ScopedCVThreads {
+	const int prev;
+	// nCVThreads: threads to allow EACH caller; 0 or 1 disables cv threading.
+	inline explicit ScopedCVThreads(int nCVThreads = 0) : prev(cv::getNumThreads()) {
+		cv::setNumThreads(nCVThreads > 1 ? nCVThreads : 0);
+	}
+	inline ~ScopedCVThreads() { cv::setNumThreads(prev > 0 ? prev : -1); }
+	ScopedCVThreads(const ScopedCVThreads&) = delete;
+	ScopedCVThreads& operator=(const ScopedCVThreads&) = delete;
+};
+/*----------------------------------------------------------------*/
+
 } // namespace MVS
 
 #endif // _MVS_COMMON_H_
