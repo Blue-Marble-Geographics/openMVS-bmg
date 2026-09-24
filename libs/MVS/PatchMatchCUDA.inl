@@ -76,6 +76,32 @@
 #define PMCUDA_OPT_FP16_TEX 1
 #endif
 
+// Floor on the photometric patch-match iterations run by the GPU estimator,
+// applied on top of whatever --iters requested (0 - disabled, --iters is used
+// as-is). One GPU iteration is a single red+black checkerboard step with a
+// fixed, local hypothesis set; one CPU iteration is a full raster sweep with
+// adaptive random refinement, so the tier values passed on the command line
+// (tuned on the CPU: 1/2/4) leave the GPU under-converged and its depth-maps
+// full of holes. A floor, not a multiplier: values already >= the floor (and
+// the app's own raise to 4 when --iters is defaulted) are unchanged, and the
+// geometric-consistency passes keep their single iteration. The environment
+// variable OPENMVS_CUDA_MIN_ITERS overrides it at run time.
+#ifndef PMCUDA_MIN_ESTIMATION_ITERS
+#define PMCUDA_MIN_ESTIMATION_ITERS 4
+#endif
+
+// Make the GPU estimator's per-scale cost filtering match the CPU estimator
+// (0 - upstream CUDA behaviour). Upstream CUDA culls at the coarsest
+// sub-resolution scale and keeps fNCCThresholdKeep*1.2 before the geometric
+// passes; the CPU never culls between scales and keeps fNCCThresholdKeep*1.333.
+// A pixel culled at the coarse scale is upsampled as depth 0 -- it restarts from
+// a random plane with no prior, and INTER_LINEAR blends that 0 into its
+// neighbours' priors -- which, with few iterations, becomes a permanent hole.
+// The environment variable OPENMVS_CUDA_CPU_FILTER (0/1) overrides it at run time.
+#ifndef PMCUDA_CPU_MATCHED_FILTER
+#define PMCUDA_CPU_MATCHED_FILTER 1
+#endif
+
 
 // S T R U C T S ///////////////////////////////////////////////////
 

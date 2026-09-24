@@ -56,6 +56,30 @@ namespace MVS {
 			inline int64_t PmcNs(const pmc_clock::time_point& a, const pmc_clock::time_point& b) {
 				return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
 			}
+
+			// integer environment override of a compile-time default (unset or empty - default)
+			int EnvIntOr(const char* name, int defaultValue) {
+				#ifdef _MSC_VER
+				char envBuf[32];
+				size_t envLen(0);
+				if (getenv_s(&envLen, envBuf, sizeof(envBuf), name) == 0 && envLen > 1)
+					return atoi(envBuf);
+				#else
+				if (const char* env = getenv(name))
+					if (*env)
+						return atoi(env);
+				#endif
+				return defaultValue;
+			}
+			// resolved once: the estimator reads them per image and per scale
+			int MinEstimationIters() {
+				static const int value(MAXF(0, EnvIntOr("OPENMVS_CUDA_MIN_ITERS", PMCUDA_MIN_ESTIMATION_ITERS)));
+				return value;
+			}
+			bool CpuMatchedFilter() {
+				static const bool value(EnvIntOr("OPENMVS_CUDA_CPU_FILTER", PMCUDA_CPU_MATCHED_FILTER) != 0);
+				return value;
+			}
 		}
 
 		// copy a cv::Mat's payload into a linear buffer (and back), tolerating
@@ -147,6 +171,16 @@ namespace MVS {
 			else {
 				params.bGeomConsistency = false;
 				params.nEstimationIters = OPTDENSE::nEstimationIters;
+				// the command-line value is a CPU-tuned count: floor it for the GPU
+				// (see PMCUDA_MIN_ESTIMATION_ITERS)
+				const int nMinIters(MinEstimationIters());
+				if (params.nEstimationIters < nMinIters) {
+					VERBOSE("CUDA: patch-match iterations raised %d -> %d for the GPU estimator (OPENMVS_CUDA_MIN_ITERS=0 disables)",
+						params.nEstimationIters, nMinIters);
+					params.nEstimationIters = nMinIters;
+				}
+				VERBOSE("CUDA: estimator cost filtering: %s (OPENMVS_CUDA_CPU_FILTER)",
+					CpuMatchedFilter() ? "matched to CPU" : "upstream");
 			}
 		}
 
@@ -479,7 +513,16 @@ namespace MVS {
 
 				// set keep threshold to:
 				params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep;
-				if (totalScaleNumber) {
+				if (CpuMatchedFilter()) {
+					// as the CPU estimator: no culling at any sub-resolution scale, and
+					// fNCCThresholdKeep*1.333 at full resolution while the geometric
+					// passes are still to run (SceneDensify.cpp, EstimateDepthMap)
+					if (scaleNumber > 0)
+						params.fThresholdKeepCost = 0.f; // disable filtering
+					else if (!params.bGeomConsistency && OPTDENSE::nEstimationGeometricIters)
+						params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep * 1.333f;
+				}
+				else if (totalScaleNumber) {
 					// multi-resolution enabled
 					if (scaleNumber > 0 && scaleNumber != totalScaleNumber) {
 						// all sub-resolutions, but the smallest and highest
