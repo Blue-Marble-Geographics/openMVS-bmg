@@ -453,16 +453,62 @@ __device__ inline void BuildRefPatch(const ImagePixels refImage, const Point2i& 
 }
 
 // compute the geometric consistency weight
-__device__ inline float GeometricConsistencyWeight(const ImagePixels depthImage, const CUDA::Camera& refCamera, const CUDA::Camera& trgCamera, const Point4& plane, const Point2i& p)
+//
+// The neighbor's depth is sampled the way the CPU estimator samples it (DepthMap.cpp
+// ScorePixel -> TImage::sample with IsDepthSimilar(X1.z, d, 0.03)): a bilinear blend
+// of only those of the 4 surrounding depths that agree with the forward-projected
+// depth to within 3%, each disagreeing tap standing in for an agreeing neighbor, and
+// the maximum penalty when none agrees. The former single hardware-filtered fetch
+// blended depths across occlusion edges and blended holes (depth 0) with valid
+// depths, so a correct estimate next to an edge or a hole was charged a spurious
+// reprojection error (the hole test `trgDepth == 0` only fired when all 4 taps were
+// holes). The texture keeps its linear filter: a fetch at a texel center returns
+// that texel exactly, so the 4 taps are exact reads.
+__device__ inline float GeometricConsistencyWeight(const ImagePixels depthImage, const CUDA::Camera& refCamera, const CUDA::Camera& trgCamera, const Point4& plane, const Point2i& p, const bool bGated)
 {
 	if (depthImage == NULL)
 		return 0.f;
 	constexpr float maxDist = 4.f;
 	const Point3 forwardPoint = refCamera.TransformPointI2W(p.cast<float>(), plane.w());
-	const Point2 trgPt = trgCamera.TransformPointW2I(forwardPoint);
-	const float trgDepth = tex2D<float>(depthImage, trgPt.x() + 0.5f, trgPt.y() + 0.5f);
-	if (trgDepth == 0.f)
+	if (!bGated) {
+		// upstream behaviour (PMCUDA_GATED_DEPTH_SAMPLING 0): one hardware-filtered fetch
+		const Point2 trgPt = trgCamera.TransformPointW2I(forwardPoint);
+		const float trgDepth = tex2D<float>(depthImage, trgPt.x() + 0.5f, trgPt.y() + 0.5f);
+		if (trgDepth == 0.f)
+			return maxDist;
+		const Point3 trgX = trgCamera.TransformPointI2W(trgPt, trgDepth);
+		const Point2 backwardPoint = refCamera.TransformPointW2I(trgX);
+		const Point2 diff = p.cast<float>() - backwardPoint;
+		const float dist = diff.norm();
+		return min(maxDist, PM_SQRTF(dist*(dist+2.f)));
+	}
+	const Point3 forwardX = trgCamera.pose.TransformPointW2C(forwardPoint);
+	if (forwardX.z() <= 0.f)
 		return maxDist;
+	const Point2 trgPt = trgCamera.model.TransformPointC2I(forwardX);
+	// inside with a 1-pixel border (as the CPU's isInsideWithBorder<float,1>), so all
+	// 4 taps are real texels rather than clamped repeats
+	if (!(trgPt.x() >= 1.f && trgPt.y() >= 1.f &&
+		  trgPt.x() <= (float)(trgCamera.size.x() - 2) && trgPt.y() <= (float)(trgCamera.size.y() - 2)))
+		return maxDist;
+	const int lx = (int)trgPt.x(), ly = (int)trgPt.y();
+	const float x = trgPt.x() - (float)lx, x1 = 1.f - x;
+	const float y = trgPt.y() - (float)ly, y1 = 1.f - y;
+	const float d00 = tex2D<float>(depthImage, lx + 0.5f, ly + 0.5f);
+	const float d10 = tex2D<float>(depthImage, lx + 1.5f, ly + 0.5f);
+	const float d01 = tex2D<float>(depthImage, lx + 0.5f, ly + 1.5f);
+	const float d11 = tex2D<float>(depthImage, lx + 1.5f, ly + 1.5f);
+	// |z - d| / z < 0.03, with z > 0; a hole (d == 0) never passes
+	const float thDepth = 0.03f * forwardX.z();
+	const bool b00 = abs(forwardX.z() - d00) < thDepth;
+	const bool b10 = abs(forwardX.z() - d10) < thDepth;
+	const bool b01 = abs(forwardX.z() - d01) < thDepth;
+	const bool b11 = abs(forwardX.z() - d11) < thDepth;
+	if (!b00 && !b10 && !b01 && !b11)
+		return maxDist;
+	const float trgDepth =
+		y1 * (x1 * (b00 ? d00 : (b10 ? d10 : (b01 ? d01 : d11))) + x * (b10 ? d10 : (b00 ? d00 : (b11 ? d11 : d01)))) +
+		y  * (x1 * (b01 ? d01 : (b11 ? d11 : (b00 ? d00 : d10))) + x * (b11 ? d11 : (b01 ? d01 : (b10 ? d10 : d00))));
 	const Point3 trgX = trgCamera.TransformPointI2W(trgPt, trgDepth);
 	const Point2 backwardPoint = refCamera.TransformPointW2I(trgX);
 	const Point2 diff = p.cast<float>() - backwardPoint;
@@ -536,7 +582,7 @@ __device__ inline void MultiViewScorePlane(const ImagePixels* images, const Imag
 		costVector[imgId-1] = ScorePlane(cameras[0], images[imgId], cameras[imgId], pairs[imgId-1], p, plane, lowDepth, rp, params);
 	if (params.bGeomConsistency)
 		for (int imgId = 0; imgId < params.nNumViews; ++imgId)
-			costVector[imgId] += 0.1f * GeometricConsistencyWeight(depthImages[imgId], cameras[0], cameras[imgId+1], plane, p);
+			costVector[imgId] += 0.1f * GeometricConsistencyWeight(depthImages[imgId], cameras[0], cameras[imgId+1], plane, p, params.bGatedDepth);
 }
 // same as above, but interpolate the plane to current pixel position
 __device__ inline float MultiViewScoreNeighborPlane(const ImagePixels* images, const ImagePixels* depthImages, const CUDA::Camera* cameras, const PatchMatch::PairConstants* pairs, const Point2i& p, const Point2i& np, Point4 plane, const float lowDepth, const RefPatch& rp, float* costVector, const PatchMatch::Params& params)
@@ -1028,6 +1074,8 @@ __host__ void PatchMatch::RunCUDA(const int width, const int height)
 	//
 	// Semantics are unaffected. MAXV only bounds the arrays; every loop still runs
 	// to params.nNumViews, and the dispatch guarantees MAXV >= nNumViews.
+	// (Measured 2026-09: extra 12/16 buckets for the 9..18-view range of the
+	// --number-views 0 command line gained ~3% on that bucket only; not kept.)
 	if (params.nNumViews <= 4)
 		RunCUDAT<4>(width, height);
 	else if (params.nNumViews <= 6)

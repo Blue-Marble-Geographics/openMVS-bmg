@@ -3033,6 +3033,38 @@ bool MeshRefineCUDA::InitImages(float scale, float sigma)
 	}
 	if (totalPixels == 0)
 		return false;
+	// hand the previous scale's working set back before measuring free memory:
+	// allocateScale() below replaces all of it anyway (every size changes between
+	// scales, so no Reset() would have reused a buffer), but while it is still
+	// resident cuMemGetInfo() counts it as taken, and the finest scale -- the one
+	// that matters -- is then judged against a budget short by the whole of the
+	// scale before it. Nothing here is read again before it is reallocated; the
+	// resident face IDs are rebuilt by the recull InvalidateVisibilityCache() forces.
+	FOREACH(idxImage, views) {
+		View& view = views[idxImage];
+		view.image.Release();
+		view.depthMap.Release();
+		view.faceMap.Release();
+		view.baryMap.Release();
+	#if MESHOPT_CUDA_FACEIDS_RESIDENT
+		view.faceIDs.Release();
+		view.numFaceIDs = 0;
+	#endif
+	}
+#if MESHOPT_CUDA_REFLOCAL_FACEBARY
+	faceMapRef.Release();
+	baryMapRef.Release();
+#endif
+	mask.Release();
+	imageMeanA.Release();
+	imageVarA.Release();
+	imageAB.Release();
+	imageMeanAB.Release();
+	imageVarAB.Release();
+	imageCov.Release();
+	imageZNCC.Release();
+	imageDZNCC.Release();
+	InvalidateVisibilityCache();
 	if (!ResolveResidency(totalPixels, (uint64_t)maxSize.area()))
 		return false;
 

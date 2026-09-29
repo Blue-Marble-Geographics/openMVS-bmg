@@ -80,6 +80,19 @@ namespace MVS {
 				static const bool value(EnvIntOr("OPENMVS_CUDA_CPU_FILTER", PMCUDA_CPU_MATCHED_FILTER) != 0);
 				return value;
 			}
+			bool GatedDepthSampling() {
+				static const bool value(EnvIntOr("OPENMVS_CUDA_GATED_DEPTH", PMCUDA_GATED_DEPTH_SAMPLING) != 0);
+				return value;
+			}
+			// the GPU estimator's keep threshold (see PMCUDA_NCC_THRESHOLD_KEEP); the
+			// environment value is in thousandths, and 0 falls back to fNCCThresholdKeep
+			float NCCThresholdKeep() {
+				static const float value([]() {
+					const int milli(EnvIntOr("OPENMVS_CUDA_NCC_KEEP", (int)(PMCUDA_NCC_THRESHOLD_KEEP * 1000.f + 0.5f)));
+					return milli > 0 ? (float)milli * 1e-3f : (float)OPTDENSE::fNCCThresholdKeep;
+				}());
+				return value;
+			}
 		}
 
 		// copy a cv::Mat's payload into a linear buffer (and back), tolerating
@@ -179,9 +192,15 @@ namespace MVS {
 						params.nEstimationIters, nMinIters);
 					params.nEstimationIters = nMinIters;
 				}
-				VERBOSE("CUDA: estimator cost filtering: %s (OPENMVS_CUDA_CPU_FILTER)",
-					CpuMatchedFilter() ? "matched to CPU" : "upstream");
+				VERBOSE("CUDA: estimator cost filtering: %s (OPENMVS_CUDA_CPU_FILTER), keep threshold %.3f (OPENMVS_CUDA_NCC_KEEP)",
+					CpuMatchedFilter() ? "matched to CPU" : "upstream", NCCThresholdKeep());
 			}
+			// neighbor-depth sampling of the geometric-consistency term (see
+			// PMCUDA_GATED_DEPTH_SAMPLING); resolved once, reported once
+			params.bGatedDepth = GatedDepthSampling();
+			if (bGeomConsistency)
+				VERBOSE("CUDA: geometric-consistency depth sampling: %s (OPENMVS_CUDA_GATED_DEPTH)",
+					params.bGatedDepth ? "similarity-gated 4-tap, as the CPU" : "upstream bilinear fetch");
 		}
 
 		void PatchMatch::InvalidateCachedDepthMaps()
@@ -512,15 +531,16 @@ namespace MVS {
 				}
 
 				// set keep threshold to:
-				params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep;
+				params.fThresholdKeepCost = NCCThresholdKeep();
 				if (CpuMatchedFilter()) {
-					// as the CPU estimator: no culling at any sub-resolution scale, and
-					// fNCCThresholdKeep*1.333 at full resolution while the geometric
-					// passes are still to run (SceneDensify.cpp, EstimateDepthMap)
+					// structured as the CPU estimator: no culling at any sub-resolution
+					// scale, and the keep threshold x1.333 at full resolution while the
+					// geometric passes are still to run (SceneDensify.cpp, EstimateDepthMap);
+					// the threshold itself is the GPU's own (PMCUDA_NCC_THRESHOLD_KEEP)
 					if (scaleNumber > 0)
 						params.fThresholdKeepCost = 0.f; // disable filtering
 					else if (!params.bGeomConsistency && OPTDENSE::nEstimationGeometricIters)
-						params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep * 1.333f;
+						params.fThresholdKeepCost = NCCThresholdKeep() * 1.333f;
 				}
 				else if (totalScaleNumber) {
 					// multi-resolution enabled
@@ -530,14 +550,14 @@ namespace MVS {
 					}
 					else if (scaleNumber == totalScaleNumber || (!params.bGeomConsistency && OPTDENSE::nEstimationGeometricIters)) {
 						// smallest sub-resolution OR highest resolution and geometric consistency is not running but enabled
-						params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep * 1.2f;
+						params.fThresholdKeepCost = NCCThresholdKeep() * 1.2f;
 					}
 				}
 				else {
 					// multi-resolution disabled
 					if (!params.bGeomConsistency && OPTDENSE::nEstimationGeometricIters) {
 						// geometric consistency is not running but enabled
-						params.fThresholdKeepCost = OPTDENSE::fNCCThresholdKeep * 1.2f;
+						params.fThresholdKeepCost = NCCThresholdKeep() * 1.2f;
 					}
 				}
 

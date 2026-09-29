@@ -34,6 +34,7 @@
 #include "Scene.h"
 #include "SceneDensify.h"
 #include "PatchMatchCUDA.h"
+#include "PointCloudFilterCUDA.h"
 // MRF: view selection
 #include "../Math/TRWS/MRFEnergy.h"
 // KD-tree for the density-based outlier filter
@@ -7672,6 +7673,9 @@ void Scene::DenseReconstructionFilter(void* pData)
 /*----------------------------------------------------------------*/
 
 // filter point-cloud based on camera-point visibility intersections
+// Experimental alternative sweeps (per-view pixel binning, CPU and GPU): the switch,
+// PCF_EXPERIMENTAL_SWEEPS, lives in PointCloudFilterCUDA.h, which also compiles the
+// GPU sweep in or out with it (PCF_GPU_SWEEP).
 // Toggle the tighter cone-vs-box octree prune (default on). 0 = original cone-vs-boundingsphere.
 #ifndef PCF_CONE_AABB
 #define PCF_CONE_AABB 1
@@ -7957,50 +7961,74 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	// below is scratch and is released as soon as the sweep finishes.
 	IntArr visibility(pointcloud.GetSize()); visibility.Memset(0);
 	int* const __restrict pVisibility = visibility.Begin();
+	// phase timers for the sweep comparison below (OPENMVS_PCF_BINNED)
+	typedef std::chrono::steady_clock pcf_clock;
+	const auto pcfMs = [](const pcf_clock::time_point& a, const pcf_clock::time_point& b) {
+		return (double)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() * 1e-3;
+	};
 
-	// gather points into a contiguous array for the octree (streaming cloud
-	// stores XYZ as a flat float stream, so build the typed array once)
-	PointArr32 ptsForOctree(pointcloud.GetSize());
-	#ifdef DENSE_USE_OPENMP
-	#pragma omp parallel for
-	for (int64_t i=0; i<(int64_t)ptsForOctree.GetSize(); ++i)
-		ptsForOctree[(uint32_t)i] = pointcloud.Point((PointCloud::Index)i);
-	#else
-	FOREACH(i, ptsForOctree)
-		ptsForOctree[i] = pointcloud.Point(i);
-	#endif
-	// create octree to speed-up search
-	Octree octree(ptsForOctree, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
-		return size > 128;
-	});
-
-	// Build leaf-ordered SoA positions aligned with the octree's index array so the classify
-	// inner loop reads positions sequentially -- the profiled bottleneck was the scattered
-	// per-point position gather. Result-identical: same positions, same lane order, same math.
-	// FloatArr, not std::vector<float>: the sized vector ctor value-initializes, which is a
-	// serial 12 bytes/point zero-fill (~324MB on a 27M-point cloud) of memory the parallel
-	// loop below overwrites in full one statement later -- twice the write bandwidth, all of
-	// it on one thread, and it first-touches every page off the thread that will own it.
-	// FloatArr is cList<...,useConstruct=0>, so its sized ctor only allocates.
-	const Octree::IDXARR_TYPE& octIdx = octree.GetIndexArr();
-	const size_t nOctItems = octIdx.size();
-	FloatArr leafX(nOctItems), leafY(nOctItems), leafZ(nOctItems);
-	{
-		const float* const __restrict pXYZsrc = pointcloud.pointsXYZ.data();
-		const Octree::IDX_TYPE* const __restrict pMI = octIdx.data();
-		float* const __restrict pLX = leafX.data(); float* const __restrict pLY = leafY.data(); float* const __restrict pLZ = leafZ.data();
+	// The octree and its leaf-ordered positions are built on first use (BuildOctree):
+	// the CPU sweeps always need them, the GPU sweep only for the queries its pixel grid
+	// cannot bound -- none on the scenes measured so far -- so a successful GPU run
+	// skips the build entirely.
+	PointArr32 ptsForOctree;
+	Octree octree;
+	FloatArr leafX, leafY, leafZ;
+	const float* pLeafX(NULL);
+	const float* pLeafY(NULL);
+	const float* pLeafZ(NULL);
+	const Octree::IDX_TYPE* pIdxBase(NULL);
+	bool bOctreeBuilt(false);
+	double msOctreeBuild(0);
+	const auto BuildOctree = [&]() {
+		if (bOctreeBuilt)
+			return;
+		const pcf_clock::time_point t0 = pcf_clock::now();
+		// gather points into a contiguous array for the octree (streaming cloud
+		// stores XYZ as a flat float stream, so build the typed array once)
+		ptsForOctree.resize((uint32_t)pointcloud.GetSize()); // 32-bit indexed (see PointArr32)
 		#ifdef DENSE_USE_OPENMP
 		#pragma omp parallel for
+		for (int64_t i=0; i<(int64_t)ptsForOctree.GetSize(); ++i)
+			ptsForOctree[(uint32_t)i] = pointcloud.Point((PointCloud::Index)i);
+		#else
+		FOREACH(i, ptsForOctree)
+			ptsForOctree[i] = pointcloud.Point(i);
 		#endif
-		for (int64_t j = 0; j < (int64_t)nOctItems; ++j) {
-			const size_t s = (size_t)pMI[j] * 3;
-			pLX[j] = pXYZsrc[s+0]; pLY[j] = pXYZsrc[s+1]; pLZ[j] = pXYZsrc[s+2];
+		// create octree to speed-up search
+		octree.Insert(ptsForOctree, [](Octree::IDX_TYPE size, Octree::Type /*radius*/) {
+			return size > 128;
+		});
+		// Build leaf-ordered SoA positions aligned with the octree's index array so the classify
+		// inner loop reads positions sequentially -- the profiled bottleneck was the scattered
+		// per-point position gather. Result-identical: same positions, same lane order, same math.
+		// FloatArr, not std::vector<float>: the sized vector ctor value-initializes, which is a
+		// serial 12 bytes/point zero-fill (~324MB on a 27M-point cloud) of memory the parallel
+		// loop below overwrites in full one statement later -- twice the write bandwidth, all of
+		// it on one thread, and it first-touches every page off the thread that will own it.
+		// FloatArr is cList<...,useConstruct=0>, so its sized ctor only allocates.
+		const Octree::IDXARR_TYPE& octIdx = octree.GetIndexArr();
+		const size_t nOctItems = octIdx.size();
+		leafX.resize(nOctItems); leafY.resize(nOctItems); leafZ.resize(nOctItems);
+		{
+			const float* const __restrict pXYZsrc = pointcloud.pointsXYZ.data();
+			const Octree::IDX_TYPE* const __restrict pMI = octIdx.data();
+			float* const __restrict pLX = leafX.data(); float* const __restrict pLY = leafY.data(); float* const __restrict pLZ = leafZ.data();
+			#ifdef DENSE_USE_OPENMP
+			#pragma omp parallel for
+			#endif
+			for (int64_t j = 0; j < (int64_t)nOctItems; ++j) {
+				const size_t s = (size_t)pMI[j] * 3;
+				pLX[j] = pXYZsrc[s+0]; pLY[j] = pXYZsrc[s+1]; pLZ[j] = pXYZsrc[s+2];
+			}
 		}
-	}
-	const float* const pLeafX = leafX.data();
-	const float* const pLeafY = leafY.data();
-	const float* const pLeafZ = leafZ.data();
-	const Octree::IDX_TYPE* const pIdxBase = octIdx.data();
+		pLeafX = leafX.data();
+		pLeafY = leafY.data();
+		pLeafZ = leafZ.data();
+		pIdxBase = octIdx.data();
+		bOctreeBuilt = true;
+		msOctreeBuild = pcfMs(t0, pcf_clock::now());
+	};
 
 	// pre-compute every view-dependent constant exactly once, into one small read-only table
 	// shared by all workers. The camera direction the old code stored per view was dead: the
@@ -8030,8 +8058,370 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	// thread for the inline pool, and a numViews-long per-thread construction pass. The point's
 	// view count is now also set once per point instead of once per pair.
 	// Accumulation into the shared visibility array stays lock-free via the atomic.
-	Util::Progress progress(_T("Point visibility checks"), pointcloud.GetSize());
+	// Sweep selector (exploration, 2026-09). OPENMVS_PCF_BINNED:
+	//   0 (default) - the octree sweep below
+	//   1           - the per-view pixel-binned sweep (see SweepBinned)
+	//   2           - run both, report timings and any difference, keep the octree result
+	//   3           - the per-view pixel-binned sweep on the GPU (PointCloudFilterCUDA.cu)
+	//   4           - GPU and octree, report timings and any difference, keep the octree result
+	// The selector is compiled out unless PCF_EXPERIMENTAL_SWEEPS is 1: with it at 0 (the
+	// default) OPENMVS_PCF_BINNED is ignored and every run takes the original octree
+	// sweep. The GPU sweep is fast (74 s -> ~13 s on a 437-view, 79M-point scene) but is
+	// not yet in the pipeline: at a one-pixel cone width the octree's own float classify
+	// test is ill-conditioned, so the two paths can differ on a small number of borderline
+	// removals (110 of 421,849 on a 45M-point test) until both use a well-conditioned test.
+	int pcfMode(0);
+	#if PCF_EXPERIMENTAL_SWEEPS
+	{
+		#ifdef _MSC_VER
+		char envBuf[16]; size_t envLen(0);
+		if (getenv_s(&envLen, envBuf, sizeof(envBuf), "OPENMVS_PCF_BINNED") == 0 && envLen > 1)
+			pcfMode = atoi(envBuf);
+		#else
+		if (const char* env = getenv("OPENMVS_PCF_BINNED"))
+			if (*env) pcfMode = atoi(env);
+		#endif
+	}
+	#endif // PCF_EXPERIMENTAL_SWEEPS
 	const int64_t numPoints = (int64_t)pointcloud.GetSize();
+
+	// -----------------------------------------------------------------------------
+	// Per-view pixel-binned sweep.
+	//
+	// The cone of a (point X, view v) query has its apex at v's center, its axis on
+	// the ray to X and a half-angle of FOV/width -- about one pixel -- so every point
+	// it can contain projects into v within about a pixel of X's own projection.
+	// Instead of threading that needle through the octree once per pair, each view
+	// projects the whole cloud ONCE into a coarse pixel grid (counting sort), and each
+	// of its queries tests only the points binned within a conservative pixel radius
+	// of X, with exactly the octree path's classify arithmetic and emit logic. The
+	// grid is only a prune, like the octree: the classify test decides, so the
+	// visibility scores are identical (integer accumulation, so order-independent).
+	//
+	// The pixel radius bound: a direction within angle a of X's ray has polar angle
+	// <= th0+a, and the sphere->image map is Lipschitz with constant f*sec^2(th), so
+	// the projection moves by at most f*a*sec^2(th0+a); 5% plus one pixel of slack
+	// cover float projection error. Queries that the grid cannot bound -- X behind
+	// the camera, rays within 15 degrees of 90, windows leaving the grid margin --
+	// fall back to the exact octree query, so correctness never depends on the grid.
+	// -----------------------------------------------------------------------------
+	// exploration knobs: bin size in pixels, and the absolute pixel slack on the radius bound
+	const auto pcfEnvInt = [](const char* name, int def) -> int {
+		#ifdef _MSC_VER
+		char b[16]; size_t l(0);
+		if (getenv_s(&l, b, sizeof(b), name) == 0 && l > 1) return atoi(b);
+		#else
+		if (const char* e = getenv(name)) if (*e) return atoi(e);
+		#endif
+		return def;
+	};
+	const int pcfBinSize(MAXF(1, pcfEnvInt("OPENMVS_PCF_BS", 2)));
+	const float pcfSlackPx((float)MAXF(0, pcfEnvInt("OPENMVS_PCF_SLACK_MPX", 50)) * 1e-3f);
+	// debug: search this many extra pixels and log in-cone points outside the tight window
+	const float pcfDebugPx((float)MAXF(0, pcfEnvInt("OPENMVS_PCF_DEBUG_PX", 0)));
+	std::atomic<int> pcfDebugLogged(0);
+	std::atomic<int64_t> pcfDebugMissed(0);
+	const auto SweepBinned = [&](int* const vis, size_t& nPairsOut, size_t& nFallbackOut) {
+		const size_t N(pointcloud.GetSize());
+		const float* const __restrict P = pointcloud.pointsXYZ.data();
+		const pcf_clock::time_point tInv0 = pcf_clock::now();
+		// invert the view streams: per view, the points that observe it
+		std::vector<uint32_t> qOff(numViews + 1, 0);
+		for (size_t i = 0; i < N; ++i) {
+			const uint32_t* const vw = pointcloud.ViewsStream(i);
+			const size_t n = pointcloud.ViewsStreamSize(i);
+			for (size_t k = 0; k < n; ++k)
+				++qOff[vw[k] + 1];
+		}
+		for (size_t v = 0; v < numViews; ++v)
+			qOff[v + 1] += qOff[v];
+		std::vector<uint32_t> qPts(qOff[numViews]);
+		{
+			std::vector<uint32_t> cur(qOff.begin(), qOff.end() - 1);
+			for (size_t i = 0; i < N; ++i) {
+				const uint32_t* const vw = pointcloud.ViewsStream(i);
+				const size_t n = pointcloud.ViewsStreamSize(i);
+				for (size_t k = 0; k < n; ++k)
+					qPts[cur[vw[k]]++] = (uint32_t)i;
+			}
+		}
+		nPairsOut = qPts.size();
+		const pcf_clock::time_point tInv1 = pcf_clock::now();
+		int64_t nFallback(0), nBinned(0), nCand(0), usProj(0), usQuery(0);
+		const float thSimilar(0.01f);
+		#ifdef DENSE_USE_OPENMP
+		#pragma omp parallel reduction(+:nFallback,nBinned,nCand,usProj,usQuery)
+		#endif
+		{
+			// fallback queries go through the octree path, which accumulates into vis too
+			Query q(pViewConsts, pViewSizes, vis, pLeafX, pLeafY, pLeafZ, pIdxBase);
+			std::vector<uint32_t> binStart, binCur, binIdx;
+			std::vector<float> binXYZ;     // positions in bin order: candidate reads are sequential
+			std::vector<uint64_t> qSorted; // this view's queries as (bin << 32 | point), sorted by bin
+			#ifdef DENSE_USE_OPENMP
+			#pragma omp for schedule(dynamic, 1)
+			#endif
+			for (int64_t iv = 0; iv < (int64_t)numViews; ++iv) {
+				const uint32_t v((uint32_t)iv);
+				if (qOff[v] == qOff[v + 1])
+					continue;
+				const Image& image = images[v];
+				const float fx((float)image.camera.K(0,0)), fy((float)image.camera.K(1,1));
+				const float cx((float)image.camera.K(0,2)), cy((float)image.camera.K(1,2));
+				float R[9];
+				for (int r = 0; r < 3; ++r)
+					for (int c = 0; c < 3; ++c)
+						R[r*3+c] = (float)image.camera.R(r,c);
+				const float Cx((float)image.camera.C.x), Cy((float)image.camera.C.y), Cz((float)image.camera.C.z);
+				const int BS = pcfBinSize; // bin size, pixels
+				constexpr int MG = 64;     // grid margin around the image, pixels
+				const int gw((image.width + 2*MG + BS - 1) / BS), gh((image.height + 2*MG + BS - 1) / BS);
+				const size_t nBins((size_t)gw * gh);
+				// project a world point: pixel (u,w) and camera depth z; false if behind
+				const auto project = [&](const float* p, float& u, float& w, float& z, float& xn, float& yn) -> bool {
+					const float X(p[0] - Cx), Y(p[1] - Cy), Z(p[2] - Cz);
+					z = R[6]*X + R[7]*Y + R[8]*Z;
+					if (!(z > 0.f))
+						return false;
+					const float iz(1.f / z);
+					xn = (R[0]*X + R[1]*Y + R[2]*Z) * iz;
+					yn = (R[3]*X + R[4]*Y + R[5]*Z) * iz;
+					u = fx*xn + cx;
+					w = fy*yn + cy;
+					return true;
+				};
+				const auto binOf = [&](float u, float w) -> int64_t {
+					const float bu((u + (float)MG) / (float)BS), bw((w + (float)MG) / (float)BS);
+					if (!(bu >= 0.f && bw >= 0.f && bu < (float)gw && bw < (float)gh))
+						return -1;
+					return (int64_t)(int)bw * gw + (int)bu;
+				};
+				// counting sort of the whole cloud into this view's grid (two passes, so
+				// only the in-grid points are stored)
+				const pcf_clock::time_point tp0 = pcf_clock::now();
+				binStart.assign(nBins + 1, 0);
+				for (size_t i = 0; i < N; ++i) {
+					float u, w, z, xn, yn;
+					if (!project(P + i*3, u, w, z, xn, yn))
+						continue;
+					const int64_t b(binOf(u, w));
+					if (b >= 0)
+						++binStart[(size_t)b + 1];
+				}
+				for (size_t b = 0; b < nBins; ++b)
+					binStart[b + 1] += binStart[b];
+				binIdx.resize(binStart[nBins]);
+				binXYZ.resize((size_t)binStart[nBins] * 3);
+				binCur.assign(binStart.begin(), binStart.end() - 1);
+				for (size_t i = 0; i < N; ++i) {
+					float u, w, z, xn, yn;
+					if (!project(P + i*3, u, w, z, xn, yn))
+						continue;
+					const int64_t b(binOf(u, w));
+					if (b >= 0) {
+						const uint32_t s(binCur[(size_t)b]++);
+						binIdx[s] = (uint32_t)i;
+						binXYZ[(size_t)s*3+0] = P[i*3+0];
+						binXYZ[(size_t)s*3+1] = P[i*3+1];
+						binXYZ[(size_t)s*3+2] = P[i*3+2];
+					}
+				}
+				// visit this view's queries in bin order, so consecutive queries read the
+				// same few bins (the bin key only orders the work; it decides nothing)
+				qSorted.clear();
+				for (uint32_t qi = qOff[v]; qi < qOff[v + 1]; ++qi) {
+					const uint32_t idx(qPts[qi]);
+					float u, w, z, xn, yn;
+					const int64_t b(project(P + (size_t)idx*3, u, w, z, xn, yn) ? binOf(u, w) : -1);
+					qSorted.push_back(((uint64_t)(b >= 0 ? (uint32_t)b : 0xFFFFFFFFu) << 32) | idx);
+				}
+				std::sort(qSorted.begin(), qSorted.end());
+				nBinned += binStart[nBins];
+				const pcf_clock::time_point tp1 = pcf_clock::now();
+				usProj += std::chrono::duration_cast<std::chrono::microseconds>(tp1 - tp0).count();
+				const float fMax(MAXF(fx, fy));
+				const float angle(pViewConsts[v].angle);
+				for (const uint64_t qk : qSorted) {
+					const uint32_t idx((uint32_t)(qk & 0xFFFFFFFFu));
+					const PointCloud::Point& X = pointcloud.Point(idx);
+					const int wgt((int)pointcloud.ViewsStreamSize(idx));
+					q.InitPoint(wgt);
+					q.InitView(v, X); // the octree path's exact per-query setup
+					float u0, w0, z0, xn0, yn0;
+					float qRadTight(0);
+					bool bFallback(!project(P + (size_t)idx*3, u0, w0, z0, xn0, yn0));
+					int bx0(0), by0(0), bx1(-1), by1(-1);
+					if (!bFallback) {
+						const float th1(atanf(sqrtf(xn0*xn0 + yn0*yn0)) + angle);
+						if (th1 > 1.3f) {
+							bFallback = true;
+						} else {
+							const float tn(tanf(th1));
+							const float radTight(1.05f * fMax * angle * (1.f + tn*tn) + pcfSlackPx);
+							const float rad(radTight + pcfDebugPx);
+							qRadTight = radTight;
+							const float lo_u((u0 - rad + (float)MG) / (float)BS), hi_u((u0 + rad + (float)MG) / (float)BS);
+							const float lo_w((w0 - rad + (float)MG) / (float)BS), hi_w((w0 + rad + (float)MG) / (float)BS);
+							if (!(lo_u >= 0.f && lo_w >= 0.f && hi_u < (float)gw && hi_w < (float)gh)) {
+								bFallback = true;
+							} else {
+								bx0 = (int)lo_u; bx1 = (int)hi_u;
+								by0 = (int)lo_w; by1 = (int)hi_w;
+							}
+						}
+					}
+					if (bFallback) {
+						octree.Collect(q, q);
+						++nFallback;
+						continue;
+					}
+					// exact classify + emit, arithmetic as in Query::operator()
+					const float ax(q.apexX), ay(q.apexY), az(q.apexZ);
+					const float dx(q.dirX), dy(q.dirY), dz(q.dirZ);
+					const float maxHeight(q.maxH), cosAngleSq(q.cosSq), refDist(q.distance);
+					for (int by = by0; by <= by1; ++by) {
+						for (int bx = bx0; bx <= bx1; ++bx) {
+							const size_t b((size_t)by * gw + bx);
+							nCand += binStart[b + 1] - binStart[b];
+							for (uint32_t j = binStart[b]; j < binStart[b + 1]; ++j) {
+								const float* const pc(binXYZ.data() + (size_t)j*3);
+								const float Dx(pc[0] - ax), Dy(pc[1] - ay), Dz(pc[2] - az);
+								const float t((dx*Dx + dy*Dy) + dz*Dz);
+								if (!(t > 0.f && t <= maxHeight))
+									continue;
+								const float nSq((Dx*Dx + Dy*Dy) + Dz*Dz);
+								if (!(t*t > cosAngleSq*nSq))
+									continue;
+								if (pcfDebugPx > 0) {
+									float uc, wc, zc, xnc, ync;
+									project(pc, uc, wc, zc, xnc, ync);
+									if (std::abs(uc - u0) > qRadTight || std::abs(wc - w0) > qRadTight) {
+										++pcfDebugMissed;
+										if (pcfDebugLogged++ < 12)
+											VERBOSE("PCF debug: view %u query %u (u %.2f w %.2f z %.4g dist %.4g) cand %u (u %.2f w %.2f z %.4g t %.4g) |du| %.3f |dw| %.3f radTight %.3f angle %.3g fx %.1f similar %d",
+												v, idx, u0, w0, z0, refDist, binIdx[j], uc, wc, zc, t, std::abs(uc-u0), std::abs(wc-w0), qRadTight, angle, fx,
+												(int)IsDepthSimilar(refDist, t, thSimilar));
+									}
+								}
+								if (IsDepthSimilar(refDist, t, thSimilar))
+									continue;
+								const uint32_t c(binIdx[j]);
+								const int delta = (t > refDist) ? (int)pViewSizes[c] : -wgt;
+								#ifdef DENSE_USE_OPENMP
+								_InterlockedExchangeAdd(reinterpret_cast<volatile long*>(vis + c), (long)delta);
+								#else
+								vis[c] += delta;
+								#endif
+							}
+						}
+					}
+				}
+				usQuery += std::chrono::duration_cast<std::chrono::microseconds>(pcf_clock::now() - tp1).count();
+			}
+		}
+		nFallbackOut = (size_t)nFallback;
+		if (pcfDebugPx > 0)
+			VERBOSE("PCF debug: %lld in-cone candidates outside the tight window", (long long)pcfDebugMissed.load());
+		VERBOSE("PCF binned detail (bin %d px, slack %.3f px): invert %.0f ms; summed over threads: project+bin %.0f ms, queries %.0f ms; %.1f binned points/view, %.1f candidates/query",
+			pcfBinSize, pcfSlackPx, pcfMs(tInv0, tInv1), (double)usProj*1e-3, (double)usQuery*1e-3,
+			(double)nBinned/(double)MAXF(numViews,(size_t)1), (double)nCand/(double)MAXF(nPairsOut,(size_t)1));
+	};
+
+	IntArr visibilityBinned;
+	size_t nBinnedPairs(0), nBinnedFallback(0);
+	double msBinned(0);
+	if (pcfMode == 1 || pcfMode == 2) {
+		int* pVis(pVisibility);
+		if (pcfMode == 2) {
+			visibilityBinned.resize(pointcloud.GetSize());
+			visibilityBinned.Memset(0);
+			pVis = visibilityBinned.Begin();
+		}
+		BuildOctree();
+		const pcf_clock::time_point t0 = pcf_clock::now();
+		SweepBinned(pVis, nBinnedPairs, nBinnedFallback);
+		msBinned = pcfMs(t0, pcf_clock::now());
+	}
+	#if PCF_GPU_SWEEP
+	bool bGpuDone(false);
+	CUDA::PCFStats gpuStats;
+	double msGpuPrep(0), msGpuFallback(0);
+	if (pcfMode == 3 || pcfMode == 4) {
+		const pcf_clock::time_point t0 = pcf_clock::now();
+		int* pVis(pVisibility);
+		if (pcfMode == 4) {
+			visibilityBinned.resize(pointcloud.GetSize());
+			visibilityBinned.Memset(0);
+			pVis = visibilityBinned.Begin();
+		}
+		// per-view query lists (the inverse of the view streams) and view descriptors
+		const size_t N(pointcloud.GetSize());
+		std::vector<uint32_t> qOff(numViews + 1, 0);
+		for (size_t i = 0; i < N; ++i) {
+			const uint32_t* const vw = pointcloud.ViewsStream(i);
+			const size_t n = pointcloud.ViewsStreamSize(i);
+			for (size_t k = 0; k < n; ++k)
+				++qOff[vw[k] + 1];
+		}
+		for (size_t v = 0; v < numViews; ++v)
+			qOff[v + 1] += qOff[v];
+		std::vector<uint32_t> qPts(qOff[numViews]);
+		{
+			std::vector<uint32_t> cur(qOff.begin(), qOff.end() - 1);
+			for (size_t i = 0; i < N; ++i) {
+				const uint32_t* const vw = pointcloud.ViewsStream(i);
+				const size_t n = pointcloud.ViewsStreamSize(i);
+				for (size_t k = 0; k < n; ++k)
+					qPts[cur[vw[k]]++] = (uint32_t)i;
+			}
+		}
+		std::vector<CUDA::PCFViewDesc> vd(numViews);
+		for (size_t v = 0; v < numViews; ++v) {
+			const Image& image = images[(IIndex)v];
+			CUDA::PCFViewDesc& d = vd[v];
+			d.fx = (float)image.camera.K(0,0); d.fy = (float)image.camera.K(1,1);
+			d.cx = (float)image.camera.K(0,2); d.cy = (float)image.camera.K(1,2);
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 3; ++c)
+					d.R[r*3+c] = (float)image.camera.R(r,c);
+			d.C[0] = pViewConsts[v].ox; d.C[1] = pViewConsts[v].oy; d.C[2] = pViewConsts[v].oz;
+			d.angle = pViewConsts[v].angle; d.cosSq = pViewConsts[v].cosAngleSq;
+			d.width = (int)image.width; d.height = (int)image.height;
+		}
+		// points without a view list have size 0 (the CPU reads the same array)
+		std::vector<uint32_t> vsz;
+		const uint32_t* pVS(pViewSizes);
+		if (!pVS) { vsz.assign(N, 0); pVS = vsz.data(); }
+		msGpuPrep = pcfMs(t0, pcf_clock::now());
+		std::vector<uint32_t> fbPts, fbViews;
+		if (CUDA::PointCloudVisibilityCUDA(pointcloud.pointsXYZ.data(), N, pVS, vd.data(), numViews,
+				qOff.data(), qPts.data(), 1, pcfSlackPx, pVis, fbPts, fbViews, gpuStats)) {
+			// the queries the grid could not bound, through the exact octree path
+			const pcf_clock::time_point tf0 = pcf_clock::now();
+			if (!fbPts.empty())
+				BuildOctree();
+			Query q(pViewConsts, pViewSizes, pVis, pLeafX, pLeafY, pLeafZ, pIdxBase);
+			for (size_t k = 0; k < fbPts.size(); ++k) {
+				const PointCloud::Point& X = pointcloud.Point(fbPts[k]);
+				q.InitPoint((int)pointcloud.ViewsStreamSize(fbPts[k]));
+				q.InitView(fbViews[k], X);
+				octree.Collect(q, q);
+			}
+			msGpuFallback = pcfMs(tf0, pcf_clock::now());
+			bGpuDone = true;
+		} else {
+			VERBOSE("PCF: GPU sweep failed; using the CPU octree sweep");
+		}
+		msBinned = pcfMs(t0, pcf_clock::now());
+	}
+	#else
+	const bool bGpuDone(false);
+	#endif
+	double msOctree(0);
+	if (pcfMode != 1 && !(pcfMode == 3 && bGpuDone)) {
+	BuildOctree();
+	const pcf_clock::time_point tOctSweep0 = pcf_clock::now();
+	Util::Progress progress(_T("Point visibility checks"), pointcloud.GetSize());
 	#ifdef DENSE_USE_OPENMP
 	#pragma omp parallel
 	{
@@ -8074,6 +8464,35 @@ void Scene::PointCloudFilter(int thRemove, float maxRemoveFrac)
 	}
 	#endif
 	progress.close();
+	msOctree = pcfMs(tOctSweep0, pcf_clock::now());
+	} // pcfMode != 1
+	if (pcfMode == 1 || pcfMode == 2) {
+		VERBOSE("PCF sweep: mode %d, %u points, %zu (point,view) queries: octree build %.0f ms, octree sweep %.0f ms, binned sweep %.0f ms (%zu octree fallbacks)",
+			pcfMode, (unsigned)pointcloud.GetSize(), nBinnedPairs, msOctreeBuild,
+			pcfMode == 2 ? msOctree : 0.0, msBinned, nBinnedFallback);
+	}
+	#if PCF_GPU_SWEEP
+	if (pcfMode == 3 || pcfMode == 4) {
+		VERBOSE("PCF GPU sweep: %s; total %.0f ms = host prep %.0f + device %.0f (upload %.0f, keys %.0f, select %.0f, sort %.0f, bounds %.0f, queries %.0f, download %.0f) + %zu fallbacks %.0f ms; %.2f of points in view on average; %.0f MB device; octree build %.0f ms%s",
+			bGpuDone ? "ok" : "FAILED", msBinned, msGpuPrep, gpuStats.msTotal, gpuStats.msUpload, gpuStats.msKeys, gpuStats.msSelect, gpuStats.msSort,
+			gpuStats.msBounds, gpuStats.msQuery, gpuStats.msDownload, gpuStats.nFallback, msGpuFallback,
+			(double)gpuStats.nInView / ((double)MAXF(numViews,(size_t)1) * (double)MAXF(pointcloud.GetSize(),(size_t)1)),
+			(double)gpuStats.bytesDevice / (1024.0*1024.0), msOctreeBuild,
+			pcfMode == 4 ? String::FormatString(", octree sweep %.0f ms", msOctree).c_str() : "");
+	}
+	#endif
+	if (pcfMode == 2 || (pcfMode == 4 && bGpuDone)) {
+		size_t nDiff(0), nRemoveOct(0), nRemoveBin(0), nRemoveDiff(0);
+		int64_t maxAbs(0);
+		for (size_t i = 0; i < pointcloud.GetSize(); ++i) {
+			const int a(pVisibility[i]), b(visibilityBinned[i]);
+			if (a != b) { ++nDiff; maxAbs = MAXF(maxAbs, (int64_t)std::abs(a - b)); }
+			const bool ra(a <= thRemove), rb(b <= thRemove);
+			nRemoveOct += ra; nRemoveBin += rb; nRemoveDiff += (ra != rb);
+		}
+		VERBOSE("PCF compare: %zu points with different scores (max |diff| %lld); removed at th<=%d: octree %zu, binned %zu, %zu points differ",
+			nDiff, (long long)maxAbs, thRemove, nRemoveOct, nRemoveBin, nRemoveDiff);
+	}
 
 	// Release the octree scaffolding NOW, before the compaction below reclaims the
 	// cloud's own buffers. This scratch is ~24 bytes/point (typed point array 12, the

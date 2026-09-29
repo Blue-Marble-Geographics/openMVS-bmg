@@ -256,7 +256,14 @@ bool Initialize(size_t argc, LPCTSTR* argv)
 	OPTDENSE::nSubResolutionLevels = nSubResolutionLevels;
 	OPTDENSE::nNumViews = nNumViews;
 	OPTDENSE::nMinViewsFuse = nMinViewsFuse;
-	OPTDENSE::fNCCThresholdKeep = 0.45f; // JPB WIP BUG override (default ~0.55) -- loosen depth-map filter to fill holes in textureless / canopy regions
+	// CPU estimator only: the GPU estimator takes its own keep threshold
+	// (PMCUDA_NCC_THRESHOLD_KEEP, 0.81, in PatchMatchCUDA.inl). The CPU reads this value
+	// for far more than its final cut -- thRobust = x4/3 drops views from the aggregated
+	// score, it gates neighbor propagation, and thConfSmall/Big/Rand size the random
+	// refinement -- so the GPU's 0.81 here changes the CPU's depths, not just which
+	// ones are kept. JPB WIP override of the default (~0.55) for textureless / canopy
+	// regions, unchanged for the CPU.
+	OPTDENSE::fNCCThresholdKeep = 0.45f;
 	OPTDENSE::nEstimationIters = nEstimationIters;
 	OPTDENSE::nEstimationGeometricIters = nEstimationGeometricIters;
 	OPTDENSE::nEstimateColors = nEstimateColors;

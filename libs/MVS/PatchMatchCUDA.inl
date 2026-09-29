@@ -76,6 +76,36 @@
 #define PMCUDA_OPT_FP16_TEX 1
 #endif
 
+// Sample the neighbor depth-maps in the geometric-consistency term the way the CPU
+// estimator does (1, default): a bilinear blend of only those of the 4 surrounding
+// depths that agree with the forward-projected depth to within 3%, the maximum
+// penalty when none does. 0 restores the upstream CUDA behaviour: one hardware
+// bilinear fetch, which blends depths across occlusion edges and blends holes with
+// valid depths, so a correct estimate next to an edge or a hole is charged a
+// spurious reprojection error. Measured on a 95-image scene: +0.25% surviving
+// fused points, no measurable cost. The environment variable
+// OPENMVS_CUDA_GATED_DEPTH (0/1) overrides it at run time.
+#ifndef PMCUDA_GATED_DEPTH_SAMPLING
+#define PMCUDA_GATED_DEPTH_SAMPLING 1
+#endif
+
+// Keep threshold of the GPU estimator's cost filter, in place of
+// OPTDENSE::fNCCThresholdKeep (0 - use OPTDENSE::fNCCThresholdKeep). A depth is culled
+// when its cost reaches this x1.333 after the photometric pass (when geometric passes
+// follow) and this itself after each geometric pass, so a LOWER value culls MORE; in
+// the geometric passes the cost also carries the consistency penalty, 0.1 x a
+// reprojection distance capped at 4. 0.81 (keep-cost 1.08) gave 86.2% valid depths /
+// 93.6M points on CobbColony; the shared 0.45 gave 72.0% / 74.2M on the same scene.
+// Separate from fNCCThresholdKeep because the CPU estimator reads that value for far
+// more than its final cut -- thRobust (views scoring above it drop out of the
+// aggregate), neighbor propagation, and the random-refinement perturbation sizes --
+// so raising it there changes the CPU's depths, not just which ones are kept. The
+// environment variable OPENMVS_CUDA_NCC_KEEP (thousandths, 0 - fNCCThresholdKeep)
+// overrides it at run time.
+#ifndef PMCUDA_NCC_THRESHOLD_KEEP
+#define PMCUDA_NCC_THRESHOLD_KEEP 0.81f
+#endif
+
 // Floor on the photometric patch-match iterations run by the GPU estimator,
 // applied on top of whatever --iters requested (0 - disabled, --iters is used
 // as-is). One GPU iteration is a single red+black checkerboard step with a
@@ -122,6 +152,9 @@ namespace MVS {
 				bool bGeomConsistency = false;
 				bool bLowResProcessed = false;
 				float fThresholdKeepCost = 0;
+				// PMCUDA_GATED_DEPTH_SAMPLING; uniform across a launch, so the branch on it
+				// inside the kernel is free of divergence
+				bool bGatedDepth = true;
 			};
 
 			// per image-pair constants of the plane-induced homography decomposition
